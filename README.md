@@ -7,6 +7,17 @@ Galaxy, Photon or Unity Gaming Services), its lobbies, invites, friends, voice a
 connections run between the copies themselves. It's one Windows program, written in
 Rust, that starts the game with a small hook inside it. No game files change.
 
+<table>
+  <tr>
+    <td><img src="docs/images/launcher.png" alt="The PeerParty launcher: a library of games, one selected, with Play and who can join you"></td>
+    <td><img src="docs/images/overlay.png" alt="PeerParty's in-game overlay: an invite, and players on the network, in a room and in public sessions"></td>
+  </tr>
+  <tr>
+    <td align="center">Launcher</td>
+    <td align="center">In-game overlay</td>
+  </tr>
+</table>
+
 ## Keeping multiplayer alive
 
 Online services close. When the lobby, sign-in or matchmaking service a game's
