@@ -1,0 +1,13 @@
+# Static CRT: no vcruntime140.dll dependency, so peerparty.exe runs on PCs without the
+# VC++ redistributable (and nothing extra has to be injected next to the hook DLL).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# 32-bit games: the x86 hook DLL.
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# What cargo runs (tests) binds to 127.0.0.1 only: no Windows Firewall prompt for every
+# rebuilt test binary. peerparty.exe started directly isn't affected.
+[env]
+PEERPARTY_LOOPBACK = "1"

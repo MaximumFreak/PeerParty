@@ -1,0 +1,8 @@
+<Project>
+  <!-- Build output stays in %TEMP%, out of the source folder. -->
+  <PropertyGroup>
+    <BaseOutputPath>$(TEMP)\pp-photon-test\bin\$(MSBuildProjectName)\</BaseOutputPath>
+    <BaseIntermediateOutputPath>$(TEMP)\pp-photon-test\obj\$(MSBuildProjectName)\</BaseIntermediateOutputPath>
+    <Nullable>disable</Nullable>
+  </PropertyGroup>
+</Project>

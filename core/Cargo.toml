@@ -1,0 +1,21 @@
+[package]
+name = "peerparty_core"
+description = "Shared LAN core: identity, discovery, lobbies and channels between copies of a game"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+windows-sys.workspace = true
+# Internet play (src/inet): pure-Rust crypto, built for x64 and the 32-bit hook alike.
+chacha20poly1305 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+sha2 = "0.10"
+sha1 = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+getrandom = "0.2"
+# Public sessions: each player's long-term signing key.
+ed25519-dalek = "2"
+# Wipes key material we hold in plain arrays (the dalek and chacha types wipe their own).
+zeroize = "1"

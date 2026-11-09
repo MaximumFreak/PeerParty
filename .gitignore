@@ -1,0 +1,6 @@
+/target/
+/peerparty.exe
+__pycache__/
+*.pyc
+*.json.tmp
+*.conflict*

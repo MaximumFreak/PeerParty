@@ -1,0 +1,56 @@
+[workspace]
+resolver = "3"
+members = ["launcher", "hook", "core"]
+
+[workspace.package]
+# Tagged `v<version>` in git; peerparty.exe adds the commits since that tag (launcher/build.rs).
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Security_Authentication_Identity",
+    "Win32_Security_Credentials",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_Kernel",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# retour 0.3.1 writes a relocated RIP displacement over the last four bytes of the
+# instruction, which corrupts `cmp dword [rip+d], imm8` and crashed a game.
+# The vendored copy finds the real displacement offset.
+[patch.crates-io]
+retour = { path = "vendor/retour" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+# What tests/run_all.ps1 builds and runs. Same optimizations as release, without
+# link-time optimization and with incremental compilation, so a hook change doesn't
+# rebuild the suite's exe the slow way. The shipping exe stays on `release`.
+[profile.testexe]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
+strip = false
