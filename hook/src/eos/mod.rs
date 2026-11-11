@@ -28,7 +28,7 @@ mod table;
 mod ui;
 mod users;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -166,6 +166,8 @@ pub(crate) unsafe fn call<T>(func: usize, info: &T) {
 // ---- structs handed out by Copy* functions, owned until their Release ----
 
 struct Owned {
+    /// Bytes from the start the value covers.
+    len: usize,
     _value: Box<dyn std::any::Any>,
     _strings: Vec<std::ffi::CString>,
 }
@@ -173,15 +175,19 @@ struct Owned {
 // The values are plain C structs that only this registry touches.
 unsafe impl Send for Owned {}
 
-static OWNED: LazyLock<Mutex<HashMap<usize, Owned>>> = LazyLock::new(Mutex::default);
+/// Handed-out values by start address.
+static OWNED: LazyLock<Mutex<BTreeMap<usize, Owned>>> = LazyLock::new(Mutex::default);
 
-/// Keeps `value` (and the strings it points into) alive until `release`.
+/// Keeps `value` (and the strings it points into) alive until `release`. The game may
+/// be given a field inside it (an attribute with its data beside it), so `release`
+/// takes any address within the value.
 pub(crate) fn hand_out<T: 'static>(value: T, strings: Vec<std::ffi::CString>) -> usize {
     let b = Box::new(value);
     let p = &*b as *const T as usize;
     OWNED.lock().unwrap().insert(
         p,
         Owned {
+            len: std::mem::size_of::<T>().max(1),
             _value: b,
             _strings: strings,
         },
@@ -189,8 +195,27 @@ pub(crate) fn hand_out<T: 'static>(value: T, strings: Vec<std::ffi::CString>) ->
     p
 }
 
+/// Frees the handed-out value `p` points into (the game's `*_Release`).
 pub(crate) fn release(p: usize) {
-    OWNED.lock().unwrap().remove(&p);
+    let mut owned = OWNED.lock().unwrap();
+    let start = owned.range(..=p).next_back().filter(|(s, o)| p < **s + o.len).map(|(s, _)| *s);
+    if let Some(s) = start {
+        owned.remove(&s);
+    }
+}
+
+/// `s` cut to at most `max` bytes at a character boundary: what another player sent,
+/// held to the SDK's documented limit before a game, which sized its buffers by that
+/// limit, gets it.
+pub(crate) fn clamp(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 /// A C string for a struct we hand out, kept in `keep` until the struct is released.
@@ -390,6 +415,26 @@ type PlatformTickFn = unsafe extern "system" fn(usize);
 static CREATE: OnceLock<GenericDetour<PlatformCreateFn>> = OnceLock::new();
 static TICK: OnceLock<GenericDetour<PlatformTickFn>> = OnceLock::new();
 
+type RestartCheckFn = unsafe extern "system" fn(usize) -> i32;
+static RESTART_CHECK: OnceLock<GenericDetour<RestartCheckFn>> = OnceLock::new();
+
+/// EOS_Platform_CheckForLauncherAndRestart: a game asks whether Epic's launcher started
+/// it, and if not, the SDK starts it again through the launcher and the game quits. One
+/// that PeerParty started would leave PeerParty that way (and run once, not twice), so
+/// the answer there is "carry on" (EOS_NoChange), in every mode. Returns the hooked
+/// function, for the call logging to leave alone.
+pub fn answer_restart_check(exports: &[Export]) -> Option<usize> {
+    let e = exports.iter().find(|e| e.name == "EOS_Platform_CheckForLauncherAndRestart")?;
+    let target: RestartCheckFn = unsafe { std::mem::transmute(e.addr) };
+    arm(&RESTART_CHECK, target, detour_restart_check, "EOS_Platform_CheckForLauncherAndRestart").then_some(e.addr as usize)
+}
+
+unsafe extern "system" fn detour_restart_check(_platform: usize) -> i32 {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| log!("eos: the game asked to restart through Epic's launcher; told to carry on (PeerParty started it)"));
+    abi::result::NO_CHANGE
+}
+
 fn arm<T>(slot: &OnceLock<GenericDetour<T>>, target: T, detour: T, label: &str) -> bool
 where
     T: retour::Function + Copy + Send + Sync + 'static,
@@ -476,6 +521,44 @@ unsafe extern "system" fn detour_tick(platform: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_restart_check_says_carry_on() {
+        assert_eq!(unsafe { detour_restart_check(0) }, abi::result::NO_CHANGE);
+    }
+
+    #[test]
+    fn clamping_keeps_whole_characters() {
+        assert_eq!(clamp("abc", 5), "abc");
+        assert_eq!(clamp("abcdef", 3), "abc");
+        assert_eq!(clamp("aé", 2), "a", "é is two bytes");
+        assert_eq!(clamp("€€", 4), "€");
+        assert_eq!(clamp("€", 0), "");
+    }
+
+    /// A value handed out is freed by its release, whichever field the game was given;
+    /// an address outside every value frees nothing.
+    #[test]
+    fn release_takes_a_field_inside_the_value() {
+        #[repr(C)]
+        struct Pair {
+            data: [u64; 4],
+            info: u32,
+        }
+        let held = |p: usize| OWNED.lock().unwrap().contains_key(&p);
+        let p = hand_out(Pair { data: [0; 4], info: 1 }, Vec::new());
+        let info = unsafe { &(*(p as *const Pair)).info } as *const u32 as usize;
+        assert_ne!(info, p);
+        let q = hand_out(7u64, Vec::new());
+        release(usize::MAX);
+        release(0);
+        assert!(held(p) && held(q));
+        release(info);
+        assert!(!held(p), "released through its inner field");
+        assert!(held(q));
+        release(q);
+        assert!(!held(q));
+    }
 
     #[test]
     fn only_an_anti_cheat_session_start_stops_the_game() {

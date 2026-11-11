@@ -22,6 +22,9 @@ pub mod result {
     pub const INVALID_PARAMETERS: i32 = 10;
     pub const NOT_IMPLEMENTED: i32 = 16;
     pub const NOT_FOUND: i32 = 18;
+    /// EOS_NoChange: what EOS_Platform_CheckForLauncherAndRestart answers when the game
+    /// may carry on.
+    pub const NO_CHANGE: i32 = 20;
     pub const LIMIT_EXCEEDED: i32 = 22;
     pub const TIMED_OUT: i32 = 27;
     pub const ALREADY_PENDING: i32 = 9;

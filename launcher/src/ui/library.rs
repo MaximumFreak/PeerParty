@@ -13,6 +13,23 @@ const CARD_W: f32 = 164.0;
 const CARD_H: f32 = 246.0;
 const GAP: f32 = 18.0;
 const ROW_H: f32 = 56.0;
+/// The top bar's buttons (list / grid, rescan, Add) with their gaps: with Add's label,
+/// and with its icon alone.
+const TOP_BUTTONS: f32 = 170.0;
+const TOP_BUTTONS_COMPACT: f32 = 130.0;
+/// The search box: as narrow as it gets, where it's wide enough for its hint, and as
+/// wide as it gets.
+const SEARCH_MIN: f32 = 96.0;
+const SEARCH_HINT_MIN: f32 = 220.0;
+const SEARCH_MAX: f32 = 460.0;
+
+/// The search box's width in a top bar `available` wide, and whether Add goes without
+/// its label to make room for it.
+fn top_bar_fit(available: f32) -> (f32, bool) {
+    let compact = available - TOP_BUTTONS < SEARCH_HINT_MIN;
+    let buttons = if compact { TOP_BUTTONS_COMPACT } else { TOP_BUTTONS };
+    ((available - buttons).clamp(SEARCH_MIN, SEARCH_MAX), compact)
+}
 
 impl App {
     pub(super) fn library(&mut self, ui: &mut egui::Ui) {
@@ -31,10 +48,14 @@ impl App {
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let w = (ui.available_width() - 170.0).clamp(220.0, 460.0);
+            // The buttons on the right keep their room. In a narrow window with a game's
+            // panel open there's little left: Add loses its label and the search box its
+            // hint, rather than one being drawn over the other.
+            let (w, compact) = top_bar_fit(ui.available_width());
+            let hint = if w >= SEARCH_HINT_MIN { t!("library.search") } else { "" };
             let search = ui.add(
                 egui::TextEdit::singleline(&mut self.search)
-                    .hint_text(egui::RichText::new(t!("library.search")).color(TEXT3))
+                    .hint_text(egui::RichText::new(hint).color(TEXT3))
                     .desired_width(w)
                     .margin(Margin { left: 36, right: 12, top: 9, bottom: 9 })
                     .background_color(theme::FIELD),
@@ -51,7 +72,8 @@ impl App {
                 ui.add(egui::Spinner::new().size(16.0).color(TEXT3));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let add = widgets::button(ui, Some(Icon::Add), t!("library.add"), widgets::Kind::Primary);
+                let add = widgets::button(ui, Some(Icon::Add), if compact { "" } else { t!("library.add") }, widgets::Kind::Primary);
+                let add = if compact { add.on_hover_text(t!("library.add")) } else { add };
                 self.top_bar_ids.insert(add.id);
                 egui::Popup::menu(&add).show(|ui| {
                     ui.set_min_width(240.0);
@@ -367,5 +389,24 @@ impl App {
                 });
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The search box and the buttons never need more than the bar has, down to the
+    /// narrowest it gets (a 900-wide window with a game's panel open: 900 - 232 - 384 - 44).
+    #[test]
+    fn the_top_bar_fits_its_width() {
+        for available in [240.0, 300.0, 389.0, 390.0, 600.0, 780.0, 2000.0] {
+            let (w, compact) = top_bar_fit(available);
+            let buttons = if compact { TOP_BUTTONS_COMPACT } else { TOP_BUTTONS };
+            assert!(w + buttons <= available, "{available}: {w} + {buttons}");
+            assert!((SEARCH_MIN..=SEARCH_MAX).contains(&w));
+        }
+        assert_eq!(top_bar_fit(780.0), (SEARCH_MAX, false), "a wide window is as it was");
+        assert!(top_bar_fit(240.0).1);
     }
 }

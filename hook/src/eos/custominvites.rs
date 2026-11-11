@@ -19,6 +19,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_char;
 use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use peerparty_core::{Event, Lan, PeerId};
 
@@ -66,7 +67,50 @@ struct State {
     next_id: u64,
     /// Requests to join we received and haven't answered.
     requests: HashSet<PeerId>,
+    /// Players we asked to join, and when: only they can answer (`ASKED_FOR`).
+    asked: HashMap<PeerId, Instant>,
     rtj_disabled: bool,
+}
+
+/// How long a request to join we sent can be answered.
+const ASKED_FOR: Duration = Duration::from_secs(600);
+/// Players asked at once, and custom invites the game hasn't finalized: the oldest go
+/// when there are more (each received invite is a peer's payload kept for the game).
+const MAX_ASKED: usize = 64;
+const MAX_RECEIVED: usize = 64;
+
+impl State {
+    fn ask(&mut self, peer: PeerId, now: Instant) {
+        self.asked.retain(|_, at| now.duration_since(*at) < ASKED_FOR);
+        while self.asked.len() >= MAX_ASKED {
+            let Some(oldest) = self.asked.iter().min_by_key(|(_, at)| **at).map(|(p, _)| *p) else { break };
+            self.asked.remove(&oldest);
+        }
+        self.asked.insert(peer, now);
+    }
+
+    /// Whether `from` may answer a request to join (we asked them, lately); an answer
+    /// uses the request up.
+    fn answered_by(&mut self, from: PeerId, now: Instant) -> bool {
+        self.asked.remove(&from).is_some_and(|at| now.duration_since(at) < ASKED_FOR)
+    }
+
+    /// Keeps a received custom invite for FinalizeInvite: its id.
+    fn keep_received(&mut self, from: PeerId, payload: &str) -> String {
+        while self.received.len() >= MAX_RECEIVED {
+            let oldest = self.received.keys().min_by_key(|id| invite_number(id)).cloned();
+            let Some(oldest) = oldest else { break };
+            self.received.remove(&oldest);
+        }
+        self.next_id += 1;
+        let id = format!("peerparty-custom-invite-{}", self.next_id);
+        self.received.insert(id.clone(), (from, payload.to_string()));
+        id
+    }
+}
+
+fn invite_number(id: &str) -> u64 {
+    id.rsplit('-').next().and_then(|n| n.parse().ok()).unwrap_or(0)
 }
 
 static S: LazyLock<Mutex<State>> = LazyLock::new(Mutex::default);
@@ -271,7 +315,10 @@ fn complete(cb: usize, cd: usize, r: i32, local: usize, target: usize) {
 unsafe extern "system" fn send_request_to_join(_h: usize, o: *const LocalTargetOptions, cd: usize, cb: usize) {
     let (local, target) = local_target(o);
     let r = match ids::peer_of_puid(target) {
-        Some(peer) if send_to(peer, RTJ) => SUCCESS,
+        Some(peer) if send_to(peer, RTJ) => {
+            S.lock().unwrap().ask(peer, Instant::now());
+            SUCCESS
+        }
         Some(_) => NOT_FOUND,
         None => INVALID_PARAMETERS,
     };
@@ -349,14 +396,13 @@ unsafe extern "system" fn remove_notify(_h: usize, id: u64) {
 /// with auto-accept on; see invite.rs).
 fn receive_invite(from: PeerId, connect: &str, payload: &str) {
     let Some(me) = me() else { return };
+    // Games size their buffers by the SDK's limit; a sender can't go over it.
+    if payload.len() > MAX_PAYLOAD {
+        trace("CustomInviteReceived", || format!("from {from}: dropped, a payload of {} bytes", payload.len()));
+        return;
+    }
     let decision = crate::invite::decision(from, connect, None);
-    let id = {
-        let mut s = S.lock().unwrap();
-        s.next_id += 1;
-        let id = format!("peerparty-custom-invite-{}", s.next_id);
-        s.received.insert(id.clone(), (from, payload.to_string()));
-        id
-    };
+    let id = S.lock().unwrap().keep_received(from, payload);
     trace("CustomInviteReceived", || format!("{id} from {from}: {payload:?}"));
     let info = |cd| CustomInviteInfo {
         ClientData: cd,
@@ -415,6 +461,10 @@ fn receive_request(from: PeerId, connect: &str) {
 
 fn receive_response(from: PeerId, accepted: bool) {
     let Some(me) = me() else { return };
+    if !S.lock().unwrap().answered_by(from, Instant::now()) {
+        trace("RequestToJoinResponseReceived", || format!("from {from}: dropped, we didn't ask them"));
+        return;
+    }
     trace("RequestToJoinResponseReceived", || format!("from {from}: accepted={accepted}"));
     for (f, cd) in listeners(Kind::RequestToJoinResponse, None) {
         let info = RequestToJoinResponseInfo {
@@ -471,6 +521,37 @@ mod tests {
         assert_eq!(parse(RTJ_REJECT), Some(Message::Response(false)));
         assert_eq!(parse("+connect_lobby 123"), None);
         assert!(is_ours(RTJ) && is_ours(INVITE) && !is_ours("lobby=abc"));
+    }
+
+    /// Only a player we asked to join answers, once, and not after `ASKED_FOR`.
+    #[test]
+    fn only_players_we_asked_answer_a_request_to_join() {
+        let mut s = State::default();
+        let (a, b) = (PeerId([1; 16]), PeerId([2; 16]));
+        let t0 = Instant::now();
+        assert!(!s.answered_by(a, t0), "nobody asked");
+        s.ask(a, t0);
+        assert!(!s.answered_by(b, t0), "someone else");
+        assert!(s.answered_by(a, t0 + Duration::from_secs(5)));
+        assert!(!s.answered_by(a, t0 + Duration::from_secs(6)), "used up");
+        s.ask(a, t0);
+        assert!(!s.answered_by(a, t0 + ASKED_FOR), "too late");
+        for n in 0..200u8 {
+            s.ask(PeerId([n; 16]), t0 + Duration::from_millis(u64::from(n)));
+        }
+        assert_eq!(s.asked.len(), MAX_ASKED);
+        assert!(s.asked.contains_key(&PeerId([199; 16])), "the newest are kept");
+    }
+
+    #[test]
+    fn received_invites_are_bounded() {
+        let mut s = State::default();
+        let from = PeerId([3; 16]);
+        let ids: Vec<String> = (0..100).map(|_| s.keep_received(from, "{}")).collect();
+        assert_eq!(s.received.len(), MAX_RECEIVED);
+        assert!(!s.received.contains_key(&ids[0]), "the oldest went");
+        assert!(s.received.contains_key(&ids[99]));
+        assert_eq!(invite_number(&ids[99]), 100);
     }
 
     /// Offsets on x64 per eos_custominvites_types.h (pack 8).

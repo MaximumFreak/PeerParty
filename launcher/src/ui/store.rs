@@ -25,7 +25,9 @@ pub fn key_of(exe: &Path) -> String {
 pub struct GameOptions {
     /// Copies on this PC: 1, or 2 for testing two players on one machine.
     pub players: u8,
-    pub copy_saves: bool,
+    // "Copy Player 1's saves to Player N" isn't kept here: it is for one start (the window's
+    // `App::copy_saves`). A `copy_saves` an older ui.json has is ignored on reading and
+    // gone at the next save.
     pub args: String,
     /// A different program than the one found, chosen by the player.
     pub exe: Option<PathBuf>,
@@ -47,7 +49,6 @@ impl Default for GameOptions {
     fn default() -> Self {
         GameOptions {
             players: 1,
-            copy_saves: false,
             args: String::new(),
             exe: None,
             auto_accept: None,
@@ -124,8 +125,9 @@ pub struct Prefs {
     /// The name public players see (`PEERPARTY_PUBLIC_NAME`). Empty: `name`, else
     /// "Player-" and the start of this PC's key.
     pub public_name: String,
-    /// Voice and party chat with public players (`PEERPARTY_PUBLIC_VOICE=0` when off).
-    /// On by default; room and LAN players always have voice.
+    /// Voice and party chat with public players (`PEERPARTY_PUBLIC_VOICE`). Off by
+    /// default: strangers hear the microphone only once the player says so. Room and
+    /// LAN players always have voice.
     pub public_voice: bool,
     /// The internet switch (`PEERPARTY_INTERNET=0` when off): the room and public
     /// sessions are kept but not used, local network only. On by default; the overlay's
@@ -158,7 +160,7 @@ impl Default for Prefs {
             room: String::new(),
             public: false,
             public_name: String::new(),
-            public_voice: true,
+            public_voice: false,
             internet: true,
             guide_tip_shown: false,
             language: String::new(),
@@ -214,11 +216,24 @@ pub struct Settings {
     /// The window's settings layout this file was written with (`UI_VERSION`); 0 is a
     /// file from before the redesign.
     pub ui_version: u32,
+    /// Ask GitHub once a day whether a newer PeerParty is out (update.rs).
+    pub check_updates: bool,
+    /// When it last asked (seconds since 1970).
+    pub update_checked: u64,
     pub prefs: Prefs,
+    /// The file is there and couldn't be read (another program had it, say): these are
+    /// defaults standing in, and saving them would put defaults over the player's real
+    /// settings. Nothing is saved until a read works.
+    #[serde(skip)]
+    pub unread: bool,
 }
 
-/// `Settings::ui_version` now.
-pub const UI_VERSION: u32 = 2;
+/// `Settings::ui_version` now. 3: voice with strangers became off unless turned on; a
+/// file from before has it switched off once, since "on" there was only the old default.
+pub const UI_VERSION: u32 = 3;
+
+/// The waits the window offers between starting one copy and the next, in seconds.
+pub const SECOND_DELAYS: [u32; 10] = [3, 5, 8, 10, 12, 15, 20, 30, 45, 60];
 
 impl Default for Settings {
     fn default() -> Self {
@@ -232,7 +247,10 @@ impl Default for Settings {
             after_launch: "minimize".into(),
             onboarded: false,
             ui_version: UI_VERSION,
+            check_updates: true,
+            update_checked: 0,
             prefs: Prefs::default(),
+            unread: false,
         }
     }
 }
@@ -243,15 +261,41 @@ impl Settings {
     }
 
     pub fn load() -> Settings {
-        let Some(mut s) = fs::read_to_string(Self::path()).ok().and_then(|t| Self::parse(&t)) else {
+        Self::load_from(&Self::path())
+    }
+
+    /// Reads the settings at `path`. A file that's there but doesn't read (cut short,
+    /// edited by hand) is kept beside it as `ui.json.bad` first: the defaults that take
+    /// its place are saved over it at the next change, and with it would go the room
+    /// code, the game folders and every game's own settings.
+    fn load_from(path: &Path) -> Settings {
+        let text = match fs::read_to_string(path) {
+            Ok(t) => t,
+            // No file is a first run. Anything else is a file we mustn't replace.
+            Err(e) => return Settings { unread: e.kind() != std::io::ErrorKind::NotFound, ..Settings::default() },
+        };
+        let Some(mut s) = Self::parse(&text) else {
+            if !text.trim().is_empty() {
+                let _ = fs::write(path.with_extension("json.bad"), &text);
+            }
             return Settings::default();
         };
         if s.ui_version == 0 {
             // Someone who used PeerParty before the first-run setup existed: they've set
             // it up already.
             s.onboarded = true;
-            s.ui_version = UI_VERSION;
         }
+        if s.ui_version < 3 {
+            s.prefs.public_voice = false;
+        }
+        // The wait before a second copy is one the window offers. An older window let it
+        // be dragged up to 120 s, and this one showed anything past 60 as 12 s while the
+        // second copy still waited the whole time: past the last choice it is the 12 s
+        // shown, between two choices the longer one.
+        if !SECOND_DELAYS.contains(&s.second_delay) {
+            s.second_delay = SECOND_DELAYS.iter().copied().find(|d| *d >= s.second_delay).unwrap_or(Settings::default().second_delay);
+        }
+        s.ui_version = UI_VERSION;
         s
     }
 
@@ -265,11 +309,21 @@ impl Settings {
     }
 
     pub fn save(&self) {
-        let _ = fs::create_dir_all(data_dir());
+        self.save_to(&Self::path());
+    }
+
+    fn save_to(&self, path: &Path) {
+        if self.unread {
+            return;
+        }
+        if let Some(dir) = path.parent() {
+            let _ = fs::create_dir_all(dir);
+        }
         if let Ok(text) = serde_json::to_string_pretty(self) {
-            let tmp = Self::path().with_extension("json.tmp");
-            if fs::write(&tmp, text).is_ok() {
-                let _ = fs::rename(&tmp, Self::path());
+            // A name of this process's own: the window and a game's overlay both save.
+            let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+            if fs::write(&tmp, text).is_ok() && fs::rename(&tmp, path).is_err() {
+                let _ = fs::remove_file(&tmp);
             }
         }
     }
@@ -348,6 +402,95 @@ mod tests {
         assert_eq!(new.ui_version, UI_VERSION);
         assert!(!new.onboarded);
         assert!(Settings::default().prefs.effects && Settings::default().prefs.language.is_empty());
+    }
+
+    /// Settings that don't read are set aside, not lost to the next save.
+    #[test]
+    fn unreadable_settings_are_kept_beside_the_new_ones() {
+        let dir = std::env::temp_dir().join(format!("peerparty-settings-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ui.json");
+        let broken = r#"{"prefs": {"room": "PP1-AAAA", "public": tru"#;
+        fs::write(&path, broken).unwrap();
+        let s = Settings::load_from(&path);
+        assert!(s.prefs.room.is_empty() && !s.onboarded, "defaults stand in");
+        assert_eq!(fs::read_to_string(dir.join("ui.json.bad")).unwrap(), broken);
+        // A good file reads as before and leaves nothing behind.
+        fs::remove_file(dir.join("ui.json.bad")).unwrap();
+        fs::write(&path, r#"{"ui_version": 2, "prefs": {"name": "Robin"}}"#).unwrap();
+        assert_eq!(Settings::load_from(&path).prefs.name, "Robin");
+        assert!(!dir.join("ui.json.bad").exists());
+        assert!(Settings::load_from(&dir.join("none.json")).prefs.name.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A file that is there and can't be read (here: it is a folder) leaves defaults in
+    /// memory, and they are never saved over it. No file at all is a first run, which saves.
+    #[test]
+    fn settings_that_couldnt_be_read_arent_written_over() {
+        let dir = std::env::temp_dir().join(format!("peerparty-unread-{}", std::process::id()));
+        let path = dir.join("ui.json");
+        fs::create_dir_all(&path).unwrap();
+        let s = Settings::load_from(&path);
+        assert!(s.unread);
+        s.save_to(&path);
+        assert!(path.is_dir(), "the unreadable thing is still there");
+        let fresh = dir.join("first-run.json");
+        let mut s = Settings::load_from(&fresh);
+        assert!(!s.unread);
+        s.prefs.name = "Robin".into();
+        s.save_to(&fresh);
+        assert_eq!(Settings::load_from(&fresh).prefs.name, "Robin");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2, "no temporary file left behind");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Voice with strangers was on unless turned off; it is off unless turned on. A file
+    /// from before can't say which the player meant, so it is asked again, once.
+    #[test]
+    fn an_older_file_has_voice_with_strangers_switched_off_once() {
+        let dir = std::env::temp_dir().join(format!("peerparty-voice-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ui.json");
+        fs::write(&path, r#"{"ui_version": 2, "prefs": {"public_voice": true, "voice": true}}"#).unwrap();
+        let s = Settings::load_from(&path);
+        assert!(!s.prefs.public_voice && s.prefs.voice && s.ui_version == UI_VERSION);
+        // Turned on since, it stays on.
+        fs::write(&path, format!(r#"{{"ui_version": {UI_VERSION}, "prefs": {{"public_voice": true}}}}"#)).unwrap();
+        assert!(Settings::load_from(&path).prefs.public_voice);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// "Copy player 1's saves" used to be a game's setting, so every later second copy
+    /// replaced its save. An older file's is ignored, the rest of the game's settings
+    /// read as before, and the next save leaves it out.
+    #[test]
+    fn an_older_files_copy_saves_is_dropped() {
+        let dir = std::env::temp_dir().join(format!("peerparty-copy-saves-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ui.json");
+        fs::write(&path, r#"{"ui_version": 3, "games": {"c:/games/a/a.exe": {"players": 2, "copy_saves": true, "args": "-windowed"}}}"#).unwrap();
+        let s = Settings::load_from(&path);
+        let o = s.options("c:/games/a/a.exe");
+        assert_eq!((o.players, o.args.as_str()), (2, "-windowed"));
+        s.save_to(&path);
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("copy_saves") && text.contains("-windowed"), "{text}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A wait the window doesn't offer (an older window's 100 s) reads as one it does,
+    /// so what the window shows is what the second copy waits.
+    #[test]
+    fn a_second_copys_wait_is_one_the_window_offers() {
+        let dir = std::env::temp_dir().join(format!("peerparty-delay-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ui.json");
+        for (stored, read) in [(100, 12), (7, 8), (0, 3), (45, 45)] {
+            fs::write(&path, format!(r#"{{"ui_version": {UI_VERSION}, "second_delay": {stored}}}"#)).unwrap();
+            assert_eq!(Settings::load_from(&path).second_delay, read, "{stored}");
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

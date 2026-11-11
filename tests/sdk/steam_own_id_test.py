@@ -5,7 +5,7 @@ role A; `PPTEST_DISPATCH=classic` for classic callback dispatch, else ManualDisp
 
 Checks, with steam_api's SteamID read from PeerParty's log (`steamown:` line):
 
-- GetSteamID is a LAN SteamID (instance 4, account with the top bit set), not
+- GetSteamID is a LAN SteamID (instance 1, account with the top bit set), not
   steam_api's; GetAppOwner says the same.
 - Saves under steam_api's SteamID, account id and hex SteamID are copied the first time
   a path with the new one is opened: a folder (with a subfolder) and a file token. The
@@ -16,7 +16,7 @@ Checks, with steam_api's SteamID read from PeerParty's log (`steamown:` line):
   steam_api's; classic dispatch's registered object answers the same way.
 
 Role `probe`, run without peerparty: only starts the SDK and reads the SteamID."""
-import ctypes as C, glob, os, re, sys, time
+import ctypes as C, glob, os, re, shutil, sys, time
 
 DIR = os.environ["PPTEST_DIR"]
 ROLE = sys.argv[1]
@@ -116,13 +116,16 @@ check("the game is shown a SteamID of its own", old is not None and old != me, f
 if old is None:
     done()
 check("peerparty maps steam_api's SteamID to ours", from_log(rf"steamown: steam_api's SteamID {old} is ({me})") == me)
-check("our SteamID is a LAN one", (me >> 32) & 0xFFFFF == 4 and me & 0x8000_0000, hex(me))
+check("our SteamID is a LAN one", (me >> 32) & 0xFFFFF == 1 and me & 0x8000_0000, hex(me))
 owner = fn("SteamAPI_ISteamApps_GetAppOwner", U64, VP)(apps)
 check("GetAppOwner is ours", owner == me, f"{owner}")
 
 # ---- saves ----
 
-base = os.path.join(DIR, "saves")
+# Not under the work folder: that is in %TEMP%, and saves.rs never copies saves there
+# (a game's temp files aren't its save).
+base = os.path.join(os.environ["LOCALAPPDATA"], "peerparty", "test-saves", f"steam-own-{os.getpid()}")
+shutil.rmtree(base, ignore_errors=True)
 
 
 def write(path, text):
@@ -158,6 +161,7 @@ check("the original is untouched", read(os.path.join(base, str(old), "a.sav")) =
 check("a file save named by account id is copied", read(os.path.join(base, f"{acc_me}_profile.dat")) == "old-p")
 check("a save already under the new name stays", read(os.path.join(base, hex_me, "x.sav")) == "mine")
 check("no half-done copy left", not glob.glob(os.path.join(base, "*.peerparty-copy")))
+shutil.rmtree(base, ignore_errors=True)
 
 # ---- stats callbacks ----
 

@@ -67,6 +67,9 @@ fn photon_parsers_reject_hostile_bytes() {
     survives("enet::parse", |b| { let _ = enet::parse(b); });
     survives("fusion::decode", |b| { let _ = fusion::decode(b); });
     survives("parse_hello", |b| { let _ = parse_hello(b); });
+    // A '%' followed by part of a character: the two bytes after it aren't text.
+    let hello = parse_hello("POST /?init&app=a%41%e\u{e9}%\u{e9}\u{e9}%4 HTTP/1.1\r\n\r\n".as_bytes()).unwrap();
+    assert_eq!(hello.init.app_id, "aA%e\u{e9}%\u{e9}\u{e9}%4");
     for proto in [Proto::V16, Proto::V18] {
         survives(proto.name(), |b| {
             let _ = proto.decode(b, None);

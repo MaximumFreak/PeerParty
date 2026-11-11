@@ -65,6 +65,25 @@ game.exe
   PeerParty the suspended process, which it injects and resumes. Children a packaged game
   starts from its own package are followed the same way (`hook/src/child.rs`), never
   crash reporters.
+- **Programs a game starts** (`hook/src/child.rs`, `launcher/src/gameroot.rs`,
+  `launcher/src/tree.rs`): the launcher works out the game's install folder (Steam
+  library, Epic's manifests, the window's game folders, Unreal's layout, or the
+  program's folder climbing out of build-named folders; never a drive's root, Windows,
+  Program Files, the user's folder or a library's root) and passes it as
+  `PEERPARTY_GAME_ROOT`. The hook's `CreateProcessInternalW` detour follows a child
+  started from inside it, unless it is an anti-cheat starter, an installer of
+  redistributables, a crash reporter, or the parent has loaded a game SDK (then the
+  parent is the game). A followed child connects to the overlay's pipe only once it
+  turns out to be the game (a game SDK loads, a window of 640x360 or more, or its
+  parent ends): it signals `Local\peerparty-follow-<pid>`, which the parent made, and
+  the parent lets the pipe go. The launcher puts the game in a job object (breakaway
+  allowed, nothing killed on close) and waits for the last of its programs inside the
+  folder, reporting that one's exit code.
+- **.bat / .cmd wrappers** (`launcher/src/wrapper.rs`): read, not run; the one program
+  line they start is the game, with the script's folder, variables and arguments.
+- **Epic's restart check**: `EOS_Platform_CheckForLauncherAndRestart` answers
+  `EOS_NoChange` in a game PeerParty started, in every mode, so the game doesn't quit
+  to restart through Epic's launcher.
 - peerparty.exe stays running beside the game: it hands back the game's exit code and
   hosts the overlay.
 - A game in which EasyAntiCheat or BattlEye loads is stopped as soon as that module
@@ -117,9 +136,16 @@ has no game or SDK code in it.
 | Voice rooms | — | RTC rooms | Party chat | — | — |
 
 - **Identity.** Each copy takes an identity slot in `%LOCALAPPDATA%\peerparty\identity`,
-  so two copies on one PC are two players. The first copy of a Steam game is shown a
+  so two copies on one PC are two players. A slot is an Ed25519 key, and the player's id
+  is 128 bits of its hash (`core/src/id.rs`): every way of connecting (the mesh's hello
+  on the LAN and inside a tunnel, a room's and a public session's handshake) has the key
+  sign for the connection, so an id can't be used by anyone but its player. The first copy of a Steam game is shown a
   SteamID of its own for this PC unless Valve's Steam client runs it (saves keyed by
-  SteamID start from a copy of the old ones); a second copy gets a LAN one.
+  SteamID start, when the new id has none, from a copy of the save of an earlier
+  PeerParty id kept in `slot-N.previous`, else the newest neighbouring PeerParty save,
+  else steam_api's; `hook/src/saves.rs`); a second copy gets a LAN one, and starts from
+  player 1's save only with `--copy-saves`, which replaces its own save and keeps it as
+  `.peerparty-before`.
 - **Discovery** (`core/src/mesh.rs`): UDP broadcast beacons carrying the game key (the
   exe's name, or `PEERPARTY_GAME`), plus a peer board under `%LOCALAPPDATA%\peerparty\
   peers` so copies on one PC find each other with no network at all. Extra beacon
@@ -131,8 +157,9 @@ has no game or SDK code in it.
   peer and complete when each has answered or after a timeout.
 - **Presence and invites:** each copy publishes key/value presence. An invite is a
   connect string and an optional lobby; it waits for the player in the overlay unless
-  auto-accept is on, and is then delivered through whichever SDK event the game listens
-  for.
+  auto-accept is on, or the overlay is off (nothing could answer it there; a public
+  player's still waits), and is then delivered through whichever SDK event the game
+  listens for.
 - **Wire protocol** (`core/src/wire.rs`): versioned messages; anything from an untrusted
   peer is size-, rate- and count-bounded before use.
 
@@ -200,7 +227,9 @@ has no game or SDK code in it.
     the path, and are armed only once a game is shown a SteamID of its own.
     `PEERPARTY_STEAM_SAVES=0` (the launcher's "Start from the game's existing saves" off)
     leaves the new saves empty. An id fused into a longer token (`save12345.dat`) or one
-    in the registry isn't matched: that game starts afresh.
+    in the registry isn't matched: that game starts afresh. Device paths (`\\.\...`, a
+    named pipe), the temp folder and Steam's own folder for an account are never copied;
+    under `userdata\<account>` only the game's own `<app id>` folder is.
 - **Clashing SteamIDs** (`hook/src/steamids.rs`).
   With the game's SteamID kept (`official`, a game Steam runs, or a player on an older
   PeerParty), players who share one are told apart by how they see *each other*:
@@ -371,7 +400,9 @@ connection is drained before the new one delivers, so nothing is lost or reorder
 - While it shows, keyboard and mouse are taken by low-level hooks in peerparty.exe, and
   controllers are held still inside the game (XInput, DirectInput, raw-input HID,
   Windows.Gaming.Input, GameInput, direct HID reads). peerparty.exe reads the
-  controllers itself.
+  controllers itself. Closed with a button down, it says so (`pads_held`), and the
+  game's controllers stay held until peerparty.exe reads the buttons up (at most 1 s;
+  the hook lets go after 2 s by itself).
 - The game's own overlay calls (Steam's `ActivateGameOverlay*`, `EOS_UI_*`, Galaxy's
   invite dialog, the Xbox invite screens) open the matching overlay page, and games hear
   it open and close as their store's overlay.
@@ -415,6 +446,42 @@ and apply however a game is started.
   through `launcher/src/platform/`: `windows.rs`, and `other.rs`, a stand-in that
   compiles anywhere, as the place a port starts. The game side (injection, the hook,
   the firewall, the overlay's windows) is Windows-only.
+
+## Updates (`launcher/src/update.rs`, `core/src/release.rs`)
+
+Made to give antivirus heuristics nothing to object to, and to need no signing key. The
+window asks GitHub's API for the latest release once a day over WinHTTP (Windows' own
+HTTP client, its proxy settings and certificate checks); the setting is `check_updates`
+in ui.json. What a download must be comes from that HTTPS answer: the `digest`
+(`sha256:...`) and `size` GitHub gives for the `peerparty.exe` asset. A release without a
+digest falls back to a plain checksum file among its assets (`peerparty.exe.sha256`,
+`peerparty-release.txt` or `SHA256SUMS`; sha256sum's form or `sha256 <hex>` lines, read
+by `core/src/release.rs`), fetched from github.com over HTTPS. With neither, the new
+version is announced, the window says it can't check a download, and only the release
+page is offered. Asset addresses must be on github.com. Nothing is signed: the check is
+that the file is the one published in the project's GitHub release, as GitHub reports
+it.
+
+- The exe is never downloaded by PeerParty: the browser does it (an app that downloads
+  and starts programs looks like a downloader to antivirus heuristics). The window
+  watches the Downloads folder for 30 minutes (`peerparty*.exe` of the release's size),
+  or takes a file the player picks, and accepts it only if it is a program (`MZ`) with
+  the release's SHA-256 and size.
+- Install: only with no other peerparty.exe running from the same file (no game), on
+  the player's click. Rename the running exe to `.old`, copy the file in, check the copy
+  again, start it with `--updated`; any failure renames the old one back. The new
+  process deletes `.old` (retrying while the old window closes; a later start retries).
+- In another app's add-on folder (an `extension.yaml` beside the exe) the window only
+  says to update the add-on, which ships its own copy.
+- No scripts, PowerShell or installers run, and the exe isn't code-signed (an
+  Authenticode certificate would be a later option against SmartScreen).
+
+Publishing a release: the release script builds `peerparty.exe`,
+writes `peerparty.exe.sha256` beside it and publishes both in a GitHub release tagged
+`v<version>`. Set the workspace `version` in `Cargo.toml` to that version before
+building: a copy updates when the tag is higher than the version built into it. GitHub
+adds its own SHA-256 to each asset; the `.sha256` file is the fallback. Published by
+hand, attaching `peerparty.exe` (that exact name) is enough.
 
 ## Windows Firewall (`launcher/src/firewall.rs`)
 

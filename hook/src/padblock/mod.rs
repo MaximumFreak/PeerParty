@@ -8,7 +8,10 @@
 //! game loads it. Steam's overlay DLL hooks XInput too, a few seconds into a game; hooked
 //! first, PeerParty's detour sits under Steam's, which calls through it, instead of on
 //! top of a patch Steam may lay again (a game moved behind the overlay that way).
-//! Each hooked call costs one flag check while the overlay is closed.
+//! Each hooked call costs one flag check while the overlay is closed. When it closes
+//! with a controller button down, everything here stays held back until the launcher
+//! reads the buttons up (`overlay::pads_held_back`), so the button that closed it isn't
+//! a fresh press for the game.
 //!
 //! When the overlay closes, the log says how many reads were held back while it showed,
 //! per API: a game that moved behind it shows which path it didn't come through.
@@ -17,7 +20,9 @@
 //!   `XInputGetState` and `XInputGetStateEx` report the pad still connected and at rest;
 //!   `XInputGetKeystroke` reports nothing.
 //! - DirectInput 8 (pads and joysticks that aren't XInput): `GetDeviceState` reads
-//!   all zero and `GetDeviceData` returns no events, for the A and W device interfaces.
+//!   at rest (buttons up, hats centred, axes and sliders at the middle of their
+//!   `DIPROP_RANGE`; keyboards and mice all zero) and `GetDeviceData` returns no events,
+//!   for the A and W device interfaces.
 //! - Raw input: `GetRawInputData` refuses HID reports (pads read as raw HID, the way SDL
 //!   and Unity's Input System read PlayStation and Switch pads through WM_INPUT).
 //!
@@ -56,7 +61,7 @@ use retour::GenericDetour;
 
 use crate::hook::with_lock;
 use crate::log;
-use crate::overlay::visible;
+use crate::overlay::pads_held_back;
 
 type GetState = unsafe extern "system" fn(u32, *mut u8) -> u32;
 type GetKeystroke = unsafe extern "system" fn(u32, u32, *mut u8) -> u32;
@@ -90,6 +95,8 @@ static HELD_XINPUT: AtomicU32 = AtomicU32::new(0);
 static HELD_RAW: AtomicU32 = AtomicU32::new(0);
 static HELD_DINPUT: AtomicU32 = AtomicU32::new(0);
 static INSTALLED: AtomicBool = AtomicBool::new(false);
+/// DirectInput joysticks' axis centres, per device, asked once per opening.
+static CENTRES: Mutex<Vec<(usize, [Option<i32>; 8])>> = Mutex::new(Vec::new());
 
 const XINPUT: [&str; 4] = ["xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll", "xinputuap.dll"];
 
@@ -127,6 +134,7 @@ pub(crate) fn hook_overlapped_results() -> usize {
 
 /// The overlay closed: what was held for this opening goes.
 pub fn hidden() {
+    CENTRES.lock().unwrap_or_else(|e| e.into_inner()).clear();
     if INSTALLED.load(Ordering::Relaxed) {
         wgi::hidden();
         gameinput::hidden();
@@ -235,7 +243,7 @@ fn state_detours() -> [GetState; 8] {
 fn get_state(i: usize, pad: u32, out: *mut u8) -> u32 {
     let Some(h) = STATES.hooks[i].get() else { return 1167 };
     let rc = unsafe { h.call(pad, out) };
-    if rc == 0 && visible() && !out.is_null() {
+    if rc == 0 && pads_held_back() && !out.is_null() {
         // XINPUT_STATE: packet number (kept), then the 12-byte XINPUT_GAMEPAD.
         unsafe { std::ptr::write_bytes(out.add(4), 0, 12) };
         HELD_XINPUT.fetch_add(1, Ordering::Relaxed);
@@ -248,7 +256,7 @@ fn keystroke_detours() -> [GetKeystroke; 4] {
 }
 
 fn get_keystroke(i: usize, pad: u32, reserved: u32, out: *mut u8) -> u32 {
-    if visible() {
+    if pads_held_back() {
         return 0x10D2; // ERROR_EMPTY
     }
     let Some(h) = KEYSTROKES.hooks[i].get() else { return 0x10D2 };
@@ -282,7 +290,7 @@ const RIM_TYPEHID: u32 = 2;
 unsafe extern "system" fn raw_input_data(h: isize, cmd: u32, data: *mut u8, size: *mut u32, header: u32) -> u32 {
     let Some(d) = RAW.get() else { return u32::MAX };
     let rc = unsafe { d.call(h, cmd, data, size, header) };
-    if visible() && cmd == RID_INPUT && !data.is_null() && rc != u32::MAX && rc as usize >= 4 {
+    if pads_held_back() && cmd == RID_INPUT && !data.is_null() && rc != u32::MAX && rc as usize >= 4 {
         // RAWINPUTHEADER.dwType comes first.
         let kind = unsafe { (data as *const u32).read_unaligned() };
         if kind == RIM_TYPEHID {
@@ -341,17 +349,69 @@ fn dev_state_detours() -> [DevGetState; 2] {
 fn dev_state(i: usize, this: usize, size: u32, out: *mut u8) -> i32 {
     let Some(h) = DEV_STATE.hooks[i].get() else { return 0 };
     let rc = unsafe { h.call(this, size, out) };
-    if rc >= 0 && visible() && !out.is_null() {
+    if rc >= 0 && pads_held_back() && !out.is_null() {
         HELD_DINPUT.fetch_add(1, Ordering::Relaxed);
-        unsafe { std::ptr::write_bytes(out, 0, size as usize) };
-        // DIJOYSTATE's POV hats read "centred" as 0xFFFFFFFF, not 0 (which is "up").
+        let out = unsafe { std::slice::from_raw_parts_mut(out, size as usize) };
         if size == 80 || size == 272 {
-            for k in 0..4 {
-                unsafe { (out.add(32 + k * 4) as *mut u32).write_unaligned(u32::MAX) };
-            }
+            at_rest(out, &centres(this));
+        } else {
+            out.fill(0);
         }
     }
     rc
+}
+
+/// DIPROPRANGE: DIPROPHEADER (size, header size, object, how) and the range.
+#[repr(C)]
+struct PropRange {
+    size: u32,
+    header_size: u32,
+    obj: u32,
+    how: u32,
+    min: i32,
+    max: i32,
+}
+
+/// The middle of each DIJOYSTATE axis's range (lX, lY, lZ, lRx, lRy, lRz, two sliders),
+/// None for one the device doesn't have (DirectInput reads those as 0).
+fn centres(this: usize) -> [Option<i32>; 8] {
+    let mut known = CENTRES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, c)) = known.iter().find(|(d, _)| *d == this) {
+        return *c;
+    }
+    // IDirectInputDevice8::GetProperty is slot 5; DIPROP_RANGE is MAKEDIPROP(4), and
+    // DIPH_BYOFFSET finds an axis by its offset in the standard joystick format.
+    type GetProperty = unsafe extern "system" fn(usize, usize, *mut PropRange) -> i32;
+    let get: GetProperty = unsafe { std::mem::transmute(*(*(this as *const *const usize)).add(5)) };
+    let mut c = [None; 8];
+    for (i, c) in c.iter_mut().enumerate() {
+        let mut r = PropRange { size: 24, header_size: 16, obj: i as u32 * 4, how: 1, min: 0, max: 0 };
+        if unsafe { get(this, 4, &mut r) } >= 0 {
+            *c = Some(middle(r.min, r.max));
+        }
+    }
+    if known.len() < 16 {
+        known.push((this, c));
+    }
+    c
+}
+
+fn middle(min: i32, max: i32) -> i32 {
+    ((min as i64 + max as i64) / 2) as i32
+}
+
+/// A DIJOYSTATE (80 bytes) or DIJOYSTATE2 (272) at rest: buttons up, POV hats centred
+/// (0xFFFFFFFF, not 0, which is "up"), the axes and sliders at `centres`, the rest 0.
+fn at_rest(out: &mut [u8], centres: &[Option<i32>; 8]) {
+    out.fill(0);
+    for (i, c) in centres.iter().enumerate() {
+        if let Some(c) = c {
+            out[i * 4..i * 4 + 4].copy_from_slice(&c.to_le_bytes());
+        }
+    }
+    for k in 0..4 {
+        out[32 + k * 4..36 + k * 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    }
 }
 
 fn dev_data_detours() -> [DevGetData; 2] {
@@ -361,7 +421,7 @@ fn dev_data_detours() -> [DevGetData; 2] {
 fn dev_data(i: usize, this: usize, size: u32, data: *mut u8, count: *mut u32, flags: u32) -> i32 {
     let Some(h) = DEV_DATA.hooks[i].get() else { return 0 };
     let rc = unsafe { h.call(this, size, data, count, flags) };
-    if rc >= 0 && visible() && !count.is_null() {
+    if rc >= 0 && pads_held_back() && !count.is_null() {
         unsafe { *count = 0 };
     }
     rc
@@ -382,6 +442,24 @@ mod tests {
     /// hooks at all), so its tests take turns. In a game the game's object comes first.
     pub(super) static GAMEINPUT_TESTS: Mutex<()> = Mutex::new(());
 
+    /// A DirectInput joystick held back reads its sticks centred, not hard over: the
+    /// middle of each axis's own range, 0 for axes it doesn't have, hats centred and
+    /// every button up.
+    #[test]
+    fn dinput_joysticks_read_centred() {
+        assert_eq!(middle(0, 65535), 32767);
+        assert_eq!(middle(-1000, 1000), 0);
+        assert_eq!(middle(i32::MIN, i32::MAX), 0);
+        for size in [80usize, 272] {
+            let mut s = vec![0xAAu8; size];
+            at_rest(&mut s, &[Some(32767), Some(32767), None, Some(0), Some(-5), None, Some(127), None]);
+            let int = |o: usize| i32::from_le_bytes(s[o..o + 4].try_into().unwrap());
+            assert_eq!([int(0), int(4), int(8), int(12), int(16), int(20), int(24), int(28)], [32767, 32767, 0, 0, -5, 0, 127, 0]);
+            assert!((0..4).all(|k| int(32 + k * 4) == -1), "hats centred");
+            assert!(s[48..].iter().all(|b| *b == 0), "buttons up, the rest 0");
+        }
+    }
+
     #[test]
     fn gameinput_readings_hold_still() {
         let _turn = GAMEINPUT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -396,11 +474,13 @@ mod tests {
         let current: unsafe extern "system" fn(usize, u32, usize, *mut usize) -> i32 = unsafe { std::mem::transmute(*vt.add(4)) };
         let next: unsafe extern "system" fn(usize, usize, u32, usize, *mut usize) -> i32 = unsafe { std::mem::transmute(*vt.add(5)) };
         crate::overlay::set_visible_for_test(true);
-        // Keyboard readings exist on any PC.
+        // Keyboard readings exist on any PC; asked for as any kind (0) they're held
+        // (keyboard and mouse alone go through: the launcher holds those itself).
+        let kind = 0;
         let (mut a, mut b, mut c) = (0usize, 0usize, 1usize);
-        let ha = unsafe { current(gi, 0x10, 0, &mut a) };
-        let hb = unsafe { current(gi, 0x10, 0, &mut b) };
-        let hc = unsafe { next(gi, a, 0x10, 0, &mut c) };
+        let ha = unsafe { current(gi, kind, 0, &mut a) };
+        let hb = unsafe { current(gi, kind, 0, &mut b) };
+        let hc = unsafe { next(gi, a, kind, 0, &mut c) };
         crate::overlay::set_visible_for_test(false);
         gameinput::hidden();
         eprintln!("GameInput: current {ha:#x} {hb:#x}, next {hc:#x}");

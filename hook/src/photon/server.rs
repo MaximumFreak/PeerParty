@@ -237,6 +237,28 @@ const PENDING_GAME_TTL: i64 = 30_000;
 const LIST_UPDATE_EVERY: i64 = 1_000;
 const APP_STATS_EVERY: i64 = 5_000;
 const MAX_LIST: usize = 500;
+/// Limits on what clients may have the server keep. Connections: each datagram is an
+/// O(connections) pass, and one that never finishes its handshake stays ten seconds.
+/// A room's cached events (every joiner is sent them all), and the properties of a
+/// room or of an actor: Photon Cloud's own limit for a room's is 500 KiB.
+const MAX_CONNS: usize = 1024;
+const CACHE_EVENTS: usize = 4096;
+const CACHE_BYTES: usize = 8 << 20;
+const PROPS_KEYS: usize = 2048;
+const PROPS_BYTES: usize = 1 << 20;
+/// Photon Cloud's longest EmptyRoomTtl; a room nobody is in isn't kept for days.
+const EMPTY_ROOM_TTL_MAX: i32 = 300_000;
+
+/// Whether an update is small enough to merge at all (each of its keys is looked for
+/// among the ones there).
+fn update_fits(update: &Table) -> bool {
+    update.len() <= PROPS_KEYS * 2
+}
+
+/// Whether properties, after an update, are within what is kept.
+fn props_fit(now: &Table) -> bool {
+    now.len() <= PROPS_KEYS && table_weight(now) <= PROPS_BYTES
+}
 
 type AppKey = (String, String);
 type LobbyKey = (AppKey, String, u8);
@@ -297,6 +319,8 @@ struct Cached {
     code: u8,
     sender: i32,
     data: Option<Value>,
+    /// `data`'s size, for `CACHE_BYTES`.
+    weight: usize,
     channel: u8,
     reliable: bool,
 }
@@ -451,7 +475,7 @@ impl Game {
                 }
                 (Value::Byte(prop::EMPTY_ROOM_TTL), v) => {
                     if let Some(n) = v.as_i32() {
-                        self.empty_ttl = n;
+                        self.empty_ttl = n.min(EMPTY_ROOM_TTL_MAX);
                     }
                 }
                 (Value::Byte(prop::MASTER_CLIENT_ID), v) => {
@@ -674,6 +698,9 @@ impl Server {
         let id = match self.by_addr.get(&(sock, from)) {
             Some(id) => *id,
             None => {
+                if self.conns.len() >= MAX_CONNS {
+                    return Vec::new();
+                }
                 let n = &mut self.next_peer_id[sock];
                 *n = if *n >= 32000 { 1 } else { *n + 1 };
                 let Some(peer) = Peer::accept(&hdr, &cmds, *n, now) else { return Vec::new() };
@@ -1571,8 +1598,14 @@ impl Server {
             a.conn = id;
             a.ip = ip;
             a.inactive_until = None;
-            for (k, v) in joined_props.drain(..) {
-                table_set(&mut a.props, k, v);
+            if update_fits(&joined_props) {
+                let before = a.props.clone();
+                for (k, v) in joined_props.drain(..) {
+                    table_set(&mut a.props, k, v);
+                }
+                if !props_fit(&a.props) {
+                    a.props = before;
+                }
             }
             table_remove(&mut a.props, &Value::Byte(prop::ACTOR_INACTIVE));
             nr
@@ -1777,6 +1810,10 @@ impl Server {
                     return self.gs_fail(id, code, err::INVALID_PARAMETERS, "Expected properties don't match");
                 }
             }
+            if !update_fits(&update) {
+                return self.gs_fail(id, code, err::INVALID_PARAMETERS, "Too many properties");
+            }
+            let before = a.props.clone();
             for (k, v) in &update {
                 if v.is_null() && delete_null {
                     table_remove(&mut a.props, k);
@@ -1784,13 +1821,25 @@ impl Server {
                     table_set(&mut a.props, k.clone(), v.clone());
                 }
             }
+            if !props_fit(&a.props) {
+                a.props = before;
+                return self.gs_fail(id, code, err::INVALID_PARAMETERS, "Too many properties");
+            }
         } else {
             if let Some(exp) = &expected {
                 if !g.matches(exp) {
                     return self.gs_fail(id, code, err::INVALID_PARAMETERS, "Expected properties don't match");
                 }
             }
+            if !update_fits(&update) {
+                return self.gs_fail(id, code, err::INVALID_PARAMETERS, "Too many properties");
+            }
+            let before = g.custom.clone();
             let (changed, hidden) = g.apply(&update);
+            if !props_fit(&g.custom) {
+                g.custom = before;
+                return self.gs_fail(id, code, err::INVALID_PARAMETERS, "Too many properties");
+            }
             list = changed || hidden;
         }
         let to_all = g.flags & flag::BROADCAST_PROPS_TO_ALL != 0 || expected.is_some();
@@ -1949,13 +1998,19 @@ impl Server {
                 return;
             }
             4 | 5 if targets.is_none() && receivers != 2 && group == 0 => {
-                g.cache.push(Cached {
-                    code,
-                    sender: if cache_op == 5 { 0 } else { me },
-                    data: data.clone(),
-                    channel,
-                    reliable: true,
-                });
+                // Past the limits the event still goes to who is here, and isn't kept
+                // for who comes later.
+                let weight = data.as_ref().map_or(0, Value::weight);
+                if g.cache.len() < CACHE_EVENTS && g.cache.iter().map(|e| e.weight).sum::<usize>() + weight <= CACHE_BYTES {
+                    g.cache.push(Cached {
+                        code,
+                        sender: if cache_op == 5 { 0 } else { me },
+                        data: data.clone(),
+                        weight,
+                        channel,
+                        reliable: true,
+                    });
+                }
             }
             _ => {}
         }
@@ -2045,7 +2100,7 @@ fn apply_room_options(g: &mut Game, p: &Params) {
         g.player_ttl = n;
     }
     if let Some(n) = param(p, key::EMPTY_ROOM_TTL).and_then(Value::as_i32) {
-        g.empty_ttl = n;
+        g.empty_ttl = n.min(EMPTY_ROOM_TTL_MAX);
     }
     if let Some(t) = param(p, key::GAME_PROPERTIES).and_then(Value::as_table) {
         let mut t = t.clone();

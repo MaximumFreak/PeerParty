@@ -23,11 +23,26 @@ pub struct State {
     show_code: bool,
     /// Blocked public players, counted when the page opens (not every frame).
     blocked: Option<usize>,
+    /// The room just left, until the window closes: Leave forgets a code that may be
+    /// nowhere else on this PC, and its button sits beside "Show code".
+    left: Option<String>,
+    /// The players "Unblock all" let back in, until the window closes: one click, on
+    /// people blocked one at a time for a reason, can be taken back.
+    unblocked: Vec<(String, String)>,
+    /// Public sessions were switched on and wait for a yes; the yes takes the focus once.
+    confirm_public: bool,
+    confirm_focus: bool,
 }
 
 impl State {
     pub fn refresh(&mut self) {
         self.blocked = Some(Blocklist::open(Blocklist::default_path()).len());
+    }
+
+    /// A room left some other way than Leave (the setup run again without friends):
+    /// offered back the same way.
+    pub(super) fn left_room(&mut self, room: String) {
+        self.left = Some(room);
     }
 }
 
@@ -42,6 +57,44 @@ pub fn summary(p: &Prefs) -> String {
         (Some(c), false) => t!("together.sum_room", room = c.fingerprint()),
         (None, true) => t!("together.sum_public").to_string(),
         (None, false) => t!("together.sum_home").to_string(),
+    }
+}
+
+/// The public-sessions switch and what it means. Off to on waits for a yes underneath,
+/// since it shows this PC's address to strangers; on to off is at once.
+fn public_switch(ui: &mut egui::Ui, p: &mut Prefs, st: &mut State) {
+    widgets::setting(ui, t!("together.public_switch"), t!("together.public_switch_sub"), |ui| {
+        let mut on = p.public;
+        let r = widgets::switch(ui, &mut on);
+        if r.clicked() {
+            st.confirm_public = on;
+            st.confirm_focus = on;
+            if !on {
+                p.public = false;
+            }
+        }
+        #[cfg(test)]
+        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("public-switch"), r.rect));
+    });
+    widgets::note(ui, Icon::Warning, theme::WARN, t!("together.public_text"));
+    if st.confirm_public && !p.public {
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(t!("together.public_confirm")).color(TEXT));
+            let yes = widgets::button(ui, Some(Icon::Globe), t!("together.public_confirm_go"), Kind::Primary);
+            if std::mem::take(&mut st.confirm_focus) {
+                yes.request_focus();
+            }
+            if yes.clicked() {
+                p.public = true;
+                st.confirm_public = false;
+            }
+            if widgets::button(ui, None, t!("common.cancel"), Kind::Ghost).clicked() {
+                st.confirm_public = false;
+            }
+            #[cfg(test)]
+            ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("public-yes"), yes.rect));
+        });
     }
 }
 
@@ -151,6 +204,7 @@ impl App {
                             st.show_code = !st.show_code;
                         }
                         if widgets::button(ui, Some(Icon::Leave), t!("together.leave"), Kind::Danger).on_hover_text(t!("together.leave_tip")).clicked() {
+                            st.left = Some(room.clone());
                             p.room.clear();
                             st.show_code = false;
                         }
@@ -180,6 +234,12 @@ impl App {
                             if widgets::button(ui, Some(Icon::Link), t!("together.join"), Kind::Secondary).clicked() {
                                 st.join = Some(String::new());
                                 st.join_focus = true;
+                            }
+                            // The room just left: one press takes it back.
+                            if let Some(code) = st.left.as_deref().and_then(RoomCode::parse)
+                                && widgets::button(ui, Some(Icon::Leave), &t!("together.rejoin", room = code.fingerprint()), Kind::Ghost).clicked()
+                            {
+                                p.room = st.left.take().unwrap_or_default();
                             }
                         });
                     }
@@ -224,14 +284,12 @@ impl App {
 
     fn public_card(&mut self, ui: &mut egui::Ui) {
         let mut unblock = false;
+        let mut reblock = false;
         widgets::card_with(ui, Some(VIOLET), |ui| {
             ui.set_width(ui.available_width());
             widgets::card_title(ui, Icon::Globe, VIOLET, t!("together.public"), t!("together.public_sub"));
             let p = &mut self.settings.prefs;
-            widgets::setting(ui, t!("together.public_switch"), t!("together.public_switch_sub"), |ui| {
-                widgets::switch(ui, &mut p.public);
-            });
-            ui.add(egui::Label::new(RichText::new(t!("together.public_text")).size(12.5).color(TEXT3)).wrap());
+            public_switch(ui, p, &mut self.together);
             if p.public {
                 widgets::divider(ui);
                 let fallback = if p.name.trim().is_empty() { t!("together.public_name_hint").to_string() } else { p.name.clone() };
@@ -248,16 +306,34 @@ impl App {
                     if n > 0 && widgets::button(ui, None, t!("together.unblock_all"), Kind::Secondary).clicked() {
                         unblock = true;
                     }
+                    if n == 0 && !self.together.unblocked.is_empty() && widgets::button(ui, None, t!("together.block_again"), Kind::Ghost).clicked() {
+                        reblock = true;
+                    }
                 });
             }
         });
         if unblock {
             let blocked = Blocklist::open(Blocklist::default_path());
-            for (fp, _) in blocked.list() {
-                let _ = blocked.remove(&fp);
+            let (mut gone, mut kept) = (Vec::new(), 0);
+            for (fp, note) in blocked.list() {
+                match blocked.remove(&fp) {
+                    Ok(_) => gone.push((fp, note)),
+                    Err(_) => kept += 1,
+                }
             }
+            self.together.unblocked = gone;
             self.together.refresh();
-            self.say(t!("together.unblocked"), true);
+            // The list is a file; if it couldn't be written, they are still blocked.
+            if kept == 0 { self.say(t!("together.unblocked"), true) } else { self.say(t!("together.unblock_failed"), false) }
+        }
+        if reblock {
+            let blocked = Blocklist::open(Blocklist::default_path());
+            let mut back = std::mem::take(&mut self.together.unblocked);
+            back.retain(|(fp, note)| blocked.add(fp, note).is_err());
+            let ok = back.is_empty();
+            self.together.unblocked = back;
+            self.together.refresh();
+            self.say(if ok { t!("together.blocked_again") } else { t!("together.unblock_failed") }, ok);
         }
     }
 
@@ -301,5 +377,44 @@ impl App {
             ui.add_space(2.0);
             widgets::note(ui, Icon::Info, Color32::from_gray(120), t!("together.internet_how"));
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eframe::egui::{Pos2, Rect, vec2};
+
+    /// Turning public sessions on waits for a yes; turning them off doesn't.
+    #[test]
+    fn public_sessions_ask_before_they_turn_on() {
+        crate::i18n::set("en");
+        let ctx = egui::Context::default();
+        let (mut p, mut st) = (Prefs::default(), State::default());
+        p.public = false;
+        let mut t = 0.0;
+        let mut run = |p: &mut Prefs, st: &mut State, click: Option<&str>| {
+            let mut events = Vec::new();
+            if let Some(name) = click {
+                let r: Rect = ctx.data(|d| d.get_temp(egui::Id::unique(name))).expect(name);
+                let at = r.center();
+                events.push(egui::Event::PointerMoved(at));
+                for pressed in [true, false] {
+                    events.push(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE });
+                }
+            }
+            t += 0.5;
+            let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900.0, 700.0))), time: Some(t), events, ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| public_switch(ui, p, st));
+            out.textures_delta.clear();
+        };
+        run(&mut p, &mut st, None);
+        run(&mut p, &mut st, Some("public-switch"));
+        run(&mut p, &mut st, None);
+        assert!(!p.public && st.confirm_public, "switching on asks first");
+        run(&mut p, &mut st, Some("public-yes"));
+        assert!(p.public && !st.confirm_public, "yes turns them on");
+        run(&mut p, &mut st, Some("public-switch"));
+        assert!(!p.public && !st.confirm_public, "off is at once");
     }
 }

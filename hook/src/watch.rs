@@ -61,7 +61,11 @@ pub fn init(module: *mut core::ffi::c_void) {
     }
     register_notification();
     if !crate::child::is_helper() {
-        crate::ipc::start();
+        // A child a starter passed PeerParty to connects once it turns out to be the
+        // game (child.rs).
+        if !crate::child::claim_later() {
+            crate::ipc::start();
+        }
         crate::modes::start();
     }
     let mods = loaded_modules();
@@ -160,6 +164,9 @@ fn consider(m: Mod) {
     };
     let names: Vec<&str> = table.code.iter().map(|e| e.name.as_str()).collect();
     let kind = sdk::identify_module(&m.name, &names);
+    if kind.is_some_and(|k| k != sdk::Sdk::SteamClient) {
+        crate::child::sdk_loaded(&m.name);
+    }
     if kind.is_some() && still_packed(&table.code) {
         log!("module {} is packed: hooking it once it has unpacked", m.full);
         crate::swap::leave_alone(m.base as usize);
@@ -190,6 +197,10 @@ fn consider(m: Mod) {
         } else {
             crate::steam::Typed { skip: Default::default(), hooked: 0 }
         };
+        if kind == sdk::Sdk::Eos && crate::net::enabled() {
+            // In every mode: a game PeerParty started stays PeerParty's.
+            typed.skip.extend(crate::eos::answer_restart_check(&table.code));
+        }
         if kind == sdk::Sdk::Eos && crate::eos::enabled() && !crate::net::skip("eos") && !crate::modes::official_now("eos") {
             let mine = crate::eos::attach(m.base as usize, &m.name, &table.code);
             typed.hooked += mine.len();

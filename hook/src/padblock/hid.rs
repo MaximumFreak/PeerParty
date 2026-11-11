@@ -15,7 +15,7 @@ use retour::GenericDetour;
 use super::{module, proc_addr};
 use crate::hook::with_lock;
 use crate::log;
-use crate::overlay::visible;
+use crate::overlay::pads_held_back;
 
 type ReadFile = unsafe extern "system" fn(usize, *mut u8, u32, *mut u32, *mut Overlapped) -> i32;
 type GetResult = unsafe extern "system" fn(usize, *mut Overlapped, *mut u32, i32) -> i32;
@@ -137,7 +137,7 @@ fn set_last_error(e: u32) {
 unsafe extern "system" fn read_file(h: usize, buf: *mut u8, len: u32, read: *mut u32, ol: *mut Overlapped) -> i32 {
     let real = READ.get().unwrap();
     let ok = unsafe { real.call(h, buf, len, read, ol) };
-    if !visible() {
+    if !pads_held_back() {
         return ok;
     }
     let err = last_error();
@@ -179,7 +179,7 @@ fn finished(h: usize, ol: *mut Overlapped, n: *mut u32) {
 unsafe extern "system" fn get_result(h: usize, ol: *mut Overlapped, n: *mut u32, wait: i32) -> i32 {
     let ok = unsafe { RESULT.get().unwrap().call(h, ol, n, wait) };
     crate::ipfwd::overlapped_result(ol as usize, ok != 0);
-    if ok != 0 && visible() {
+    if ok != 0 && pads_held_back() {
         let err = last_error();
         finished(h, ol, n);
         set_last_error(err);
@@ -190,7 +190,7 @@ unsafe extern "system" fn get_result(h: usize, ol: *mut Overlapped, n: *mut u32,
 unsafe extern "system" fn get_result_ex(h: usize, ol: *mut Overlapped, n: *mut u32, ms: u32, alertable: i32) -> i32 {
     let ok = unsafe { RESULT_EX.get().unwrap().call(h, ol, n, ms, alertable) };
     crate::ipfwd::overlapped_result(ol as usize, ok != 0);
-    if ok != 0 && visible() {
+    if ok != 0 && pads_held_back() {
         let err = last_error();
         finished(h, ol, n);
         set_last_error(err);

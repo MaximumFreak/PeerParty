@@ -24,6 +24,13 @@
 //! (`set_no_play`), and send data to chosen members (`send_data_to`). EOS uses none of
 //! these, so its rooms behave as before.
 //!
+//! Who is in a room: whoever says so, among the players this one plays with (the LAN, a
+//! room code). A public player is a stranger, and a room's name is no secret (it is a
+//! lobby's id, which a search hands out), so one is only let in, and only told the room
+//! exists, while the core vouches for them (`Lan::knows`: we invited them, or they are
+//! in a lobby with us). `sweep` keeps that up to date as players come into lobbies and
+//! leave them.
+//!
 //! The capture/playback loop is the classic double-buffered waveIn/waveOut
 //! pattern from Microsoft's Waveform Audio documentation
 //! (learn.microsoft.com/windows/win32/multimedia/waveform-audio).
@@ -48,6 +55,9 @@ const HERE: u8 = 2;
 const LEAVE: u8 = 3;
 const AUDIO: u8 = 4;
 const DATA: u8 = 5;
+/// A room's events waiting for the game: past this the oldest go (a game that never
+/// takes them, or a player sending faster than it does).
+const EVENTS_MAX: usize = 4096;
 
 /// Device format: 16 kHz mono, 20 ms frames.
 pub const DEVICE_RATE: u32 = 16_000;
@@ -93,12 +103,72 @@ struct Room {
     no_play: HashSet<PeerId>,
     /// When we last sent audio, for "talking" indicators.
     last_sent: Option<Instant>,
+    /// Public players told of the room since they became known to us (see `sweep`).
+    greeted: HashSet<PeerId>,
+    /// Members the player blocked: no audio or data either way (EOS BlockParticipant).
+    blocked: HashSet<PeerId>,
+}
+
+impl Room {
+    fn new(device_in: bool, device_out: bool) -> Room {
+        Room {
+            members: BTreeSet::new(),
+            events: VecDeque::new(),
+            sending: true,
+            receiving: true,
+            muted: HashSet::new(),
+            data_sending: true,
+            device_in,
+            device_out,
+            volume_out: 1.0,
+            peer_volume: HashMap::new(),
+            heard: HashMap::new(),
+            send_to: None,
+            hear: None,
+            no_play: HashSet::new(),
+            last_sent: None,
+            greeted: HashSet::new(),
+            blocked: HashSet::new(),
+        }
+    }
+
+    /// Who gets our audio.
+    fn audio_to(&self) -> Vec<PeerId> {
+        self.members
+            .iter()
+            .copied()
+            .filter(|p| self.send_to.as_ref().is_none_or(|t| t.contains(p)) && !self.blocked.contains(p))
+            .collect()
+    }
+
+    /// Who gets the room's data.
+    fn data_to(&self) -> Vec<PeerId> {
+        self.members.iter().copied().filter(|p| !self.blocked.contains(p)).collect()
+    }
+
+    /// Whether a member's audio is taken in.
+    fn hears(&self, p: PeerId) -> bool {
+        self.receiving
+            && self.hear.as_ref().is_none_or(|h| h.contains(&p))
+            && !self.muted.contains(&p)
+            && !self.blocked.contains(&p)
+    }
 }
 
 #[derive(Default)]
 struct State {
     rooms: HashMap<String, Room>,
+    /// When `sweep` last ran.
+    swept: Option<Instant>,
 }
+
+/// How often `sweep` looks at who the public players in and around the rooms are.
+const SWEEP_EVERY: Duration = Duration::from_millis(500);
+/// An audio frame's sample rate and channel count as a peer may give them: anything a
+/// microphone or a game's mixer produces, and nothing that makes resampling one frame
+/// cost what a second of sound should.
+const RATES: std::ops::RangeInclusive<u32> = 8_000..=96_000;
+const MAX_CHANNELS: u32 = 8;
 
 static S: LazyLock<Mutex<State>> = LazyLock::new(Mutex::default);
 
@@ -121,32 +191,18 @@ pub fn join(lan: &Lan, room: &str, device_in: bool, device_out: bool) {
         if s.rooms.contains_key(room) {
             return;
         }
-        s.rooms.insert(
-            room.to_string(),
-            Room {
-                members: BTreeSet::new(),
-                events: VecDeque::new(),
-                sending: true,
-                receiving: true,
-                muted: HashSet::new(),
-                data_sending: true,
-                device_in: device_in && devices_allowed(),
-                device_out: device_out && devices_allowed(),
-                volume_out: 1.0,
-                peer_volume: HashMap::new(),
-                heard: HashMap::new(),
-                send_to: None,
-                hear: None,
-                no_play: HashSet::new(),
-                last_sent: None,
-            },
-        );
+        s.rooms.insert(room.to_string(), Room::new(device_in && devices_allowed(), device_out && devices_allowed()));
     }
     for (peer, _) in lan.peers() {
+        // A stranger hears of the room from `sweep`, once there is reason to tell them.
+        if lan.peer_trust(peer) == Some(peerparty_core::Trust::Public) {
+            continue;
+        }
         // Also answers a room channel the peer asked for while nobody here listened.
         lan.accept(peer, &socket(room));
         send(lan, peer, room, CH_CTRL, &[JOIN], true);
     }
+    S.lock().unwrap().swept = None;
     log!("voice joined room {room} (devices: in={device_in} out={device_out}, allowed={})", devices_allowed());
     devices::update();
 }
@@ -192,6 +248,19 @@ pub fn set_receiving(room: &str, peer: Option<PeerId>, on: bool) -> bool {
         }
         Some(p) => {
             r.muted.insert(p);
+        }
+    })
+    .is_some()
+}
+
+/// A participant blocked or unblocked: blocked, nothing goes either way between us,
+/// audio or data (EOS's BlockParticipant), unlike muting, which only stops what we hear.
+pub fn set_blocked(room: &str, peer: PeerId, on: bool) -> bool {
+    with_room(room, |r| {
+        if on {
+            r.blocked.insert(peer);
+        } else {
+            r.blocked.remove(&peer);
         }
     })
     .is_some()
@@ -266,7 +335,12 @@ fn decode_audio(b: &[u8]) -> Option<Frame> {
     }
     let rate = u32::from_le_bytes(b[1..5].try_into().ok()?);
     let channels = b[5] as u32;
-    if rate == 0 || channels == 0 {
+    // A rate of 1 made the resampler write 16,000 samples for each one sent.
+    if !RATES.contains(&rate) || !(1..=MAX_CHANNELS).contains(&channels) {
+        return None;
+    }
+    // A frame is a few hundredths of a second; one claiming over a second isn't one.
+    if (b.len() - 6) / 2 > (rate * channels) as usize {
         return None;
     }
     let samples = b[6..].chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
@@ -281,11 +355,7 @@ pub fn send_audio(lan: &Lan, room: &str, frame: &Frame) -> bool {
         if !r.sending {
             return true;
         }
-        r.members
-            .iter()
-            .copied()
-            .filter(|p| r.send_to.as_ref().is_none_or(|t| t.contains(p)))
-            .collect::<Vec<_>>()
+        r.audio_to()
     };
     with_room(room, |r| r.last_sent = Some(Instant::now()));
     let msg = encode_audio(frame);
@@ -302,7 +372,7 @@ pub fn send_data(lan: &Lan, room: &str, data: &[u8]) -> bool {
         if !r.data_sending {
             return true;
         }
-        r.members.iter().copied().collect::<Vec<_>>()
+        r.data_to()
     };
     let mut msg = Vec::with_capacity(data.len() + 1);
     msg.push(DATA);
@@ -316,13 +386,11 @@ pub fn send_data(lan: &Lan, room: &str, data: &[u8]) -> bool {
 /// Room data to chosen players, members yet or not (their room may still be
 /// announcing itself). False if we're not in the room.
 pub fn send_data_to(lan: &Lan, room: &str, peers: &[PeerId], data: &[u8]) -> bool {
-    if !joined(room) {
-        return false;
-    }
+    let Some(blocked) = with_room(room, |r| r.blocked.clone()) else { return false };
     let mut msg = Vec::with_capacity(data.len() + 1);
     msg.push(DATA);
     msg.extend_from_slice(data);
-    for p in peers {
+    for p in peers.iter().filter(|p| !blocked.contains(p)) {
         send(lan, *p, room, CH_DATA, &msg, true);
     }
     true
@@ -346,10 +414,15 @@ pub fn output_present() -> bool {
 /// Core events: room sockets are always accepted; players who leave the LAN leave rooms.
 pub fn on_event(lan: &Lan, ev: &Event) {
     match ev {
-        Event::ChanRequest { peer, socket } if socket.starts_with(SOCKET_PREFIX) => lan.accept(*peer, socket),
+        Event::ChanRequest { peer, socket } if socket.starts_with(SOCKET_PREFIX) => {
+            if lan.knows(*peer) {
+                lan.accept(*peer, socket);
+            }
+        }
         // A player met after we joined a room hasn't heard our join: tell them now (two
         // copies that each joined before meeting would otherwise never see each other).
-        Event::PeerJoined(peer) => {
+        // A stranger hears of it from `sweep`.
+        Event::PeerJoined(peer) if lan.peer_trust(*peer) != Some(peerparty_core::Trust::Public) => {
             let rooms: Vec<String> = S.lock().unwrap().rooms.keys().cloned().collect();
             for room in rooms {
                 lan.accept(*peer, &socket(&room));
@@ -359,6 +432,7 @@ pub fn on_event(lan: &Lan, ev: &Event) {
         Event::PeerLeft(peer) => {
             let mut s = S.lock().unwrap();
             for r in s.rooms.values_mut() {
+                r.greeted.remove(peer);
                 if r.members.remove(peer) {
                     r.events.push_back(RoomEvent::Left(*peer));
                 }
@@ -368,11 +442,62 @@ pub fn on_event(lan: &Lan, ev: &Event) {
     }
 }
 
+/// Public players and the rooms, every `SWEEP_EVERY`: one the core no longer vouches
+/// for (they left the lobby we shared, or we did) is out of every room; one it has
+/// come to vouch for is told of each room, as a LAN player is on arriving. Their
+/// answer, or their own join, makes them a member.
+fn sweep(lan: &Lan) {
+    {
+        let mut s = S.lock().unwrap();
+        if s.rooms.is_empty() || s.swept.is_some_and(|t| t.elapsed() < SWEEP_EVERY) {
+            return;
+        }
+        s.swept = Some(Instant::now());
+    }
+    let strangers: Vec<(PeerId, bool)> = lan
+        .peers()
+        .into_iter()
+        .filter(|(p, _)| lan.peer_trust(*p) == Some(peerparty_core::Trust::Public))
+        .map(|(p, _)| (p, lan.knows(p)))
+        .collect();
+    if strangers.is_empty() {
+        return;
+    }
+    let mut greet = Vec::new();
+    {
+        let mut s = S.lock().unwrap();
+        for (name, r) in s.rooms.iter_mut() {
+            for (p, known) in &strangers {
+                if !known {
+                    r.greeted.remove(p);
+                    if r.members.remove(p) {
+                        r.events.push_back(RoomEvent::Left(*p));
+                    }
+                } else if r.greeted.insert(*p) && !r.members.contains(p) {
+                    greet.push((name.clone(), *p));
+                }
+            }
+        }
+    }
+    for (room, p) in greet {
+        lan.accept(p, &socket(&room));
+        send(lan, p, &room, CH_CTRL, &[JOIN], true);
+    }
+}
+
 /// Moves arrived room traffic into each room's events.
 pub fn pump(lan: &Lan) {
+    sweep(lan);
+    // Whether each sender is someone a room takes anything from, asked once a pass.
+    let mut known: HashMap<PeerId, bool> = HashMap::new();
     while let Some(p) = lan.receive_where(None, |s| s.starts_with(SOCKET_PREFIX)) {
         let room = &p.socket[SOCKET_PREFIX.len()..];
         let Some(&kind) = p.data.first() else { continue };
+        // Saying "join", or sending audio, used to be all it took to be sent the
+        // room's microphones.
+        if kind != LEAVE && !*known.entry(p.peer).or_insert_with(|| lan.knows(p.peer)) {
+            continue;
+        }
         let mut reply = false;
         {
             let mut s = S.lock().unwrap();
@@ -394,8 +519,7 @@ pub fn pump(lan: &Lan) {
                         r.members.insert(p.peer);
                         r.events.push_back(RoomEvent::Joined(p.peer));
                     }
-                    let allowed = r.hear.as_ref().is_none_or(|h| h.contains(&p.peer));
-                    if r.receiving && allowed && !r.muted.contains(&p.peer) {
+                    if r.hears(p.peer) {
                         if let Some(f) = decode_audio(&p.data) {
                             if r.heard.insert(p.peer, Instant::now()).is_none() {
                                 r.events.push_back(RoomEvent::Speaking(p.peer, true));
@@ -408,7 +532,15 @@ pub fn pump(lan: &Lan) {
                         }
                     }
                 }
-                DATA => r.events.push_back(RoomEvent::Data(p.peer, p.data[1..].to_vec())),
+                DATA if r.blocked.contains(&p.peer) => {}
+                DATA => {
+                    // What isn't taken piles up: a room's data is a game's small
+                    // messages, and a game that has stopped taking them loses the oldest.
+                    if r.events.len() >= EVENTS_MAX {
+                        r.events.pop_front();
+                    }
+                    r.events.push_back(RoomEvent::Data(p.peer, p.data[1..].to_vec()))
+                }
                 _ => {}
             }
         }
@@ -798,6 +930,149 @@ mod tests {
         let f = Frame { rate: 48_000, channels: 2, samples: vec![1, -2, 300, -32768, 32767, 0] };
         assert_eq!(decode_audio(&encode_audio(&f)), Some(f));
         assert_eq!(decode_audio(&[AUDIO, 0, 0, 0, 0, 1]), None);
+    }
+
+    /// A frame says its own rate, and playing it means resampling to the device's: at a
+    /// rate of 1 each sample sent became 16,000 to compute, on the game's thread.
+    #[test]
+    fn frames_with_absurd_formats_are_dropped() {
+        let frame = |rate: u32, channels: u8, samples: usize| {
+            let mut b = vec![AUDIO];
+            b.extend_from_slice(&rate.to_le_bytes());
+            b.push(channels);
+            b.resize(6 + samples * 2, 0);
+            b
+        };
+        assert!(decode_audio(&frame(16_000, 1, 320)).is_some());
+        assert!(decode_audio(&frame(48_000, 2, 1920)).is_some());
+        for (rate, channels, samples) in [(1, 1, 4000), (7_999, 1, 320), (4_000_000_000, 1, 320), (16_000, 9, 320), (16_000, 0, 320), (16_000, 1, 16_001)] {
+            assert_eq!(decode_audio(&frame(rate, channels, samples)), None, "{rate} Hz, {channels} channels, {samples} samples");
+        }
+    }
+
+    /// A public player isn't in a room for saying so, or for sending audio; they are
+    /// once the player here has invited them, and out again when that no longer holds.
+    #[test]
+    fn a_stranger_is_in_a_room_only_while_vouched_for() {
+        use peerparty_core::inet::{self, public};
+        use peerparty_core::{Identity, Lobby, Options, Permission, Trust};
+        fn quiet(_: &str) {}
+        let port = |n: u16| 36_000 + (std::process::id() % 1000) as u16 * 8 + n;
+        let start = |name: &str, mine: u16, theirs: u16, disc: u16| {
+            let mut c = inet::Config::public(public::PublicCfg::ephemeral(name));
+            c.port = mine;
+            c.peers = vec![format!("127.0.0.1:{theirs}")];
+            (c.dht, c.bootstrap, c.stun, c.node_cache, c.allow_private) = (false, Vec::new(), Vec::new(), None, true);
+            Lan::start(Options {
+                game: format!("test:voice-strangers:{}", std::process::id()),
+                identity: Identity::ephemeral(name),
+                discovery_port: disc,
+                extra_targets: Vec::new(),
+                log: quiet,
+                internet: None,
+                public: Some(c),
+                lan_discovery: false,
+            })
+            .unwrap()
+        };
+        // `me` is this copy, with voice.rs's rooms; `them` is a stranger driven by hand.
+        let (me, them) = (start("me", port(0), port(1), port(2)), start("them", port(1), port(0), port(3)));
+        me.set_public_voice(true);
+        them.set_public_voice(true);
+        let room = format!("strangers-{}", std::process::id());
+        let sock = socket(&room);
+        // What `them` got on the room's socket, and one turn of both copies.
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        let mut turn = |got: &mut Vec<Vec<u8>>| {
+            for l in [&me, &them] {
+                l.tick();
+            }
+            for e in me.poll() {
+                on_event(&me, &e);
+            }
+            for e in them.poll() {
+                if let Event::ChanRequest { peer, socket } = &e {
+                    them.accept(*peer, socket);
+                }
+            }
+            pump(&me);
+            while let Some(p) = them.receive_where(None, |s| s == sock) {
+                got.push(p.data);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let wait = |what: &str, got: &mut Vec<Vec<u8>>, turn: &mut dyn FnMut(&mut Vec<Vec<u8>>), done: &dyn Fn(&[Vec<u8>]) -> bool| {
+            let until = Instant::now() + Duration::from_secs(30);
+            while !done(got) {
+                assert!(Instant::now() < until, "timed out waiting for {what}");
+                turn(got);
+            }
+        };
+        wait("the two to meet", &mut got, &mut turn, &|_| me.peer_trust(them.me()) == Some(Trust::Public) && them.peer_trust(me.me()).is_some());
+
+        join(&me, &room, false, false);
+        // The stranger says it joined, says it's here, and sends audio and data.
+        let audio = encode_audio(&Frame { rate: 16_000, channels: 1, samples: vec![9; 320] });
+        for (ch, msg, reliable) in [(CH_CTRL, vec![JOIN], true), (CH_CTRL, vec![HERE], true), (CH_AUDIO, audio.clone(), false), (CH_DATA, vec![DATA, 1], true)] {
+            them.send(me.me(), &sock, ch, &msg, reliable, reliable, true);
+        }
+        for _ in 0..150 {
+            turn(&mut got);
+        }
+        assert!(members(&room).is_empty(), "a stranger joined a room by saying so");
+        assert!(got.is_empty(), "a stranger was told of, or answered from, a room: {got:?}");
+        assert!(take(&room).is_empty());
+
+        // The player here invites them (to a lobby of theirs): now they are told of the
+        // room, and their answer makes them a member who is sent its audio.
+        let mut l = Lobby::new("test.lobby");
+        l.permission = Permission::InviteOnly;
+        let lobby = me.create_lobby(l).unwrap();
+        me.invite(Some(them.me()), "", Some(&lobby));
+        wait("the room to be announced", &mut got, &mut turn, &|g| g.iter().any(|m| m == &[JOIN]));
+        them.send(me.me(), &sock, CH_CTRL, &[HERE], true, true, true);
+        wait("the stranger to be a member", &mut got, &mut turn, &|_| members(&room) == [them.me()]);
+        got.clear();
+        send_audio(&me, &room, &Frame { rate: 16_000, channels: 1, samples: vec![3; 320] });
+        wait("our audio to reach them", &mut got, &mut turn, &|g| g.iter().any(|m| m.first() == Some(&AUDIO)));
+
+        // Shown the door (which takes the invite back), they are out of the room too.
+        them.join_by_id("test.lobby", &lobby.id).unwrap();
+        wait("them to join the lobby", &mut got, &mut turn, &|_| me.lobby(&lobby.id).is_some_and(|l| l.members.len() == 2));
+        me.kick(&lobby.id, them.me()).unwrap();
+        wait("them to be out of the room", &mut got, &mut turn, &|_| members(&room).is_empty());
+        got.clear();
+        send_audio(&me, &room, &Frame { rate: 16_000, channels: 1, samples: vec![3; 320] });
+        them.send(me.me(), &sock, CH_AUDIO, &audio, false, false, true);
+        for _ in 0..100 {
+            turn(&mut got);
+        }
+        assert!(got.is_empty() && members(&room).is_empty(), "audio went to, or came from, someone no longer in the room");
+        leave(&me, &room);
+        me.shutdown();
+        them.shutdown();
+    }
+
+    /// Blocking a member stops our audio and data to them as well as theirs to us;
+    /// muting only stops theirs.
+    #[test]
+    fn blocking_works_both_ways() {
+        let (a, b) = (PeerId([1; 16]), PeerId([2; 16]));
+        let mut r = Room::new(false, false);
+        r.members.extend([a, b]);
+        assert_eq!(r.audio_to(), [a, b]);
+        r.muted.insert(b);
+        assert!(!r.hears(b) && r.hears(a));
+        assert_eq!(r.audio_to(), [a, b], "muting stops only what we hear");
+        r.muted.clear();
+        r.blocked.insert(b);
+        assert!(!r.hears(b) && r.hears(a));
+        assert_eq!(r.audio_to(), [a]);
+        assert_eq!(r.data_to(), [a]);
+        r.blocked.remove(&b);
+        assert_eq!(r.audio_to(), [a, b]);
+        assert_eq!(r.data_to(), [a, b]);
+        assert!(r.hears(b));
     }
 
     #[test]

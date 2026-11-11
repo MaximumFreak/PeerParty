@@ -41,9 +41,10 @@ const CONFIRM_CONTEXT: &[u8] = b"peerparty public v1 confirm";
 pub const MAX_NAME: usize = 32;
 const MAX_BLOCKED: usize = 10_000;
 const MAX_PINS: usize = 4096;
-/// Pins kept in memory for this session once the file is full: new ids stay protected
-/// for the session; past this, new ids are refused rather than let in unpinned.
+/// Keys remembered in memory for this session once the file is full.
 const MAX_SESSION_PINS: usize = 65536;
+/// What a copy signs to prove its key to the copy it shakes hands with on the mesh.
+const HELLO_CONTEXT: &[u8] = b"peerparty mesh hello v3";
 
 fn local_dir() -> Option<PathBuf> {
     std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("peerparty"))
@@ -85,27 +86,47 @@ impl IdentityKey {
         IdentityKey { key: SigningKey::from_bytes(&seed) }
     }
 
+    /// The key in a key file's text (its 32-byte seed in hex), as `load_or_create`
+    /// reads it.
+    pub fn from_text(text: &str) -> Option<IdentityKey> {
+        unhex::<32>(text).map(IdentityKey::from_seed)
+    }
+
     /// Loads the key at `path`, or makes one and saves it there. A key that can't be
     /// saved still works for this run.
+    ///
+    /// A player's id is this key's hash, and games keep saves under ids made from it, so
+    /// a key is never written over while it might still be read: a file that is there but
+    /// can't be read now (another program has it open) gets a key for this run only. One
+    /// that reads as something else is kept beside it as `.bad`. A new key is written
+    /// whole or not at all.
     pub fn load_or_create(path: &Path) -> IdentityKey {
-        if let Some(seed) = std::fs::read_to_string(path).ok().and_then(|s| unhex::<32>(&s)) {
-            return IdentityKey::from_seed(seed);
+        match std::fs::read_to_string(path) {
+            Ok(s) => {
+                if let Some(k) = IdentityKey::from_text(&s) {
+                    return k;
+                }
+                let _ = std::fs::rename(path, path.with_extension("bad"));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return IdentityKey::generate(),
         }
         let k = IdentityKey::generate();
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let _ = std::fs::write(path, hex(k.key.as_bytes()));
+        let tmp = path.with_extension(format!("new-{}", std::process::id()));
+        if std::fs::write(&tmp, hex(k.key.as_bytes())).is_ok() && std::fs::rename(&tmp, path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
         k
     }
 
-    /// The key of an identity slot (`%LOCALAPPDATA%\peerparty\identity\slot-N.ed25519`);
-    /// a throwaway one for a throwaway identity (`u32::MAX`).
-    pub fn for_slot(slot: u32) -> IdentityKey {
-        if slot == u32::MAX {
-            return IdentityKey::generate();
-        }
-        IdentityKey::load_or_create(&crate::Identity::default_dir().join(format!("slot-{slot}.ed25519")))
+    /// Proof for the mesh's hello that the signer holds this key: its signature over
+    /// the game, and over both sides' ids and the numbers each made up for this one
+    /// connection (so it is no use on another connection, or to anyone but `to`).
+    pub fn sign_hello(&self, game: &str, mine: (PeerId, &[u8; 16]), to: (PeerId, &[u8; 16])) -> [u8; SIG_LEN] {
+        self.sign(&hello_transcript(game, mine, to))
     }
 
     pub fn public(&self) -> [u8; KEY_LEN] {
@@ -119,6 +140,25 @@ impl IdentityKey {
     fn sign(&self, msg: &[u8]) -> [u8; SIG_LEN] {
         self.key.sign(msg).to_bytes()
     }
+}
+
+fn hello_transcript(game: &str, signer: (PeerId, &[u8; 16]), verifier: (PeerId, &[u8; 16])) -> Vec<u8> {
+    let mut t = Vec::with_capacity(HELLO_CONTEXT.len() + 4 + game.len() + 64);
+    t.extend_from_slice(HELLO_CONTEXT);
+    t.extend_from_slice(&(game.len() as u32).to_le_bytes());
+    t.extend_from_slice(game.as_bytes());
+    for (id, nonce) in [signer, verifier] {
+        t.extend_from_slice(&id.0);
+        t.extend_from_slice(nonce);
+    }
+    t
+}
+
+/// Whether `sig` is `IdentityKey::sign_hello` by the holder of `key`, as `signer`, for
+/// `verifier` (us), and `key` is the one `signer`'s id comes from.
+pub fn hello_proves(key: &[u8; KEY_LEN], sig: &[u8; SIG_LEN], game: &str, signer: (PeerId, &[u8; 16]), verifier: (PeerId, &[u8; 16])) -> bool {
+    PeerId::of_key(key) == signer.0
+        && VerifyingKey::from_bytes(key).is_ok_and(|vk| vk.verify_strict(&hello_transcript(game, signer, verifier), &Signature::from_bytes(sig)).is_ok())
 }
 
 /// A public key's short, shareable form: "3fa9-c1d2-0b7e-55aa" (64 bits of a hash).
@@ -385,8 +425,13 @@ impl Blocklist {
     }
 }
 
-/// Which key each public player's id came with first (trust on first use), so nobody
-/// else can take over that id later. `%LOCALAPPDATA%\peerparty\public-keys.txt`.
+/// The keys of public players met before, to tell a returning player from a key made
+/// a minute ago (a blocked player coming back as someone new is held off for a while,
+/// see `Shared::new_keys_cooling`). `%LOCALAPPDATA%\peerparty\public-keys.txt`.
+///
+/// It was once what tied an id to its key (the first key seen for an id kept it). An id
+/// is its key's hash now, which nobody has to remember, and which a stranger can't get
+/// to first.
 pub struct Pins {
     path: Option<PathBuf>,
     map: Mutex<Option<HashMap<PeerId, [u8; KEY_LEN]>>>,
@@ -401,11 +446,6 @@ impl fmt::Debug for Pins {
 impl Pins {
     pub fn default_path() -> Option<PathBuf> {
         local_dir().map(|d| d.join("public-keys.txt"))
-    }
-
-    /// Room members' keys, apart from public players'.
-    pub fn room_path() -> Option<PathBuf> {
-        local_dir().map(|d| d.join("room-keys.txt"))
     }
 
     pub fn open(path: Option<PathBuf>) -> Pins {
@@ -425,10 +465,9 @@ impl Pins {
         })
     }
 
-    /// Whether `key` may speak for `id`: yes if it's the key pinned for it, or if the id
-    /// is new (then it's pinned: in the file for the first `MAX_PINS`, then in memory for
-    /// this session; with memory full too, new ids are refused).
-    pub fn check(&self, id: PeerId, key: &[u8; KEY_LEN]) -> bool {
+    /// Remembers `key` (in the file for the first `MAX_PINS`, then in memory for this
+    /// session, then not at all: a list that is full never keeps a player out).
+    pub fn remember(&self, id: PeerId, key: &[u8; KEY_LEN]) {
         let mut g = self.map.lock().unwrap();
         let map = g.get_or_insert_with(|| {
             let mut m = HashMap::new();
@@ -443,25 +482,19 @@ impl Pins {
             }
             m
         });
-        match map.get(&id) {
-            Some(k) => k == key,
-            None => {
-                if map.len() >= MAX_SESSION_PINS {
-                    return false;
+        if map.contains_key(&id) || map.len() >= MAX_SESSION_PINS {
+            return;
+        }
+        map.insert(id, *key);
+        if map.len() <= MAX_PINS {
+            if let Some(p) = &self.path {
+                use std::io::Write;
+                if let Some(dir) = p.parent() {
+                    let _ = std::fs::create_dir_all(dir);
                 }
-                map.insert(id, *key);
-                if map.len() <= MAX_PINS {
-                    if let Some(p) = &self.path {
-                        use std::io::Write;
-                        if let Some(dir) = p.parent() {
-                            let _ = std::fs::create_dir_all(dir);
-                        }
-                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
-                            let _ = writeln!(f, "{} {}", id.hex(), hex(key));
-                        }
-                    }
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                    let _ = writeln!(f, "{} {}", id.hex(), hex(key));
                 }
-                true
             }
         }
     }
@@ -639,6 +672,20 @@ mod tests {
         let a = IdentityKey::load_or_create(&p);
         let b = IdentityKey::load_or_create(&p);
         assert_eq!(a.public(), b.public());
+        assert_eq!(IdentityKey::from_text(&format!("{}\r\n", std::fs::read_to_string(&p).unwrap())).map(|k| k.public()), Some(a.public()));
+        // A file that reads as something else is kept aside, and a new key takes its place.
+        std::fs::write(&p, "not a key").unwrap();
+        let c = IdentityKey::load_or_create(&p);
+        assert_ne!(c.public(), a.public());
+        assert_eq!(std::fs::read_to_string(dir.join("k.bad")).unwrap(), "not a key");
+        assert_eq!(IdentityKey::load_or_create(&p).public(), c.public());
+        // One that is there but can't be read (here a folder) isn't written over.
+        let locked = dir.join("locked.ed25519");
+        std::fs::create_dir_all(&locked).unwrap();
+        let d = IdentityKey::load_or_create(&locked);
+        assert!(locked.is_dir(), "left as it was");
+        assert_ne!(IdentityKey::load_or_create(&locked).public(), d.public(), "a key for one run each time");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 3, "no temporary files left");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -667,34 +714,53 @@ mod tests {
     }
 
     #[test]
-    fn pins_refuse_a_second_key_for_an_id() {
+    fn keys_met_before_are_remembered() {
         let p = Pins::in_memory();
-        let id = PeerId::random();
         let (k1, k2) = (IdentityKey::generate().public(), IdentityKey::generate().public());
-        assert!(p.check(id, &k1));
-        assert!(p.check(id, &k1));
-        assert!(!p.check(id, &k2));
-        assert!(p.check(PeerId::random(), &k2));
+        p.remember(PeerId::of_key(&k1), &k1);
+        p.remember(PeerId::of_key(&k1), &k1);
+        p.remember(PeerId::of_key(&k2), &k2);
         assert!(p.knows_key(&k1) && p.knows_key(&k2));
         assert!(!p.knows_key(&IdentityKey::generate().public()));
     }
 
     #[test]
-    fn pins_still_protect_ids_once_the_file_is_full() {
+    fn the_key_file_stops_growing_and_a_full_list_keeps_nobody_out() {
         let dir = std::env::temp_dir().join(format!("pp-pins-{}", std::process::id()));
         let path = dir.join("keys.txt");
         let p = Pins::open(Some(path.clone()));
         let k = IdentityKey::generate().public();
         for _ in 0..MAX_PINS {
-            assert!(p.check(PeerId::random(), &k));
+            p.remember(PeerId::random(), &k);
         }
-        let late = PeerId::random();
-        let (k1, k2) = (IdentityKey::generate().public(), IdentityKey::generate().public());
-        assert!(p.check(late, &k1));
-        assert!(!p.check(late, &k2), "an id first seen past the file limit is still pinned");
+        let late = IdentityKey::generate().public();
+        p.remember(PeerId::of_key(&late), &late);
+        assert!(p.knows_key(&late), "past the file's limit a key is still remembered for the session");
         let lines = std::fs::read_to_string(&path).unwrap().lines().count();
         assert_eq!(lines, MAX_PINS, "the file stops growing");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The mesh's hello: an id is proved by the key it is the hash of, for one
+    /// connection and one other side.
+    #[test]
+    fn a_hello_is_proved_only_by_its_own_key_for_this_connection() {
+        let (ann, ben, eve) = (IdentityKey::generate(), IdentityKey::generate(), IdentityKey::generate());
+        let id = |k: &IdentityKey| PeerId::of_key(&k.public());
+        let (na, nb) = ([1u8; 16], [2u8; 16]);
+        let sig = ann.sign_hello("game", (id(&ann), &na), (id(&ben), &nb));
+        let ok = |key: &IdentityKey, sig: &[u8; SIG_LEN], game: &str, signer: (PeerId, &[u8; 16]), verifier: (PeerId, &[u8; 16])| hello_proves(&key.public(), sig, game, signer, verifier);
+        assert!(ok(&ann, &sig, "game", (id(&ann), &na), (id(&ben), &nb)));
+        // Another connection (either number differs), another game, another listener.
+        assert!(!ok(&ann, &sig, "game", (id(&ann), &[9; 16]), (id(&ben), &nb)));
+        assert!(!ok(&ann, &sig, "game", (id(&ann), &na), (id(&ben), &[9; 16])));
+        assert!(!ok(&ann, &sig, "other", (id(&ann), &na), (id(&ben), &nb)));
+        assert!(!ok(&ann, &sig, "game", (id(&ann), &na), (id(&eve), &nb)));
+        // Eve with her own key, saying she is Ann: the id isn't her key's.
+        let forged = eve.sign_hello("game", (id(&ann), &na), (id(&ben), &nb));
+        assert!(!ok(&eve, &forged, "game", (id(&ann), &na), (id(&ben), &nb)));
+        // Eve with Ann's public key and her own signature.
+        assert!(!ok(&ann, &forged, "game", (id(&ann), &na), (id(&ben), &nb)));
     }
 
     #[test]

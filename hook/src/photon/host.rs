@@ -32,6 +32,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// How long a write to a TCP or WebSocket client may take (see `Adapter::put`).
+const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub struct Host {
     stop: Arc<AtomicBool>,
     threads: Vec<thread::JoinHandle<()>>,
@@ -80,7 +83,7 @@ impl Adapter {
                 self.drop_init_response = false;
                 return;
             }
-            let _ = self.stream.write_all(&ws::frame(ws::OP_BINARY, msg));
+            self.put(&ws::frame(ws::OP_BINARY, msg));
             return;
         }
         let mut f = Vec::with_capacity(msg.len() + 7);
@@ -89,7 +92,16 @@ impl Adapter {
         f.push(channel);
         f.push(u8::from(reliable));
         f.extend_from_slice(msg);
-        let _ = self.stream.write_all(&f);
+        self.put(&f);
+    }
+
+    /// Writes to the client, on the one thread that runs every Photon server: a client
+    /// that stops reading may hold it for `WRITE_TIMEOUT` once, and is then closed (a
+    /// write cut short leaves the stream out of step anyway).
+    fn put(&mut self, bytes: &[u8]) {
+        if self.stream.write_all(bytes).is_err() {
+            let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        }
     }
 }
 
@@ -306,6 +318,7 @@ impl Host {
                         Ok((s, from)) => {
                             let _ = s.set_nonblocking(false);
                             let _ = s.set_nodelay(true);
+                            let _ = s.set_write_timeout(Some(WRITE_TIMEOUT));
                             let Ok(w) = s.try_clone() else { continue };
                             if tx.send(Input::TcpOpen(TCP_BASE + r, from, w)).is_err() {
                                 break;
@@ -343,6 +356,7 @@ impl Host {
                         Ok((s, from)) => {
                             let _ = s.set_nonblocking(false);
                             let _ = s.set_nodelay(true);
+                            let _ = s.set_write_timeout(Some(WRITE_TIMEOUT));
                             let tx = tx.clone();
                             let _ = thread::Builder::new().name("pp-photon-ws-rx".into()).spawn(move || read_ws(WS_BASE + r, from, s, tx, start));
                         }
@@ -365,34 +379,43 @@ impl Host {
             let now = || start.elapsed().as_millis() as i64;
             let mut adapters: HashMap<(usize, SocketAddr), Adapter> = HashMap::new();
             let mut next = 0i64;
+            let mut failures = 0u32;
             while !stop2.load(Ordering::Relaxed) {
                 let wait = (next - now()).clamp(1, 200) as u64;
                 let t = now();
-                match rx.recv_timeout(Duration::from_millis(wait)) {
-                    Ok(Input::Udp(sock, from, data)) => {
+                let input = match rx.recv_timeout(Duration::from_millis(wait)) {
+                    Ok(i) => Some(i),
+                    Err(mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+                // What clients send is checked, and a mistake in that checking must not
+                // be the end of the server for everyone: a panic costs the one message.
+                let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match input {
+                    Some(Input::Udp(sock, from, data)) => {
                         let outs = server.on_datagram(sock, from, &data, t);
                         route(&mut server, &mut adapters, &senders, outs, t);
                     }
-                    Ok(Input::TcpOpen(sock, from, stream)) => {
+                    Some(Input::TcpOpen(sock, from, stream)) => {
                         let challenge = u32::from_le_bytes(super::crypto::random_bytes(4).try_into().unwrap());
                         let mut a = Adapter::new(Peer::connect(challenge, 32, t), stream, false, false);
                         let dgs = a.peer.flush(t);
                         adapters.insert((sock, from), a);
                         feed(&mut server, &mut adapters, &senders, (sock, from), dgs, t);
                     }
-                    Ok(Input::WsOpen(sock, from, stream, made_init)) => {
+                    Some(Input::WsOpen(sock, from, stream, made_init)) => {
                         let challenge = u32::from_le_bytes(super::crypto::random_bytes(4).try_into().unwrap());
                         let mut a = Adapter::new(Peer::connect(challenge, 32, t), stream, is_ws(sock), made_init);
                         let dgs = a.peer.flush(t);
                         adapters.insert((sock, from), a);
                         feed(&mut server, &mut adapters, &senders, (sock, from), dgs, t);
                     }
-                    Ok(Input::Write(sock, from, bytes)) => {
+                    Some(Input::Write(sock, from, bytes)) => {
                         if let Some(a) = adapters.get_mut(&(sock, from)) {
-                            let _ = a.stream.write_all(&bytes);
+                            a.put(&bytes);
                         }
                     }
-                    Ok(Input::TcpFrame(sock, from, channel, reliable, msg)) => {
+                    Some(Input::TcpFrame(sock, from, channel, reliable, msg)) => {
                         let dgs = match adapters.get_mut(&(sock, from)) {
                             Some(a) => {
                                 if a.peer.state == State::Connected {
@@ -406,24 +429,23 @@ impl Host {
                         };
                         feed(&mut server, &mut adapters, &senders, (sock, from), dgs, t);
                     }
-                    Ok(Input::TcpPing(sock, from, client_time)) => {
+                    Some(Input::TcpPing(sock, from, client_time)) => {
                         if let Some(a) = adapters.get_mut(&(sock, from)) {
                             let mut r = [0u8; 9];
                             r[0] = 0xF0;
                             r[1..5].copy_from_slice(&(t as i32).to_be_bytes());
                             r[5..9].copy_from_slice(&client_time);
-                            let _ = a.stream.write_all(&r);
+                            a.put(&r);
                         }
                     }
-                    Ok(Input::TcpClosed(sock, from)) => {
+                    Some(Input::TcpClosed(sock, from)) => {
                         if let Some(mut a) = adapters.remove(&(sock, from)) {
                             let _ = a.stream.shutdown(std::net::Shutdown::Both);
                             let dgs = a.peer.disconnect(t);
                             feed(&mut server, &mut adapters, &senders, (sock, from), dgs, t);
                         }
                     }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    None => {}
                 }
                 let t = now();
                 if t >= next {
@@ -436,6 +458,13 @@ impl Host {
                         feed(&mut server, &mut adapters, &senders, k, dgs, t);
                     }
                     next = server.next_tick(t);
+                }
+                }));
+                if step.is_err() {
+                    failures += 1;
+                    if failures <= 3 {
+                        log("photon: the server failed on a message and dropped it (the error is above, in the game's own output if it shows one)");
+                    }
                 }
                 conns2.store(server.connection_count(), Ordering::Relaxed);
             }

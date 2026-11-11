@@ -8,7 +8,7 @@ license.workspace = true
 [dependencies]
 # Room codes and the internet check (--new-room, --net-test, the Settings page).
 peerparty_core = { path = "../core" }
-windows-sys = { workspace = true, features = ["Win32_Graphics_Gdi", "Win32_UI_Shell", "Win32_System_Com", "Win32_System_Console", "Win32_System_Pipes", "Win32_System_IO", "Win32_Devices_HumanInterfaceDevice", "Win32_Devices_DeviceAndDriverInstallation", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_HiDpi", "Win32_Storage_Packaging_Appx"] }
+windows-sys = { workspace = true, features = ["Win32_Graphics_Gdi", "Win32_UI_Shell", "Win32_System_Com", "Win32_System_Console", "Win32_System_Pipes", "Win32_System_IO", "Win32_Devices_HumanInterfaceDevice", "Win32_Devices_DeviceAndDriverInstallation", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_HiDpi", "Win32_Storage_Packaging_Appx", "Win32_System_JobObjects", "Win32_Networking_WinHttp"] }
 # The launcher window (src/ui), shown when peerparty.exe starts with no arguments.
 eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "clipboard", "links"] }
 egui_extras = { version = "0.37", features = ["image", "file"] }

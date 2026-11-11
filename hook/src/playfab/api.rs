@@ -777,17 +777,20 @@ fn lan_lobbies(lan: &peerparty_core::Lan, ns: &str) -> Vec<Lobby> {
     let id = lan.search(q);
     let deadline = Instant::now() + SEARCH_WAIT;
     while Instant::now() < deadline {
-        for ev in net::take(Front::PlayFab) {
-            if let Event::SearchDone { search, results } = ev {
-                if search == id {
-                    return results;
-                }
-            }
+        // Other requests' searches and joins wait in the same queue (net::take_one).
+        let mine = |e: &Event| matches!(e, Event::SearchDone { search, .. } if *search == id);
+        if let Some(Event::SearchDone { results, .. }) = net::take_one(Front::PlayFab, mine, waited_for) {
+            return results;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
     log!("playfab search of {ns} timed out");
     Vec::new()
+}
+
+/// The events requests wait for in the PlayFab queue (here and pfmp.rs's REST joins).
+pub(crate) fn waited_for(e: &Event) -> bool {
+    matches!(e, Event::SearchDone { .. } | Event::JoinDone { .. })
 }
 
 // ---- lobbies ----
@@ -971,19 +974,10 @@ fn advance(lan: &peerparty_core::Lan, id: &str) -> bool {
 /// already named (it noticed first), else the mutual-oldest compatible pair.
 fn find_match(me: &View, all: &[View]) -> Option<(String, Vec<View>)> {
     let others: Vec<&View> = all.iter().filter(|v| v.id != me.id).collect();
-    if let Some(named) = others.iter().find(|v| v.matched.split('+').any(|t| t == me.id)) {
-        let members = named
-            .matched
-            .split('+')
-            .filter_map(|t| {
-                if t == me.id {
-                    Some(me.clone())
-                } else {
-                    all.iter().find(|v| v.id == t).cloned()
-                }
-            })
-            .collect::<Vec<_>>();
-        return (members.len() >= 2).then(|| (named.matched.clone(), members));
+    if let Some(named) = others.iter().find(|v| names_me(v, me)) {
+        let mut members = vec![me.clone(), (*named).clone()];
+        members.sort_by(|a, b| a.id.cmp(&b.id));
+        return Some((named.matched.clone(), members));
     }
     let mut open: Vec<&View> = others.into_iter().filter(|v| v.matched.is_empty()).collect();
     open.push(me);
@@ -1002,6 +996,17 @@ fn find_match(me: &View, all: &[View]) -> Option<(String, Vec<View>)> {
     let mut members = vec![me.clone(), pick];
     members.sort_by(|a, b| a.id.cmp(&b.id));
     Some((ids.join("+"), members))
+}
+
+/// Whether `named` claims a match with `me` that this side would have made too: its
+/// "match" is exactly the two ids, sorted and joined by `+`, and the two tickets are
+/// compatible. Any copy can write its own ticket's "match", so a claim naming other
+/// tickets as well, or pairing tickets the rules keep apart (a different password, two
+/// hosts), is ignored and `me` goes on matching as usual.
+fn names_me(named: &View, me: &View) -> bool {
+    let mut ids = [me.id.as_str(), named.id.as_str()];
+    ids.sort();
+    named.id != me.id && named.matched == ids.join("+") && compatible(&me.data, &named.data)
 }
 
 /// Keys that describe a player rather than what they're looking for.
@@ -1025,8 +1030,8 @@ fn strings(v: &Json) -> Vec<&str> {
 /// - a host (ISHOST with a LOBBYID) pairs with a joiner whose ROLE is one of the host's
 ///   open ROLES; two non-hosts pair when their ROLES overlap; two hosts never pair
 /// - platform lists (PLAT) must overlap when both have one
-/// - every other text attribute both have (a password, a mode) must be equal; Salt and
-///   Sacrifice marks a joiner's "hopper" with a trailing `j`, so that's ignored
+/// - every other text attribute both have (a password, a mode) must be equal; a game
+///   may mark a joiner's copy of a value with a trailing `j`, so that's ignored
 /// Numbers (levels, counts) aren't compared: on a LAN anyone may play anyone.
 pub(crate) fn compatible(a: &str, b: &str) -> bool {
     let (Some(a), Some(b)) = (Json::parse(a), Json::parse(b)) else {
@@ -1276,6 +1281,40 @@ mod tests {
         let (m3, members) = find_match(&joiner, &[marked, joiner.clone()]).unwrap();
         assert_eq!(m3, "a+b");
         assert_eq!(members.iter().filter(|m| m.id == "a").count(), 1);
+    }
+
+    /// A ticket that names ours is adopted only when the claim is one this side would
+    /// make: a stranger can't pull a ticket into a match its rules keep it out of.
+    #[test]
+    fn a_named_match_must_be_one_we_would_make() {
+        let joiner = v("b", 2, JOINER);
+        let claim = |id: &str, data: &str, matched: &str| {
+            let mut c = v(id, 1, data);
+            c.matched = matched.into();
+            c
+        };
+        let honest = claim("a", HOST, "a+b");
+        assert_eq!(find_match(&joiner, &[honest.clone(), joiner.clone()]).map(|m| m.0), Some("a+b".into()));
+        // A different password, a different role, or a second host.
+        for data in [WRONG_PASS, INVADER] {
+            let bad = claim("a", &data.replace("\"ISJOINER\":1", "\"ISHOST\":1,\"LOBBYID\":\"x\""), "a+b");
+            assert!(find_match(&joiner, &[bad, joiner.clone()]).is_none(), "{data}");
+        }
+        let host = v("h", 1, HOST);
+        assert!(find_match(&host, &[claim("a", HOST, "a+h"), host.clone()]).is_none(), "two hosts");
+        // Not exactly the two ids, sorted: other tickets named too, the order swapped,
+        // ours named twice, or only ours.
+        for matched in ["a+b+c", "b+a", "a+b+b", "b", "a+b+", "+a+b", "a++b"] {
+            let bad = claim("a", HOST, matched);
+            assert!(find_match(&joiner, &[bad, joiner.clone()]).is_none(), "{matched}");
+        }
+        // A refused claim doesn't stop the usual matching: an honest open host still
+        // pairs with us.
+        let squatter = claim("0", WRONG_PASS, "0+b");
+        let open = v("c", 3, HOST);
+        let (m, members) = find_match(&joiner, &[squatter, open, joiner.clone()]).expect("matched");
+        assert_eq!(m, "b+c");
+        assert_eq!(members.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(), ["b", "c"]);
     }
 
     #[test]

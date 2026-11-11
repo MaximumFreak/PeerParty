@@ -161,14 +161,13 @@ static COPIES: LazyLock<Mutex<HashMap<usize, usize>>> = LazyLock::new(Mutex::def
 static OURS: LazyLock<Mutex<HashSet<usize>>> = LazyLock::new(Mutex::default);
 
 /// Whether registered callback objects get the swapping vtable: in a game started through PeerParty, unless
-/// the game keeps steam_api's SteamID (`steamid` mode official, or Valve's own Steam
-/// client already in the game), or `PEERPARTY_SKIP=steamown`. A game whose SteamID
-/// turns out to be kept anyway only pays a check per callback.
+/// the game keeps steam_api's SteamID (`steamlan::own_id_on`: `steamid` mode official,
+/// or auto with Valve's Steam client in the game), or `PEERPARTY_SKIP=steamown`. The
+/// same decision as the calls' swap, so `steamid` mode lan swaps classic callbacks too,
+/// with the Steam client loaded. A game whose SteamID turns out to be kept anyway only
+/// pays a check per callback.
 fn wrap_wanted() -> bool {
-    crate::net::enabled()
-        && !crate::net::skip("steamown")
-        && !std::env::var("PEERPARTY_MODE_STEAMID").is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "official" | "off" | "game" | "0"))
-        && !crate::steamlan::steam_client_in_game()
+    crate::net::enabled() && !crate::net::skip("steamown") && crate::steamlan::own_id_on()
 }
 
 /// A `CCallbackBase` the game registers (a callback, or a call result): from now on

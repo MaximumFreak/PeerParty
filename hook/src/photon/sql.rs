@@ -54,7 +54,9 @@ impl V {
             (V::Null, V::Null) => Ordering::Equal,
             (V::Null, _) => Ordering::Less,
             (_, V::Null) => Ordering::Greater,
-            (V::Num(a), V::Num(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+            // NaN (a property reading "NaN", or a float that is one) has a place too:
+            // calling it equal to everything isn't an order, and a sort handed one panics.
+            (V::Num(a), V::Num(b)) => a.partial_cmp(b).unwrap_or_else(|| a.total_cmp(b)),
             (V::Num(_), V::Text(_)) => Ordering::Less,
             (V::Text(_), V::Num(_)) => Ordering::Greater,
             (V::Text(a), V::Text(b)) => a.as_bytes().cmp(b.as_bytes()),
@@ -159,12 +161,27 @@ enum Expr {
     Call(String, Vec<Expr>),
 }
 
+/// A filter comes from whoever connects, and is parsed and evaluated by functions that
+/// call themselves: past these it is refused, well short of what the stack holds. Real
+/// filters are a handful of comparisons.
+const MAX_TOKENS: usize = 512;
+const MAX_NESTING: usize = 24;
+/// LIKE compares at most this many characters a side (its cost is one times the other).
+const MAX_LIKE: usize = 1024;
+
 struct P {
     t: Vec<Tok>,
     i: usize,
+    /// How many brackets, NOTs and signs deep the parser is.
+    depth: usize,
 }
 
 impl P {
+    fn deeper(&mut self) -> Result<(), String> {
+        self.depth += 1;
+        if self.depth > MAX_NESTING { Err("filter nested too deep".into()) } else { Ok(()) }
+    }
+
     fn peek(&self) -> Option<&Tok> {
         self.t.get(self.i)
     }
@@ -189,10 +206,12 @@ impl P {
     }
 
     fn or(&mut self) -> Result<Expr, String> {
+        self.deeper()?;
         let mut e = self.and()?;
         while self.eat_word("OR") {
             e = Expr::Or(Box::new(e), Box::new(self.and()?));
         }
+        self.depth -= 1;
         Ok(e)
     }
     fn and(&mut self) -> Result<Expr, String> {
@@ -204,7 +223,10 @@ impl P {
     }
     fn not(&mut self) -> Result<Expr, String> {
         if self.eat_word("NOT") {
-            return Ok(Expr::Not(Box::new(self.not()?)));
+            self.deeper()?;
+            let e = self.not()?;
+            self.depth -= 1;
+            return Ok(Expr::Not(Box::new(e)));
         }
         self.cmp()
     }
@@ -275,11 +297,13 @@ impl P {
         Ok(e)
     }
     fn unary(&mut self) -> Result<Expr, String> {
-        if self.eat_op("-") {
-            return Ok(Expr::Neg(Box::new(self.unary()?)));
-        }
-        if self.eat_op("+") {
-            return self.unary();
+        let minus = self.op("-");
+        if minus || self.op("+") {
+            self.i += 1;
+            self.deeper()?;
+            let e = self.unary()?;
+            self.depth -= 1;
+            return Ok(if minus { Expr::Neg(Box::new(e)) } else { e });
         }
         self.primary()
     }
@@ -318,8 +342,11 @@ impl P {
 }
 
 fn like(text: &str, pattern: &str) -> bool {
-    let t: Vec<char> = text.to_ascii_lowercase().chars().collect();
-    let p: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
+    let t: Vec<char> = text.chars().take(MAX_LIKE + 1).map(|c| c.to_ascii_lowercase()).collect();
+    let p: Vec<char> = pattern.chars().take(MAX_LIKE + 1).map(|c| c.to_ascii_lowercase()).collect();
+    if t.len() > MAX_LIKE || p.len() > MAX_LIKE {
+        return false;
+    }
     // Iterative wildcard match with backtracking on the last '%'.
     let (mut ti, mut pi, mut star, mut mark) = (0, 0, None, 0);
     while ti < t.len() {
@@ -437,8 +464,16 @@ pub struct Filter {
 
 impl Filter {
     pub fn parse(text: &str) -> Result<Filter, String> {
+        // A chain of ANDs or ORs is a tree as deep as it is long, which the token limit
+        // bounds; brackets, NOTs and signs have their own.
+        if text.len() > MAX_TOKENS * 16 {
+            return Err("filter too long".into());
+        }
         let toks = tokens(text)?;
-        let mut p = P { t: toks, i: 0 };
+        if toks.len() > MAX_TOKENS {
+            return Err("filter too long".into());
+        }
+        let mut p = P { t: toks, i: 0, depth: 0 };
         let filter = if p.peek().is_none() || p.word("ORDER") { None } else { Some(p.or()?) };
         let mut order = Vec::new();
         if p.eat_word("ORDER") {
@@ -537,6 +572,60 @@ mod tests {
         assert_eq!(f.compare(&room(&b), &room(&a)), Ordering::Less, "closer to 10 first");
         assert_eq!(f.compare(&room(&c), &room(&b)), Ordering::Less, "equal distance: C1 descending");
         assert!(Filter::parse("ORDER BY C0").unwrap().matches(&room(&a)));
+    }
+
+    /// A filter comes from anyone who can connect; these used to end the game's process
+    /// (the parser and the evaluator call themselves) or its Photon thread (the sort).
+    #[test]
+    fn hostile_filters_are_refused_or_harmless() {
+        // On a quarter of the stack the server's thread has, in a build whose frames are
+        // several times a release build's: a limit set too high fails here, not in a game.
+        std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                for f in [
+                    format!("{}1{}", "(".repeat(5000), ")".repeat(5000)),
+                    format!("{} 1", "NOT ".repeat(20_000)),
+                    format!("{}1", "-".repeat(20_000)),
+                    format!("ABS({}1{})", "ABS(".repeat(5000), ")".repeat(5000)),
+                    format!("1{}", " OR 1".repeat(100_000)),
+                    "x".repeat(1 << 20),
+                ] {
+                    assert!(Filter::parse(&f).is_err(), "{} bytes starting {:?}", f.len(), &f[..12]);
+                }
+                // The longest chain let through still evaluates, and drops, on this stack.
+                let chain = format!("C0 = 1{}", " OR C0 = 2".repeat((MAX_TOKENS - 3) / 4));
+                let r = [("C0", Value::Int(2))];
+                assert!(Filter::parse(&chain).unwrap().matches(&room(&r)));
+                let nest = format!("{}C0 = 2{}", "(".repeat(MAX_NESTING - 1), ")".repeat(MAX_NESTING - 1));
+                assert!(Filter::parse(&nest).unwrap().matches(&room(&r)));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        // LIKE's cost is bounded: an oversized side just doesn't match.
+        assert!(!like(&"a".repeat(200_000), &format!("%{}b", "a".repeat(100_000))));
+        assert!(like(&"a".repeat(MAX_LIKE), "a%a"));
+    }
+
+    #[test]
+    fn rooms_with_nan_properties_sort() {
+        // As a float, and as text that arithmetic reads as a number.
+        let vals = ["NaN", "1", "inf", "-inf", "nan", "0", "-0", "7", "x", ""];
+        for by in ["ORDER BY C0", "ORDER BY C0 + 0", "ORDER BY C0 - C0 DESC"] {
+            let f = Filter::parse(by).unwrap();
+            for n in [16usize, 32, 64, 500] {
+                let rooms: Vec<[(&str, Value); 1]> = (0..n)
+                    .map(|i| [("C0", if i % 5 == 0 { Value::Float(f32::NAN) } else { Value::Str(vals[(i * 7) % vals.len()].into()) })])
+                    .collect();
+                let mut order: Vec<usize> = (0..n).collect();
+                order.sort_by(|a, b| f.compare(&room(&rooms[*a]), &room(&rooms[*b])));
+                assert_eq!(order.len(), n);
+            }
+        }
+        // Ordinary numbers compare as before: the two zeros are still equal.
+        let r = [("C1", Value::Double(-0.0))];
+        assert!(Filter::parse("C1 = 0").unwrap().matches(&room(&r)));
     }
 
     #[test]

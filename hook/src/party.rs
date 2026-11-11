@@ -1626,6 +1626,10 @@ unsafe extern "system" fn party_create_new_network(
     let mut lobby = Lobby::new(NS);
     lobby.id = guid.clone();
     lobby.max_members = config.max_devices.clamp(1, 32);
+    // A network is joined by its id, which the game hands out through its own lobby
+    // or invite. Left public, a stranger could list every network and walk into any:
+    // this way a public player gets in from a lobby they share with us, or invited.
+    lobby.permission = peerparty_core::Permission::Friends;
     lobby.join_by_id = true;
     lobby.host_migration = true;
     if let Err(e) = lan.create_lobby(lobby) {

@@ -89,12 +89,24 @@ pub fn serve(conn: TcpStream) {
     }
 }
 
+/// The most a request's head and body may be. Only this PC's own programs reach this
+/// service, but one of them sending without end shouldn't take the game's memory.
+const MAX_HEAD: usize = 64 * 1024;
+const MAX_BODY: usize = 16 << 20;
+
+fn too_big() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "request too big")
+}
+
 /// Reads one request. `pending` holds bytes read past the previous one.
 fn read_request(tls: &mut TlsStream, pending: &mut Vec<u8>) -> io::Result<Option<Request>> {
     let mut chunk = [0u8; 8192];
     let head_end = loop {
         if let Some(i) = find(pending, b"\r\n\r\n") {
             break i;
+        }
+        if pending.len() > MAX_HEAD {
+            return Err(too_big());
         }
         let n = tls.read(&mut chunk)?;
         if n == 0 {
@@ -130,6 +142,9 @@ fn read_request(tls: &mut TlsStream, pending: &mut Vec<u8>) -> io::Result<Option
         .header("Content-Length")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    if len > MAX_BODY {
+        return Err(too_big());
+    }
     // .NET Framework asks before sending a POST body.
     if req
         .header("Expect")
@@ -154,6 +169,9 @@ fn read_chunked(tls: &mut TlsStream, pending: &mut Vec<u8>) -> io::Result<Vec<u8
     let mut chunk = [0u8; 8192];
     let mut body = Vec::new();
     let mut more = |tls: &mut TlsStream, pending: &mut Vec<u8>| -> io::Result<()> {
+        if pending.len() > MAX_BODY + MAX_HEAD {
+            return Err(too_big());
+        }
         let n = tls.read(&mut chunk)?;
         if n == 0 {
             return Err(io::ErrorKind::UnexpectedEof.into());
@@ -172,6 +190,11 @@ fn read_chunked(tls: &mut TlsStream, pending: &mut Vec<u8>) -> io::Result<Vec<u8
         let size = usize::from_str_radix(size_text.split(';').next().unwrap_or("0").trim(), 16)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad chunk size"))?;
         pending.drain(..line_end + 2);
+        // Before it is added to anything: a size near the largest number wrapped
+        // round in `size + 2` below, and the copy after it panicked.
+        if size > MAX_BODY - body.len().min(MAX_BODY) {
+            return Err(too_big());
+        }
         if size == 0 {
             // Trailers, up to the empty line.
             loop {

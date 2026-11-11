@@ -16,7 +16,14 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThrea
 struct Log {
     file: Mutex<File>,
     start: Instant,
+    /// Bytes written so far (see MAX_BYTES).
+    written: std::sync::atomic::AtomicU64,
 }
+
+/// A run's log stops here. Lines are thinned out where they repeat, so a real run stays
+/// far below this; it is for whatever isn't (another player's copy sending something
+/// that is logged every time, say), which must not fill the disk.
+const MAX_BYTES: u64 = 256 << 20;
 
 static LOG: OnceLock<Log> = OnceLock::new();
 static CALLS: LazyLock<Mutex<HashMap<String, u64>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -52,6 +59,7 @@ pub fn open(dll_dir: PathBuf, exe_name: &str) -> Option<PathBuf> {
     LOG.set(Log {
         file: Mutex::new(file),
         start: Instant::now(),
+        written: std::sync::atomic::AtomicU64::new(0),
     })
     .ok()?;
     Some(path)
@@ -59,14 +67,24 @@ pub fn open(dll_dir: PathBuf, exe_name: &str) -> Option<PathBuf> {
 
 pub fn line(args: fmt::Arguments) {
     let Some(log) = LOG.get() else { return };
+    if log.written.load(std::sync::atomic::Ordering::Relaxed) >= MAX_BYTES {
+        return;
+    }
     let ms = log.start.elapsed().as_millis();
-    let text = format!(
+    let mut text = format!(
         "[{:>4}.{:03} t{:<5}] {args}\r\n",
         ms / 1000,
         ms % 1000,
         unsafe { GetCurrentThreadId() }
     );
     if let Ok(mut f) = log.file.lock() {
+        let before = log.written.fetch_add(text.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        if before >= MAX_BYTES {
+            return;
+        }
+        if before + text.len() as u64 >= MAX_BYTES {
+            text.push_str(&format!("[log] this log reached {} MiB: nothing more is written to it this run\r\n", MAX_BYTES >> 20));
+        }
         let _ = f.write_all(text.as_bytes());
         // A spike log is only useful if a crash still leaves it on disk.
         let _ = f.flush();

@@ -59,8 +59,14 @@ const PROTO: u8 = 1;
 const T_INIT: u8 = 1;
 const T_CONFIRM: u8 = 2;
 const T_DATA: u8 = 3;
+/// Public sessions' answer to a first INIT: a cookie, not a session (see COOKIE_FOR).
+const T_COOKIE: u8 = 4;
 const HEAD: usize = 3;
 const INIT_LEN: usize = HEAD + 8 + 48 + 16;
+/// An INIT carrying the cookie it was answered with, before its MAC.
+const INIT_COOKIE_LEN: usize = INIT_LEN + 16;
+/// [head][room id][the INIT's blob][cookie]: no bigger than the INIT it answers.
+const COOKIE_LEN: usize = HEAD + 8 + 48 + 16;
 const CONFIRM_AD: usize = HEAD + 8 + 48 + 48;
 
 const F_SEG: u8 = 1;
@@ -124,8 +130,6 @@ const REPLACE_QUIET: Duration = Duration::from_secs(10);
 /// Our mesh finished its side of a tunnelled connection (it moved to a better path):
 /// the session stays until the peer has everything we sent, this long at most.
 const FINISH_FOR: Duration = Duration::from_secs(10);
-/// A live session ignores a new handshake from its address until it's been quiet this long.
-const RESTART_QUIET: Duration = Duration::from_secs(2);
 const MAX_SESSIONS: usize = 32;
 const MAX_EARLY: usize = 8 << 20;
 const TICK: Duration = Duration::from_millis(10);
@@ -139,11 +143,28 @@ const PUBLIC_MAX_SESSIONS: usize = 16;
 const PUBLIC_PER_IP: usize = 32;
 const PUBLIC_PER_KEY: usize = 4;
 const PUBLIC_HALF_OPEN_PER_IP: usize = 8;
+/// ... and in all, whatever addresses they come from (a UDP packet's source is whatever
+/// its sender wrote there): half the session table. The other half stays free for
+/// finished sessions and for our own punches to players the DHT found, so a flood of
+/// first packets from made-up addresses can't keep us from meeting anyone. A player we
+/// punch as well gets in through that punch.
+const PUBLIC_HALF_OPEN_TOTAL: usize = PUBLIC_MAX_SESSIONS / 2;
 const PUBLIC_MAX_EARLY: usize = 1 << 20;
 const PUBLIC_HALF_OPEN: Duration = Duration::from_secs(10);
 /// Handshakes (a new session or new keys) per internet address: a burst, then per second.
 const PUBLIC_INIT_BURST: f32 = 32.0;
 const PUBLIC_INIT_RATE: f32 = 8.0;
+/// Public sessions: a first INIT from an address we have no session with gets a cookie
+/// back (a MAC of that address, the INIT's key and the time, under a key that never
+/// leaves this run), and nothing is kept for it. It gets a session when its INIT comes
+/// again carrying the cookie, which only a sender that receives packets at that address
+/// can do: made-up source addresses can't take the half-open slots, and what one gets
+/// back is no bigger than what it sent. A cookie is good for one to two COOKIE_FORs
+/// (an INIT goes out every second or faster while unanswered).
+const COOKIE_FOR: Duration = Duration::from_secs(10);
+/// Cookies sent in all, whatever the addresses: a burst, then per second.
+const COOKIE_BURST: f32 = 64.0;
+const COOKIE_RATE: f32 = 32.0;
 /// How long a blocked player's address is ignored.
 const BLOCKED_FOR: Duration = Duration::from_secs(600);
 /// After a block, how long keys we've never seen are refused from that player's internet
@@ -177,12 +198,10 @@ pub struct Config {
     pub portmap: bool,
     /// Prefer a direct IPv6 path to a peer when both sides have one (`PEERPARTY_IPV6=0`: off).
     pub ipv6: bool,
-    /// Rooms: the key that signs our handshakes (the identity slot's, filled in by the
-    /// engine; a fresh one when `None`), and the id -> key pins that stop one room
-    /// member from passing as another (in memory when `None`). Public sessions use
-    /// `public`'s instead.
+    /// Rooms: the key that signs our handshakes (this player's, filled in by the
+    /// engine; a fresh one when `None`). A member's id must be its key's hash, which
+    /// stops one from passing as another. Public sessions use `public`'s instead.
     pub room_key: Option<Arc<public::IdentityKey>>,
-    pub room_pins: Option<Arc<public::Pins>>,
     /// Quiet time before a restarted player's new handshake replaces the old session.
     /// Production is 10s (`REPLACE_QUIET`); tests set a shorter one.
     #[doc(hidden)]
@@ -206,7 +225,6 @@ impl Config {
             portmap: !crate::loopback_only(),
             ipv6: true,
             room_key: None,
-            room_pins: None,
             replace_quiet: REPLACE_QUIET,
         }
     }
@@ -443,11 +461,12 @@ impl HelloFilter {
         if self.buf.len() < 4 + len {
             return Ok(Vec::new());
         }
-        let Some(Msg::Hello { version, game, id, mut name, mut udp }) = Msg::decode(&self.buf[4..4 + len]) else {
+        let Some(Msg::Hello { version, game, id, mut name, mut udp, key, nonce }) = Msg::decode(&self.buf[4..4 + len]) else {
             return Err("the first message isn't a hello".into());
         };
         f(id, &mut name, &mut udp)?;
-        let hello = Msg::Hello { version, game, id, name, udp }.encode();
+        // The name and port are ours to change: the proof that follows signs neither.
+        let hello = Msg::Hello { version, game, id, name, udp, key, nonce }.encode();
         let mut out = (hello.len() as u32).to_le_bytes().to_vec();
         out.extend_from_slice(&hello);
         out.extend_from_slice(&self.buf[4 + len..]);
@@ -476,6 +495,7 @@ struct Bridge {
     to_tcp_bytes: Arc<AtomicUsize>,
     relay: Arc<UdpSocket>,
     relay_port: u16,
+    _relay_own: crate::own::Held,
     /// Our mesh's data socket port (0 until its Hello passes).
     mesh_udp: Arc<AtomicU16>,
     closed: Arc<AtomicBool>,
@@ -516,6 +536,9 @@ struct Session {
     rtt: Option<Duration>,
     /// The peer started it (it sent the first INIT we saw).
     inbound: bool,
+    /// The cookie the peer answered our INIT with (public sessions), sent in each INIT
+    /// after it.
+    cookie: Option<[u8; 16]>,
     /// Public sessions: the player's verified key and its fingerprint.
     key: Option<[u8; public::KEY_LEN]>,
     fp: Option<String>,
@@ -635,6 +658,7 @@ impl Session {
             finishing: None,
             rtt: None,
             inbound,
+            cookie: None,
             key: None,
             fp: None,
             path: addr,
@@ -652,6 +676,9 @@ impl Session {
         let mut p = head(T_INIT).to_vec();
         p.extend_from_slice(&cx.room_id);
         p.extend_from_slice(&self.eph.blob);
+        if let Some(c) = &self.cookie {
+            p.extend_from_slice(c);
+        }
         let tag = crypto::mac16(cx.init_key, &[&p]);
         p.extend_from_slice(&tag);
         cx.send(self.addr, &p);
@@ -880,12 +907,19 @@ struct Shared {
     full_logged: Mutex<HashSet<SocketAddr>>,
     /// Rooms' signing key and pins (None for public sessions, which have `pubs`).
     room_sig: Option<RoomSig>,
+    /// Our sockets' ports are ours, not the game's: the typed-IP forwarder never delivers
+    /// a peer's traffic to them (see `own`).
+    _own: Vec<crate::own::Held>,
+    /// Public sessions' cookies (COOKIE_FOR): the key, the time they count from, and
+    /// how many go out (one bucket for all addresses).
+    cookie_key: [u8; 32],
+    cookie_t0: Instant,
+    cookies: Mutex<public::RateLimit>,
 }
 
-/// A room's signing key and pins (see Config::room_key).
+/// A room's signing key (see Config::room_key).
 struct RoomSig {
     key: Arc<public::IdentityKey>,
-    pins: Arc<public::Pins>,
 }
 
 struct PubState {
@@ -977,6 +1011,35 @@ impl Shared {
         *g += 1;
         *g
     }
+
+    /// The cookie for an INIT with `blob` from `from`, in time slot `slot`.
+    fn cookie(&self, from: SocketAddr, blob: &[u8; 48], slot: u64) -> [u8; 16] {
+        crypto::mac16(&self.cookie_key, &[&cookie_input(from, blob, slot)])
+    }
+
+    fn cookie_slot(&self, now: Instant) -> u64 {
+        now.saturating_duration_since(self.cookie_t0).as_secs() / COOKIE_FOR.as_secs()
+    }
+
+    /// Whether `c` is the cookie we gave `from` for `blob`, this time slot or the last.
+    fn cookie_ok(&self, from: SocketAddr, blob: &[u8; 48], c: &[u8], now: Instant) -> bool {
+        let slot = self.cookie_slot(now);
+        [Some(slot), slot.checked_sub(1)].into_iter().flatten().any(|s| crypto::mac16_ok(&self.cookie_key, &[&cookie_input(from, blob, s)], c))
+    }
+}
+
+/// What a cookie is the MAC of: the address (IPv4 as IPv4-mapped), port, blob and slot.
+fn cookie_input(from: SocketAddr, blob: &[u8; 48], slot: u64) -> [u8; 16 + 2 + 48 + 8] {
+    let ip = match from.ip() {
+        IpAddr::V4(v) => v.to_ipv6_mapped().octets(),
+        IpAddr::V6(v) => v.octets(),
+    };
+    let mut b = [0u8; 16 + 2 + 48 + 8];
+    b[..16].copy_from_slice(&ip);
+    b[16..18].copy_from_slice(&from.port().to_le_bytes());
+    b[18..66].copy_from_slice(blob);
+    b[66..].copy_from_slice(&slot.to_le_bytes());
+    b
 }
 
 impl Drop for Shared {
@@ -984,6 +1047,7 @@ impl Drop for Shared {
         use zeroize::Zeroize;
         self.psk.zeroize();
         self.init_key.zeroize();
+        self.cookie_key.zeroize();
     }
 }
 
@@ -1083,7 +1147,6 @@ impl Inet {
         });
         let room_sig = pubs.is_none().then(|| RoomSig {
             key: cfg.room_key.clone().unwrap_or_else(|| Arc::new(public::IdentityKey::generate())),
-            pins: cfg.room_pins.clone().unwrap_or_else(|| Arc::new(public::Pins::in_memory())),
         });
         let name = match (&pubs, &cfg.public) {
             (Some(ps), Some(p)) => public::our_name(p.name.as_deref(), &ps.fp),
@@ -1095,7 +1158,12 @@ impl Inet {
         if let Some(d) = &mut dht {
             d.allow_private = cfg.allow_private;
         }
+        let mut own = vec![crate::own::udp(local_port)];
+        if let Some(p) = sock6.as_ref().and_then(|s| s.local_addr().ok()).map(|a| a.port()) {
+            own.push(crate::own::udp(p));
+        }
         let sh = Arc::new(Shared {
+            _own: own,
             room_id: cfg.room.room_id(),
             init_key: cfg.room.init_key(),
             psk: cfg.room.psk(),
@@ -1136,6 +1204,9 @@ impl Inet {
             stop_mapping: AtomicBool::new(false),
             full_logged: Mutex::new(HashSet::new()),
             room_sig,
+            cookie_key: crypto::random_array(),
+            cookie_t0: now,
+            cookies: Mutex::new(public::RateLimit::new(COOKIE_BURST, COOKIE_RATE)),
         });
         if let Some(p) = &sh.pubs {
             sh.log(&format!("public sessions: we are {} ({})", sh.me.name, p.fp));
@@ -1320,7 +1391,7 @@ fn recv6_loop(sh: &Arc<Shared>) {
     while !sh.stop.load(Ordering::Relaxed) {
         let Ok((n, from)) = sock.recv_from(&mut buf) else { continue };
         let d = &buf[..n];
-        if d.len() >= HEAD && d[0] == MAGIC && d[1] == PROTO && matches!(d[2], T_INIT | T_CONFIRM | T_DATA) {
+        if d.len() >= HEAD && d[0] == MAGIC && d[1] == PROTO && matches!(d[2], T_INIT | T_CONFIRM | T_DATA | T_COOKIE) {
             let acts = {
                 let mut s = sh.sessions.lock().unwrap();
                 on_packet(sh, &mut s, from, d, Instant::now())
@@ -1336,16 +1407,29 @@ fn on_packet(sh: &Arc<Shared>, ss: &mut HashMap<SocketAddr, Session>, from: Sock
     let tag = || redact::addr(from);
     match d[2] {
         T_INIT => {
-            if d.len() != INIT_LEN || d[HEAD..HEAD + 8] != cx.room_id {
+            let n = d.len();
+            if !(n == INIT_LEN || n == INIT_COOKIE_LEN) || d[HEAD..HEAD + 8] != cx.room_id {
                 return acts;
             }
-            if !crypto::mac16_ok(cx.init_key, &[&d[..INIT_LEN - 16]], &d[INIT_LEN - 16..]) {
+            if !crypto::mac16_ok(cx.init_key, &[&d[..n - 16]], &d[n - 16..]) {
                 return acts;
             }
             let blob: [u8; 48] = d[HEAD + 8..HEAD + 56].try_into().unwrap();
             if sh.pubs.is_some() {
                 // Anyone can send these: limit what a stranger can make us do.
                 if sh.is_blocked_addr(from, now) {
+                    return acts;
+                }
+                // Nothing is kept for an address until it shows it gets our packets
+                // (COOKIE_FOR): it's sent a cookie, and comes back with it.
+                if !ss.contains_key(&from) && !(n == INIT_COOKIE_LEN && sh.cookie_ok(from, &blob, &d[INIT_LEN - 16..INIT_LEN], now)) {
+                    if sh.cookies.lock().unwrap().allow(IpAddr::V4(Ipv4Addr::UNSPECIFIED), now) {
+                        let mut p = head(T_COOKIE).to_vec();
+                        p.extend_from_slice(&cx.room_id);
+                        p.extend_from_slice(&blob);
+                        p.extend_from_slice(&sh.cookie(from, &blob, sh.cookie_slot(now)));
+                        cx.send(from, &p);
+                    }
                     return acts;
                 }
                 let fresh = ss.get(&from).is_none_or(|s| s.peer != Some(blob));
@@ -1355,7 +1439,10 @@ fn on_packet(sh: &Arc<Shared>, ss: &mut HashMap<SocketAddr, Session>, from: Sock
                         // its other ports (an earlier run's, found on the DHT) mustn't
                         // lock its live port out.
                         let same = || ss.values().filter(|s| s.addr.ip() == from.ip());
-                        if same().count() >= PUBLIC_PER_IP || same().filter(|s| s.inbound && !s.confirmed).count() >= PUBLIC_HALF_OPEN_PER_IP {
+                        if same().count() >= PUBLIC_PER_IP
+                            || same().filter(|s| s.inbound && !s.confirmed).count() >= PUBLIC_HALF_OPEN_PER_IP
+                            || ss.values().filter(|s| s.inbound && !s.confirmed).count() >= PUBLIC_HALF_OPEN_TOTAL
+                        {
                             return acts;
                         }
                     }
@@ -1397,7 +1484,12 @@ fn on_packet(sh: &Arc<Shared>, ss: &mut HashMap<SocketAddr, Session>, from: Sock
             let s = ss.get_mut(&from).unwrap();
             if s.peer != Some(blob) {
                 if s.confirmed {
-                    if now.duration_since(s.last_rx) < RESTART_QUIET {
+                    // A first packet proves nothing about who sent it (in public
+                    // sessions anyone can make one, and a source address can be made
+                    // up), so it doesn't end a session that is alive: only one that has
+                    // missed two keepalives, as when the game at the other end was
+                    // started again. At 2 s, an idle session could be reset at will.
+                    if now.duration_since(s.last_rx) < sh.cfg.replace_quiet {
                         return acts;
                     }
                     // The peer started over (it lost our session): so do we.
@@ -1416,6 +1508,20 @@ fn on_packet(sh: &Arc<Shared>, ss: &mut HashMap<SocketAddr, Session>, from: Sock
                 s.send_confirm(&cx, now);
             }
             if !s.confirmed && s.last_init.is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100)) {
+                s.send_init(&cx, now);
+            }
+        }
+        T_COOKIE => {
+            // Our INIT was answered with a cookie: it goes in our INITs from now on.
+            if d.len() != COOKIE_LEN || d[HEAD..HEAD + 8] != cx.room_id {
+                return acts;
+            }
+            let Some(s) = ss.get_mut(&from) else { return acts };
+            if s.confirmed || d[HEAD + 8..HEAD + 56] != s.eph.blob[..] {
+                return acts;
+            }
+            s.cookie = Some(d[HEAD + 56..COOKIE_LEN].try_into().unwrap());
+            if s.last_init.is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100)) {
                 s.send_init(&cx, now);
             }
         }
@@ -1456,15 +1562,14 @@ fn on_packet(sh: &Arc<Shared>, ss: &mut HashMap<SocketAddr, Session>, from: Sock
                 acts.push(Act::Log(format!("{} is ourselves (our own announcement)", tag())));
                 return acts;
             }
-            // Rooms: each player id is bound to the first key seen for it, so a member
-            // can't pass as another.
-            if let Some(r) = &sh.room_sig
-                && !r.pins.check(info.id, &signed_by)
-            {
+            // A player's id is its key's hash, in rooms and public sessions alike: the
+            // signature just checked is that key's, so nobody passes as another, and
+            // nobody can be first to an id that isn't theirs.
+            if info.id != PeerId::of_key(&signed_by) {
                 ss.remove(&from);
                 acts.push(Act::Ban(from));
                 acts.push(Act::Log(format!(
-                    "{} ({}) claims to be {} with another key ({}): refused",
+                    "{} ({}) claims to be {}, which isn't its key's id ({}): refused",
                     tag(),
                     info.name,
                     info.id,
@@ -1505,12 +1610,7 @@ fn on_packet(sh: &Arc<Shared>, ss: &mut HashMap<SocketAddr, Session>, from: Sock
                     )));
                     return acts;
                 }
-                if !p.pins.check(info.id, k) {
-                    ss.remove(&from);
-                    acts.push(Act::Ban(from));
-                    acts.push(Act::Log(format!("{} claims to be {} with another key ({fp}): refused", tag(), info.id)));
-                    return acts;
-                }
+                p.pins.remember(info.id, k);
                 if ss.values().filter(|o| o.confirmed && o.fp.as_deref() == Some(fp.as_str())).count() >= PUBLIC_PER_KEY {
                     ss.remove(&from);
                     acts.push(Act::Log(format!("{} is {fp} again: {PUBLIC_PER_KEY} sessions with that key already, refused", tag())));
@@ -1615,6 +1715,9 @@ fn frames(s: &mut Session, cx: &Ctx, mut p: &[u8], now: Instant) -> Result<(), S
                 let (Some(seq), Some(len)) = (p.get(..4), p.get(4..6)) else { return Err("bad segment".into()) };
                 let seq = u32::from_le_bytes(seq.try_into().unwrap());
                 let len = u16::from_le_bytes(len.try_into().unwrap()) as usize;
+                if len > stream::MAX_SEG_IN {
+                    return Err("a segment bigger than any peerparty sends".into());
+                }
                 let data = p.get(6..6 + len).ok_or("bad segment")?.to_vec();
                 p = &p[6 + len..];
                 let ready = s.stream.on_segment(seq, data);
@@ -1631,6 +1734,13 @@ fn frames(s: &mut Session, cx: &Ctx, mut p: &[u8], now: Instant) -> Result<(), S
                 let len = u16::from_le_bytes(p.get(..2).ok_or("bad datagram")?.try_into().unwrap()) as usize;
                 let data = p.get(2..2 + len).ok_or("bad datagram")?;
                 p = &p[2 + len..];
+                // A mesh datagram names its sender, and our mesh takes it at its word
+                // from this address (every tunnel ends at this one). Here is where it is
+                // known who sent it: the player this session was proved to be, and no
+                // other.
+                if s.info.as_ref().is_none_or(|i| !crate::mesh::datagram_is_from(data, i.id)) {
+                    continue;
+                }
                 if let Some(b) = &s.bridge {
                     let port = b.mesh_udp.load(Ordering::Relaxed);
                     if port != 0 {
@@ -1841,6 +1951,8 @@ fn start_bridge(sh: Arc<Shared>, addr: SocketAddr, epoch: u64, id: PeerId) {
             if sh.me.id < id {
                 let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
                 l.set_nonblocking(true)?;
+                // Only our own mesh may come to this listener (see `own`).
+                let _own = crate::own::tcp(l.local_addr()?.port());
                 sh.host.dial_local(l.local_addr()?.port(), id);
                 let deadline = Instant::now() + Duration::from_secs(10);
                 loop {
@@ -1884,6 +1996,9 @@ fn attach(sh: &Arc<Shared>, addr: SocketAddr, epoch: u64, tcp: TcpStream) -> io:
     let relay = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?);
     relay.set_read_timeout(Some(Duration::from_millis(200)))?;
     let relay_port = relay.local_addr()?.port();
+    // The relay takes our mesh's datagrams for this peer, and nobody else's (see `own`):
+    // held for as long as the bridge or its thread has the socket.
+    let (relay_own, relay_own_thread) = (crate::own::udp(relay_port), crate::own::udp(relay_port));
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     let to_tcp_bytes = Arc::new(AtomicUsize::new(0));
     let closed = Arc::new(AtomicBool::new(false));
@@ -1920,6 +2035,7 @@ fn attach(sh: &Arc<Shared>, addr: SocketAddr, epoch: u64, tcp: TcpStream) -> io:
             to_tcp_bytes: to_tcp_bytes.clone(),
             relay: relay.clone(),
             relay_port,
+            _relay_own: relay_own,
             mesh_udp: mesh_udp.clone(),
             closed: closed.clone(),
             eof: eof.clone(),
@@ -2011,6 +2127,7 @@ fn attach(sh: &Arc<Shared>, addr: SocketAddr, epoch: u64, tcp: TcpStream) -> io:
     {
         let (sh, closed) = (sh.clone(), closed.clone());
         thread::Builder::new().name("peerparty-inet-u".into()).spawn(move || {
+            let _own = relay_own_thread;
             let mut buf = vec![0u8; 65536];
             while !closed.load(Ordering::Relaxed) && !sh.stop.load(Ordering::Relaxed) {
                 let Ok((n, from)) = relay.recv_from(&mut buf) else { continue };
@@ -2508,6 +2625,40 @@ pub mod testing {
         PeerInfo { id, game: game.into(), name: name.into() }.encode()
     }
 
+    /// The frame for `data`: a mesh datagram that says `as_peer` sent `bytes` on `socket`.
+    pub fn forged_datagram(as_peer: PeerId, socket: &str, bytes: &[u8]) -> Vec<u8> {
+        let msg = crate::wire::Msg::ChanData { socket: socket.into(), channel: 0, reliable: false, data: bytes.to_vec() };
+        let d = crate::mesh::unreliable_datagram(as_peer, None, &msg);
+        let mut f = vec![F_DGRAM];
+        f.extend_from_slice(&(d.len() as u16).to_le_bytes());
+        f.extend_from_slice(&d);
+        f
+    }
+
+    /// The INIT to send again, with its cookie, when `d` is a cookie for `eph`.
+    pub fn init_answering(room: &RoomCode, eph: &crypto::Ephemeral, d: &[u8]) -> Option<Vec<u8>> {
+        Some(init_with_cookie(room, &eph.blob, &cookie_in(room, &eph.blob, d)?))
+    }
+
+    /// `init_answering`'s INIT, but for `blob` and with any 16 bytes as the cookie.
+    pub fn init_with_cookie(room: &RoomCode, blob: &[u8; 48], cookie: &[u8; 16]) -> Vec<u8> {
+        let mut p = head(T_INIT).to_vec();
+        p.extend_from_slice(&room.room_id());
+        p.extend_from_slice(blob);
+        p.extend_from_slice(cookie);
+        let tag = crypto::mac16(&room.init_key(), &[&p]);
+        p.extend_from_slice(&tag);
+        p
+    }
+
+    /// The cookie in `d`, if it's one answering an INIT with `blob`.
+    pub fn cookie_in(room: &RoomCode, blob: &[u8; 48], d: &[u8]) -> Option<[u8; 16]> {
+        if d.len() != COOKIE_LEN || d[..HEAD] != head(T_COOKIE) || d[HEAD..HEAD + 8] != room.room_id() || d[HEAD + 8..HEAD + 56] != blob[..] {
+            return None;
+        }
+        d[HEAD + 56..].try_into().ok()
+    }
+
     /// From a CONFIRM we got: the sender's blob, if it's one for `eph`.
     pub fn confirm_sender(room: &RoomCode, eph: &crypto::Ephemeral, d: &[u8]) -> Option<[u8; 48]> {
         if d.len() < CONFIRM_AD + 16 || d[..HEAD] != head(T_CONFIRM) || d[HEAD..HEAD + 8] != room.room_id() {
@@ -2529,14 +2680,93 @@ pub mod testing {
         Some(p)
     }
 
-    /// What a hostile public player puts on the mesh stream once its session is up: its
-    /// hello, then `n` framed messages aimed at `owner`'s lobby `victim` (forged owner
-    /// snapshots, closes and kicks, oversized attributes and presence, channel traffic for
-    /// sockets nobody opened, a second hello), most mutated while still decoding, and last
-    /// a frame that doesn't decode.
-    pub fn hostile_mesh_stream(me: PeerId, game: &str, owner: PeerId, victim: &str, seed: u64, n: usize) -> Vec<u8> {
+    /// The nonce in the hello the other side's mesh sent first, out of the data packets
+    /// it came in (what a test player's own hello must be proved against).
+    pub fn hello_nonce(room: &RoomCode, eph: &crypto::Ephemeral, theirs: &[u8; 48], packets: &[Vec<u8>]) -> Option<[u8; 16]> {
+        let keys = crypto::Keys::derive(&room.psk(), eph, theirs)?;
+        let mut segs = std::collections::BTreeMap::new();
+        for d in packets {
+            if d.len() < HEAD + 8 || d[..HEAD] != head(T_DATA) {
+                continue;
+            }
+            let c = u64::from_le_bytes(d[HEAD..HEAD + 8].try_into().ok()?);
+            let Some(plain) = keys.open(c, &d[..HEAD + 8], &d[HEAD + 8..]) else { continue };
+            let mut p = &plain[..];
+            while let Some(&f) = p.first() {
+                p = &p[1..];
+                let skip = match f {
+                    F_SEG => {
+                        let seq = u32::from_le_bytes(p.get(..4)?.try_into().ok()?);
+                        let len = u16::from_le_bytes(p.get(4..6)?.try_into().ok()?) as usize;
+                        segs.insert(seq, p.get(6..6 + len)?.to_vec());
+                        6 + len
+                    }
+                    F_ACK => 12,
+                    F_DGRAM => 2 + u16::from_le_bytes(p.get(..2)?.try_into().ok()?) as usize,
+                    F_PING | F_PONG => 8,
+                    F_ADDRS6 => 1 + *p.first()? as usize * 18,
+                    _ => break,
+                };
+                p = p.get(skip..)?;
+            }
+        }
+        let mut stream = Vec::new();
+        for (i, (seq, data)) in segs.iter().enumerate() {
+            if *seq != i as u32 {
+                break;
+            }
+            stream.extend_from_slice(data);
+        }
+        let len = u32::from_le_bytes(stream.get(..4)?.try_into().ok()?) as usize;
+        match Msg::decode(stream.get(4..4 + len)?) {
+            Some(Msg::Hello { nonce, .. }) => Some(nonce),
+            _ => None,
+        }
+    }
+
+    /// A test player's mesh hello, framed: the first thing it puts on the stream (the
+    /// side with the lower id is dialed by its own mesh and speaks first; the other
+    /// waits for this).
+    pub fn mesh_hello(key: &public::IdentityKey, game: &str, nonce: &[u8; 16]) -> Vec<u8> {
+        mesh_hello_as(PeerId::of_key(&key.public()), &key.public(), game, nonce)
+    }
+
+    /// A framed mesh hello that says whatever it is told to: any id, with any key.
+    pub fn mesh_hello_as(id: PeerId, key: &[u8; 32], game: &str, nonce: &[u8; 16]) -> Vec<u8> {
+        framed(&Msg::Hello { version: crate::wire::VERSION, game: game.into(), id, name: "Fuzz".into(), udp: 0, key: *key, nonce: *nonce })
+    }
+
+    /// A framed mesh proof carrying `sig` (`IdentityKey::sign_hello` makes real ones).
+    pub fn mesh_proof(sig: [u8; 64]) -> Vec<u8> {
+        framed(&Msg::Proof { sig })
+    }
+
+    /// The id and nonce in a mesh hello (one frame's body, without its length).
+    pub fn mesh_hello_read(body: &[u8]) -> Option<(PeerId, [u8; 16])> {
+        match Msg::decode(body) {
+            Some(Msg::Hello { id, nonce, .. }) => Some((id, nonce)),
+            _ => None,
+        }
+    }
+
+    fn framed(m: &Msg) -> Vec<u8> {
+        let body = m.encode();
+        let mut out = (body.len() as u32).to_le_bytes().to_vec();
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// What a hostile public player puts on the mesh stream after its `mesh_hello`: the
+    /// proof of it (it is who its key says: that much can't be faked; `owner_nonce` is
+    /// `hello_nonce`), then `n` framed messages aimed at `owner`'s lobby `victim` (forged
+    /// owner snapshots, closes and kicks, oversized attributes and presence, channel
+    /// traffic for sockets nobody opened, a second hello), most mutated while still
+    /// decoding, and last a frame that doesn't decode.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hostile_mesh_stream(key: &public::IdentityKey, game: &str, nonce: &[u8; 16], owner: PeerId, owner_nonce: &[u8; 16], victim: &str, seed: u64, n: usize) -> Vec<u8> {
         use crate::lobby::{Attr, Lobby, Member, Query, Value};
         use crate::wire::{JoinResult, VERSION};
+        let me = PeerId::of_key(&key.public());
         let mut x = seed | 1;
         let mut next = move || {
             x ^= x << 13;
@@ -2556,7 +2786,8 @@ pub mod testing {
         let big = "A".repeat(20_000);
         let many: Vec<(String, String)> = (0..2000).map(|i| (format!("k{i}"), big[..i % 300].to_string())).collect();
         let seeds = [
-            Msg::Hello { version: VERSION, game: game.into(), id: PeerId::random(), name: "again".into(), udp: 1 },
+            Msg::Hello { version: VERSION, game: game.into(), id: PeerId::random(), name: "again".into(), udp: 1, key: [3; 32], nonce: [4; 16] },
+            Msg::Proof { sig: [5; 64] },
             Msg::Search { search: 1, query: Query::new("eos.lobby") },
             Msg::SearchReply { search: 1, lobbies: vec![lobby.clone(); 100] },
             Msg::Join { lobby: victim.into() },
@@ -2575,7 +2806,7 @@ pub mod testing {
         ]
         .map(|m| m.encode());
         let mut out = Vec::new();
-        frame(&mut out, &Msg::Hello { version: VERSION, game: game.into(), id: me, name: "Fuzz".into(), udp: 0 }.encode());
+        frame(&mut out, &Msg::Proof { sig: key.sign_hello(game, (me, nonce), (owner, owner_nonce)) }.encode());
         for _ in 0..n {
             let base = &seeds[(next() % seeds.len() as u64) as usize];
             let mut pick = base.clone();
@@ -2737,7 +2968,7 @@ mod tests {
     #[test]
     fn hello_filter_rewrites_only_the_first_hello() {
         let id = PeerId::random();
-        let hello = Msg::Hello { version: 2, game: "g".into(), id, name: "n".into(), udp: 5000 }.encode();
+        let hello = Msg::Hello { version: 2, game: "g".into(), id, name: "n".into(), udp: 5000, key: [6; 32], nonce: [7; 16] }.encode();
         let mut bytes = (hello.len() as u32).to_le_bytes().to_vec();
         bytes.extend_from_slice(&hello);
         bytes.extend_from_slice(b"rest");
@@ -2777,7 +3008,7 @@ mod tests {
     fn hello_names_are_cleaned_or_replaced() {
         let id = PeerId::random();
         let frame = |name: &str| {
-            let hello = Msg::Hello { version: 2, game: "g".into(), id, name: name.into(), udp: 5000 }.encode();
+            let hello = Msg::Hello { version: 2, game: "g".into(), id, name: name.into(), udp: 5000, key: [6; 32], nonce: [7; 16] }.encode();
             let mut b = (hello.len() as u32).to_le_bytes().to_vec();
             b.extend_from_slice(&hello);
             b

@@ -37,7 +37,9 @@ DHT) with no friend needed.
    2 minutes once connected.
 4. **STUN** (`stun.rs`, RFC 5389): Google's and Cloudflare's public STUN servers report
    our public address; two different answers mean a symmetric NAT. The DHT's BEP 42 `ip`
-   field gives the same information without STUN.
+   field gives the same information without STUN: it's taken once two nodes at different
+   addresses agree on the IP (not the port, which differs per node behind a symmetric
+   NAT; the latest agreeing node's port is kept), so one lying node can't set it.
 5. **One UDP socket** (port from `PEERPARTY_INET_PORT`, else any) carries STUN, the DHT
    and the tunnel, so the port announced on the DHT is the one friends punch to.
 6. **Hole punching**: every address found (and every `PEERPARTY_INET_PEERS` entry) gets
@@ -69,7 +71,11 @@ DHT) with no friend needed.
    channel data. The mesh is not changed. The lower peer id's side opens a loopback
    listener that its mesh dials (`Mesh::dial_local`), the other side connects to its own
    mesh, and each gateway relays. Only the peer's Hello is rewritten (its UDP port
-   becomes a local relay socket's). **The LAN wire protocol is unchanged.**
+   becomes a local relay socket's). **The LAN wire protocol is unchanged**: as on the
+   LAN, each side's hello carries its key and a fresh number, and is followed by its
+   signature over both hellos' ids and numbers. A peer id is its key's hash, so a
+   connection is a player's only once that key has signed for it, whichever way it came.
+   A datagram is passed on only if it names the player the tunnel was proved to be.
 9. **Keepalives**: one every 5 s. A peer silent for 30 s is dropped, a tunnel that ends
    says goodbye (CLOSE), and the DHT finds them again. A peer the LAN already reaches
    gets no tunnel.
@@ -140,9 +146,8 @@ Addresses aren't logged or shown: the status says e.g. "UPnP: external port 4929
 **Security limits.**
 - Anyone with the code is in the room and is trusted the same way a LAN player is. Share
   codes privately, and make a new one if a code leaks. Each member signs its handshake
-  with its identity key (as public players do), and its peer id is pinned to that key on
-  first sight (`%LOCALAPPDATA%\peerparty\room-keys.txt`), so one member can't pass as
-  another.
+  with its identity key (as public players do), and its peer id must be that key's hash,
+  so one member can't pass as another.
 - Room members' PCs see each other's public IP address at the network level, but
   PeerParty doesn't show it: games get a stand-in address in 198.18.0.0/15, the overlay
   says "your room", and logs use short tags (`PEERPARTY_INET_DEBUG=1` for real

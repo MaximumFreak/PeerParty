@@ -236,8 +236,11 @@ pub struct Dht {
     lookups: Vec<Lookup>,
     out: Vec<(SocketAddr, Vec<u8>)>,
     found: Vec<([u8; 20], SocketAddr)>,
-    /// Our address as the nodes see it (BEP 42's `ip`).
+    /// Our address as the nodes see it (BEP 42's `ip`): two of them must agree on the IP;
+    /// the port is the latest agreeing node's (see `told_address`).
     pub external: Option<SocketAddr>,
+    /// What nodes lately said it is, and which node said it (one say each).
+    said: Vec<(IpAddr, SocketAddr)>,
     /// Responses so far, from any node.
     pub replies: u64,
     /// Accept nodes on private or loopback addresses (the tests' local network).
@@ -247,11 +250,17 @@ pub struct Dht {
     pub mapped_port: Option<u16>,
 }
 
+/// Whether an address a node handed us (another node's, or a player's) is one on the
+/// internet: anything else is somewhere on this network, or nowhere, and is not sent to.
 fn public(addr: &SocketAddr) -> bool {
     match addr.ip() {
         IpAddr::V4(ip) => {
-            !(ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_broadcast()
-                || ip.is_multicast() || ip.is_unspecified() || ip.octets()[0] == 0)
+            let o = ip.octets();
+            addr.port() != 0
+                && !(ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_broadcast()
+                    || ip.is_multicast() || ip.is_unspecified() || o[0] == 0
+                    // Carrier NAT, the stand-in range, and addresses never given out.
+                    || (o[0] == 100 && o[1] & 0xC0 == 64) || (o[0] == 198 && o[1] & 0xFE == 18) || o[0] >= 240)
         }
         IpAddr::V6(_) => false,
     }
@@ -270,6 +279,7 @@ impl Dht {
             out: Vec::new(),
             found: Vec::new(),
             external: None,
+            said: Vec::new(),
             replies: 0,
             allow_private: false,
             mapped_port: None,
@@ -405,6 +415,11 @@ impl Dht {
         }
         let p = self.pending.remove(&t).unwrap();
         let y = msg.get("y").and_then(B::bytes);
+        if y == Some(b"r")
+            && let Some(ip) = msg.get("ip").and_then(B::bytes).and_then(compact)
+        {
+            self.told_address(from.ip(), ip);
+        }
         let Some(lookup) = self.lookups.iter_mut().find(|l| l.id == p.lookup) else {
             return true;
         };
@@ -416,9 +431,6 @@ impl Dht {
             return true;
         }
         self.replies += 1;
-        if let Some(ip) = msg.get("ip").and_then(B::bytes).and_then(compact) {
-            self.external = Some(ip);
-        }
         if p.announce {
             return true;
         }
@@ -452,13 +464,36 @@ impl Dht {
         }
         if let Some(B::List(values)) = r.get("values") {
             for v in values {
-                if let Some(addr) = v.bytes().and_then(compact) {
+                // Players are on the internet, like nodes: a node naming this PC, the
+                // router or anything else on this network as one would have us send
+                // our handshakes there.
+                if let Some(addr) = v.bytes().and_then(compact).filter(|a| self.allow_private || public(a)) {
                     lookup.values += 1;
                     self.found.push((lookup.target, addr));
                 }
             }
         }
         true
+    }
+
+    /// A node says our address is `said`. One node's word isn't taken: what we believe
+    /// our address to be is never punched to, so a node that named a friend's address
+    /// would keep us from that friend. Two nodes at different addresses must agree on
+    /// the IP. Only the IP: behind a symmetric NAT each node sees us from a different
+    /// port, so the full addresses would never agree, and the IP check alone still stops
+    /// a single lying node. The port kept is the one the latest agreeing node saw.
+    fn told_address(&mut self, by: IpAddr, said: SocketAddr) {
+        if !(self.allow_private || public(&said)) {
+            return;
+        }
+        self.said.retain(|(b, _)| *b != by);
+        self.said.push((by, said));
+        if self.said.len() > 16 {
+            self.said.remove(0);
+        }
+        if self.allow_private || self.said.iter().filter(|(_, s)| s.ip() == said.ip()).count() >= 2 {
+            self.external = Some(said);
+        }
     }
 
     pub fn drain_out(&mut self) -> Vec<(SocketAddr, Vec<u8>)> {
@@ -576,6 +611,59 @@ mod tests {
         assert!(public(&"8.8.8.8:1".parse().unwrap()));
         assert!(!public(&"192.168.1.2:1".parse().unwrap()));
         assert!(!public(&"127.0.0.1:1".parse().unwrap()));
+        for a in ["169.254.169.254:80", "100.64.0.1:1", "198.18.0.1:1", "240.0.0.1:1", "8.8.8.8:0", "10.0.0.138:3389"] {
+            assert!(!public(&a.parse().unwrap()), "{a}");
+        }
+    }
+
+    /// One node can say anything: that players are at addresses on our own network, and
+    /// that our own address is someone else's.
+    #[test]
+    fn one_nodes_word_isnt_taken_as_fact() {
+        let nodes: [SocketAddr; 3] = ["203.0.113.1:6881".parse().unwrap(), "203.0.113.2:6881".parse().unwrap(), "203.0.113.3:6881".parse().unwrap()];
+        let me: SocketAddr = "198.51.100.7:5000".parse().unwrap();
+        let friend: SocketAddr = "198.51.100.77:5555".parse().unwrap();
+        let mut d = Dht::new(nodes.to_vec(), Vec::new());
+        d.told_address(nodes[0].ip(), friend);
+        d.told_address(nodes[0].ip(), friend);
+        assert_eq!(d.external, None, "one node, however often it says so");
+        d.told_address(nodes[1].ip(), me);
+        d.told_address(nodes[2].ip(), "192.168.1.1:80".parse().unwrap());
+        assert_eq!(d.external, None);
+        d.told_address(nodes[2].ip(), me);
+        assert_eq!(d.external, Some(me), "two nodes agree");
+
+        // Behind a symmetric NAT each node sees another port: the IP is what has to
+        // agree, and the port is the latest agreeing node's.
+        let mut d = Dht::new(nodes.to_vec(), Vec::new());
+        d.told_address(nodes[0].ip(), "198.51.100.7:40001".parse().unwrap());
+        assert_eq!(d.external, None, "one node");
+        d.told_address(nodes[1].ip(), "198.51.100.7:40002".parse().unwrap());
+        assert_eq!(d.external, Some("198.51.100.7:40002".parse().unwrap()), "same IP, other ports");
+        // A lone node naming another IP (with a port another node saw) changes nothing.
+        d.told_address(nodes[2].ip(), "198.51.100.77:40002".parse().unwrap());
+        assert_eq!(d.external, Some("198.51.100.7:40002".parse().unwrap()));
+
+        // Values: a reply that lists addresses on this network among the players.
+        let now = Instant::now();
+        let topic = [9u8; 20];
+        d.lookup(topic, None, now);
+        d.tick(now);
+        let (to, q) = d.drain_out().remove(0);
+        let t = B::decode(&q).and_then(|m| m.get("t").and_then(B::bytes).map(<[u8]>::to_vec)).unwrap();
+        let listed = ["127.0.0.1:445", "192.168.1.1:80", "10.0.0.138:3389", "169.254.169.254:80", "198.51.100.9:4000"];
+        let values: Vec<B> = listed.iter().map(|a| B::Bytes(to_compact(a.parse().unwrap()).to_vec())).collect();
+        let dict = |pairs: Vec<(&str, B)>| B::Dict(pairs.into_iter().map(|(k, v)| (k.as_bytes().to_vec(), v)).collect());
+        let reply = dict(vec![
+            ("r", dict(vec![("id", B::Bytes(vec![7; 20])), ("values", B::List(values))])),
+            ("t", B::Bytes(t)),
+            ("y", B::Bytes(b"r".to_vec())),
+        ]);
+        let mut bytes = Vec::new();
+        reply.encode(&mut bytes);
+        assert!(d.handle(to, &bytes));
+        let found: Vec<SocketAddr> = d.drain_found().into_iter().map(|(_, a)| a).collect();
+        assert_eq!(found, ["198.51.100.9:4000".parse::<SocketAddr>().unwrap()]);
     }
 
     /// Two clients announce and find each other through one test node, all in memory.

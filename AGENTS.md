@@ -67,7 +67,15 @@ it does and docs/usage.md how to use it; this file is about how changes get in.
   New code that logs or shows an address goes through `redact`.
 - **Strangers are hostile.** Anything from a public-session player is untrusted until
   checked: bound its size, rate and count, and add it to the fuzz tests
-  (`core/src/fuzz_tests.rs`, `core/tests/public.rs`).
+  (`core/src/fuzz_tests.rs`, `core/tests/public.rs`). A parser that calls itself needs a
+  depth limit (a stack overflow ends the game), and a test on a small stack. What isn't
+  open to everyone (a lobby that isn't public, a voice room) asks `Lan::knows` first.
+- **PeerParty's own sockets register with `core/src/own.rs`.** The typed-IP forwarder
+  delivers to ports the game process has open, and ours are open in it too: a new
+  listener or UDP socket of ours holds an `own::tcp` / `own::udp` for as long as it lives.
+- **peerparty.exe takes no DLL from its own folder** (`only_system_dlls` in
+  launcher/src/main.rs, the delay-load list in launcher/build.rs). After adding a
+  dependency, `tools\dll-search-check.ps1` says whether that still holds.
 - **Game files are never changed.** Hooks live in memory; PeerParty's settings and data
   go under `%LOCALAPPDATA%\peerparty`. Anything written elsewhere (save copies, firewall
   rules, the local certificate's key) must be listed under "What it changes on your PC"

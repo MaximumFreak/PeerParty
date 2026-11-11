@@ -44,6 +44,13 @@ const MAX_CMDS: usize = 99;
 const CRC_TYPE: u8 = 204;
 const MAX_ASSEMBLY: usize = 500 * 1024;
 const WINDOW: u32 = 8192;
+/// What one peer may have waiting to be delivered: commands that came ahead of a gap,
+/// fragments of unfinished messages, messages not yet taken. Without it that is a window
+/// of commands on each of up to 255 channels, at up to a datagram each. A client in step
+/// holds one message being put together and a few stragglers.
+const HOLD_MAX: usize = 8 << 20;
+/// What a held command costs beyond its payload.
+const CMD_COST: usize = 96;
 const MAX_RESENDS: u32 = 7;
 const DISCONNECT_TIMEOUT: i64 = 10_000;
 const PING_INTERVAL: i64 = 1000;
@@ -304,6 +311,9 @@ pub struct Peer {
     group_window: [u32; 4],
     pub last_receive: i64,
     is_client: bool,
+    /// At least what is held (see `HOLD_MAX`): counted up as commands come, and counted
+    /// again from what is really there only when it passes the limit.
+    held: usize,
 }
 
 impl Peer {
@@ -326,7 +336,33 @@ impl Peer {
             group_window: [0; 4],
             last_receive: now,
             is_client: false,
+            held: 0,
         }
+    }
+
+    fn holding(&self) -> usize {
+        self.channels
+            .values()
+            .map(|ch| {
+                let cmds = ch.in_reliable.values().chain(ch.in_unreliable.values()).chain(ch.unseq_frags.values()).chain(ch.in_unsequenced.iter());
+                cmds.map(|c| c.payload.len() + CMD_COST).sum::<usize>() + ch.unseq_seen.len() * 32
+            })
+            .sum()
+    }
+
+    /// Whether there is room to hold `len` more bytes. A peer over the limit is one that
+    /// isn't following the protocol; it is dropped, and what it had held with it.
+    fn room_for(&mut self, len: usize) -> bool {
+        self.held += len + CMD_COST;
+        if self.held > HOLD_MAX {
+            self.held = self.holding() + len + CMD_COST;
+            if self.held > HOLD_MAX {
+                self.channels.clear();
+                self.state = State::Disconnected;
+                return false;
+            }
+        }
+        true
     }
 
     /// Server side: a datagram from an unknown address that carries Connect.
@@ -530,7 +566,7 @@ impl Peer {
                 if self.state == State::Connecting && !self.is_client {
                     self.state = State::Connected;
                 }
-                if self.state != State::Connected {
+                if self.state != State::Connected || !self.room_for(c.payload.len()) {
                     return;
                 }
                 if c.ty == ct::FRAGMENT || c.ty == ct::FRAGMENT_UNSEQUENCED {
@@ -616,16 +652,22 @@ impl Peer {
         fn store(ch: &Channel, s: u32, sequenced: bool) -> Option<&Cmd> {
             if sequenced { ch.in_reliable.get(&s) } else { ch.unseq_frags.get(&s) }
         }
-        let Some(first) = store(ch, start, sequenced) else { return };
-        if first.ty != ct::FRAGMENT && first.ty != ct::FRAGMENT_UNSEQUENCED {
-            return;
-        }
-        if (start..start + count).any(|s| store(ch, s, sequenced).is_none()) {
+        // Each fragment was checked against what it says of itself; what the run is
+        // built from is what they all agree on. One that names another run, or a whole
+        // command sitting at a sequence number of this run, would be copied past the
+        // end of the buffer.
+        let Some(end) = start.checked_add(count) else { return };
+        let fits = |f: &Cmd| {
+            (f.ty == ct::FRAGMENT || f.ty == ct::FRAGMENT_UNSEQUENCED)
+                && (f.frag_start, f.frag_count, f.frag_total) == (start, count, total)
+                && f.frag_off as usize + f.payload.len() <= total as usize
+        };
+        if count == 0 || !(start..end).all(|s| store(ch, s, sequenced).is_some_and(fits)) {
             return;
         }
         let mut full = vec![0u8; total as usize];
         let mut head = Cmd::default();
-        for s in start..start + count {
+        for s in start..end {
             let f = if sequenced { ch.in_reliable.remove(&s) } else { ch.unseq_frags.remove(&s) }.unwrap();
             let off = f.frag_off as usize;
             full[off..off + f.payload.len()].copy_from_slice(&f.payload);
@@ -637,7 +679,7 @@ impl Peer {
         if sequenced {
             head.ty = ct::RELIABLE;
             // Delivered at the start sequence; consumes the whole run.
-            head.seq = start + count - 1;
+            head.seq = end - 1;
             ch.in_reliable.insert(start, head);
         } else {
             head.ty = ct::RELIABLE_UNSEQUENCED;
@@ -890,6 +932,63 @@ mod tests {
         server.send(0, &big, true, true);
         pump(&mut server, &mut client, 11, |_| false);
         assert_eq!(client.dispatch().unwrap().payload, big);
+    }
+
+    fn frag(seq: u32, run: (u32, u32, u32), no: u32, off: u32, len: usize) -> Cmd {
+        let mut c = Cmd::new(ct::FRAGMENT, 0, FLAG_RELIABLE);
+        (c.seq, c.frag_start, c.frag_count, c.frag_total, c.frag_no, c.frag_off) = (seq, run.0, run.1, run.2, no, off);
+        c.payload = vec![7; len];
+        c
+    }
+
+    /// Fragments that disagree about their run, and a whole command where a fragment
+    /// should be, were copied past the end of the buffer: a panic that ended the server.
+    #[test]
+    fn fragments_that_disagree_arent_put_together() {
+        let h = Header { peer_id: 7, crc: false, sent_time: 5, challenge: 0x1234_5678 };
+        let (_c, mut s) = pair();
+        s.handle(&h, vec![frag(1, (1, 2, 1000), 0, 900, 100), frag(2, (1, 2, 10), 1, 0, 10)], 5);
+        assert_eq!(s.dispatch(), None);
+
+        let (_c, mut s) = pair();
+        let mut whole = Cmd::new(ct::RELIABLE, 0, FLAG_RELIABLE);
+        whole.seq = 2;
+        whole.payload = vec![1; 1000];
+        s.handle(&h, vec![whole, frag(1, (1, 2, 10), 0, 0, 10)], 5);
+        assert_eq!(s.dispatch(), None);
+
+        // The same fragments, agreeing, are a message.
+        let (_c, mut s) = pair();
+        s.handle(&h, vec![frag(2, (1, 2, 20), 1, 10, 10), frag(1, (1, 2, 20), 0, 0, 10)], 5);
+        assert_eq!(s.dispatch().unwrap().payload, vec![7; 20]);
+    }
+
+    #[test]
+    fn a_peer_holding_too_much_is_dropped() {
+        let h = Header { peer_id: 7, crc: false, sent_time: 5, challenge: 0x1234_5678 };
+        let (_c, mut s) = pair();
+        // Sequence 1 never comes, so everything after it waits: on two channels, more
+        // than the limit in all.
+        let each = 60_000;
+        for i in 0..(HOLD_MAX / each + 2) as u32 {
+            let mut c = Cmd::new(ct::RELIABLE, (i % 2) as u8, FLAG_RELIABLE);
+            c.seq = 2 + i / 2;
+            c.payload = vec![0; each];
+            s.handle(&h, vec![c], 5);
+        }
+        assert_eq!(s.state, State::Disconnected);
+        assert_eq!(s.holding(), 0);
+
+        // A client in step can send many times the limit.
+        let (mut client, mut server) = pair();
+        let big = vec![3u8; 400_000];
+        for i in 0..(3 * HOLD_MAX / big.len()) as i64 {
+            client.send(0, &big, true, false);
+            pump(&mut client, &mut server, 10 + i, |_| false);
+            assert_eq!(server.dispatch().unwrap().payload.len(), big.len());
+            pump(&mut server, &mut client, 10 + i, |_| false);
+        }
+        assert_eq!(server.state, State::Connected);
     }
 
     #[test]

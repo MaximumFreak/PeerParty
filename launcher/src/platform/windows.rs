@@ -188,6 +188,91 @@ pub fn in_front() -> bool {
     }
 }
 
+const LAUNCHER_MUTEX: &str = r"Local\peerparty.launcher";
+
+/// Takes the named mutex for the rest of the process (Windows lets go of it at exit),
+/// or None when another process holds it. One that can't be made at all counts as
+/// taken, so a launcher never refuses to open over it.
+fn claim(name: &str) -> Option<windows_sys::Win32::Foundation::HANDLE> {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError};
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+    let h = unsafe { CreateMutexW(ptr::null(), 0, wide(name).as_ptr()) };
+    if !h.is_null() && unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        unsafe { CloseHandle(h) };
+        return None;
+    }
+    Some(h)
+}
+
+/// Only one launcher window runs: a second (the exe opened twice, or a shortcut and
+/// the exe) would keep its own copy of the settings and save over the first's games,
+/// hidden games and folders. False when another one has it: that window comes to the
+/// front instead.
+///
+/// `after_update`: the window that put this exe in place (update.rs) started it and is
+/// closing, still holding the mutex. It is waited for (10 s at most); otherwise this one
+/// would bring that closing window to the front and quit, leaving none.
+pub fn first_launcher(after_update: bool) -> bool {
+    if claim(LAUNCHER_MUTEX).is_some() {
+        return true;
+    }
+    if after_update {
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if claim(LAUNCHER_MUTEX).is_some() {
+                return true;
+            }
+        }
+    }
+    // The other may be starting and not have its window yet.
+    for _ in 0..30 {
+        if let Some(w) = launcher_window() {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, SW_RESTORE, SetForegroundWindow, ShowWindow};
+            unsafe {
+                if IsIconic(w) != 0 {
+                    ShowWindow(w, SW_RESTORE);
+                }
+                SetForegroundWindow(w);
+            }
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    false
+}
+
+/// A top-level window is another launcher's: its title is the launcher's and its
+/// process runs an exe of the same name as this one (a browser tab or a folder called
+/// PeerParty isn't). The overlay's windows have their own title.
+fn is_launcher(title: &str, exe: Option<&Path>, ours: &Path) -> bool {
+    title == "PeerParty" && exe.and_then(|e| e.file_name()).is_some_and(|n| ours.file_name().is_some_and(|o| n.eq_ignore_ascii_case(o)))
+}
+
+fn launcher_window() -> Option<windows_sys::Win32::Foundation::HWND> {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowTextW, GetWindowThreadProcessId};
+    struct Find {
+        ours: PathBuf,
+        found: HWND,
+    }
+    unsafe extern "system" fn each(w: HWND, l: LPARAM) -> i32 {
+        let f = unsafe { &mut *(l as *mut Find) };
+        let mut buf = [0u16; 32];
+        let n = unsafe { GetWindowTextW(w, buf.as_mut_ptr(), buf.len() as i32) }.max(0) as usize;
+        let title = String::from_utf16_lossy(&buf[..n]);
+        let mut pid = 0;
+        unsafe { GetWindowThreadProcessId(w, &mut pid) };
+        if pid != std::process::id() && is_launcher(&title, crate::firewall::process_exe(pid).as_deref(), &f.ours) {
+            f.found = w;
+            return 0;
+        }
+        1
+    }
+    let mut f = Find { ours: std::env::current_exe().ok()?, found: ptr::null_mut() };
+    unsafe { EnumWindows(Some(each), &mut f as *mut Find as LPARAM) };
+    (!f.found.is_null()).then_some(f.found)
+}
+
 /// The user's display languages, most preferred first ("de-DE", "en-US").
 pub fn languages() -> Vec<String> {
     use windows_sys::Win32::Globalization::{GetUserDefaultLocaleName, GetUserPreferredUILanguages, MUI_LANGUAGE_NAME};
@@ -276,4 +361,30 @@ pub fn user_name() -> String {
 /// Where PeerParty's logs go.
 pub fn logs_dir() -> PathBuf {
     std::env::temp_dir().join("peerparty").join("logs")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The second launcher finds the mutex taken; once the first is gone it's free.
+    #[test]
+    fn a_second_launcher_finds_the_first() {
+        let name = format!(r"Local\peerparty.launcher-test-{}", std::process::id());
+        let first = claim(&name).expect("free");
+        assert!(!first.is_null());
+        assert!(claim(&name).is_none());
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(first) };
+        let again = claim(&name).expect("free again");
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(again) };
+    }
+
+    #[test]
+    fn only_a_launcher_window_is_brought_up() {
+        let ours = Path::new(r"C:\Apps\PeerParty\peerparty.exe");
+        assert!(is_launcher("PeerParty", Some(Path::new(r"D:\Other\PEERPARTY.EXE")), ours));
+        assert!(!is_launcher("PeerParty", Some(Path::new(r"C:\Browser\browser.exe")), ours));
+        assert!(!is_launcher("PeerParty", None, ours));
+        assert!(!is_launcher("PeerParty overlay", Some(ours), ours));
+    }
 }

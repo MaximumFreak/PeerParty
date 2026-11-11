@@ -63,6 +63,9 @@ pub fn is_local(ip: IpAddr) -> bool {
 /// Whether text has something that reads as an IP address in it ("1.2.3.4", with or
 /// without a port, or an IPv6 address): display names that do are replaced.
 pub fn has_address(s: &str) -> bool {
+    if s.chars().any(is_wide) {
+        return has_address(&narrow(s));
+    }
     // Dotted quads anywhere, with any separators around them.
     let b = s.as_bytes();
     let mut i = 0;
@@ -122,41 +125,168 @@ fn quad(b: &[u8], i: usize) -> Option<(Ipv4Addr, usize)> {
     Some((Ipv4Addr::from(o), j))
 }
 
-/// Whether `ip` in game data is an address to hide. `port`: it had one (":7777");
-/// `alone`: it was the whole value.
-fn hides(ip: Ipv4Addr, port: bool, alone: bool) -> bool {
+/// Stand-ins, this PC, masks, multicast and broadcast say nothing about where anyone is.
+fn says_nothing(ip: Ipv4Addr) -> bool {
     let o = ip.octets();
-    // Stand-ins, this PC, masks, multicast and broadcast say nothing about where anyone is.
-    if (o[0] == 198 && o[1] & 0xFE == 18) || ip.is_loopback() || o[0] == 0 || o[0] >= 224 {
-        return false;
+    (o[0] == 198 && o[1] & 0xFE == 18) || ip.is_loopback() || o[0] == 0 || o[0] >= 224
+}
+
+/// Full-width digits and the full-width dot and colon ("１９２．１６８．０．１"), which
+/// read as an address to a person or a game that converts them.
+fn is_wide(c: char) -> bool {
+    matches!(c, '\u{FF10}'..='\u{FF19}' | '\u{FF0E}' | '\u{FF1A}')
+}
+
+/// `s` with full-width digits, dots and colons as ASCII.
+fn narrow(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\u{FF10}'..='\u{FF19}' => char::from(b'0' + (c as u32 - 0xFF10) as u8),
+            '\u{FF0E}' => '.',
+            '\u{FF1A}' => ':',
+            c => c,
+        })
+        .collect()
+}
+
+/// LAN ranges that don't read as a version stuck to a word, as "v10.0.0.1" does:
+/// 192.168/16, 172.16/12, link-local and carrier-grade NAT.
+fn plainly_lan(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    (o[0] == 192 && o[1] == 168) || (o[0] == 172 && o[1] & 0xF0 == 16) || ip.is_link_local() || (o[0] == 100 && o[1] & 0xC0 == 64)
+}
+
+/// Whether `ip` in game data is an address to hide. `port`: it had one (":7777");
+/// `apart`: it was the whole value, or a whole item in it (quoted, or between the
+/// punctuation of a list or of JSON).
+fn hides(ip: Ipv4Addr, port: bool, apart: bool) -> bool {
+    // Public addresses only with a port or set apart: "1.0.7.2" in a sentence is more
+    // likely a version than an address.
+    !says_nothing(ip) && (port || apart || is_local(ip.into()))
+}
+
+/// Whether an attribute's name says its value is a version: one of its words is "ver",
+/// "rev" or "v", or ends in "version", "build" or "revision" ("game_ver", "BuildVersion").
+/// Words, not letters anywhere: "server" and "driver" have "ver" in them, and a server's
+/// address under such a key was kept as if it were a version.
+fn names_a_version(key: &str) -> bool {
+    key_words(key).iter().any(|w| matches!(w.as_str(), "ver" | "rev" | "v") || ["version", "build", "revision"].iter().any(|s| w.ends_with(s)))
+}
+
+/// An attribute name's words, lower case: split at anything not a letter or digit, and
+/// where a capital follows a small letter ("ServerAddress": "server", "address").
+fn key_words(key: &str) -> Vec<String> {
+    let mut words: Vec<String> = vec![String::new()];
+    let mut was_lower = false;
+    for c in key.chars() {
+        if !c.is_ascii_alphanumeric() || (c.is_ascii_uppercase() && was_lower) {
+            words.push(String::new());
+        }
+        if c.is_ascii_alphanumeric() {
+            words.last_mut().unwrap().push(c.to_ascii_lowercase());
+        }
+        was_lower = c.is_ascii_lowercase();
     }
-    // Public addresses only with a port or on their own: "1.0.7.2" in a description is
-    // more likely a version than an address.
-    port || alone || is_local(ip.into())
+    words.retain(|w| !w.is_empty());
+    words
+}
+
+/// Whether an attribute's name says its value is an address ("ip", "HostAddr",
+/// "server_ip"), and not a number about one ("host_port", "server_id").
+fn names_an_address(key: &str) -> bool {
+    let words = key_words(key);
+    let addressy = |w: &str| {
+        matches!(w, "ip" | "ipv4" | "addr" | "address" | "host" | "server" | "endpoint" | "hostip" | "serverip" | "ipaddr" | "ipaddress" | "hostaddr" | "serveraddr")
+    };
+    let other = |w: &str| matches!(w, "port" | "id" | "count" | "num" | "number" | "time" | "score" | "version" | "ver" | "build");
+    words.iter().any(|w| addressy(w)) && !words.iter().any(|w| other(w))
+}
+
+/// An integer that holds an IPv4 address (`Value::Int`), under a key that names one
+/// (`names_an_address`): the same number for `with`, in the same byte order (`ntohl`'s,
+/// or an `in_addr` read as a little-endian integer) and the same sign (a 32-bit value
+/// stored signed). `None`: nothing to replace. Without such a key a number is left alone:
+/// seeds, scores and hashes are numbers of the same size.
+pub fn scrub_int(key: &str, v: i64, with: Ipv4Addr) -> Option<i64> {
+    if !names_an_address(key) {
+        return None;
+    }
+    let (raw, signed) = if (0..=u32::MAX as i64).contains(&v) {
+        (v as u32, false)
+    } else if (i32::MIN as i64..0).contains(&v) {
+        (v as i32 as u32, true)
+    } else {
+        return None;
+    };
+    // Four octets, the first not 0 whichever end it's at ("7777" is a port).
+    if raw < 1 << 24 || raw & 0xFF == 0 {
+        return None;
+    }
+    let (be, le) = (Ipv4Addr::from(raw), Ipv4Addr::from(raw.swap_bytes()));
+    // A stand-in or this PC in either order is that (the other order reads as some
+    // public address, which it isn't).
+    let ours = |ip: Ipv4Addr| ip.is_loopback() || (ip.octets()[0] == 198 && ip.octets()[1] & 0xFE == 18);
+    if ours(be) || ours(le) {
+        return None;
+    }
+    let hide = |ip: Ipv4Addr| hides(ip, false, true);
+    let as_be = match (hide(be), hide(le)) {
+        (false, false) => return None,
+        (true, false) => true,
+        (false, true) => false,
+        // Both read as one: the order that gives a LAN address (what games put there
+        // most), else `ntohl`'s.
+        (true, true) => !(is_local(le.into()) && !is_local(be.into())),
+    };
+    let w = if as_be { u32::from(with) } else { u32::from(with).swap_bytes() };
+    Some(if signed { w as i32 as i64 } else { w as i64 })
 }
 
 /// `s` (the value of attribute `key`) with the IP addresses in it replaced by `with`,
 /// keeping ports: "203.0.113.5:7777" becomes "198.18.4.9:7777", "[2001:db8::1]:80"
 /// becomes "198.18.4.9:80". `None`: nothing to replace. Values of keys that name a
 /// version or build keep public-looking quads that stand alone ("1.0.7.2").
+/// Full-width digits ("２０３．０．１１３．５") are read as ASCII; a value with an
+/// address in them comes back in ASCII.
 pub fn scrub(key: &str, s: &str, with: Ipv4Addr) -> Option<String> {
-    let k = key.to_ascii_lowercase();
-    let versiony = ["ver", "build", "rev"].iter().any(|w| k.contains(w));
+    if s.chars().any(is_wide) {
+        return scrub_ascii(key, &narrow(s), with);
+    }
+    scrub_ascii(key, s, with)
+}
+
+fn scrub_ascii(key: &str, s: &str, with: Ipv4Addr) -> Option<String> {
+    let versiony = names_a_version(key);
     let whole = s.trim();
     let b = s.as_bytes();
     let repl = with.to_string();
     let mut out = String::with_capacity(s.len());
     let mut last = 0;
     let mut i = 0;
+    // What sets an item apart inside a value: quotes, and the punctuation of lists,
+    // "key=value" pairs and JSON.
+    let opens = |i: usize| i == 0 || matches!(b[i - 1], b'"' | b'\'' | b'=' | b':' | b'[' | b'{' | b'(' | b',' | b';' | b'|');
+    let closes = |end: usize| end == b.len() || matches!(b[end], b'"' | b'\'' | b']' | b'}' | b')' | b',' | b';' | b'|');
     while i < b.len() {
         let starts = |i: usize| i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'.' || b[i - 1] == b':');
-        // IPv4 first: a v4-mapped v6 ("::ffff:1.2.3.4") is caught by the v6 pass below.
+        // IPv4: after anything but a digit or a dot ("ip:1.2.3.4:7777", `"1.2.3.4"`). A
+        // v4-mapped v6 ("::ffff:1.2.3.4") is taken whole by the v6 pass below, which
+        // comes to it first.
         if b[i].is_ascii_digit()
-            && starts(i)
+            && (i == 0 || !(b[i - 1].is_ascii_digit() || b[i - 1] == b'.'))
+            && !(i > 0 && b[i - 1] == b':' && s[..i].ends_with("::"))
             && let Some((ip, end)) = quad(b, i)
         {
-            let port = b.get(end) == Some(&b':') && b.get(end + 1).is_some_and(u8::is_ascii_digit);
-            if hides(ip, port, &s[i..end] == whole && !versiony) {
+            let digits = |from: usize| b[from.min(b.len())..].iter().take_while(|c| c.is_ascii_digit()).count();
+            // ":7777", and "1.2.3.4 7777" when that is the whole value.
+            let port = (b.get(end) == Some(&b':') && digits(end + 1) > 0)
+                || (b.get(end) == Some(&b' ') && s[..i].trim().is_empty() && (2..=5).contains(&digits(end + 1)) && end + 1 + digits(end + 1) == s.trim_end().len());
+            // Stuck to a word ("v1.0.7.2", "build10.0.0.1"): an address only with a port,
+            // or in a LAN range no version looks like ("x192.168.1.20").
+            let glued = i > 0 && b[i - 1].is_ascii_alphabetic();
+            let apart = &s[i..end] == whole || (opens(i) && closes(end));
+            let hide = if glued { (port || plainly_lan(ip)) && !says_nothing(ip) } else { hides(ip, port, apart && !versiony) };
+            if hide {
                 out.push_str(&s[last..i]);
                 out.push_str(&repl);
                 last = end;
@@ -282,6 +412,85 @@ mod tests {
         }
         // A version-named key still loses an address with a port.
         assert_eq!(scrub("server_version", "10.0.0.1:1", w).as_deref(), Some("198.18.4.9:1"));
+    }
+
+    /// Ways a game writes an address that used to reach strangers as written.
+    #[test]
+    fn scrubs_addresses_in_the_forms_games_write_them() {
+        let w = Ipv4Addr::new(198, 18, 4, 9);
+        let cases = [
+            // After a colon, in a pair, in JSON, in a list.
+            ("x", "ip:203.0.113.5:7777", Some("ip:198.18.4.9:7777")),
+            ("x", "ip=203.0.113.5", Some("ip=198.18.4.9")),
+            ("info", "{\"ip\":\"203.0.113.5\",\"port\":7777}", Some("{\"ip\":\"198.18.4.9\",\"port\":7777}")),
+            ("x", "203.0.113.5;7777", Some("198.18.4.9;7777")),
+            ("x", "203.0.113.5,7777", Some("198.18.4.9,7777")),
+            ("x", "203.0.113.5 7777", Some("198.18.4.9 7777")),
+            ("hosts", "[203.0.113.5|203.0.113.6]", Some("[198.18.4.9|198.18.4.9]")),
+            // Under keys with "ver" in them that aren't about versions.
+            ("server", "203.0.113.5", Some("198.18.4.9")),
+            ("ServerAddress", "203.0.113.5", Some("198.18.4.9")),
+            ("driver_host", "203.0.113.5", Some("198.18.4.9")),
+            // Stuck to a word, with a port.
+            ("x", "udp203.0.113.5:7777", Some("udp198.18.4.9:7777")),
+            // Still versions: under a version's key, in a sentence, stuck to a word.
+            ("GameVersion", "203.0.113.5", None),
+            ("buildVer", "1.0.7.2", None),
+            ("client_build", "\"1.0.7.2\"", None),
+            ("desc", "patch 1.0.7.2 is out", None),
+            ("desc", "v1.0.7.2", None),
+            ("desc", "v10.0.0.1", None),
+            ("x", "1.0.7.2 2024 edition", None),
+        ];
+        for (k, v, want) in cases {
+            assert_eq!(scrub(k, v, w).as_deref(), want, "{k}={v}");
+        }
+        for (k, want) in [("ver", true), ("game_ver", true), ("GameVersion", true), ("build", true), ("clientBuild", true), ("v", true), ("rev", true), ("server", false), ("ServerAddress", false), ("driver", false), ("river", false), ("host", false)] {
+            assert_eq!(names_a_version(k), want, "{k}");
+        }
+    }
+
+    /// The rest of what slipped through: LAN addresses stuck to a word, full-width
+    /// digits, and addresses held as integers.
+    #[test]
+    fn scrubs_glued_wide_and_integer_addresses() {
+        let w = Ipv4Addr::new(198, 18, 4, 9);
+        let cases = [
+            ("x", "x192.168.1.20", Some("x198.18.4.9")),
+            ("x", "lan172.16.0.5 here", Some("lan198.18.4.9 here")),
+            ("x", "id169.254.10.1", Some("id198.18.4.9")),
+            ("x", "\u{FF12}\u{FF10}\u{FF13}\u{FF0E}\u{FF10}\u{FF0E}\u{FF11}\u{FF11}\u{FF13}\u{FF0E}\u{FF15}", Some("198.18.4.9")),
+            ("x", "at \u{FF11}\u{FF19}\u{FF12}.\u{FF11}\u{FF16}\u{FF18}.1.20\u{FF1A}\u{FF17}\u{FF17}\u{FF17}\u{FF17}", Some("at 198.18.4.9:7777")),
+            // Still kept: a version stuck to a word, full-width digits that aren't an address.
+            ("desc", "v10.0.0.1", None),
+            ("desc", "v1.0.7.2", None),
+            ("score", "\u{FF11}\u{FF10}\u{FF10}", None),
+        ];
+        for (k, v, want) in cases {
+            assert_eq!(scrub(k, v, w).as_deref(), want, "{k}={v}");
+        }
+        assert!(has_address("\u{FF11}\u{FF10}\u{FF0E}\u{FF10}\u{FF0E}\u{FF10}\u{FF0E}\u{FF11}"));
+
+        let ip = |s: &str| u32::from(s.parse::<Ipv4Addr>().unwrap());
+        let (wb, wl) = (u32::from(w) as i64, u32::from(w).swap_bytes() as i64);
+        // ntohl's order, an in_addr read little-endian, and either one stored signed.
+        assert_eq!(scrub_int("ip", ip("203.0.113.5") as i64, w), Some(wb));
+        assert_eq!(scrub_int("HostIp", ip("192.168.1.20") as i64, w), Some(wb));
+        assert_eq!(scrub_int("server_addr", ip("192.168.1.20").swap_bytes() as i64, w), Some(wl));
+        assert_eq!(scrub_int("ip", ip("203.0.113.5") as i32 as i64, w), Some(u32::from(w) as i32 as i64));
+        assert_eq!(scrub_int("addr", ip("10.0.0.7").swap_bytes() as i32 as i64, w), Some(u32::from(w).swap_bytes() as i32 as i64));
+        // Not addresses: other keys (a seed of the same size), ports, stand-ins, this
+        // PC, out of range.
+        assert_eq!(scrub_int("seed", ip("203.0.113.5") as i64, w), None);
+        assert_eq!(scrub_int("host_port", 7777, w), None);
+        assert_eq!(scrub_int("ip", 7777, w), None);
+        assert_eq!(scrub_int("server_id", ip("203.0.113.5") as i64, w), None);
+        assert_eq!(scrub_int("ip", ip("198.19.3.4") as i64, w), None);
+        assert_eq!(scrub_int("ip", ip("127.0.0.1") as i64, w), None);
+        assert_eq!(scrub_int("ip", 1 << 40, w), None);
+        for (k, want) in [("ip", true), ("HostIp", true), ("server_address", true), ("ServerAddr", true), ("host", true), ("hostPort", false), ("membership", false), ("tip", false), ("ip_count", false)] {
+            assert_eq!(names_an_address(k), want, "{k}");
+        }
     }
 
     #[test]

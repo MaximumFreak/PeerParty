@@ -20,7 +20,7 @@ impl ThreadAllocator {
 
   /// Allocates read-, write- & executable memory close to `origin`.
   pub fn allocate(&self, origin: *const (), size: usize) -> Result<ExecutableMemory> {
-    let mut allocator = self.0.lock().unwrap();
+    let mut allocator = self.0.lock().unwrap_or_else(|e| e.into_inner());
     allocator
       .allocate(origin, size)
       .map(|data| ExecutableMemory {
@@ -39,7 +39,7 @@ pub struct ExecutableMemory {
 impl Drop for ExecutableMemory {
   fn drop(&mut self) {
     // Release the associated memory map (if unique)
-    self.allocator.lock().unwrap().release(&self.data);
+    self.allocator.lock().unwrap_or_else(|e| e.into_inner()).release(&self.data);
   }
 }
 

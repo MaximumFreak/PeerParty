@@ -34,7 +34,14 @@ The sidebar has three places:
 
 - **Library**: the games, as covers or a list, with filters (All, Recent, each store,
   Games folder, Added, Hidden) and a search (Ctrl+F). A game's panel has Play, the
-  number of players on this PC, **Who can join you** (people on your network, with a
+  number of players on this PC (at 2: **Second instance starts after**), **Copy Player
+  1's saves to Player N** (shown at 2 players, or at 1 once an instance runs and Play
+  has become **Start another instance**, and not while an instance counts down; for
+  the next instance only: it turns itself
+  off once used, when no instance is left at 1 player, and every time the launcher
+  starts, and warns that a save the new instance already has is replaced, with a
+  backup kept). While the second instance waits, Play reads **Start instance 2 now**
+  and the Now playing card has Start now and Cancel. Then **Who can join you** (people on your network, with a
   Windows Firewall check and Fix; your room; public sessions), **This game's own
   settings** (invites, overlay, voice and saves for this game alone) and **Advanced**
   (multiplayer through PeerParty on or off, online services, PeerParty layers to turn
@@ -84,7 +91,8 @@ starts), and while a game it started runs with the window behind, the process dr
 background priority. Lighting and animations can be turned off in Settings > General;
 they're off when Windows' animation effects are.
 
-Settings live in `%LOCALAPPDATA%\peerparty\ui.json`. The window is egui (Rust,
+Settings live in `%LOCALAPPDATA%\peerparty\ui.json` (one that can't be read as
+settings is kept as `ui.json.bad` before defaults replace it). The window is egui (Rust,
 `launcher/src/ui/`); what it asks of the operating system goes through
 `launcher/src/platform/`, and nothing in it is specific to one PC.
 
@@ -96,6 +104,24 @@ and what a crash code means to the end of that run's log (`[launcher 17:32:07] g
 exited after 0.3 s with exit code 3221225477 (0xC0000005), crash: access violation`),
 starting a log for it if the game died before the hook could open one. PowerShell doesn't wait for GUI programs: use
 `Start-Process -Wait` there if a script needs to.
+
+### Updates
+
+Once a day the window asks GitHub whether a newer PeerParty is out (Settings > About >
+Updates, where "Check for updates every day" turns it off and "Check now" asks at once).
+Nothing downloads or installs by itself. **Download** opens the new `peerparty.exe` in
+your browser, which scans and saves it like any download; the window finds it in your
+Downloads folder ("Saved it somewhere else…" if you put it elsewhere) and checks it is the
+release's file: a program with the size and SHA-256 GitHub publishes for it (read from
+GitHub's releases API over HTTPS). For a release GitHub has no SHA-256 for, a plain
+checksum file published beside the exe (`peerparty.exe.sha256`) is used instead; with
+neither, the window says it can't check the download and offers only the release page.
+Nothing is signed. **Install and
+restart** renames the running exe to `peerparty.exe.old`, copies the new one into its
+place and starts it; any step that fails puts the old one back. It waits until no game
+runs through PeerParty. PeerParty never downloads a program itself, and runs no scripts
+to update. A copy that came with another app's add-on only says that a newer version is
+out: update the add-on to get it.
 
 ### From a prompt
 
@@ -119,6 +145,8 @@ both.
   service is set to the official servers. Everything works with no internet: see
   "Offline" below.
 - `peerparty --invite`: the game in front invites every other player to where it is.
+  It says so, or fails (exit code 1) when no game took it. The window's "Invite players
+  at home" asks the game that was last in front.
   Bind it to a hotkey for games without an invite button.
 - `PEERPARTY_INVITES=auto`: invites from other players are accepted at once. The
   default is `ask`: the game hears an invite arrived (where its SDK has
@@ -138,8 +166,25 @@ both.
 - `PEERPARTY_NAME`: the name other players see, in every service (Steam's persona name,
   EOS and GOG display names, PlayFab, Unity). Set from the launcher's Settings ("Your
   name"); empty means the Windows user name, and a second copy on one PC adds " (2)".
-- `PEERPARTY_FOLLOW=1`: PeerParty also goes into the programs the game starts (on by
-  itself in packaged games, for the programs of their own package).
+- Programs the game starts: PeerParty works out the game's install folder (its Steam
+  library folder, Epic's install list, the folder under one of the window's game folders,
+  Unreal's layout, or the program's own folder above ones named like `bin` or `Win64`;
+  `PEERPARTY_GAME_ROOT` sets it) and goes into programs started from inside it, so a
+  launcher or starter program in the game's folder passes PeerParty on to the game. The
+  overlay goes to the program that loads a game SDK or opens a window of a game's size.
+  Never followed: anything outside that folder, anti-cheat starters, installers of
+  what the game needs (`_CommonRedist`, `vcredist`, ...), crash reporters, and anything
+  the game starts once it has loaded a game SDK itself. PeerParty runs until the last of
+  the game's programs in that folder ends, and hands back its exit code.
+- `PEERPARTY_FOLLOW=1`: PeerParty goes into every program the game starts (on by itself
+  in packaged games, for the programs of their own package).
+- A `.bat` or `.cmd` in place of the exe: PeerParty reads it and starts the program it
+  runs, with its arguments, folder and variables (`@echo off`, comments, `cd`, `pushd`,
+  `set`, `start ""`, `%~dp0`, `%*` and `%1`..`%9`; one program line). A script that does
+  more (`if`, `goto`, `call`, a second program) is refused with a message to start the
+  game's .exe instead.
+- A game that asks Epic's SDK whether Epic's launcher started it, and would restart
+  itself through the launcher, is told to carry on when PeerParty started it.
 - When a game exits with a non-zero code, its log says so with the modules on the
   caller's stack (`exit: ...`), which explains an `abort()` that leaves no crash dump.
 - `--appid N`: rarely needed. A Steam game started outside the Steam client's own
@@ -150,11 +195,25 @@ both.
   licence.
 - `--multi-instance`: let a second copy start on the same PC (Unity's single-instance
   mutex).
-- `--copy-saves`: a second copy on the same PC starts from the first copy's progress,
-  for games that don't offer multiplayer from a fresh save. A second copy plays under
-  LAN ids (SteamID, EOS id, PlayFab id); the first time the game touches a path that
-  contains one, the same path with the main id (the first copy's SteamID and ids) is
-  copied over it, folder or file, newer files only. Saves that some games
+- `--copy-saves`: this copy starts from player 1's progress, for games that don't
+  offer multiplayer from a fresh save. A second copy plays under LAN ids (SteamID, EOS
+  id, PlayFab id); the first time the game touches a path that contains one, the same
+  path with the main id (the first copy's SteamID and ids) replaces it whole, folder or
+  file (a save over 1 GB isn't copied). Files are never merged by date. What was there
+  is renamed to `<name>.peerparty-before` beside it (the three latest backups are kept:
+  `.peerparty-before` is the newest, then `-2`, `-3`). Without the flag nothing is
+  copied, and `PEERPARTY_COPY_SAVES` is cleared, so a game library, shortcut or
+  command-line start never copies unless asked. The launcher's Play adds it only to the
+  copy it was asked for (a two-player start's second copy, or the one more copy Play
+  starts while one runs).
+- Player 1's own Steam saves: when the first copy is shown a SteamID of its own and
+  that SteamID has no save folder yet (or only an empty one), it starts from a copy of
+  the save of the id this PC used before: first one recorded in
+  `identity\slot-0.previous` (an old identity is recorded there before it is retired),
+  then, with no record, the newest-modified sibling save folder of a PeerParty SteamID
+  that isn't another copy's (every candidate and the choice are logged), then
+  steam_api's own. A save for the new id that already has files is never touched.
+  Saves that some games
   don't keep per player are shared by both copies already: back them up before playing
   two copies at once.
 - `PEERPARTY_PLAYFAB=0` / `=1`: never / always answer PlayFab's web API locally
@@ -241,7 +300,8 @@ version that keeps Epic's append-only struct rule:
   logging and string helpers stay with Epic's SDK.
 - Copies of the same game (same EOS product id) find each other by UDP broadcast on
   port 47590 and connect over TCP. Each copy takes its own identity slot in
-  `%LOCALAPPDATA%\peerparty\identity`.
+  `%LOCALAPPDATA%\peerparty\identity`: a signing key, whose hash is the player's id.
+  A connection counts as a player's once that key has signed for it.
 - Sessions (modification, search, details, active sessions, registered players,
   invites) and Presence (status, rich text, data, join info) are PeerParty's too. A
   session whose host set no address reads as the host's LAN IP on the other copies.
@@ -498,8 +558,8 @@ tunnel. Off unless a code is set. How it works and its limits: docs/internet-dht
   room member's public IP (the game sees a stand-in address in 198.18.0.0/15, the overlay
   says "your room"), but their PCs still see it at the network level. Games that connect
   by typed IP address use the stand-in shown on the overlay's Network > Connection details, and the hook
-  carries that traffic through the tunnel. Each member's player id is bound to its key
-  (`room-keys.txt`), so one member can't pass as another. Both sides on symmetric NATs
+  carries that traffic through the tunnel. Each member's player id is its key's hash,
+  so one member can't pass as another. Both sides on symmetric NATs
   can't connect without a forwarded port (there's no relay).
 
 ### Public sessions
@@ -510,12 +570,14 @@ on in Play together > Anyone online > **Public sessions** (pick the name others 
 for one run with `--public` or `PEERPARTY_PUBLIC=1`. Room codes and LAN play are
 unchanged and work at the same time. Details: docs/public-sessions.md.
 
-- Every player has a signed key. Adverts that are forged, altered or replayed are refused,
-  and a known player's key can't be swapped (pinned on first use).
+- Every player has a signing key, and a player's id is that key's hash. Adverts that are
+  forged, altered or replayed are refused, and nobody can use another player's id.
+- Lobbies the game made friends-only or invite-only stay closed to public players until
+  you invite them or they are in a lobby with you.
 - Public players get lobbies, invites, game traffic (all of it, PlayFab Party's
-  included) and voice. Voice and party chat with them is on by default; turn it off in
-  Play together > Anyone online > **Voice chat with strangers**, with
-  `--set public_voice=off`, or with `PEERPARTY_PUBLIC_VOICE=0` (the environment wins).
+  included) and, if you turn it on, voice. Voice and party chat with them is off by
+  default; turn it on in Play together > Anyone online > **Voice chat with strangers**,
+  with `--set public_voice=on`, or with `PEERPARTY_PUBLIC_VOICE=1` (the environment wins).
   "Invite everyone on your network" never reaches them, and their invites always wait
   for you to accept.
 - Block a player from the overlay (Players > their Details > **Block this player**) or
@@ -597,10 +659,13 @@ PeerParty's SDK answers and, while the overlay shows, its controllers held still
   (arrows, Enter, Esc, Q / E, Tab) and mouse work too.
 - Nothing reaches the game while it shows: keyboard and mouse are taken by low-level
   hooks in peerparty.exe (only while open), controllers are held still in the game
-  (XInput, DirectInput and raw-input HID at rest; Windows.Gaming.Input's Gamepad and
-  RawGameController readings at rest; GameInput readings standing still at the one from
-  when it opened, and its reading callbacks not called, in every GameInput API version;
-  HID devices read directly, SDL's HIDAPI, repeating their first report).
+  (XInput, DirectInput and raw-input HID at rest, DirectInput's sticks at the middle of
+  their range; Windows.Gaming.Input's Gamepad and RawGameController readings at rest;
+  GameInput's controller readings standing still at the one from when it opened, and its
+  reading callbacks not called, in every GameInput API version; HID devices read
+  directly, SDL's HIDAPI, repeating their first report). A button still down when it
+  closes (the Start or B that closed it) keeps controllers held until it's let go, at
+  most a second, so the game doesn't read it as a new press.
 - Xbox Game Bar opens over the game without taking the foreground, so PeerParty looks for
   it (a hit test of the game's area): while it shows, the overlay leaves the
   controller, keyboard and mouse to it and stays open underneath (also when one Guide

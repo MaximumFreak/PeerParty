@@ -93,6 +93,11 @@ network, and in your room or public sessions if you use them. A game's panel can
 two instances on one PC, copy the first player's saves for the second, and turn single
 layers off.
 
+Updates: once a day the window asks GitHub whether a newer PeerParty is out (Settings >
+About, where it can be turned off). **Download** opens it in your browser; PeerParty
+checks the file has the SHA-256 GitHub publishes for the release before it replaces
+itself, and never while a game runs. A copy that came with another app's add-on is updated through that add-on.
+
 Windows Firewall may ask to let the game accept connections the first time: allow it on
 private networks. If it's blocked (a cancelled prompt leaves a Block rule), the game's
 panel, the sidebar and the overlay's Home and Network pages say so, and **Fix** lets it
@@ -170,7 +175,7 @@ included. Options for one run go in front of the game's path (or of `%command%`)
 | `--public` | Turns public sessions on this run. |
 | `--set key=value` | Changes one setting this run, e.g. `name=Alex`, `voice=off`, `internet=off`. |
 | `--multi-instance` | Lets a second copy of the game start on the same PC. |
-| `--copy-saves` | A second copy on the same PC starts from the first copy's saves. |
+| `--copy-saves` | This copy starts from player 1's whole save; its own save, if any, is moved aside as a backup. Only when given. |
 | `--appid N` | A Steam game's app id, when PeerParty can't find it. |
 | `--log-dir DIR` | Where the logs go. |
 

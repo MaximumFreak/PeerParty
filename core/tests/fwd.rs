@@ -53,6 +53,11 @@ fn typed_ip_tcp_and_udp_cross_the_mesh() {
     meet(&a, &b);
     let fa = Forwarder::new(a.clone(), None, quiet);
     let fb = Forwarder::new(b.clone(), None, quiet);
+    // Every game socket here is on loopback only, which public players don't get to
+    // (tests/public.rs): LAN players do.
+    fa.keep_loopback_private(true);
+    fb.keep_loopback_private(true);
+    assert_eq!(a.peer_trust(b.me()), Some(Trust::Lan));
     fa.ensure_pump();
     fb.ensure_pump();
     let (sa, sb) = (Forwarder::address_of(a.me()), Forwarder::address_of(b.me()));
@@ -105,6 +110,17 @@ fn typed_ip_tcp_and_udp_cross_the_mesh() {
     c.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
     let mut buf = [0u8; 16];
     assert!(matches!(c.read(&mut buf), Ok(0) | Err(_)), "a refused stream stayed open");
+
+    // B's engine listens in B's process too, but its listener isn't B's game: a peer the
+    // forwarder connected there would arrive from loopback, like a player on B's own PC,
+    // and be trusted as one. Refused like a port nobody listens on (the engine would
+    // have sent its hello at once).
+    assert!(peerparty_core::own::is_held(true, b.tcp_port()));
+    let to = fa.tcp_dest(SocketAddrV4::new(sb, b.tcp_port())).unwrap();
+    let mut c = TcpStream::connect(to).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+    assert!(matches!(c.read(&mut buf), Ok(0) | Err(_)), "the forwarder reached the engine's own listener");
+    assert_eq!(b.peers().len(), 1, "nobody new joined B through the forwarder");
 
     // UDP: A's game sends to B's stand-in; B's game sees A's stand-in and answers it.
     let ga = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();

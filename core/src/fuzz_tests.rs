@@ -90,7 +90,8 @@ fn sample_msgs() -> Vec<Msg> {
         Filter::Attr { key: "m".into(), op: Op::Contains, value: Value::Str("v".into()) },
     ];
     vec![
-        Msg::Hello { version: VERSION, game: "eos:game".into(), id: PeerId([1; 16]), name: "Robin".into(), udp: 50000 },
+        Msg::Hello { version: VERSION, game: "eos:game".into(), id: PeerId([1; 16]), name: "Robin".into(), udp: 50000, key: [2; 32], nonce: [3; 16] },
+        Msg::Proof { sig: [4; 64] },
         Msg::Search { search: 9, query },
         Msg::SearchReply { search: 9, lobbies: vec![lobby.clone(), lobby.clone()] },
         Msg::JoinReply { lobby: "x".into(), result: JoinResult::Full },
@@ -120,6 +121,39 @@ fn wire_messages_survive_mutation_and_noise() {
     }
     // Some mutations (a flipped bit in a string) are still valid messages.
     assert!(accepted > 0);
+}
+
+/// What strangers put in lobby data and presence goes through the address scrubber:
+/// mutated address-like text (full-width digits too), noise and integers never make it
+/// panic, and whatever it changes it changes to the stand-in.
+#[test]
+fn the_address_scrubber_survives_mutation_and_noise() {
+    use crate::inet::redact::{has_address, scrub, scrub_int};
+    let mut r = Rng(0x5c7u64 << 40 | 0xab1e);
+    let w = std::net::Ipv4Addr::new(198, 18, 4, 9);
+    let seeds = [
+        "203.0.113.5:7777",
+        "{\"ip\":\"192.168.1.20\",\"port\":7777}",
+        "[2001:db8::1]:80",
+        "x192.168.1.20",
+        "\u{FF12}\u{FF10}\u{FF13}\u{FF0E}\u{FF10}\u{FF0E}\u{FF11}\u{FF11}\u{FF13}\u{FF0E}\u{FF15}\u{FF1A}\u{FF17}",
+        "::ffff:10.0.0.2 and fe80::1%12",
+        "v1.0.7.2",
+    ];
+    for i in 0..ROUNDS {
+        let d = if i % 5 == 0 { r.noise(80) } else { let k = r.below(seeds.len()); r.mutate(seeds[k].as_bytes()) };
+        let s = String::from_utf8_lossy(&d);
+        for key in ["ip", "server_version", "desc"] {
+            if let Some(out) = scrub(key, &s, w) {
+                assert!(out.contains("198.18.4.9"), "{key}={s:?} became {out:?}");
+            }
+        }
+        let _ = has_address(&s);
+        let n = (r.next() as i64) >> r.below(40);
+        if let Some(m) = scrub_int("ip", n, w) {
+            assert!(m == u32::from(w) as i64 || m == u32::from(w).swap_bytes() as i64 || m == u32::from(w) as i32 as i64 || m == u32::from(w).swap_bytes() as i32 as i64, "{n} became {m}");
+        }
+    }
 }
 
 #[test]

@@ -18,6 +18,8 @@ pub mod inet;
 mod lan;
 mod lobby;
 mod mesh;
+pub mod own;
+pub mod release;
 mod wire;
 
 pub use id::{Identity, PeerId};

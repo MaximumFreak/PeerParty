@@ -142,6 +142,10 @@ pub(crate) fn server() -> Option<Ipv4Addr> {
                 return None;
             }
         };
+        // This game's alone: it answers as the player's own PlayFab and Unity services
+        // (their saved data too), so the typed-IP forwarder never brings another
+        // player's connection to it.
+        peerparty_core::own::tcp(443).forever();
         log!("playfab service on https://{ip}:443 (PlayFab's hosts resolve here)");
         std::thread::spawn(move || {
             for conn in listener.incoming() {

@@ -22,7 +22,9 @@
 //! Connection data is opaque to clients, so PeerParty writes its own into it: "LBRL",
 //! a version, host or joiner, the allocation id and the host's connection limit. The
 //! relay reads ids from there and needs no shared allocation table. The Bind HMAC is
-//! not checked (the LAN is trusted). Allocations list `udp` and `dtls` endpoints, both
+//! not checked (its key comes from the id, which isn't secret), so an allocation is
+//! held to the address that bound it (`REBIND_AFTER`), and packets pass only between a
+//! joiner and the host it connected to. Allocations list `udp` and `dtls` endpoints, both
 //! with `secure: false`: Unity Transport's RelayServerData(allocation, type) and the
 //! SDK's AllocationUtils.ToRelayServerData take `isSecure` from the endpoint, so games
 //! asking for "dtls" (the Multiplayer SDK's default) run the plain protocol.
@@ -60,6 +62,15 @@ const MAGIC: &[u8; 4] = b"LBRL";
 const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 /// Bound allocations that send nothing for this long are dropped (clients ping).
 const IDLE: Duration = Duration::from_secs(120);
+/// An allocation belongs to the address that bound it, until that address has said
+/// nothing for this long (a client that came back on another port binds again). The
+/// Bind HMAC isn't checked and ids aren't secret, so without this any packet naming an
+/// allocation moved it to its sender: one ping took over a player's traffic.
+const REBIND_AFTER: Duration = Duration::from_secs(20);
+/// Allocations bound and DTLS sessions open at once: far more than a game's players,
+/// and an end to what datagrams from made-up addresses can have the relay keep.
+const MAX_BOUND: usize = 1024;
+const MAX_TLS: usize = 256;
 
 pub const BIND: u8 = 0;
 pub const BIND_RECEIVED: u8 = 1;
@@ -167,20 +178,31 @@ impl Server {
         }
     }
 
+    /// Whether `from` is the address `id` is bound from (which counts as life).
     fn known(&mut self, id: &AllocId, from: SocketAddr, now: Instant) -> bool {
         match self.bound.get_mut(id) {
-            Some(b) => {
-                *b = (from, now);
+            Some(b) if b.0 == from => {
+                b.1 = now;
                 true
             }
-            None => false,
+            _ => false,
         }
+    }
+
+    /// Whether the two are a joiner and the host it connected to: the only pairs
+    /// packets pass between. (Any bound allocation could be sent to before, so a Bind
+    /// from a made-up address aimed the relay at it.)
+    fn linked(&self, a: &AllocId, b: &AllocId) -> bool {
+        self.links.get(a) == Some(b) || self.links.get(b) == Some(a)
     }
 
     /// One datagram from `from`, plain or DTLS: what to send where.
     pub fn datagram(&mut self, from: SocketAddr, pkt: &[u8], now: Instant) -> Vec<(SocketAddr, Vec<u8>)> {
         let mut out = vec![];
         let msgs = if dtls::is_dtls(pkt) {
+            if !self.tls.contains_key(&from) && self.tls.len() >= MAX_TLS {
+                return out;
+            }
             let s = self.tls.entry(from).or_insert_with(|| {
                 log!("ugs relay: DTLS handshake from {from}");
                 dtls::Session::new(now)
@@ -222,11 +244,14 @@ impl Server {
                 let Some(data) = pkt.get(8..8 + 255) else { return vec![] };
                 match parse_connection_data(data) {
                     Some((id, _, _)) => {
-                        let fresh = !self.bound.contains_key(&id);
-                        self.bound.insert(id, (from, now));
-                        if fresh {
-                            log!("ugs relay: allocation {} bound from {from}", hex(&id));
+                        match self.bound.get(&id) {
+                            // Someone else's, and they're still there.
+                            Some((at, seen)) if *at != from && now.duration_since(*seen) < REBIND_AFTER => return vec![],
+                            Some(_) => {}
+                            None if self.bound.len() >= MAX_BOUND => return vec![],
+                            None => log!("ugs relay: allocation {} bound from {from}", hex(&id)),
                         }
+                        self.bound.insert(id, (from, now));
                         vec![(from, header(BIND_RECEIVED).to_vec())]
                     }
                     None => vec![(from, error(&[0; 16], ERR_NOT_FOUND))],
@@ -273,13 +298,13 @@ impl Server {
                     return vec![(from, error(&src, ERR_CLIENT_MISMATCH))];
                 }
                 match self.bound.get(&dst) {
-                    Some((to, _)) => vec![(*to, pkt.to_vec())],
-                    None => vec![(from, error(&src, ERR_NOT_CONNECTED))],
+                    Some((to, _)) if self.linked(&src, &dst) => vec![(*to, pkt.to_vec())],
+                    _ => vec![(from, error(&src, ERR_NOT_CONNECTED))],
                 }
             }
             DISCONNECT => {
                 let (Some(src), Some(dst)) = (id_at(pkt, 4), id_at(pkt, 20)) else { return vec![] };
-                if !self.known(&src, from, now) {
+                if !self.known(&src, from, now) || !self.linked(&src, &dst) {
                     return vec![];
                 }
                 if self.links.get(&src) == Some(&dst) {
@@ -630,9 +655,56 @@ mod tests {
         let bye = pair(DISCONNECT, &a, &host);
         assert_eq!(s.handle(addr(2), &bye, now), vec![(addr(1), bye.clone())]);
         assert_eq!(s.handle(addr(4), &connect(&c, &host), now)[0].1[3], ACCEPTED);
-        // Rebinding from a new port moves the allocation.
-        s.handle(addr(20), &bind(&a, false), now);
-        assert_eq!(s.handle(addr(1), &down, now), vec![(addr(20), down)]);
+        // Rebinding from a new port moves the allocation, once its old port has gone
+        // quiet (the test below is about before that).
+        let later = now + REBIND_AFTER;
+        assert_eq!(s.handle(addr(20), &bind(&b, false), later)[0].1, header(BIND_RECEIVED));
+        let down = relay_msg(&host, &b, b"to its new port");
+        s.handle(addr(1), &bind(&host, true), later);
+        assert_eq!(s.handle(addr(1), &down, later), vec![(addr(20), down)]);
+    }
+
+    /// Allocation ids aren't secret (they are in every packet, and in lobby data), and
+    /// nothing in a packet proves who sent it but where it came from. Each of these took
+    /// over a connected player's traffic, or aimed the relay at an address of choice.
+    #[test]
+    fn an_allocation_stays_with_the_address_that_bound_it() {
+        let now = Instant::now();
+        let mut s = Server::default();
+        let (host, a, x) = ([1u8; 16], [2u8; 16], [9u8; 16]);
+        s.add_host(host, 4);
+        s.handle(addr(1), &bind(&host, true), now);
+        s.handle(addr(2), &bind(&a, false), now);
+        assert_eq!(s.handle(addr(2), &connect(&a, &host), now)[0].1[3], ACCEPTED);
+        let (thief, soon) = (addr(66), now + Duration::from_secs(1));
+        // A ping, a connect request, a packet and a disconnect, each naming the
+        // joiner's allocation from somewhere else; then a Bind for it.
+        let mut ping = header(PING).to_vec();
+        ping.extend_from_slice(&a);
+        ping.extend_from_slice(&1u16.to_le_bytes());
+        for forged in [ping, connect(&a, &host), relay_msg(&a, &host, b"x"), pair(DISCONNECT, &a, &host)] {
+            let out = s.handle(thief, &forged, soon);
+            assert!(out.iter().all(|(to, p)| *to == thief && p.get(3) != Some(&RELAY)), "{out:?}");
+        }
+        assert!(s.handle(thief, &bind(&a, false), soon).is_empty());
+        // The joiner's traffic still goes to the joiner, and the joiner is still connected.
+        let down = relay_msg(&host, &a, b"for the joiner");
+        assert_eq!(s.handle(addr(1), &down, soon), vec![(addr(2), down)]);
+        assert_eq!(s.clients_of(&host), 1);
+
+        // An allocation bound from an address of the sender's choosing isn't somewhere
+        // packets can be sent: only a joiner and its host pass them.
+        s.handle(addr(77), &bind(&x, false), soon);
+        let aimed = relay_msg(&a, &x, &[0u8; 1000]);
+        assert_eq!(s.handle(addr(2), &aimed, soon), vec![(addr(2), error(&a, ERR_NOT_CONNECTED))]);
+
+        // And what one sender can have the relay keep has an end.
+        for i in 0..(MAX_BOUND as u32 + 50) {
+            let mut id = [0xEEu8; 16];
+            id[..4].copy_from_slice(&i.to_le_bytes());
+            s.handle(addr(1000 + (i % 60_000) as u16), &bind(&id, false), soon);
+        }
+        assert_eq!(s.bound.len(), MAX_BOUND);
     }
 
     /// A DTLS client's handshake with the relay, done in place.
@@ -658,6 +730,7 @@ mod tests {
         let mut h = dtls_bind(&mut s, 1, &host, true, now);
         let mut ca = dtls_bind(&mut s, 2, &a, false, now);
         s.datagram(addr(3), &bind(&b, false), now);
+        assert_eq!(s.datagram(addr(3), &connect(&b, &host), now)[0].1[3], ACCEPTED);
         // The DTLS joiner connects and talks to the DTLS host, sealed both ways.
         let out = s.datagram(addr(2), &ca.seal(&connect(&a, &host)), now);
         assert_eq!(ca.recv(&out[0].1).1, vec![pair(ACCEPTED, &host, &a)]);

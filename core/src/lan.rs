@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use crate::id::{Identity, PeerId};
 use crate::inet;
-use crate::lobby::{self, Attr, Lobby, Member, Query};
+use crate::lobby::{self, Attr, Lobby, Member, Permission, Query};
 use crate::mesh::{self, Conn, Mesh, Sink};
 use crate::wire::{JoinResult, Msg};
 
@@ -32,6 +32,11 @@ const JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// nobody reads, would otherwise grow the inbox without limit. The oldest go first.
 const INBOX_MAX_PACKETS: usize = 65_536;
 const INBOX_MAX_BYTES: usize = 64 << 20;
+/// What one public player's packets may take of the inbox: past it, its new ones are
+/// dropped, so a stranger sending faster than the game reads can't push friends'
+/// packets out (the inbox drops its oldest when full, whoever sent them).
+const PUBLIC_INBOX_PACKETS: usize = 8192;
+const PUBLIC_INBOX_BYTES: usize = 8 << 20;
 /// Packets held per channel for a peer that hasn't agreed yet, at most; past that a send
 /// is dropped (and says so).
 const DELAYED_MAX_PACKETS: usize = 4096;
@@ -203,8 +208,12 @@ impl Chan {
 struct Inbox {
     q: VecDeque<Packet>,
     bytes: usize,
+    /// Packets and bytes in `q` by sender.
+    per_peer: HashMap<PeerId, (usize, usize)>,
     /// Packets dropped to make room, ever.
     dropped: u64,
+    /// Public players' packets dropped for going past their share, ever.
+    over_share: u64,
 }
 
 impl Inbox {
@@ -212,25 +221,61 @@ impl Inbox {
         self.push_capped(p, INBOX_MAX_PACKETS, INBOX_MAX_BYTES);
     }
 
+    /// A public player's packet: dropped if its packets already hold their share.
+    fn push_stranger(&mut self, p: Packet) {
+        self.push_shared(p, PUBLIC_INBOX_PACKETS, PUBLIC_INBOX_BYTES);
+    }
+
+    fn push_shared(&mut self, p: Packet, max_n: usize, max_bytes: usize) {
+        let (n, bytes) = self.per_peer.get(&p.peer).copied().unwrap_or_default();
+        if n + 1 > max_n || (n > 0 && bytes + p.data.len() > max_bytes) {
+            self.over_share += 1;
+            return;
+        }
+        self.push(p);
+    }
+
     fn push_capped(&mut self, p: Packet, max_n: usize, max_bytes: usize) {
         self.bytes += p.data.len();
+        let e = self.per_peer.entry(p.peer).or_default();
+        e.0 += 1;
+        e.1 += p.data.len();
         self.q.push_back(p);
         while self.q.len() > max_n || (self.bytes > max_bytes && self.q.len() > 1) {
             let Some(old) = self.q.pop_front() else { break };
-            self.bytes -= old.data.len();
+            self.forget(&old);
             self.dropped += 1;
+        }
+    }
+
+    /// Takes a packet that left `q` off the counts.
+    fn forget(&mut self, p: &Packet) {
+        self.bytes -= p.data.len();
+        if let Some(e) = self.per_peer.get_mut(&p.peer) {
+            e.0 -= 1;
+            e.1 -= p.data.len();
+            if e.0 == 0 {
+                self.per_peer.remove(&p.peer);
+            }
         }
     }
 
     fn remove(&mut self, i: usize) -> Option<Packet> {
         let p = self.q.remove(i)?;
-        self.bytes -= p.data.len();
+        self.forget(&p);
         Some(p)
     }
 
     fn retain(&mut self, f: impl FnMut(&Packet) -> bool) {
         self.q.retain(f);
-        self.bytes = self.q.iter().map(|p| p.data.len()).sum();
+        self.bytes = 0;
+        self.per_peer.clear();
+        for p in &self.q {
+            self.bytes += p.data.len();
+            let e = self.per_peer.entry(p.peer).or_default();
+            e.0 += 1;
+            e.1 += p.data.len();
+        }
     }
 
     fn iter(&self) -> impl Iterator<Item = &Packet> {
@@ -260,6 +305,39 @@ struct Peer {
     /// The peer sent `Msg::Moved` on this connection, which is still our live one: it
     /// moved to a new one we haven't seen yet.
     moved_off: Option<Arc<Conn>>,
+    /// When the peer joined (it keeps this through a move to a better path).
+    joined: Instant,
+    /// The invites a public player may still send us (see PUBLIC_INVITE_BURST).
+    invites: Ration,
+    /// A public player: connected to us only because public sessions are on (kept up
+    /// to date as the peer moves between paths).
+    stranger: bool,
+    /// When we last invited this peer ourselves.
+    invited: Option<Instant>,
+}
+
+/// A token bucket: `burst` at once, then one more every `every`.
+struct Ration {
+    tokens: f32,
+    at: Instant,
+}
+
+impl Ration {
+    fn new(burst: f32, now: Instant) -> Ration {
+        Ration { tokens: burst, at: now }
+    }
+
+    /// Takes one if there's one to take.
+    fn take(&mut self, now: Instant, burst: f32, every: Duration) -> bool {
+        self.tokens = (self.tokens + now.saturating_duration_since(self.at).as_secs_f32() / every.as_secs_f32()).min(burst);
+        self.at = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 struct Prior {
@@ -271,8 +349,9 @@ struct Prior {
 }
 
 impl Peer {
-    fn new(conn: Arc<Conn>, name: String, shown: IpAddr) -> Peer {
-        Peer { conn, name, shown, prior: VecDeque::new(), held: Vec::new(), moved_off: None }
+    fn new(conn: Arc<Conn>, name: String, shown: IpAddr, stranger: bool) -> Peer {
+        let now = Instant::now();
+        Peer { conn, name, shown, prior: VecDeque::new(), held: Vec::new(), moved_off: None, joined: now, invites: Ration::new(PUBLIC_INVITE_BURST, now), stranger, invited: None }
     }
 
     fn held_count(&self) -> usize {
@@ -301,6 +380,12 @@ struct State {
     events: VecDeque<Event>,
     my_presence: Vec<(String, String)>,
     presence: HashMap<PeerId, Vec<(String, String)>>,
+    /// Strangers' requests to join lobbies that aren't public, and when each is
+    /// answered "not allowed" if nothing has vouched for them by then (see JOIN_WAIT).
+    waiting: Vec<(PeerId, String, Instant)>,
+    /// Joins by id a public player answered, held until JOIN_CLAIM_WAIT is up: the
+    /// first such answer for each lobby, and when it counts.
+    claims: HashMap<String, (PeerId, JoinResult, Instant)>,
 }
 
 struct Inner {
@@ -315,8 +400,8 @@ struct Inner {
     /// An entry outlives its tunnel (`down`) until the mesh connection on it is gone, so
     /// what's still draining off it keeps its trust.
     tunnels: Mutex<HashMap<SocketAddr, TunnelEntry>>,
-    /// Voice and party chat with public players: on unless `PEERPARTY_PUBLIC_VOICE=0`
-    /// (the launcher's "Voice chat with public players" setting) or `set_public_voice`.
+    /// Voice and party chat with public players: off unless `PEERPARTY_PUBLIC_VOICE=1`
+    /// (the launcher's "Voice chat with strangers" setting) or `set_public_voice`.
     public_voice: std::sync::atomic::AtomicBool,
     /// (peer, socket) pairs whose dropped traffic has been logged: each once.
     drop_logged: Mutex<HashSet<(PeerId, String)>>,
@@ -336,13 +421,13 @@ pub enum Trust {
     Lan,
     /// Through a room code (people we gave the code to).
     Room,
-    /// A stranger from public sessions: lobbies, game traffic and (unless it's turned
-    /// off) voice; no file, overlay or IP extras.
+    /// A stranger from public sessions: lobbies, game traffic and (when it's turned
+    /// on) voice; no file, overlay or IP extras.
     Public,
 }
 
-/// Voice sockets: what public players don't get when voice with them is turned off
-/// (`PEERPARTY_PUBLIC_VOICE=0`). That's voice.rs's rooms, `rtc:<room>`: EOS RTC rooms,
+/// Voice sockets: what public players don't get unless voice with them is turned on
+/// (`PEERPARTY_PUBLIC_VOICE=1`). That's voice.rs's rooms, `rtc:<room>`: EOS RTC rooms,
 /// EOS lobby voice (`rtc:<lobby>:peerparty-voice`) and PlayFab Party / Xbox party chat
 /// (`rtc:party:<guid>`, voice and chat text). Never game data: PlayFab Party's endpoint
 /// messages ride `party:<guid>`, and Steam (`steam:`), EOS P2P, Photon, UGS, GOG and
@@ -351,10 +436,12 @@ fn voice_socket(socket: &str) -> bool {
     socket.starts_with("rtc:")
 }
 
-/// `PEERPARTY_PUBLIC_VOICE`: voice with public players is on unless it's 0/off/false/no.
+/// `PEERPARTY_PUBLIC_VOICE`: voice with public players is off unless it's set, and to
+/// something other than 0/off/false/no. A microphone isn't opened to strangers by a
+/// variable that's missing.
 fn public_voice_env() -> bool {
     std::env::var("PEERPARTY_PUBLIC_VOICE")
-        .map_or(true, |v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no"))
+        .is_ok_and(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "off" | "false" | "no"))
 }
 
 fn msg_socket(m: &Msg) -> Option<&str> {
@@ -386,6 +473,28 @@ const PUBLIC_VALUE_BYTES: usize = 1000;
 const PUBLIC_MEMBERS: usize = 64;
 const PUBLIC_ID_BYTES: usize = 256;
 const PUBLIC_CONNECT_BYTES: usize = 1024;
+/// Channels a public player may have with us at once (each stays until it's closed or
+/// the player leaves, and each new one is an event for the game), and how long a
+/// channel's name may be. The names are PeerParty's own ("steam:...", "party:<guid>",
+/// "peerparty-ip:t:<port>:<n>"): a few dozen bytes, a handful of channels.
+const PUBLIC_CHANNELS: usize = 256;
+const PUBLIC_SOCKET_BYTES: usize = 256;
+/// Invites (and requests to join, and room codes) a public player may send: this many at
+/// once, then one every `PUBLIC_INVITE_EVERY`. Each one waits in the overlay, tells the
+/// game and is logged, so a stranger doesn't get to send them without end.
+/// A public player asking to join a lobby that isn't public may be a moment ahead of
+/// the news that puts them in a lobby with us (it comes from that lobby's owner, by
+/// another path). Their request waits this long for it, and at most this many wait.
+const JOIN_WAIT: Duration = Duration::from_secs(2);
+/// A join by id asks every peer, and any of them can answer as the owner. A public
+/// player's answer is held this long, and counts only if no LAN or room player answers
+/// meanwhile: a stranger can't answer for a friend's lobby (its own lobbies it can).
+const JOIN_CLAIM_WAIT: Duration = Duration::from_secs(1);
+const JOINS_WAITING: usize = 64;
+/// How long our invite to a public player stands (see `State::known`).
+const INVITE_STANDS: Duration = Duration::from_secs(15 * 60);
+const PUBLIC_INVITE_BURST: f32 = 5.0;
+const PUBLIC_INVITE_EVERY: Duration = Duration::from_secs(4);
 
 /// Drops attributes that are too big and keeps at most `PUBLIC_ATTRS`.
 fn cap_attrs(attrs: &mut Vec<Attr>) {
@@ -429,10 +538,19 @@ pub(crate) fn may_carry_addresses(msg: &Msg) -> bool {
 
 fn scrub_attrs(attrs: &mut [Attr], with: std::net::Ipv4Addr) {
     for a in attrs {
-        if let lobby::Value::Str(s) = &mut a.value
-            && let Some(clean) = inet::redact::scrub(&a.key, s, with)
-        {
-            *s = clean;
+        match &mut a.value {
+            lobby::Value::Str(s) => {
+                if let Some(clean) = inet::redact::scrub(&a.key, s, with) {
+                    *s = clean;
+                }
+            }
+            // An address held as a number, under a key that names one.
+            lobby::Value::Int(n) => {
+                if let Some(clean) = inet::redact::scrub_int(&a.key, *n, with) {
+                    *n = clean;
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -827,12 +945,13 @@ impl Lan {
             this: OnceLock::new(),
         });
         let _ = inner.this.set(Arc::downgrade(&inner));
-        let slot = opts.identity.slot;
+        let key = opts.identity.key.clone();
         let intervals = test_intervals();
         let mesh = mesh::start(
             mesh::Config {
                 game: opts.game,
                 me: opts.identity.id,
+                key: key.clone(),
                 name: opts.identity.name.clone(),
                 discovery_port: opts.discovery_port,
                 extra_targets: opts.extra_targets,
@@ -847,34 +966,15 @@ impl Lan {
         if !opts.lan_discovery {
             (inner.log)("lan discovery off: only internet peers");
         }
+        // Room and public handshakes are signed with this player's one key, the key
+        // the id is the hash of: whatever key a config came with, the id wouldn't be its.
         let room_cfg = opts.internet.map(|mut cfg| {
-            // Room handshakes are signed with this identity slot's key, and each member's
-            // id is pinned to its key (a throwaway identity keeps both in memory).
-            if slot != u32::MAX {
-                if cfg.room_key.is_none() {
-                    cfg.room_key = Some(Arc::new(inet::public::IdentityKey::for_slot(slot)));
-                }
-                if cfg.room_pins.is_none() {
-                    cfg.room_pins = Some(Arc::new(inet::public::Pins::open(inet::public::Pins::room_path())));
-                }
-            } else {
-                // A throwaway identity: one key and pin set for the whole run, so switching
-                // internet play off and on doesn't change who we are to the room.
-                cfg.room_key.get_or_insert_with(|| Arc::new(inet::public::IdentityKey::generate()));
-                cfg.room_pins.get_or_insert_with(|| Arc::new(inet::public::Pins::in_memory()));
-            }
+            cfg.room_key = Some(key.clone());
             apply_test_intervals(&mut cfg, intervals);
             cfg
         });
         let public_cfg = opts.public.map(|mut cfg| {
-            if let Some(p) = &mut cfg.public
-                && p.key.is_none()
-            {
-                p.key = Some(Arc::new(inet::public::IdentityKey::for_slot(slot)));
-            }
-            if cfg.public.is_none() {
-                cfg.public = Some(inet::public::PublicCfg::standard());
-            }
+            cfg.public.get_or_insert_with(inet::public::PublicCfg::standard).key = Some(key.clone());
             apply_test_intervals(&mut cfg, intervals);
             cfg
         });
@@ -1015,6 +1115,18 @@ impl Lan {
             .iter()
             .map(|(id, p)| (*id, p.name.clone()))
             .collect()
+    }
+
+    /// Every peer, the one that speaks for an address first: the most trusted (the LAN,
+    /// then a room, then public sessions), and of those the one that has been here
+    /// longest. Two peers can share a stand-in address (`inet::redact::stand_in`); a
+    /// newcomer, or a stranger, then doesn't take it from the peer that had it.
+    pub fn peers_by_standing(&self) -> Vec<PeerId> {
+        let s = self.inner.state.lock().unwrap();
+        let mut v: Vec<(std::cmp::Reverse<u8>, Instant, PeerId)> =
+            s.peers.iter().map(|(id, p)| (std::cmp::Reverse(rank(self.inner.trust(&p.conn))), p.joined, *id)).collect();
+        v.sort();
+        v.into_iter().map(|(_, _, id)| id).collect()
     }
 
     pub fn peer_name(&self, id: PeerId) -> Option<String> {
@@ -1181,6 +1293,18 @@ impl Lan {
         for id in expired {
             s.finish_search(id);
         }
+        s.answer_waiting_joins(self.inner.me, now);
+        // Public players' answers to joins by id that no LAN or room player beat.
+        let due: Vec<(String, PeerId, JoinResult)> =
+            s.claims.iter().filter(|(_, c)| c.2 <= now).map(|(id, c)| (id.clone(), c.0, c.1)).collect();
+        for (id, from, result) in due {
+            s.claims.remove(&id);
+            let asking = s.joins.contains_key(&id)
+                && s.lobbies.get(&id).is_some_and(|h| h.role == Role::Joining && h.lobby.owner == PeerId::default());
+            if asking && s.peers.contains_key(&from) {
+                s.join_answered(id, from, result);
+            }
+        }
         let late: Vec<String> = s
             .joins
             .iter()
@@ -1189,7 +1313,11 @@ impl Lan {
             .collect();
         for id in late {
             s.joins.remove(&id);
-            s.lobbies.remove(&id);
+            // The owner may have let us in and its answer be lost or late: it hears
+            // that we aren't coming, or it keeps a member who never arrived.
+            if let Some(held) = s.lobbies.remove(&id) {
+                s.tell_left(&held.lobby);
+            }
             s.events.push_back(Event::JoinDone {
                 lobby: id,
                 result: JoinResult::TimedOut,
@@ -1261,12 +1389,10 @@ impl Lan {
             .take(max)
             .collect();
         results.truncate(max);
-        let awaiting: HashSet<PeerId> = s
-            .peers
-            .keys()
-            .copied()
-            .filter(|p| query.member.is_none_or(|m| m == *p) || query.lobby_id.is_some())
-            .collect();
+        // Everyone is asked, also for one player's lobbies: a lobby is answered for by
+        // its owner, and the lobby a player is in is as often someone else's as theirs
+        // ("join my friend's game" found nothing when the friend had joined a host).
+        let awaiting: HashSet<PeerId> = s.peers.keys().copied().collect();
         let msg = Msg::Search {
             search: id,
             query: query.clone(),
@@ -1323,6 +1449,7 @@ impl Lan {
         for p in s.peers.values() {
             p.conn.send(&msg);
         }
+        s.claims.remove(id);
         let mut placeholder = Lobby::new(namespace);
         placeholder.id = id.into();
         s.lobbies.insert(
@@ -1346,7 +1473,7 @@ impl Lan {
         s.joins.remove(id);
         match held.role {
             Role::Hosting => s.close_hosted(me, held.lobby, true),
-            _ => s.send_to(held.lobby.owner, &Msg::Leave { lobby: id.into() }),
+            _ => s.tell_left(&held.lobby),
         }
         Ok(())
     }
@@ -1426,6 +1553,10 @@ impl Lan {
         }
         held.lobby.members.retain(|m| m.id != target);
         let lobby = held.lobby.clone();
+        // Our invite doesn't outlast being shown the door.
+        if let Some(p) = s.peers.get_mut(&target) {
+            p.invited = None;
+        }
         s.send_to(target, &Msg::Kicked { lobby: id.into() });
         s.broadcast(&lobby);
         s.events.push_back(Event::MemberStatus {
@@ -1497,7 +1628,7 @@ impl Lan {
 
     /// Asks `to` (or every peer) to join us. Returns how many peers it went to.
     pub fn invite(&self, to: Option<PeerId>, connect: &str, lobby: Option<&Lobby>) -> usize {
-        let s = self.inner.state.lock().unwrap();
+        let mut s = self.inner.state.lock().unwrap();
         let msg = Msg::Invite {
             connect: connect.into(),
             lobby: lobby.map(|l| l.public_view()),
@@ -1513,7 +1644,18 @@ impl Lan {
                 n += 1;
             }
         }
+        // An invite to one player is the player's word that this one may come in.
+        if let Some(p) = to.and_then(|t| s.peers.get_mut(&t)) {
+            p.invited = Some(Instant::now());
+        }
         n
+    }
+
+    /// Whether `peer` may be let into what isn't open to everyone (a voice room, say):
+    /// always for a LAN or room player; for a public player only once we invited them
+    /// or while they are in a lobby with us.
+    pub fn knows(&self, peer: PeerId) -> bool {
+        self.inner.state.lock().unwrap().known(peer)
     }
 
     // ---- channels ----
@@ -1711,9 +1853,52 @@ impl Lan {
 }
 
 impl State {
+    /// Strangers' joins that waited (JOIN_WAIT): let in if something vouches for them by
+    /// now, refused once their wait is up. One for a lobby we no longer host, or from a
+    /// player who has gone, has nobody to answer: it goes, or it would hold one of the
+    /// JOINS_WAITING places for good.
+    fn answer_waiting_joins(&mut self, me: PeerId, now: Instant) {
+        for (peer, lobby, until) in std::mem::take(&mut self.waiting) {
+            if !self.peers.contains_key(&peer) || !self.lobbies.get(&lobby).is_some_and(|h| h.role == Role::Hosting) {
+                continue;
+            }
+            if self.known(peer) || until <= now {
+                // Kept in `waiting` so the handler answers this time, one way or the other.
+                self.waiting.push((peer, lobby.clone(), until));
+                self.handle(me, peer, Msg::Join { lobby }, true);
+            } else {
+                self.waiting.push((peer, lobby, until));
+            }
+        }
+    }
+    /// Whether a peer may be let into what isn't open to everyone: a lobby that isn't
+    /// public, a voice room. Anyone on the LAN or in the room may, as before: they are
+    /// who the player chose to play with. A public player (anyone at all who runs the
+    /// game) only once we invited them, or while they are in a lobby with us.
+    fn known(&self, peer: PeerId) -> bool {
+        let Some(p) = self.peers.get(&peer) else { return false };
+        !p.stranger
+            || p.invited.is_some_and(|t| t.elapsed() < INVITE_STANDS)
+            || self.lobbies.values().any(|h| h.role != Role::Joining && h.lobby.member(peer).is_some())
+    }
+
     fn send_to(&self, peer: PeerId, msg: &Msg) {
         if let Some(p) = self.peers.get(&peer) {
             p.conn.send(msg);
+        }
+    }
+
+    /// We are out of `lobby` (one we joined, or were still asking to join): its owner
+    /// hears it, or everyone does when we asked by id and don't know yet whose it is.
+    /// Anyone but the owner of a lobby we're in ignores it.
+    fn tell_left(&self, lobby: &Lobby) {
+        let msg = Msg::Leave { lobby: lobby.id.clone() };
+        if lobby.owner != PeerId::default() {
+            self.send_to(lobby.owner, &msg);
+        } else {
+            for p in self.peers.values() {
+                p.conn.send(&msg);
+            }
         }
     }
 
@@ -1817,13 +2002,17 @@ impl State {
     /// `ordered`: the message came off the TCP stream rather than as a datagram.
     fn handle(&mut self, me: PeerId, from: PeerId, msg: Msg, ordered: bool) {
         match msg {
-            Msg::Hello { .. } | Msg::Moved => {}
+            Msg::Hello { .. } | Msg::Proof { .. } | Msg::Moved => {}
             Msg::Search { search, query } => {
                 let max = query.max_results.max(1) as usize;
+                // A search by id or by member finds lobbies that aren't public, for a
+                // friend following an invite or a friend's game. Not for a stranger:
+                // every public player has every other's id.
+                let known = self.known(from);
                 let lobbies: Vec<Lobby> = self
                     .lobbies
                     .values()
-                    .filter(|h| h.role == Role::Hosting && lobby::matches(&h.lobby, &query))
+                    .filter(|h| h.role == Role::Hosting && (known || h.lobby.permission == Permission::Public) && lobby::matches(&h.lobby, &query))
                     .map(|h| h.lobby.public_view())
                     .take(max)
                     .collect();
@@ -1848,14 +2037,26 @@ impl State {
                 }
             }
             Msg::Join { lobby: id } => {
+                // What the game made the lobby (friends only, invite only) holds for
+                // strangers: one gets in when invited, or from a lobby we share.
+                let known = self.known(from);
                 let Some(held) = self.lobbies.get_mut(&id) else {
                     return;
                 };
                 if held.role != Role::Hosting {
                     return;
                 }
+                let allowed = known || held.lobby.permission == Permission::Public;
+                if !allowed && held.lobby.member(from).is_none() && !self.waiting.iter().any(|(p, l, _)| *p == from && *l == id) && self.waiting.len() < JOINS_WAITING {
+                    self.waiting.push((from, id, Instant::now() + JOIN_WAIT));
+                    return;
+                }
+                self.waiting.retain(|(p, l, _)| !(*p == from && *l == id));
+                let held = self.lobbies.get_mut(&id).unwrap();
                 let result = if held.lobby.member(from).is_some() {
                     JoinResult::Ok
+                } else if !allowed {
+                    JoinResult::NotAllowed
                 } else if held.lobby.open_slots() == 0 {
                     JoinResult::Full
                 } else {
@@ -1884,27 +2085,38 @@ impl State {
             }
             Msg::JoinReply { lobby: id, result } => {
                 if !self.joins.contains_key(&id) {
+                    // Let into a lobby we stopped asking for (we left, or gave up
+                    // waiting): the owner is told, or we'd stay in it as a ghost.
+                    if result == JoinResult::Ok && !self.lobbies.contains_key(&id) {
+                        self.send_to(from, &Msg::Leave { lobby: id });
+                    }
                     return;
                 }
-                let Some(held) = self.lobbies.get_mut(&id) else {
+                let Some(held) = self.lobbies.get(&id) else {
                     return;
                 };
                 let unknown_owner = held.lobby.owner == PeerId::default();
                 if held.role != Role::Joining || !(unknown_owner || held.lobby.owner == from) {
                     return;
                 }
-                if result != JoinResult::Ok && unknown_owner {
-                    // One peer of several asked by id said no; wait for the owner.
+                // Asked by id, only the owner answers (a peer that doesn't host the
+                // lobby says nothing), so the first answer is the owner's, "full" and
+                // "not allowed" too. Unless someone else answers as the owner: a public
+                // player's answer waits for JOIN_CLAIM_WAIT (`tick`), and a LAN or room
+                // player's beats it.
+                if unknown_owner && self.peers.get(&from).is_none_or(|p| p.stranger) {
+                    match self.claims.get(&id) {
+                        None => {
+                            self.claims.insert(id, (from, result, Instant::now() + JOIN_CLAIM_WAIT));
+                        }
+                        // Let in by a second stranger answering for it: it hears we
+                        // aren't coming.
+                        Some(c) if c.0 != from && result == JoinResult::Ok => self.send_to(from, &Msg::Leave { lobby: id }),
+                        Some(_) => {}
+                    }
                     return;
                 }
-                self.joins.remove(&id);
-                if result == JoinResult::Ok {
-                    held.role = Role::Joined;
-                    held.lobby.owner = from;
-                } else {
-                    self.lobbies.remove(&id);
-                }
-                self.events.push_back(Event::JoinDone { lobby: id, result });
+                self.join_answered(id, from, result);
             }
             Msg::State { lobby: new } => {
                 let Some(held) = self.lobbies.get_mut(&new.id) else {
@@ -2005,13 +2217,14 @@ impl State {
             } => {
                 let key = (from, socket.clone());
                 match self.chans.get(&key).map(|c| c.state) {
-                    Some(ChanState::Open) => self.inbox.push(Packet {
-                        peer: from,
-                        socket,
-                        channel,
-                        data,
-                        ordered,
-                    }),
+                    Some(ChanState::Open) => {
+                        let p = Packet { peer: from, socket, channel, data, ordered };
+                        if self.peers.get(&from).is_some_and(|p| p.stranger) {
+                            self.inbox.push_stranger(p);
+                        } else {
+                            self.inbox.push(p);
+                        }
+                    }
                     None => {
                         self.chans.insert(
                             key,
@@ -2040,6 +2253,30 @@ impl State {
                 });
             }
         }
+    }
+
+    /// The answer to a join that counts: from the owner we asked, or (asked by id) the
+    /// peer taken for the owner.
+    fn join_answered(&mut self, id: String, from: PeerId, result: JoinResult) {
+        // A stranger's answer held for it, now beaten: if it let us in, it hears we
+        // aren't coming (or it keeps a member who never arrives).
+        if let Some((other, held_result, _)) = self.claims.remove(&id)
+            && other != from
+            && held_result == JoinResult::Ok
+        {
+            self.send_to(other, &Msg::Leave { lobby: id.clone() });
+        }
+        self.joins.remove(&id);
+        let Some(held) = self.lobbies.get_mut(&id) else {
+            return;
+        };
+        if result == JoinResult::Ok {
+            held.role = Role::Joined;
+            held.lobby.owner = from;
+        } else {
+            self.lobbies.remove(&id);
+        }
+        self.events.push_back(Event::JoinDone { lobby: id, result });
     }
 
     /// The owner closed the lobby or kicked us out of it.
@@ -2230,6 +2467,14 @@ impl State {
                 conn.send(&Msg::Join { lobby: id.clone() });
             }
         }
+        // And channels asked for while this peer wasn't there to hear it (a game goes
+        // on sending through a second's break in the connection): asked for again, or
+        // they would wait for an answer to a question nobody got.
+        for ((peer, socket), chan) in &self.chans {
+            if *peer == conn.peer && chan.state == ChanState::Pending {
+                conn.send(&Msg::ChanRequest { socket: socket.clone() });
+            }
+        }
     }
 }
 
@@ -2280,6 +2525,7 @@ impl Sink for Inner {
                 }
                 p.prior.push_back(Prior { conn: old.clone(), held: Vec::new(), done });
                 p.conn = conn.clone();
+                p.stranger = now == Trust::Public;
                 (self.log)(&format!("lan peer {} ({}) moved from {} to {}", conn.peer, p.name, describe(was), self.how(conn)));
                 if done {
                     s.release(self.me, conn.peer);
@@ -2319,19 +2565,25 @@ impl Sink for Inner {
         }
         (self.log)(&format!("lan peer {} ({name}) at {}", conn.peer, self.how(conn)));
         let shown = self.shown_ip(conn);
-        s.peers.insert(conn.peer, Peer::new(conn.clone(), name, shown));
+        let stranger = self.is_public(conn);
+        s.peers.insert(conn.peer, Peer::new(conn.clone(), name, shown, stranger));
         s.greet(conn);
         s.events.push_back(Event::PeerJoined(conn.peer));
         true
     }
 
     fn message(&self, conn: &Arc<Conn>, mut msg: Msg, ordered: bool) {
-        if self.is_public(conn) {
+        let public = self.is_public(conn);
+        if public {
             // Strangers: voice and party chat unless that's turned off, and bounded presence.
             if !self.public_voice.load(std::sync::atomic::Ordering::Relaxed)
                 && let Some(socket) = msg_socket(&msg).filter(|s| voice_socket(s))
             {
                 self.note_drop(conn.peer, socket, "voice from a public player ignored: voice chat with public players is off");
+                return;
+            }
+            if msg_socket(&msg).is_some_and(|s| s.len() > PUBLIC_SOCKET_BYTES) {
+                self.note_drop(conn.peer, "a channel", "ignored: its name is too long to be one of ours");
                 return;
             }
             if !cap_public(&mut msg) {
@@ -2340,6 +2592,25 @@ impl Sink for Inner {
             scrub_public(&mut msg, inet::redact::stand_in(&conn.peer.0));
         }
         let mut s = self.state.lock().unwrap();
+        if public {
+            // A channel the stranger doesn't have yet, past what one player may have.
+            if let Msg::ChanRequest { socket } | Msg::ChanData { socket, .. } = &msg
+                && !s.chans.contains_key(&(conn.peer, socket.clone()))
+                && s.chans.keys().filter(|(p, _)| *p == conn.peer).count() >= PUBLIC_CHANNELS
+            {
+                drop(s);
+                self.note_drop(conn.peer, "channels", "a new one ignored: this public player has as many open as one may have");
+                return;
+            }
+            if let Msg::Invite { .. } = &msg
+                && let Some(p) = s.peers.get_mut(&conn.peer)
+                && !p.invites.take(Instant::now(), PUBLIC_INVITE_BURST, PUBLIC_INVITE_EVERY)
+            {
+                drop(s);
+                self.note_drop(conn.peer, "invites", "ignored: this public player sends more than a player would");
+                return;
+            }
+        }
         let Some(p) = s.peers.get_mut(&conn.peer) else {
             return;
         };
@@ -2381,13 +2652,21 @@ impl Sink for Inner {
                 }
             }
         }
-        let dropped = s.inbox.dropped;
+        let (dropped, over) = (s.inbox.dropped, s.inbox.over_share);
         s.handle(self.me, conn.peer, msg, ordered);
         let now = s.inbox.dropped;
         if now != dropped && (dropped == 0 || now.ilog2() != dropped.ilog2()) {
             (self.log)(&format!(
                 "lan inbox full ({INBOX_MAX_PACKETS} packets / {} MiB): dropped the oldest; {now} so far",
                 INBOX_MAX_BYTES >> 20
+            ));
+        }
+        let now = s.inbox.over_share;
+        if now != over && (over == 0 || now.ilog2() != over.ilog2()) {
+            (self.log)(&format!(
+                "lan dropped packets from public player {}: its share of the inbox ({PUBLIC_INBOX_PACKETS} packets / {} MiB) is full; {now} so far",
+                conn.peer,
+                PUBLIC_INBOX_BYTES >> 20
             ));
         }
     }
@@ -2513,6 +2792,37 @@ mod tests {
         assert!(!cap_public(&mut Msg::Invite { connect: "c".repeat(5000), lobby: None }));
     }
 
+    /// A stranger's join that waits for a lobby closed meanwhile, or from a player who
+    /// left, is let go: it doesn't keep one of the JOINS_WAITING places for good.
+    #[test]
+    fn waiting_joins_with_nobody_to_answer_go() {
+        let mut s = State::default();
+        let (me, gone) = (PeerId([1; 16]), PeerId([2; 16]));
+        let now = Instant::now();
+        let mut l = Lobby::new("eos.lobby");
+        l.id = "hosted".into();
+        s.lobbies.insert(l.id.clone(), Held { lobby: l, role: Role::Hosting });
+        for i in 0..JOINS_WAITING {
+            s.waiting.push((gone, format!("closed {i}"), now + JOIN_WAIT));
+        }
+        s.waiting.push((gone, "hosted".into(), now + JOIN_WAIT));
+        s.answer_waiting_joins(me, now);
+        assert!(s.waiting.is_empty(), "{:?}", s.waiting);
+        assert!(s.events.is_empty());
+    }
+    #[test]
+    fn a_public_players_invites_are_rationed() {
+        let t0 = Instant::now();
+        let mut r = Ration::new(PUBLIC_INVITE_BURST, t0);
+        let mut take = |now: Instant| r.take(now, PUBLIC_INVITE_BURST, PUBLIC_INVITE_EVERY);
+        assert_eq!((0..100).filter(|_| take(t0)).count(), PUBLIC_INVITE_BURST as usize, "a burst, then no more");
+        assert!(!take(t0 + PUBLIC_INVITE_EVERY / 2));
+        assert!(take(t0 + PUBLIC_INVITE_EVERY * 2), "one more after a wait");
+        // A long wait doesn't save up more than the burst.
+        let later = t0 + Duration::from_secs(3600);
+        assert_eq!((0..100).filter(|_| take(later)).count(), PUBLIC_INVITE_BURST as usize);
+    }
+
     fn packet(n: u8, len: usize) -> Packet {
         Packet {
             peer: PeerId([n; 16]),
@@ -2548,6 +2858,41 @@ mod tests {
         inbox.push(packet(5, 9));
         inbox.retain(|p| p.data[0] == 5);
         assert_eq!(inbox.bytes, 9);
+        assert_eq!(inbox.per_peer.len(), 1);
+        assert_eq!(inbox.per_peer[&PeerId([5; 16])], (1, 9));
+    }
+
+    /// A public player's packets stop at their share; the others' still go in, and the
+    /// share frees up as the game reads.
+    #[test]
+    fn a_strangers_share_of_the_inbox_is_bounded() {
+        let mut inbox = Inbox::default();
+        for _ in 0..10 {
+            inbox.push_shared(packet(1, 10), 4, 1000);
+        }
+        assert_eq!((inbox.q.len(), inbox.over_share), (4, 6), "count share");
+        for _ in 0..3 {
+            inbox.push_shared(packet(2, 400), 100, 1000);
+        }
+        assert_eq!(inbox.per_peer[&PeerId([2; 16])], (2, 800), "byte share");
+        // A friend's packets aren't held to a share, and nothing was pushed out for them.
+        for _ in 0..50 {
+            inbox.push(packet(3, 10));
+        }
+        assert_eq!(inbox.q.len(), 56);
+        assert_eq!(inbox.dropped, 0);
+        // Read one: there's room for one more.
+        let i = inbox.iter().position(|p| p.peer == PeerId([1; 16])).unwrap();
+        inbox.remove(i).unwrap();
+        inbox.push_shared(packet(1, 10), 4, 1000);
+        inbox.push_shared(packet(1, 10), 4, 1000);
+        assert_eq!(inbox.per_peer[&PeerId([1; 16])].0, 4);
+        assert_eq!(inbox.over_share, 8);
+        // A first packet bigger than the byte share is still taken (as a lone one over
+        // the inbox's cap is).
+        inbox.push_shared(packet(4, 5000), 100, 1000);
+        assert_eq!(inbox.per_peer[&PeerId([4; 16])], (1, 5000));
+        assert_eq!(inbox.bytes, inbox.iter().map(|p| p.data.len()).sum::<usize>());
     }
 
     #[test]

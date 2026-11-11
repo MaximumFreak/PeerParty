@@ -84,6 +84,42 @@ impl App {
                     });
                     if o.players >= 2 {
                         ui.add(egui::Label::new(egui::RichText::new(t!("game.players_two_note")).size(12.0).color(TEXT3)).wrap());
+                        // The label wraps beside the stepper rather than running under it.
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            let w = (ui.available_width() - 168.0).max(80.0);
+                            ui.vertical(|ui| {
+                                ui.set_width(w);
+                                ui.add(egui::Label::new(egui::RichText::new(t!("game.second_after")).size(13.5).color(TEXT)).wrap());
+                            });
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let opts = store::SECOND_DELAYS;
+                                let labels: Vec<String> = opts.iter().map(|s| t!("common.seconds", n = s)).collect();
+                                let mut i = opts.iter().position(|s| *s >= self.settings.second_delay).unwrap_or(4);
+                                if widgets::stepper(ui, "delay", &labels, &mut i, 160.0).changed() {
+                                    self.settings.second_delay = opts[i];
+                                    self.save_settings();
+                                }
+                            });
+                        });
+                    }
+                    // For the second copy, or the next one "Start another instance" adds. Not a
+                    // setting: it is off whenever the window starts and once a start used it.
+                    if self.copy_saves_offered(&key, o.players, !running.is_empty()) {
+                        let mut copy = self.copy_saves.contains(&key);
+                        let to = self.copy_saves_target(&key);
+                        stacked(ui, &t!("game.copy_saves", player = to), t!("game.copy_saves_sub"), |ui| {
+                            if widgets::switch(ui, &mut copy).changed() {
+                                if copy {
+                                    self.copy_saves.insert(key.clone());
+                                } else {
+                                    self.copy_saves.remove(&key);
+                                }
+                            }
+                        });
+                        if copy {
+                            widgets::note(ui, Icon::Warning, theme::WARN, t!("game.copy_saves_warn"));
+                        }
                     }
                 } else {
                     widgets::note(ui, Icon::Info, TEXT3, t!("game.xbox_one_copy"));
@@ -130,19 +166,49 @@ impl App {
         self.apply(actions);
     }
 
+    /// Whether "Copy Player 1's saves to Player N" is shown: at 2 players (it is for copy 2),
+    /// or at 1 once a copy runs (for the one "Start another instance" adds). A first copy
+    /// never copies, so at 1 with nothing running there is nothing for it to do. Hidden
+    /// too while a queued copy counts down: that copy's saves are settled already, and
+    /// the switch would name the one after it. Hidden, it is also turned off, so it
+    /// never comes back on by itself.
+    pub(super) fn copy_saves_offered(&mut self, key: &str, players: u8, running: bool) -> bool {
+        let waiting = self.pending.iter().any(|p| p.key == key);
+        let shown = (players >= 2 || running) && !waiting;
+        if !shown {
+            self.copy_saves.remove(key);
+        }
+        shown
+    }
+
+    /// The player the save switch is for: the next copy Play adds (2 before the first
+    /// starts at two players; after the last running copy otherwise; the switch isn't
+    /// shown while one waits, but the count goes past it all the same).
+    pub(super) fn copy_saves_target(&self, key: &str) -> u8 {
+        let running = self.running(key).last().copied().unwrap_or(0);
+        let waiting = self.pending.iter().filter(|p| p.key == key).map(|p| p.player).max().unwrap_or(0);
+        running.max(waiting).max(1) + 1
+    }
+
     fn play_button(&mut self, ui: &mut egui::Ui, g: &super::scan::Game, key: &str, o: &GameOptions, running: &[u8], actions: &mut Vec<Action>) {
         // An Xbox app game runs one copy per PC: Windows won't start another while one
         // runs, so the button says so instead.
         let xbox = g.source == Source::Xbox;
-        let label = match (o.players >= 2 && !xbox, running.is_empty(), xbox) {
-            (_, false, true) => t!("game.already_running"),
-            (true, true, _) => t!("game.play_two"),
-            (false, true, _) => t!("game.play"),
-            (true, false, _) => t!("game.play_two_more"),
-            (false, false, _) => t!("game.play_another"),
+        let waiting = self.pending.iter().find(|p| p.key == key).map(|p| (p.player, p.at.saturating_duration_since(std::time::Instant::now()).as_secs() + 1));
+        let label: String = match (o.players >= 2 && !xbox, running.is_empty(), xbox) {
+            // The two-player start's second copy is waiting: Play starts it now.
+            _ if waiting.is_some() => {
+                let (player, left) = waiting.unwrap_or_default();
+                t!("game.start_now", player = player, n = left)
+            }
+            (_, false, true) => t!("game.already_running").to_string(),
+            (true, true, _) => t!("game.play_two").to_string(),
+            (false, true, _) => t!("game.play").to_string(),
+            // With a copy running, Play adds one more, whatever the count says.
+            (_, false, _) => t!("game.play_another").to_string(),
         };
         let enabled = !(xbox && !running.is_empty());
-        let resp = ui.add_enabled_ui(enabled, |ui| widgets::wide_button(ui, Some(Icon::Play), label, Kind::Primary, 54.0)).inner;
+        let resp = ui.add_enabled_ui(enabled, |ui| widgets::wide_button(ui, Some(Icon::Play), &label, Kind::Primary, 54.0)).inner;
         first_focus(&resp, &mut self.focus_play);
         let resp = if !enabled {
             resp.on_disabled_hover_text(t!("game.xbox_running_tip"))
@@ -232,20 +298,6 @@ impl App {
     }
 
     fn advanced(&mut self, ui: &mut egui::Ui, g: &super::scan::Game, key: &str, o: &mut GameOptions, actions: &mut Vec<Action>) {
-        if o.players >= 2 && g.source != Source::Xbox {
-            stacked(ui, t!("game.adv_copy_saves"), t!("game.adv_copy_saves_sub"), |ui| {
-                widgets::switch(ui, &mut o.copy_saves);
-            });
-            stacked(ui, t!("game.adv_delay"), "", |ui| {
-                let opts = [3u32, 5, 8, 10, 12, 15, 20, 30, 45, 60];
-                let labels: Vec<String> = opts.iter().map(|s| t!("common.seconds", n = s)).collect();
-                let mut i = opts.iter().position(|s| *s >= self.settings.second_delay).unwrap_or(4);
-                if widgets::stepper(ui, "delay", &labels, &mut i, 160.0).changed() {
-                    self.settings.second_delay = opts[i];
-                    self.save_settings();
-                }
-            });
-        }
         widgets::section(ui, t!("settings.services"));
         for (sdk, label, default) in SDK_MODES {
             let global = self.settings.prefs.modes.get(*sdk).cloned().unwrap_or_else(|| default.to_string());
@@ -318,7 +370,7 @@ impl App {
 
 /// Anything under a game's Advanced that differs from the recommended.
 fn advanced_changed(o: &GameOptions) -> bool {
-    o.copy_saves || !o.modes.is_empty() || !o.skip.is_empty() || !o.game_key.is_empty() || o.exe.is_some() || !o.args.trim().is_empty()
+    !o.modes.is_empty() || !o.skip.is_empty() || !o.game_key.is_empty() || o.exe.is_some() || !o.args.trim().is_empty()
 }
 
 /// A line of "who can join": an icon, who, and how it stands.

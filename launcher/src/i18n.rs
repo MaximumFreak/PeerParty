@@ -2,7 +2,7 @@
 //!
 //! Each language is one file in `launcher/locales/` (`key = text`, one per line, `#`
 //! comments, `\n` for a line break, `{name}` for a value filled in), built into the
-//! program. English is complete; any other language may lack keys, which then show in
+//! program. Every language has every key (a test checks); one missing would show in
 //! English. A key with plural forms has `key.one`, `key.few`, `key.many` and `key.other`
 //! variants (the ones its language uses), chosen by the value named `n`.
 //!
@@ -243,6 +243,23 @@ mod tests {
                 assert!(got.is_subset(&want), "{code}: {k} has {got:?}, English {want:?}");
             }
         }
+    }
+
+    /// Every language has every English key, so nothing shows in English by accident:
+    /// a key added in English needs its translations in the same change.
+    #[test]
+    fn every_language_has_every_key() {
+        let en: HashSet<&str> = parse(LANGS[0].2).keys().map(|k| base(k)).collect();
+        let mut gaps = Vec::new();
+        for (code, _, text) in &LANGS[1..] {
+            let have: HashSet<&str> = parse(text).keys().map(|k| base(k)).collect();
+            let mut missing: Vec<&str> = en.difference(&have).copied().collect();
+            missing.sort();
+            if !missing.is_empty() {
+                gaps.push(format!("{code}: {missing:?}"));
+            }
+        }
+        assert!(gaps.is_empty(), "untranslated keys:\n{}", gaps.join("\n"));
     }
 
     #[test]

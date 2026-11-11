@@ -195,6 +195,11 @@ const OBJECT_BITS: usize = 32768;
 /// Messages stop past this many bits in a packet.
 const MESSAGE_BITS: usize = 9088;
 const TIMEOUT_MS: i64 = 10_000;
+/// Limits on what clients may have this server keep: an object's size in words, and a
+/// room's objects and their words in all (far past what a packet can carry updates for).
+const OBJECT_WORDS: usize = 1 << 16;
+const ROOM_OBJECTS: usize = 8192;
+const ROOM_WORDS: usize = 1 << 21;
 
 struct Object {
     words: Vec<i32>,
@@ -575,6 +580,13 @@ impl Server {
         }
     }
 
+    /// Whether a new object of `words` words may be kept.
+    fn room_for(&self, words: usize) -> bool {
+        (word::HEADER..=OBJECT_WORDS).contains(&words)
+            && self.objects.len() < ROOM_OBJECTS
+            && self.objects.values().map(|o| o.words.len()).sum::<usize>() + words <= ROOM_WORDS
+    }
+
     fn destroy(&mut self, id: u32, by: Option<i32>) {
         if self.objects.remove(&id).is_none() {
             return;
@@ -740,7 +752,10 @@ impl Server {
             }
             if !self.objects.contains_key(&id) {
                 let Some((ty, count, transform, fl, root, key, guid)) = create else { continue };
-                if !(word::HEADER..=1 << 20).contains(&count) {
+                // The client says how big its object is, and each word is kept twice (its
+                // value and when it changed): a short packet naming many objects of the
+                // biggest size took hundreds of megabytes.
+                if !self.room_for(count) {
                     continue;
                 }
                 let mut w = vec![0; count];
@@ -866,10 +881,16 @@ impl Server {
                 if id == INTERNAL_STATE {
                     return;
                 }
+                if !self.objects.contains_key(&id) && !self.room_for(words.len()) {
+                    return;
+                }
                 let o = self.objects.entry(id).or_insert_with(|| Object::new(vec![0; words.len()]));
                 for (i, v) in words.into_iter().enumerate() {
                     if i < word::FIRST_DELTA {
-                        o.words[i] = v;
+                        // An object there already may be shorter than this one says.
+                        if let Some(w) = o.words.get_mut(i) {
+                            *w = v;
+                        }
                     } else {
                         o.set(i, v, tick);
                     }
@@ -1352,6 +1373,28 @@ mod tests {
         let mut w = BitWriter::default();
         m.write(&mut w);
         assert_eq!(Message::read(&mut BitReader::new(&w.data)), Some(m));
+    }
+
+    /// One short packet naming many objects of the biggest size took hundreds of megabytes.
+    #[test]
+    fn objects_a_client_declares_are_bounded() {
+        let mut s = Server::new(60, 4);
+        let mut a = Client::new(1);
+        a.connect(&mut s, 0);
+        let base = a.counter << 19;
+        let sized = |n: usize| -> Vec<(u32, Vec<i32>, bool)> { (1..=40).map(|i| (base | (n as u32 % 4096 + i), vec![0; n], true)).collect() };
+        let huge = sized(1 << 20);
+        // The server's own state object is there from the start.
+        let (had, words) = (s.objects.len(), s.objects.values().map(|o| o.words.len()).sum::<usize>());
+        a.send(&mut s, 10, &huge, &[], vec![]);
+        assert_eq!(s.objects.len(), had, "past an object's limit");
+        let big = sized(OBJECT_WORDS);
+        a.send(&mut s, 20, &big, &[], vec![]);
+        let fit = (ROOM_WORDS - words) / OBJECT_WORDS;
+        assert_eq!(s.objects.len(), had + fit, "up to the room's limit");
+        let more = sized(OBJECT_WORDS);
+        a.send(&mut s, 30, &more, &[], vec![]);
+        assert_eq!(s.objects.len(), had + fit, "and none after");
     }
 
     #[test]

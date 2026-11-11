@@ -286,7 +286,7 @@ impl App {
             crate::platform::reveal(&dir);
         }
         if setup {
-            self.welcome = Some(super::welcome::Welcome::new(&self.settings.prefs));
+            self.welcome = Some(super::welcome::Welcome::again(&self.settings.prefs));
         }
         if reset {
             reset_to_recommended(&mut self.settings.prefs);
@@ -315,6 +315,8 @@ impl App {
             first_focus(&r, &mut self.focus_first);
             data = r.clicked();
         });
+        ui.add_space(12.0);
+        self.updates_card(ui);
         if data {
             let dir = super::store::data_dir();
             let _ = std::fs::create_dir_all(&dir);
@@ -326,7 +328,10 @@ impl App {
 fn overlay(ui: &mut egui::Ui, p: &mut Prefs, focus: &mut bool) {
     widgets::card(ui, |ui| {
         ui.set_width(ui.available_width());
-        widgets::setting(ui, t!("settings.overlay_on"), t!("settings.overlay_on_sub"), |ui| {
+        // Off, invites from the network and the room are accepted by the hook (nothing in
+        // the game could answer them): said where it's turned off.
+        let sub = if p.overlay { t!("settings.overlay_on_sub") } else { t!("settings.overlay_off_sub") };
+        widgets::setting(ui, t!("settings.overlay_on"), sub, |ui| {
             let r = widgets::switch(ui, &mut p.overlay);
             first_focus(&r, focus);
         });

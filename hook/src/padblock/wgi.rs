@@ -16,7 +16,7 @@ use retour::GenericDetour;
 use super::{module, proc_addr};
 use crate::hook::with_lock;
 use crate::log;
-use crate::overlay::visible;
+use crate::overlay::pads_held_back;
 
 type GamepadReading = unsafe extern "system" fn(usize, *mut u8) -> i32;
 type RawReading = unsafe extern "system" fn(usize, u32, *mut u8, u32, *mut i32, u32, *mut f64, *mut u64) -> i32;
@@ -180,7 +180,7 @@ pub fn hidden() {
 unsafe extern "system" fn gamepad_reading(this: usize, out: *mut u8) -> i32 {
     let Some(h) = GAMEPAD.get() else { return -1 };
     let hr = unsafe { h.call(this, out) };
-    if hr >= 0 && visible() && !out.is_null() {
+    if hr >= 0 && pads_held_back() && !out.is_null() {
         // GamepadReading: Timestamp (u64, kept), Buttons (u32), then six doubles.
         unsafe { std::ptr::write_bytes(out.add(8), 0, 56) };
     }
@@ -199,7 +199,7 @@ unsafe extern "system" fn raw_reading(
 ) -> i32 {
     let Some(h) = RAW.get() else { return -1 };
     let hr = unsafe { h.call(this, n_buttons, buttons, n_switches, switches, n_axes, axes, timestamp) };
-    if hr < 0 || !visible() {
+    if hr < 0 || !pads_held_back() {
         return hr;
     }
     if !buttons.is_null() {

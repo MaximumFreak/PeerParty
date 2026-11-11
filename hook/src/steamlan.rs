@@ -437,9 +437,9 @@ pub fn my_steam_id() -> u64 {
     if let (true, Some(game)) = (own, real) {
         // steam_api still knows the player by its own SteamID: what goes to it and comes
         // back from it is mapped (steamown.rs). Saves keyed by SteamID start from a copy
-        // of steam_api's (saves.rs).
+        // of an earlier one of its own for this PC, else steam_api's (saves.rs).
         crate::steamown::set(id, game);
-        crate::saves::adopt_steam(id, game);
+        crate::saves::adopt_steam(id, game, &crate::saves::earlier_own_steam_ids());
     }
     // The first copy waits for the game to fetch its ISteamUser before settling.
     if real.is_some() || lan.slot() != 0 {
@@ -1001,7 +1001,7 @@ fn digital(name: &str, this: usize, input: u64, action: u64) -> u16 {
     let Some(f) = real(name) else { return 0 };
     let f: unsafe extern "C" fn(usize, u64, u64) -> u16 = unsafe { std::mem::transmute(f) };
     let r = unsafe { f(this, input, action) };
-    if crate::overlay::visible() { r & 0xFF00 } else { r }
+    if crate::overlay::pads_held_back() { r & 0xFF00 } else { r }
 }
 
 /// `InputAnalogActionData_t { EInputSourceMode eMode; float x; float y; bool bActive; }`:
@@ -1011,7 +1011,7 @@ fn analog(name: &str, out: *mut u8, this: usize, input: u64, action: u64) -> *mu
     let Some(f) = real(name) else { return out };
     let f: unsafe extern "C" fn(*mut u8, usize, u64, u64) -> *mut u8 = unsafe { std::mem::transmute(f) };
     let r = unsafe { f(out, this, input, action) };
-    if crate::overlay::visible() && !r.is_null() {
+    if crate::overlay::pads_held_back() && !r.is_null() {
         unsafe { std::ptr::write_bytes(r.add(4), 0, 8) };
     }
     r

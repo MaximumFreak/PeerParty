@@ -81,7 +81,18 @@ const NO_LOCAL_MEMBERS: u32 = 0;
 const LOBBY_DELETED: u32 = 1;
 
 // PFLobbyAccessPolicy
+const ACCESS_FRIENDS: u32 = 1;
 const ACCESS_PRIVATE: u32 = 2;
+
+/// Who the lobby is open to. "Friends" is everyone the player plays with (the LAN, a
+/// room), who find and join it as they would a public one; not public players.
+fn permission_of(access: u32) -> Permission {
+    match access {
+        ACCESS_PRIVATE => Permission::InviteOnly,
+        ACCESS_FRIENDS => Permission::Friends,
+        _ => Permission::Public,
+    }
+}
 
 // PFMatchmakingTicketStatus and PFMatchmakingStateChangeType
 const TICKET_CREATING: u32 = 0;
@@ -1812,7 +1823,7 @@ fn new_lobby(
     let mut l = Lobby::new(NS);
     l.id = id.to_string();
     l.max_members = max.clamp(2, 128);
-    l.permission = if access == ACCESS_PRIVATE { Permission::InviteOnly } else { Permission::Public };
+    l.permission = permission_of(access);
     l.host_migration = true;
     l.join_by_id = true;
     l.attrs = vec![
@@ -2479,7 +2490,7 @@ pub(crate) fn rest_update(id: &str, u: RestUpdate) -> Result<(), &'static str> {
 /// PFLobbyAccessPolicy from the web API's name.
 fn access_of(name: &str) -> u32 {
     match name {
-        "Friends" => 1,
+        "Friends" => ACCESS_FRIENDS,
         "Private" => ACCESS_PRIVATE,
         _ => 0,
     }
@@ -2532,15 +2543,15 @@ fn wait_joined(lan: &Lan, id: &str, wait: Duration) -> Result<(), &'static str> 
         if lan.lobby(id).is_some_and(|l| l.members.iter().any(|m| m.id == lan.me())) {
             return Ok(());
         }
-        for ev in net::take(net::Front::PlayFab) {
-            if let Event::JoinDone { lobby, result } = ev {
-                if lobby == id && result != JoinResult::Ok {
-                    return Err(match result {
-                        JoinResult::Full => "LobbyFull",
-                        JoinResult::NotAllowed => "LobbyNotJoinable",
-                        _ => "LobbyNotFound",
-                    });
-                }
+        // Other requests' searches and joins wait in the same queue (net::take_one).
+        let mine = |e: &Event| matches!(e, Event::JoinDone { lobby, .. } if lobby == id);
+        if let Some(Event::JoinDone { result, .. }) = net::take_one(net::Front::PlayFab, mine, crate::playfab::api::waited_for) {
+            if result != JoinResult::Ok {
+                return Err(match result {
+                    JoinResult::Full => "LobbyFull",
+                    JoinResult::NotAllowed => "LobbyNotJoinable",
+                    _ => "LobbyNotFound",
+                });
             }
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -2712,8 +2723,7 @@ unsafe extern "system" fn lobby_post_update(
             }
             if u.access != 0 {
                 let access = unsafe { *(u.access as *const u32) };
-                lobby_now.permission =
-                    if access == ACCESS_PRIVATE { Permission::InviteOnly } else { Permission::Public };
+                lobby_now.permission = permission_of(access);
                 peerparty_core::set_attr(&mut lobby_now.attrs, str_attr("acc".into(), &access.to_string(), true));
             }
             if u.lock != 0 {

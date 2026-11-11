@@ -5,9 +5,17 @@
 use crate::id::PeerId;
 use crate::lobby::{Attr, Filter, Lobby, Member, Op, Permission, Query, Value};
 
-pub const VERSION: u16 = 2;
+/// 3: the hello carries the sender's key and is followed by `Proof`; a peer id is its
+/// key's hash.
+pub const VERSION: u16 = 3;
 /// Larger frames are a broken or hostile peer.
 pub const MAX_FRAME: usize = 1 << 24;
+/// Room set aside for a list before its elements are read, at most. A count only has to
+/// be no more than the bytes left in the frame (`R::count`), and an element in memory is
+/// many times its smallest form on the wire: a frame that only claims millions of
+/// lobbies must not get gigabytes set aside for them (a 32-bit game has no such room,
+/// and running out ends the process). The list still grows as far as real elements come.
+const PREALLOC: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JoinResult {
@@ -27,6 +35,17 @@ pub enum Msg {
         name: String,
         /// Our data socket's UDP port, for unreliable channel data (0: none).
         udp: u16,
+        /// The sender's public key, which `id` is the hash of (`PeerId::of_key`).
+        key: [u8; 32],
+        /// Made up for this connection: what the other side's `Proof` signs.
+        nonce: [u8; 16],
+    },
+    /// Sent once each way, right after the hellos: the sender's signature
+    /// (`IdentityKey::sign_hello`) over both hellos' ids and nonces, which shows it
+    /// holds the key its id comes from. Nothing else is taken from a connection before
+    /// it.
+    Proof {
+        sig: [u8; 64],
     },
     Search {
         search: u64,
@@ -247,7 +266,7 @@ impl<'a> R<'a> {
     }
     fn attrs(&mut self) -> Option<Vec<Attr>> {
         let n = self.count()?;
-        let mut out = Vec::with_capacity(n);
+        let mut out = Vec::with_capacity(n.min(PREALLOC));
         for _ in 0..n {
             out.push(Attr {
                 key: self.str()?,
@@ -267,7 +286,7 @@ impl<'a> R<'a> {
         let flags = self.u8()?;
         let attrs = self.attrs()?;
         let n = self.count()?;
-        let mut members = Vec::with_capacity(n);
+        let mut members = Vec::with_capacity(n.min(PREALLOC));
         for _ in 0..n {
             members.push(Member {
                 id: self.id()?,
@@ -310,7 +329,7 @@ impl<'a> R<'a> {
         let member = self.id()?;
         let max_results = self.u32()?;
         let n = self.count()?;
-        let mut filters = Vec::with_capacity(n);
+        let mut filters = Vec::with_capacity(n.min(PREALLOC));
         for _ in 0..n {
             filters.push(match self.u8()? {
                 0 => Filter::Attr {
@@ -364,6 +383,8 @@ impl Msg {
                 id,
                 name,
                 udp,
+                key,
+                nonce,
             } => {
                 w.u8(1);
                 w.u16(*version);
@@ -371,6 +392,12 @@ impl Msg {
                 w.id(id);
                 w.str(name);
                 w.u16(*udp);
+                w.0.extend_from_slice(key);
+                w.0.extend_from_slice(nonce);
+            }
+            Msg::Proof { sig } => {
+                w.u8(18);
+                w.0.extend_from_slice(sig);
             }
             Msg::Search { search, query } => {
                 w.u8(2);
@@ -469,7 +496,10 @@ impl Msg {
                 id: r.id()?,
                 name: r.str()?,
                 udp: r.u16()?,
+                key: r.take(32)?.try_into().ok()?,
+                nonce: r.take(16)?.try_into().ok()?,
             },
+            18 => Msg::Proof { sig: r.take(64)?.try_into().ok()? },
             2 => Msg::Search {
                 search: r.u64()?,
                 query: r.query()?,
@@ -477,7 +507,7 @@ impl Msg {
             3 => {
                 let search = r.u64()?;
                 let n = r.count()?;
-                let mut lobbies = Vec::with_capacity(n);
+                let mut lobbies = Vec::with_capacity(n.min(PREALLOC));
                 for _ in 0..n {
                     lobbies.push(r.lobby()?);
                 }
@@ -507,7 +537,7 @@ impl Msg {
             14 => Msg::ChanClose { socket: r.str()? },
             15 => {
                 let n = r.count()?;
-                let mut kv = Vec::with_capacity(n);
+                let mut kv = Vec::with_capacity(n.min(PREALLOC));
                 for _ in 0..n {
                     kv.push((r.str()?, r.str()?));
                 }
@@ -599,7 +629,10 @@ mod tests {
                 id: PeerId([1; 16]),
                 name: "n".into(),
                 udp: 50000,
+                key: [7; 32],
+                nonce: [8; 16],
             },
+            Msg::Proof { sig: [9; 64] },
             Msg::Search { search: 9, query },
             Msg::SearchReply {
                 search: 9,
@@ -651,6 +684,38 @@ mod tests {
         assert!(Msg::decode(&padded).is_none());
         // A count far larger than the frame.
         assert!(Msg::decode(&[3, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0x7f]).is_none());
+    }
+
+    /// A list longer than the room set aside up front still decodes whole.
+    #[test]
+    fn long_lists_outgrow_the_room_set_aside() {
+        let n = PREALLOC * 4 + 3;
+        let kv: Vec<(String, String)> = (0..n).map(|i| (format!("k{i}"), "v".into())).collect();
+        let m = Msg::Presence { kv };
+        assert_eq!(Msg::decode(&m.encode()), Some(m));
+        let mut lobby = Lobby::new("eos.lobby");
+        lobby.attrs = (0..n).map(|i| Attr { key: format!("a{i}"), value: Value::Int(i as i64), public: true }).collect();
+        lobby.members = (0..n).map(|i| Member { id: PeerId([i as u8; 16]), attrs: Vec::new() }).collect();
+        let m = Msg::SearchReply { search: 1, lobbies: vec![lobby; 3] };
+        assert_eq!(Msg::decode(&m.encode()), Some(m));
+    }
+
+    /// A frame that claims as many elements as it has bytes, with none of them there, is
+    /// dropped without room for them being set aside first (16 million lobbies would be
+    /// gigabytes: more than a 32-bit game has).
+    #[test]
+    fn a_count_without_its_elements_costs_nothing() {
+        for kind in [3u8, 15] {
+            let mut frame = vec![kind];
+            if kind == 3 {
+                frame.extend_from_slice(&0u64.to_le_bytes());
+            }
+            let rest = MAX_FRAME - frame.len() - 4;
+            frame.extend_from_slice(&(rest as u32).to_le_bytes());
+            frame.resize(frame.len() + rest, 0xff);
+            assert_eq!(frame.len(), MAX_FRAME);
+            assert!(Msg::decode(&frame).is_none());
+        }
     }
 
     #[test]

@@ -30,6 +30,27 @@ use crate::log;
 use crate::net;
 
 pub const EVENT_NAME: &str = "Local\\peerparty.invite";
+/// Set by the launcher's own "Invite" button: for the game that was last in front (the
+/// launcher is in front when its button is pressed, so no game is).
+pub const EVENT_LAST: &str = "Local\\peerparty.invite.last";
+/// Set by the copy that acts on either, so whoever asked can say whether a game did.
+pub const EVENT_ACK: &str = "Local\\peerparty.invite.ack";
+/// Four bytes shared by every hooked game: the process id of the one last in front.
+const FRONT_MAP: &str = "Local\\peerparty.front";
+
+/// Where the last game in front writes its process id (null if it couldn't be shared).
+fn front_slot() -> *mut u32 {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_ALL_ACCESS, MapViewOfFile, PAGE_READWRITE};
+    let name: Vec<u16> = FRONT_MAP.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        let map = CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, 4, name.as_ptr());
+        if map.is_null() {
+            return std::ptr::null_mut();
+        }
+        MapViewOfFile(map, FILE_MAP_ALL_ACCESS, 0, 0, 4).Value.cast()
+    }
+}
 
 /// The lobby we're in, EOS or Steam.
 fn here() -> Option<Lobby> {
@@ -302,13 +323,35 @@ impl Pending {
 type Key = (PeerId, String, Option<String>);
 
 static PENDING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
-static FORCED: Mutex<Vec<Key>> = Mutex::new(Vec::new());
+/// Invites the player accepted, and when a front end was first told so. A game often
+/// runs two SDKs' front ends, each handed the same invite and each asking `decision`:
+/// all of them hear "accepted" for `FORCED_FOR` from the first, not only whichever
+/// asked first.
+static FORCED: Mutex<Vec<(Key, Option<Instant>)>> = Mutex::new(Vec::new());
+const FORCED_FOR: Duration = Duration::from_secs(2);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 /// Bumped whenever the pending list changes, so ipc.rs knows to send it.
 pub static CHANGES: AtomicU64 = AtomicU64::new(0);
 
 /// Unanswered invites are dropped after this long.
 const PENDING_FOR: Duration = Duration::from_secs(600);
+/// Invites waiting at most, from one player and in all: a new one takes the place of
+/// that player's oldest (or the oldest of all). Nobody sorts through more than a few,
+/// and each is a row in the overlay and in every state update sent to it.
+const PENDING_PER_PLAYER: usize = 3;
+const PENDING_MAX: usize = 32;
+
+/// Adds an invite to the waiting ones, within the limits.
+fn push_pending(p: &mut Vec<Pending>, new: Pending) {
+    while p.iter().filter(|x| x.from == new.from).count() >= PENDING_PER_PLAYER {
+        let Some(i) = p.iter().position(|x| x.from == new.from) else { break };
+        p.remove(i);
+    }
+    while p.len() >= PENDING_MAX {
+        p.remove(0);
+    }
+    p.push(new);
+}
 
 fn key(from: PeerId, connect: &str, lobby: Option<&Lobby>) -> Key {
     (from, connect.to_string(), lobby.map(|l| l.id.clone()))
@@ -322,24 +365,41 @@ pub fn decision(from: PeerId, connect: &str, lobby: Option<&Lobby>) -> Decision 
         if let Some(i) = j.iter().position(|(p, t)| *p == from && t.elapsed() < JOIN_WAIT) {
             j.remove(i);
             log!("join: {from} invited us as asked; accepted");
+            FORCED.lock().unwrap().push((k, Some(Instant::now())));
             return Decision::Forced;
         }
     }
     {
         let mut forced = FORCED.lock().unwrap();
-        if let Some(i) = forced.iter().position(|f| *f == k) {
-            forced.remove(i);
+        forced.retain(|(_, told)| told.is_none_or(|t| t.elapsed() < FORCED_FOR));
+        if let Some((_, told)) = forced.iter_mut().find(|(f, _)| *f == k) {
+            told.get_or_insert_with(Instant::now);
             return Decision::Forced;
         }
     }
     if auto_for(from) { Decision::Auto } else { Decision::Ask }
 }
 
-/// Invites accepted without asking: when the player said so, and never from a public
-/// player (a stranger), whose invites always wait for the player.
+/// Invites accepted without asking: when the player said so, or when there's no
+/// overlay to ask in, and never from a public player (a stranger), whose invites
+/// always wait for the player.
 fn auto_for(from: PeerId) -> bool {
-    crate::settings::auto_accept()
-        && crate::net::lan_if_started().and_then(|l| l.peer_trust(from)) != Some(peerparty_core::Trust::Public)
+    let trust = crate::net::lan_if_started().and_then(|l| l.peer_trust(from));
+    auto_rule(crate::settings::auto_accept(), overlay_on(), trust)
+}
+
+/// `auto_for` from what it depends on. With the overlay off (the game started without
+/// the launcher's pipe) an invite that waited would wait until it expired, since
+/// nothing can show it: LAN and room players' invites go through as if auto-accept
+/// were on. A stranger's still wait, and so go nowhere, which is the safe side.
+fn auto_rule(auto_accept: bool, overlay: bool, trust: Option<peerparty_core::Trust>) -> bool {
+    trust != Some(peerparty_core::Trust::Public) && (auto_accept || !overlay)
+}
+
+/// Whether the overlay can show waiting invites. Tests run without the launcher's pipe
+/// and test the waiting itself, so they count as having one.
+fn overlay_on() -> bool {
+    cfg!(test) || crate::ipc::enabled()
 }
 
 /// A fresh invite from the LAN (net.rs, before it reaches the front ends). Unless
@@ -355,7 +415,7 @@ pub fn arrived(ev: &Event) {
     p.retain(|x| key(x.from, &x.connect, x.lobby.as_ref()) != k);
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     log!("invite {id} from {from} waits for the player (auto-accept is off)");
-    p.push(Pending { id, from: *from, connect: connect.clone(), lobby: lobby.clone(), at: Instant::now() });
+    push_pending(&mut p, Pending { id, from: *from, connect: connect.clone(), lobby: lobby.clone(), at: Instant::now() });
     CHANGES.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -375,7 +435,7 @@ pub fn code_arrived(from: PeerId, code: &str) {
     p.retain(|x| x.at.elapsed() < PENDING_FOR && !(x.from == from && x.connect == connect));
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     log!("room code {code} from {from} waits for the player (pending {id})");
-    p.push(Pending { id, from, connect, lobby: None, at: Instant::now() });
+    push_pending(&mut p, Pending { id, from, connect, lobby: None, at: Instant::now() });
     CHANGES.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -414,7 +474,7 @@ pub fn accept(id: u64) -> bool {
         return true;
     }
     log!("invite {id} from {} accepted by the player", inv.from);
-    FORCED.lock().unwrap().push(key(inv.from, &inv.connect, inv.lobby.as_ref()));
+    FORCED.lock().unwrap().push((key(inv.from, &inv.connect, inv.lobby.as_ref()), None));
     net::redeliver(Event::Invite { from: inv.from, connect: inv.connect, lobby: inv.lobby });
     true
 }
@@ -495,10 +555,16 @@ fn xinput() -> Option<GetStateFn> {
 /// turned on; with them off (the default) the thread sleeps in the wait.
 fn run() {
     use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
-    use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
-    let name: Vec<u16> = EVENT_NAME.encode_utf16().chain(Some(0)).collect();
+    use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects, WaitForSingleObject};
     // Manual reset: `peerparty --invite` sets it, then clears it a moment later.
-    let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, name.as_ptr()) };
+    let open = |name: &str| {
+        let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        unsafe { CreateEventW(std::ptr::null(), 1, 0, name.as_ptr()) }
+    };
+    let (event, last, ack) = (open(EVENT_NAME), open(EVENT_LAST), open(EVENT_ACK));
+    let front = front_slot();
+    let me = std::process::id();
+    let mut last_was_set = false;
     let mut get_state: Option<Option<GetStateFn>> = None;
     log!(
         "invite triggers: `peerparty --invite`, the overlay{}",
@@ -515,20 +581,38 @@ fn run() {
     let mut combo_fired = [false; 4];
     loop {
         let buttons = crate::settings::invite_buttons();
-        let wait = if buttons == 0 && !was_set { 1000 } else { 50 };
+        let wait = if buttons == 0 && !was_set && !last_was_set { 1000 } else { 50 };
         if event.is_null() {
             std::thread::sleep(Duration::from_millis(u64::from(wait)));
         } else {
-            let set = unsafe { WaitForSingleObject(event, wait) } == WAIT_OBJECT_0;
-            if set && !was_set && in_front() {
-                log!("invite: triggered by peerparty --invite");
+            // Sleeps until either is set, or the time is up.
+            if last.is_null() {
+                unsafe { WaitForSingleObject(event, wait) };
+            } else {
+                unsafe { WaitForMultipleObjects(2, [event, last].as_ptr(), 0, wait) };
+            }
+            let set = unsafe { WaitForSingleObject(event, 0) } == WAIT_OBJECT_0;
+            let in_front = in_front();
+            if in_front && !front.is_null() {
+                unsafe { front.write_volatile(me) };
+            }
+            // The launcher's button: its window is in front, so the game meant is the
+            // one that was before it.
+            let last_set = !last.is_null() && unsafe { WaitForSingleObject(last, 0) } == WAIT_OBJECT_0;
+            let mine = in_front || (!front.is_null() && unsafe { front.read_volatile() } == me);
+            if (set && !was_set && in_front) || (last_set && !last_was_set && mine) {
+                log!("invite: triggered by {}", if set { "peerparty --invite" } else { "the launcher" });
+                if !ack.is_null() {
+                    unsafe { SetEvent(ack) };
+                }
                 everyone();
             }
-            if set {
+            if set || last_set {
                 // Still set: don't spin on it until the sender clears it.
                 std::thread::sleep(Duration::from_millis(50));
             }
             was_set = set;
+            last_was_set = last_set;
         }
         if buttons == 0 || !in_front() {
             guide_down = [false; 4];
@@ -592,7 +676,12 @@ mod tests {
         assert!(accept(id));
         assert!(pending().iter().all(|x| x.from != from));
         assert_eq!(decision(from, "+connect_lobby 1", None), Decision::Forced);
-        // Used up: the next delivery is an ordinary one again.
+        // A second front end handed the same delivery hears the same.
+        assert_eq!(decision(from, "+connect_lobby 1", None), Decision::Forced);
+        // Used up a moment later: the next delivery is an ordinary one again.
+        for (_, told) in FORCED.lock().unwrap().iter_mut().filter(|(k, _)| k.0 == from) {
+            *told = Instant::now().checked_sub(FORCED_FOR);
+        }
         assert_eq!(decision(from, "+connect_lobby 1", None), Decision::Ask);
         arrived(&ev);
         let id = pending().iter().find(|x| x.from == from).unwrap().id;
@@ -611,6 +700,39 @@ mod tests {
         arrived(&from_host);
         assert!(pending().iter().all(|x| x.from != host));
         assert_eq!(decision(host, "x", None), Decision::Forced);
+    }
+
+    /// With the overlay off nothing can answer a waiting invite, so a LAN or room
+    /// player's goes through; a stranger's never does without the player.
+    #[test]
+    fn without_the_overlay_friends_invites_go_through() {
+        use peerparty_core::Trust;
+        for trust in [None, Some(Trust::Lan), Some(Trust::Room)] {
+            assert!(auto_rule(false, false, trust), "{trust:?}, overlay off");
+            assert!(!auto_rule(false, true, trust), "{trust:?}, overlay on, asking");
+            assert!(auto_rule(true, true, trust), "{trust:?}, auto-accept on");
+        }
+        for (auto, overlay) in [(false, false), (false, true), (true, false), (true, true)] {
+            assert!(!auto_rule(auto, overlay, Some(Trust::Public)), "public, {auto} {overlay}");
+        }
+    }
+
+    #[test]
+    fn waiting_invites_are_bounded() {
+        let inv = |from: u8, n: u64| Pending { id: n, from: PeerId([from; 16]), connect: format!("c{n}"), lobby: None, at: Instant::now() };
+        let mut p = Vec::new();
+        for n in 0..10 {
+            push_pending(&mut p, inv(1, n));
+        }
+        // One player's newest few are kept.
+        assert_eq!(p.iter().map(|x| x.id).collect::<Vec<_>>(), [7, 8, 9]);
+        // Many players: the oldest of all make room.
+        for from in 2..100u8 {
+            push_pending(&mut p, inv(from, 1000 + u64::from(from)));
+        }
+        assert_eq!(p.len(), PENDING_MAX);
+        assert_eq!(p.last().unwrap().id, 1099);
+        assert!(p.iter().all(|x| x.from != PeerId([1; 16])), "the oldest went first");
     }
 
     #[test]

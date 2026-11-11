@@ -43,6 +43,9 @@ pub struct GameState {
     /// Why there's nothing to invite to (empty when inviting works).
     pub invite_note: String,
     pub sdks: Vec<String>,
+    /// Other stores' overlays loaded in the game ("steam", "epic", "ea"): their hotkeys
+    /// open theirs too.
+    pub foreign: Vec<String>,
     /// Internet play: a room and / or public sessions (the Internet page).
     pub internet: Vec<NetInfo>,
     /// The internet switch: whether internet play is on, and whether there's a room code
@@ -219,6 +222,7 @@ impl GameState {
             codes: v.get("codes").and_then(Value::as_bool).unwrap_or(false),
             invite_note: s(v, "invite_note"),
             sdks: arr(v, "sdks").iter().filter_map(|x| x.as_str().map(String::from)).collect(),
+            foreign: arr(v, "foreign").iter().filter_map(|x| x.as_str().map(String::from)).collect(),
             internet: internet_list
                 .iter()
                 .map(|n| {
@@ -391,6 +395,9 @@ struct Row {
     header: bool,
     icon: Option<Icon>,
     tone: Tone,
+    /// What the row is about, when its title doesn't say it alone (two invites or two
+    /// players can read the same): see `key`.
+    id: String,
 }
 
 impl Row {
@@ -408,7 +415,15 @@ impl Row {
             header: false,
             icon: None,
             tone: Tone::Plain,
+            id: String::new(),
         }
+    }
+
+    /// The row across state updates: the selection stays on it while rows come and go
+    /// round it. Its action can't be the key (`Accept(1)` is another invite once the
+    /// first one is gone); its id, or else its title and button, can.
+    fn key(&self) -> String {
+        if self.id.is_empty() { format!("{}\u{1f}{}", self.title, self.main_label) } else { self.id.clone() }
     }
 
     fn header(title: impl Into<String>) -> Row {
@@ -445,6 +460,9 @@ impl Row {
     }
 }
 
+/// How long Select waits after the selected row went away (`Overlay::sel_moved`).
+const MOVED_HOLD: Duration = Duration::from_millis(300);
+
 /// A small left (`dir` -1) or right (1) pointing triangle centred on `c`.
 fn arrow(p: &egui::Painter, c: Pos2, dir: f32) {
     let (w, h) = (4.0, 5.0);
@@ -464,6 +482,12 @@ pub struct Overlay {
     pub invite_mode: bool,
     sel: usize,
     scroll_to_sel: bool,
+    /// The selected row's `Row::key`, to find it again after a state update.
+    sel_key: Option<String>,
+    /// When the selected row went away and the selection moved to its neighbour: Select
+    /// waits a moment (`MOVED_HOLD`), a press meant for the row that went doesn't act on
+    /// the one that took its place.
+    sel_moved: Option<Instant>,
     pub state: GameState,
     pub game_name: String,
     pub toasts: Vec<Toast>,
@@ -521,6 +545,8 @@ impl Overlay {
             invite_mode: false,
             sel: 0,
             scroll_to_sel: false,
+            sel_key: None,
+            sel_moved: None,
             state: GameState::default(),
             game_name,
             toasts: Vec::new(),
@@ -538,6 +564,29 @@ impl Overlay {
         self.page = page;
         self.invite_mode = invite_mode;
         self.sel = 0;
+        self.scroll_to_sel = true;
+        self.sel_key = None;
+        self.sel_moved = None;
+    }
+
+    /// Puts the selection back on its row after the rows changed under it (the hook's
+    /// state adds and removes invites and problem rows above it). A row that is gone
+    /// leaves the selection on the nearest one, for which Select waits a moment.
+    fn follow(&mut self, rows: &[Row]) {
+        let Some(key) = self.sel_key.as_deref() else { return };
+        if rows.get(self.sel).is_some_and(|r| r.selectable && r.key() == key) {
+            return;
+        }
+        if let Some(i) = rows.iter().position(|r| r.selectable && r.key() == key) {
+            self.sel = i;
+        } else {
+            let at = self.sel;
+            if let Some(i) = (0..rows.len()).filter(|&i| rows[i].selectable).min_by_key(|&i| i.abs_diff(at)) {
+                self.sel = i;
+            }
+            self.sel_moved = Some(Instant::now());
+        }
+        self.sel_key = rows.get(self.sel).filter(|r| r.selectable).map(Row::key);
         self.scroll_to_sel = true;
     }
 
@@ -587,14 +636,13 @@ impl Overlay {
             .iter()
             .enumerate()
             .map(|(i, p)| {
-                if !p.code.is_empty() {
-                    return Row::action(t!("overlay.code_from", name = p.name, code = p.code), t!("overlay.code_answer"), Action::Accept(i), t!("overlay.type_code"))
+                let row = if !p.code.is_empty() {
+                    Row::action(t!("overlay.code_from", name = p.name, code = p.code), t!("overlay.code_answer"), Action::Accept(i), t!("overlay.type_code"))
                         .second(Action::Decline(i), t!("overlay.dismiss"))
-                        .icon(Icon::Bell, Tone::Good);
-                }
-                Row::action(invite_text(&p.name, &p.kind), t!("overlay.invite_answer"), Action::Accept(i), t!("overlay.accept"))
-                    .second(Action::Decline(i), t!("overlay.decline"))
-                    .icon(Icon::Bell, Tone::Good)
+                } else {
+                    Row::action(invite_text(&p.name, &p.kind), t!("overlay.invite_answer"), Action::Accept(i), t!("overlay.accept")).second(Action::Decline(i), t!("overlay.decline"))
+                };
+                Row { id: format!("invite {}", p.id), ..row.icon(Icon::Bell, Tone::Good) }
             })
             .collect()
     }
@@ -724,7 +772,7 @@ impl Overlay {
                     } else {
                         Row::action(p.name.clone(), detail, Action::Join(i), t!("overlay.join")).second(Action::Invite(i), t!("overlay.invite"))
                     };
-                    rows.push(r.icon(icon, if p.with_me { Tone::Good } else { Tone::Plain }));
+                    rows.push(Row { id: format!("peer {}", p.id), ..r.icon(icon, if p.with_me { Tone::Good } else { Tone::Plain }) });
                 }
                 rows
             }
@@ -1006,6 +1054,12 @@ impl Overlay {
         // already acted on.
         if ui.ctx().current_pass_index() > 0 {
             nav = Nav::default();
+        }
+        let rows = self.rows(prefs);
+        self.follow(&rows);
+        if self.sel_moved.is_some_and(|t| t.elapsed() < MOVED_HOLD) {
+            nav.select = false;
+            nav.second = false;
         }
         // Left / right change the selected row's value when it has one, and switch pages
         // otherwise.
@@ -1323,6 +1377,7 @@ impl Overlay {
         if let Some(tip) = &self.tip {
             plate(tip, 13.0, TEXT, below);
         }
+        self.sel_key = rows.get(self.sel).filter(|r| r.selectable).map(Row::key);
         if pending_action != Action::None {
             self.act(pending_action, prefs, out);
         }
@@ -1714,6 +1769,85 @@ mod tests {
         out.clear();
         o.act(Action::Accept(0), &mut prefs, &mut out);
         assert!(out.iter().any(|c| matches!(c, Cmd::Hook(v) if v["t"] == "accept" && v["id"] == 7)) && out.iter().any(|c| matches!(c, Cmd::Close)));
+    }
+
+    /// Draws one frame and returns what it asked for.
+    fn press(ctx: &egui::Context, tex: &mut Textures, o: &mut Overlay, prefs: &mut Prefs, nav: Nav) -> Vec<Cmd> {
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 900.0))), ..Default::default() };
+        let mut cmds = Vec::new();
+        let out = ctx.run_ui(input, |ui| o.frame(ui, nav, prefs, &mut cmds));
+        tex.apply(out.textures_delta);
+        cmds
+    }
+
+    fn invites_state(pending: &[(u64, &str)], unreachable: u32) -> GameState {
+        let pending: Vec<serde_json::Value> = pending.iter().map(|(id, name)| serde_json::json!({"id": id, "from": name, "name": name, "kind": "invited you"})).collect();
+        GameState::from_json(&serde_json::json!({"t": "state", "can_invite": true, "lan_unreachable": unreachable, "pending": pending}))
+    }
+
+    fn accepted(cmds: &[Cmd]) -> Option<u64> {
+        cmds.iter().find_map(|c| match c {
+            Cmd::Hook(v) if v["t"] == "accept" => v["id"].as_u64(),
+            _ => None,
+        })
+    }
+
+    /// The selection stays on its row while the hook's state adds a row above it or
+    /// takes one away: Select accepts the invite that was selected, not whatever row now
+    /// has its place.
+    #[test]
+    fn the_selection_follows_its_row_through_state_updates() {
+        crate::i18n::set("en");
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let (mut tex, mut prefs) = (Textures::default(), Prefs::default());
+        let mut o = Overlay::new("Game".into());
+        o.state = invites_state(&[(3, "Alex"), (4, "Pat")], 0);
+        o.open(Page::Home, false);
+        press(&ctx, &mut tex, &mut o, &mut prefs, Nav::default());
+        let on_pat = |o: &Overlay| o.rows(&Prefs::default())[o.sel].title.contains("Pat");
+        for _ in 0..6 {
+            if on_pat(&o) {
+                break;
+            }
+            press(&ctx, &mut tex, &mut o, &mut prefs, Nav { down: true, ..Nav::default() });
+        }
+        assert!(on_pat(&o), "Pat's invite is never selected");
+        // A problem row appears on top.
+        o.state = invites_state(&[(3, "Alex"), (4, "Pat")], 1);
+        press(&ctx, &mut tex, &mut o, &mut prefs, Nav::default());
+        assert!(on_pat(&o), "a row above moved the selection to {:?}", o.rows(&prefs)[o.sel].title);
+        // Alex's invite is answered elsewhere, just before A is pressed on Pat's.
+        o.state = invites_state(&[(4, "Pat")], 1);
+        let cmds = press(&ctx, &mut tex, &mut o, &mut prefs, Nav { select: true, ..Nav::default() });
+        assert_eq!(accepted(&cmds), Some(4));
+    }
+
+    /// The selected row itself goes away: the selection moves to its neighbour, and a
+    /// Select pressed right then (meant for the row that went) does nothing; a moment
+    /// later it acts again.
+    #[test]
+    fn select_waits_a_moment_when_the_selected_row_goes() {
+        crate::i18n::set("en");
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let (mut tex, mut prefs) = (Textures::default(), Prefs::default());
+        let mut o = Overlay::new("Game".into());
+        o.state = invites_state(&[(3, "Alex"), (4, "Pat")], 0);
+        o.open(Page::Home, false);
+        press(&ctx, &mut tex, &mut o, &mut prefs, Nav::default());
+        while !o.rows(&prefs)[o.sel].title.contains("Pat") {
+            press(&ctx, &mut tex, &mut o, &mut prefs, Nav { down: true, ..Nav::default() });
+        }
+        o.state = invites_state(&[(3, "Alex")], 0);
+        let cmds = press(&ctx, &mut tex, &mut o, &mut prefs, Nav { select: true, ..Nav::default() });
+        assert!(cmds.is_empty(), "Select acted at once on {:?}", o.rows(&prefs)[o.sel].title);
+        std::thread::sleep(MOVED_HOLD + Duration::from_millis(50));
+        while !o.rows(&prefs)[o.sel].title.contains("Alex") {
+            press(&ctx, &mut tex, &mut o, &mut prefs, Nav { up: true, ..Nav::default() });
+        }
+        let cmds = press(&ctx, &mut tex, &mut o, &mut prefs, Nav { select: true, ..Nav::default() });
+        assert_eq!(accepted(&cmds), Some(3));
     }
 
     /// Draws one frame and returns its pixels.

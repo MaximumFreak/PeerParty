@@ -238,10 +238,11 @@ pub fn names(b: u32) -> String {
 }
 
 fn xinput() -> Option<GetStateFn> {
-    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW};
     for dll in ["xinput1_4.dll", "xinput1_3.dll"] {
         let wide: Vec<u16> = dll.encode_utf16().chain(Some(0)).collect();
-        let m = unsafe { LoadLibraryW(wide.as_ptr()) };
+        // From System32 and nowhere else (see `only_system_dlls` in main.rs).
+        let m = unsafe { LoadLibraryExW(wide.as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
         if m.is_null() {
             continue;
         }
@@ -294,6 +295,77 @@ fn hat(v: u8) -> u32 {
 
 fn axis(v: u8) -> f32 {
     (v as f32 - 128.0) / 127.0
+}
+
+/// A value's logical range from a generic pad's report descriptor, and its size in bits.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Range {
+    min: i32,
+    max: i32,
+    bits: u16,
+}
+
+impl Range {
+    fn new(min: i32, max: i32, bits: u16) -> Range {
+        // A maximum written in too few bytes (65535 as two) comes back negative: it
+        // means the field's unsigned top.
+        let max = if max < min && min >= 0 && (1..32).contains(&bits) { ((1i64 << bits) - 1) as i32 } else { max };
+        Range { min, max, bits }
+    }
+
+    /// The raw field as the number the descriptor means: a range below zero is
+    /// two's complement in `bits`.
+    fn signed(self, v: u32) -> i64 {
+        if self.min < 0 && (1..32).contains(&self.bits) && (v >> (self.bits - 1)) & 1 == 1 {
+            v as i64 - (1i64 << self.bits)
+        } else {
+            v as i64
+        }
+    }
+}
+
+/// A generic pad's stick and hat ranges, read once when it's opened.
+#[derive(Clone, Copy, Debug, Default)]
+struct Ranges {
+    x: Option<Range>,
+    y: Option<Range>,
+    hat: Option<Range>,
+}
+
+/// A stick value as -1..1 across its range. Without one (a descriptor Windows
+/// couldn't read), a guess: 8 or 16 bits, unsigned.
+fn stick(v: u32, r: Option<Range>) -> f32 {
+    match r {
+        Some(r) if r.max > r.min => {
+            let v = r.signed(v).clamp(r.min as i64, r.max as i64) as f64;
+            let half = (r.max as f64 - r.min as f64) / 2.0;
+            ((v - r.min as f64 - half) / half) as f32
+        }
+        _ if v <= 255 => axis(v as u8),
+        _ => ((v as f32 - 32768.0) / 32767.0).clamp(-1.0, 1.0),
+    }
+}
+
+/// The d-pad from a hat value: positions count from the range's minimum (some pads
+/// start at 1), 4 of them on a 4-way hat. Outside the range is the null value pads send
+/// for released, not a direction.
+fn hat_in(v: u32, r: Option<Range>) -> u32 {
+    let Some(r) = r else { return hat(v.min(255) as u8) };
+    let v = r.signed(v);
+    if v < r.min as i64 || v > r.max as i64 || r.max - r.min > 8 {
+        return 0;
+    }
+    let pos = (v - r.min as i64) as u8;
+    if r.max - r.min == 3 { hat(pos * 2) } else { hat(pos) }
+}
+
+/// The logical range of Generic Desktop `usage` in a pad's input reports.
+fn value_range(pre: isize, usage: u16) -> Option<Range> {
+    use windows_sys::Win32::Devices::HumanInterfaceDevice::{HIDP_VALUE_CAPS, HidP_GetSpecificValueCaps, HidP_Input};
+    let mut caps: [HIDP_VALUE_CAPS; 4] = unsafe { std::mem::zeroed() };
+    let mut n = caps.len() as u16;
+    let rc = unsafe { HidP_GetSpecificValueCaps(HidP_Input, 0x01, 0, usage, caps.as_mut_ptr(), &mut n, pre) };
+    (rc == 0x0011_0000 && n >= 1).then(|| Range::new(caps[0].LogicalMin, caps[0].LogicalMax, caps[0].BitSize))
 }
 
 /// DualShock 4 / DualSense in their common layout: sticks at 0..4, buttons from `b`.
@@ -468,6 +540,7 @@ fn open_hid(list: &Arc<Mutex<Vec<Hid>>>, path: String) {
         home: true,
     });
     let (vid, pid, len) = (attr.VendorID, attr.ProductID, caps.InputReportByteLength as usize);
+    let ranges = Ranges { x: value_range(pre, 0x30), y: value_range(pre, 0x31), hat: value_range(pre, 0x39) };
     let (h, pre) = (h as usize, pre);
     std::thread::spawn(move || {
         let mut buf = vec![0u8; len.max(64)];
@@ -480,7 +553,7 @@ fn open_hid(list: &Arc<Mutex<Vec<Hid>>>, path: String) {
                 break;
             }
             let report = &buf[..got as usize];
-            let parsed = parse_known(vid, pid, report).or_else(|| parse_generic(pre, report));
+            let parsed = parse_known(vid, pid, report).or_else(|| parse_generic(pre, ranges, report));
             if let Some(s) = parsed {
                 *state.lock().unwrap() = s;
             }
@@ -495,8 +568,9 @@ fn open_hid(list: &Arc<Mutex<Vec<Hid>>>, path: String) {
 /// (south, east, west, north: the common order), 5-6 shoulders, 7-8 back / start, 13 home;
 /// the hat switch as the d-pad; X / Y as the left stick. Home is also whichever of the
 /// usages pads give it instead of a button number: Generic Desktop's System Main Menu
-/// (0x85) and Consumer's AC Home (0x223).
-fn parse_generic(pre: isize, report: &[u8]) -> Option<State> {
+/// (0x85) and Consumer's AC Home (0x223). Sticks and hat are read by their descriptor's
+/// `ranges`: a centred stick isn't always 128, and a released hat isn't always 8.
+fn parse_generic(pre: isize, ranges: Ranges, report: &[u8]) -> Option<State> {
     use windows_sys::Win32::Devices::HumanInterfaceDevice::{HidP_GetUsageValue, HidP_GetUsages, HidP_Input};
     let mut usages = [0u16; 32];
     let mut n = usages.len() as u32;
@@ -539,11 +613,10 @@ fn parse_generic(pre: isize, report: &[u8]) -> Option<State> {
         (rc == 0x0011_0000).then_some(v)
     };
     if let Some(h) = value(0x39) {
-        buttons |= hat(h as u8);
+        buttons |= hat_in(h, ranges.hat);
     }
     let (lx, ly) = match (value(0x30), value(0x31)) {
-        (Some(x), Some(y)) if x <= 255 && y <= 255 => (axis(x as u8), -axis(y as u8)),
-        (Some(x), Some(y)) => ((x as f32 - 32768.0) / 32767.0, -((y as f32 - 32768.0) / 32767.0)),
+        (Some(x), Some(y)) => (stick(x, ranges.x), -stick(y, ranges.y)),
         _ => (0.0, 0.0),
     };
     Some(State { buttons, lx, ly })
@@ -573,6 +646,34 @@ mod tests {
         assert_eq!(from_xinput(&x).buttons, SOUTH | START | UP);
         // Stick folds into the d-pad.
         assert_eq!(State { buttons: 0, lx: 0.0, ly: -0.9 }.with_stick(), DOWN);
+    }
+
+    /// Generic pads' values read by their descriptor's ranges.
+    #[test]
+    fn generic_values_follow_their_ranges() {
+        let near = |a: f32, b: f32| (a - b).abs() < 0.01;
+        // 8-bit unsigned, the common case: ends and middle.
+        let u8r = Some(Range::new(0, 255, 8));
+        assert!(near(stick(0, u8r), -1.0) && near(stick(255, u8r), 1.0) && near(stick(128, u8r), 0.0));
+        // Signed 16-bit: -1 arrives as 0xFFFF and is centred, not full right.
+        let s16 = Some(Range::new(-32768, 32767, 16));
+        assert!(near(stick(0xFFFF, s16), 0.0) && near(stick(0x8000, s16), -1.0) && near(stick(0x7FFF, s16), 1.0));
+        // 10-bit and 12-bit sticks: their own middle is centred.
+        assert!(near(stick(512, Some(Range::new(0, 1023, 10))), 0.0));
+        assert!(near(stick(2048, Some(Range::new(0, 4095, 12))), 0.0));
+        // 65535 written in two bytes reads back as -1: still 16-bit unsigned.
+        let wrapped = Some(Range::new(0, -1, 16));
+        assert!(near(stick(32768, wrapped), 0.0) && near(stick(65535, wrapped), 1.0));
+        // No range: the old guess.
+        assert!(near(stick(128, None), 0.0) && near(stick(32768, None), 0.0));
+        // Hat 0-7 with 8 as null, hat 1-8 with 0 as null, and 4-way 0-3.
+        let h07 = Some(Range::new(0, 7, 4));
+        assert_eq!((hat_in(0, h07), hat_in(3, h07), hat_in(8, h07), hat_in(15, h07)), (UP, RIGHT | DOWN, 0, 0));
+        let h18 = Some(Range::new(1, 8, 4));
+        assert_eq!((hat_in(1, h18), hat_in(8, h18), hat_in(0, h18)), (UP, LEFT | UP, 0));
+        let h03 = Some(Range::new(0, 3, 2));
+        assert_eq!((hat_in(1, h03), hat_in(3, h03)), (RIGHT, LEFT));
+        assert_eq!((hat_in(2, None), hat_in(258, None)), (RIGHT, 0));
     }
 
     /// One XInput pad on slot 0 whose buttons are `FAKE_BUTTONS`.

@@ -1,9 +1,11 @@
 //! GameInput (the GDK's input API, so most Microsoft Store games): while the overlay
 //! shows, `IGameInput::GetCurrentReading` keeps returning the reading it gave when the
 //! overlay opened (per input kind and device), `GetNextReading` finds nothing newer, and
-//! reading callbacks aren't called. The game sees its input stand still, whatever kind
-//! of device it reads, without PeerParty depending on the layout of GameInput's reading
-//! objects.
+//! reading callbacks aren't called. The game sees its controllers stand still, whatever
+//! kind they are, without PeerParty depending on the layout of GameInput's reading
+//! objects. Keyboard and mouse readings go through: the launcher's low-level hooks hold
+//! those back already, and let the release of a key held at opening through (held here,
+//! the Shift and Tab that opened the overlay would read down until it closed).
 //!
 //! Every API version has its own IGameInput (github.com/microsoftconnect/GameInput,
 //! include/v0..v2 and include/GameInput.h for v3): v0 is what `GameInputCreate` hands
@@ -26,7 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::{Slots, arm, module, proc_addr};
 use crate::log;
-use crate::overlay::visible;
+use crate::overlay::pads_held_back;
 
 type Current = unsafe extern "system" fn(usize, u32, usize, *mut usize) -> i32;
 type Next = unsafe extern "system" fn(usize, usize, u32, usize, *mut usize) -> i32;
@@ -54,6 +56,16 @@ static REGISTER_V0: Slots<RegisterV0, 2> = Slots::new();
 static REGISTER: Slots<Register, 6> = Slots::new();
 /// Readings held while the overlay shows: (kind, device, reading, AddRef'd).
 static HELD: Mutex<Vec<(u32, usize, usize)>> = Mutex::new(Vec::new());
+
+/// GameInputKindKeyboard and GameInputKindMouse.
+const KEYBOARD: u32 = 0x10;
+const MOUSE: u32 = 0x20;
+
+/// Whether reads of `kind` are held back: anything but keyboard and mouse alone (0 is
+/// "any kind", so held).
+fn held_kind(kind: u32) -> bool {
+    kind == 0 || kind & !(KEYBOARD | MOUSE) != 0
+}
 
 /// GAMEINPUT_E_READING_NOT_FOUND.
 const NOT_FOUND: i32 = 0x838A_0003_u32 as i32;
@@ -236,7 +248,7 @@ fn current_detours() -> [Current; 8] {
 
 fn current(i: usize, this: usize, kind: u32, device: usize, out: *mut usize) -> i32 {
     let Some(h) = CURRENT.hooks[i].get() else { return NOT_FOUND };
-    if !visible() || out.is_null() {
+    if !pads_held_back() || out.is_null() || !held_kind(kind) {
         return unsafe { h.call(this, kind, device, out) };
     }
     let mut held = HELD.lock().unwrap();
@@ -260,7 +272,7 @@ fn next_detours() -> [Next; 8] {
 
 fn next(i: usize, this: usize, reference: usize, kind: u32, device: usize, out: *mut usize) -> i32 {
     let Some(h) = NEXT.hooks[i].get() else { return NOT_FOUND };
-    if visible() && !out.is_null() {
+    if pads_held_back() && !out.is_null() && held_kind(kind) {
         unsafe { *out = 0 };
         return NOT_FOUND;
     }
@@ -272,26 +284,28 @@ fn next(i: usize, this: usize, reference: usize, kind: u32, device: usize, out: 
 struct Relay {
     callback: usize,
     context: usize,
+    /// Whether the kinds it was registered for are held back (`held_kind`).
+    held: bool,
 }
 
-fn relay_for(callback: usize, context: usize) -> usize {
-    Box::into_raw(Box::new(Relay { callback, context })) as usize
+fn relay_for(callback: usize, context: usize, kind: u32) -> usize {
+    Box::into_raw(Box::new(Relay { callback, context, held: held_kind(kind) })) as usize
 }
 
 unsafe extern "system" fn relay_v0(token: u64, relay: usize, reading: usize, overrun: bool) {
-    if visible() {
+    let r = unsafe { &*(relay as *const Relay) };
+    if r.held && pads_held_back() {
         return;
     }
-    let r = unsafe { &*(relay as *const Relay) };
     let f: CallbackV0 = unsafe { std::mem::transmute(r.callback) };
     unsafe { f(token, r.context, reading, overrun) }
 }
 
 unsafe extern "system" fn relay(token: u64, relay: usize, reading: usize) {
-    if visible() {
+    let r = unsafe { &*(relay as *const Relay) };
+    if r.held && pads_held_back() {
         return;
     }
-    let r = unsafe { &*(relay as *const Relay) };
     let f: Callback = unsafe { std::mem::transmute(r.callback) };
     unsafe { f(token, r.context, reading) }
 }
@@ -306,7 +320,7 @@ fn register_v0(i: usize, this: usize, device: usize, kind: u32, threshold: f32, 
     if callback == 0 {
         return unsafe { h.call(this, device, kind, threshold, context, callback, token) };
     }
-    let r = relay_for(callback, context);
+    let r = relay_for(callback, context, kind);
     let hr = unsafe { h.call(this, device, kind, threshold, r, relay_v0 as CallbackV0 as usize, token) };
     if hr < 0 {
         drop(unsafe { Box::from_raw(r as *mut Relay) });
@@ -326,7 +340,7 @@ fn register(i: usize, this: usize, device: usize, kind: u32, context: usize, cal
     if callback == 0 {
         return unsafe { h.call(this, device, kind, context, callback, token) };
     }
-    let r = relay_for(callback, context);
+    let r = relay_for(callback, context, kind);
     let hr = unsafe { h.call(this, device, kind, r, relay as Callback as usize, token) };
     if hr < 0 {
         drop(unsafe { Box::from_raw(r as *mut Relay) });
@@ -339,6 +353,16 @@ fn register(i: usize, this: usize, device: usize, kind: u32, context: usize, cal
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Controllers' readings are held, keyboard and mouse alone aren't.
+    #[test]
+    fn keyboard_and_mouse_readings_go_through() {
+        assert!(!held_kind(KEYBOARD) && !held_kind(MOUSE) && !held_kind(KEYBOARD | MOUSE));
+        // Any kind, ControllerButton, Gamepad, and a gamepad with the keyboard.
+        for kind in [0, 0x4, 0x40000, 0x40000 | KEYBOARD] {
+            assert!(held_kind(kind), "{kind:#x}");
+        }
+    }
 
     /// Every version GameInput on this PC offers is found, and a reading callback
     /// registered through the hooked method goes through PeerParty's relay: it reaches
@@ -364,13 +388,17 @@ mod tests {
             assert_eq!(context, 0x1234);
             CALLS.fetch_add(1, Ordering::SeqCst);
         }
-        let r = relay_for(game as Callback as usize, 0x1234);
+        // GameInputKindGamepad.
+        let r = relay_for(game as Callback as usize, 0x1234, 0x40000);
+        let keys = relay_for(game as Callback as usize, 0x1234, KEYBOARD | MOUSE);
         crate::overlay::set_visible_for_test(true);
         unsafe { relay(1, r, 0) };
         assert_eq!(CALLS.load(Ordering::SeqCst), 0, "held back while the overlay shows");
+        unsafe { relay(1, keys, 0) };
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1, "keyboard and mouse go through");
         crate::overlay::set_visible_for_test(false);
         unsafe { relay(1, r, 0) };
-        assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(CALLS.load(Ordering::SeqCst), 2);
 
         // A real registration through the hooked v1+ method, then unregistered.
         if let Some(f) = found.iter().find(|f| !f.v0) {

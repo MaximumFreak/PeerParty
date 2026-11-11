@@ -214,9 +214,12 @@ fn directory() -> api::Directory {
     let me = api::Player {
         xuid: my_xuid().unwrap_or(0),
         name: lan.map(|l| l.name().to_string()).unwrap_or_default(),
+        quiet: false,
     };
+    // The same switch that keeps PeerParty's own voice rooms from public players.
+    let quiet = |l: &peerparty_core::Lan, p: PeerId| !l.public_voice() && l.peer_trust(p) == Some(peerparty_core::Trust::Public);
     let peers = lan
-        .map(|l| l.peers().into_iter().map(|(p, name)| api::Player { xuid: xuid_of(p), name }).collect())
+        .map(|l| l.peers().into_iter().map(|(p, name)| api::Player { xuid: xuid_of(p), name, quiet: quiet(l, p) }).collect())
         .unwrap_or_default();
     let (title_id, title_name) = title().map(|t| (t.id, t.name.clone())).unwrap_or_default();
     api::Directory { me, peers, title_id, title_name, now: crate::playfab::api::iso(SystemTime::now()) }

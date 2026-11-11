@@ -50,3 +50,7 @@ pub fn quiet(cmd: &mut std::process::Command) -> &mut std::process::Command {
 pub fn in_front() -> bool {
     true
 }
+
+pub fn first_launcher(_after_update: bool) -> bool {
+    true
+}

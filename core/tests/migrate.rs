@@ -18,8 +18,11 @@ fn noisy(s: &str) {
 }
 
 fn base_port(offset: u16) -> u16 {
-    // Clear of the other test files' ranges (20000.., 30000.., 40000.., 47600..).
-    50000 + (std::process::id() % 700) as u16 * 20 + offset
+    // Clear of the other test files' ranges (10000.., 30000.., 40000.., 47300..), and
+    // below 49152: Windows hands out ports from there up to any socket bound to port 0,
+    // this process's own too, and one taking a port a test named first left that test
+    // waiting for a peer that was never there.
+    20000 + (std::process::id() % 400) as u16 * 20 + offset
 }
 
 fn room_cfg(room: &RoomCode, port: u16, peers: Vec<String>) -> inet::Config {
@@ -474,7 +477,7 @@ fn more_than_four_players_behind_one_address_all_connect() {
     let hub = start(&game, "hub", hub_port + 1000, None, Some(public_cfg("hub", hub_port, Vec::new())), false);
     let players: Vec<Lan> = (0..6u16)
         .map(|i| {
-            let p = 64000 + (std::process::id() % 70) as u16 * 15 + i * 2;
+            let p = 29000 + (std::process::id() % 60) as u16 * 16 + i * 2;
             start(&game, &format!("p{i}"), p + 1, None, Some(public_cfg(&format!("p{i}"), p, vec![format!("127.0.0.1:{hub_port}")])), false)
         })
         .collect();

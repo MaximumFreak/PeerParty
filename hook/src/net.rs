@@ -130,6 +130,7 @@ pub fn lan() -> Option<&'static Lan> {
     LAN.get_or_init(|| match Lan::global(&game_key(), core_log) {
         Ok(l) => {
             crate::saves::learn_lan(&l);
+            crate::saves::adopt_earlier_ids(&l);
             let build = build_id();
             log!("lan: this copy's game build is {build}");
             PRESENCE.lock().unwrap().insert("build", vec![(BUILD_KEY.into(), build)]);
@@ -230,21 +231,18 @@ pub fn version() -> String {
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
 }
 
-/// Logs, once per peer and version, whether a peer runs the same PeerParty as us, so a
-/// log shows mismatched copies.
+/// Logs whether a peer runs the same PeerParty as us, so a log shows mismatched copies:
+/// when it first says, and the few times it says something else (a version doesn't
+/// change while a copy runs; a peer that keeps changing it gets no more lines).
 fn check_version(lan: &Lan, peer: peerparty_core::PeerId) {
-    static SEEN: Mutex<Vec<(peerparty_core::PeerId, Option<String>)>> = Mutex::new(Vec::new());
+    static SEEN: Mutex<Vec<Said>> = Mutex::new(Vec::new());
     let theirs = lan.presence(peer).into_iter().find(|(k, _)| k == VERSION_KEY).map(|(_, v)| v);
     let here = lan.peers().iter().any(|(p, _)| *p == peer);
     if !says_version(here, theirs.as_deref()) {
         return;
     }
-    {
-        let mut seen = SEEN.lock().unwrap();
-        if seen.iter().any(|(p, v)| *p == peer && *v == theirs) {
-            return;
-        }
-        seen.push((peer, theirs.clone()));
+    if !note_version(&mut SEEN.lock().unwrap(), peer, &theirs) {
+        return;
     }
     let mine = version();
     match theirs {
@@ -252,6 +250,35 @@ fn check_version(lan: &Lan, peer: peerparty_core::PeerId) {
         Some(t) => log!("lan: {peer} runs a different peerparty: {t} (this copy: {mine})"),
         None => log!("lan: {peer} doesn't say its peerparty version (older than this copy: {mine})"),
     }
+}
+
+/// What a peer last said its version was, and how many different things it has said.
+struct Said {
+    peer: peerparty_core::PeerId,
+    version: Option<String>,
+    times: u32,
+}
+
+/// Versions logged per peer, and peers remembered (the oldest are forgotten).
+const VERSION_LINES: u32 = 4;
+const VERSION_PEERS: usize = 1024;
+
+/// Records what `peer` says its version is. Whether to log it: it's new for that peer,
+/// and the peer hasn't used up its lines.
+fn note_version(seen: &mut Vec<Said>, peer: peerparty_core::PeerId, theirs: &Option<String>) -> bool {
+    if let Some(s) = seen.iter_mut().find(|s| s.peer == peer) {
+        if s.version == *theirs {
+            return false;
+        }
+        s.version = theirs.clone();
+        s.times = s.times.saturating_add(1);
+        return s.times <= VERSION_LINES;
+    }
+    if seen.len() >= VERSION_PEERS {
+        seen.remove(0);
+    }
+    seen.push(Said { peer, version: theirs.clone(), times: 1 });
+    true
 }
 
 /// Whether a presence change tells us anything about a peer's version. A peer that left
@@ -322,6 +349,30 @@ pub fn take(front: Front) -> Vec<Event> {
     q.get_mut(&front)
         .map(|q| q.drain(..).collect())
         .unwrap_or_default()
+}
+
+/// Ticks the engine and takes from `front`'s queue the first event `want` picks,
+/// leaving the rest in place for whoever waits on them. For a queue several waiters
+/// share, each on its own thread (PlayFab's web API serves each request on one), where
+/// `take` would hand one waiter, and so lose, the others' answers. Events neither
+/// `want` nor `others` cares for are dropped; of those `others` keeps, the newest
+/// `SHARED_KEEP` stay (an answer nobody waits for any more goes in time).
+pub fn take_one(front: Front, want: impl Fn(&Event) -> bool, others: impl Fn(&Event) -> bool) -> Option<Event> {
+    let lan = LAN.get().and_then(|l| l.as_ref())?;
+    let mut q = QUEUES.lock().unwrap();
+    tick_into(lan, &mut q);
+    pick(q.get_mut(&front)?, want, others)
+}
+
+const SHARED_KEEP: usize = 64;
+
+fn pick(q: &mut VecDeque<Event>, want: impl Fn(&Event) -> bool, others: impl Fn(&Event) -> bool) -> Option<Event> {
+    let found = q.iter().position(&want).and_then(|i| q.remove(i));
+    q.retain(|e| others(e));
+    while q.len() > SHARED_KEEP {
+        q.pop_front();
+    }
+    found
 }
 
 /// Ticks the engine and hands its events to the front ends, without being one (the
@@ -445,7 +496,52 @@ fn wants(front: Front, ev: &Event, fronts: &[Front]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{key_for, says_version};
+    use super::{Said, VERSION_LINES, VERSION_PEERS, key_for, note_version, says_version};
+
+    /// Two waiters on one queue: each takes its own answer and leaves the other's.
+    #[test]
+    fn a_shared_queue_keeps_the_other_waiters_answers() {
+        use peerparty_core::{Event, JoinResult, PeerId};
+        use std::collections::VecDeque;
+        let search = |n: u64| Event::SearchDone { search: n, results: Vec::new() };
+        let join = |l: &str| Event::JoinDone { lobby: l.into(), result: JoinResult::Ok };
+        let others = |e: &Event| matches!(e, Event::SearchDone { .. } | Event::JoinDone { .. });
+        let mut q: VecDeque<Event> = VecDeque::from([search(1), Event::PresenceChanged(PeerId([1; 16])), join("x"), search(2)]);
+        let mine = super::pick(&mut q, |e| matches!(e, Event::SearchDone { search: 2, .. }), others);
+        assert!(matches!(mine, Some(Event::SearchDone { search: 2, .. })));
+        assert_eq!(q.len(), 2, "the other search's answer and the join's stay; the rest goes");
+        let theirs = super::pick(&mut q, |e| matches!(e, Event::JoinDone { lobby, .. } if lobby == "x"), others);
+        assert!(theirs.is_some());
+        assert!(super::pick(&mut q, |e| matches!(e, Event::JoinDone { .. }), others).is_none());
+        // Answers nobody takes don't pile up.
+        for n in 0..1000 {
+            q.push_back(search(100 + n));
+        }
+        assert!(super::pick(&mut q, |_| false, others).is_none());
+        assert_eq!(q.len(), super::SHARED_KEEP);
+        assert!(matches!(q.back(), Some(Event::SearchDone { search: 1099, .. })));
+    }
+
+    #[test]
+    fn version_lines_are_bounded() {
+        let mut seen: Vec<Said> = Vec::new();
+        let p = peerparty_core::PeerId([1; 16]);
+        let v = |s: &str| Some(s.to_string());
+        assert!(note_version(&mut seen, p, &v("1")));
+        assert!(!note_version(&mut seen, p, &v("1")), "the same again says nothing new");
+        assert!(note_version(&mut seen, p, &v("2")));
+        // A peer that keeps changing it stops being logged, and takes no more room.
+        let logged = (0..1000).filter(|i| note_version(&mut seen, p, &v(&format!("x{i}")))).count();
+        assert_eq!(logged as u32, VERSION_LINES - 2);
+        assert_eq!(seen.len(), 1);
+        // Many peers: the oldest are forgotten.
+        for i in 0..(VERSION_PEERS as u32 + 10) {
+            let mut id = [2u8; 16];
+            id[..4].copy_from_slice(&i.to_le_bytes());
+            note_version(&mut seen, peerparty_core::PeerId(id), &None);
+        }
+        assert_eq!(seen.len(), VERSION_PEERS);
+    }
 
     #[test]
     fn a_dedicated_servers_exe_meets_its_clients() {

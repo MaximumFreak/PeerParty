@@ -346,12 +346,25 @@ unsafe extern "system" fn delete_cache(_h: usize, _o: usize, cd: usize, cb: usiz
 
 // ---- transfers ----
 
-fn new_request(filename: &str) -> usize {
-    hand_out(Request { filename: filename.to_string(), done: AtomicBool::new(false), canceled: AtomicBool::new(false) }, Vec::new())
+/// Transfers the game holds a handle to, by that handle. The handle is the request's
+/// address, but nothing reads it as one: the game may release a handle while its
+/// transfer is still running (the SDK allows it), and may hand back one it never got.
+/// The transfer keeps its own share of the request, and a handle not in here is no
+/// request at all.
+static REQUESTS: std::sync::Mutex<Vec<std::sync::Arc<Request>>> = std::sync::Mutex::new(Vec::new());
+
+fn new_request(filename: &str) -> std::sync::Arc<Request> {
+    let r = std::sync::Arc::new(Request { filename: filename.to_string(), done: AtomicBool::new(false), canceled: AtomicBool::new(false) });
+    REQUESTS.lock().unwrap().push(r.clone());
+    r
 }
 
-fn request<'a>(h: usize) -> Option<&'a Request> {
-    (h != 0).then(|| unsafe { &*(h as *const Request) })
+fn handle_of(r: &std::sync::Arc<Request>) -> usize {
+    std::sync::Arc::as_ptr(r) as usize
+}
+
+fn request(h: usize) -> Option<std::sync::Arc<Request>> {
+    REQUESTS.lock().unwrap().iter().find(|r| handle_of(r) == h).cloned()
 }
 
 fn read(store: Store, o: *const TransferOptions, cd: usize, cb: usize) -> usize {
@@ -362,6 +375,7 @@ fn read(store: Store, o: *const TransferOptions, cd: usize, cb: usize) -> usize 
     let name = unsafe { text(o.filename) };
     let (chunk, data_cb, progress_cb) = (if o.chunk == 0 { 4096 } else { o.chunk } as usize, o.data_callback, o.progress_callback);
     let req = new_request(&name);
+    let handle = handle_of(&req);
     let data = path(store, &name).and_then(|p| std::fs::read(p).ok());
     trace(if store == Store::Title { "EOS_TitleStorage_ReadFile" } else { "EOS_PlayerDataStorage_ReadFile" }, || {
         format!("{name}: {}", data.as_ref().map_or("not found".to_string(), |d| format!("{} bytes", d.len())))
@@ -369,7 +383,7 @@ fn read(store: Store, o: *const TransferOptions, cd: usize, cb: usize) -> usize 
     later(move || {
         let c_name = std::ffi::CString::new(name.replace('\0', "")).unwrap_or_default();
         let local = me_id();
-        let canceled = || request(req).is_some_and(|r| r.canceled.load(Ordering::Relaxed));
+        let canceled = || req.canceled.load(Ordering::Relaxed);
         let result = match &data {
             None => NOT_FOUND,
             Some(d) => {
@@ -413,13 +427,11 @@ fn read(store: Store, o: *const TransferOptions, cd: usize, cb: usize) -> usize 
                 result
             }
         };
-        if let Some(r) = request(req) {
-            r.done.store(true, Ordering::Relaxed);
-        }
+        req.done.store(true, Ordering::Relaxed);
         let info = FileDone { result, client_data: cd, local, filename: c_name.as_ptr() };
         unsafe { call(cb, &info) };
     });
-    req
+    handle
 }
 
 unsafe extern "system" fn title_read(_h: usize, o: *const TransferOptions, cd: usize, cb: usize) -> usize {
@@ -438,6 +450,7 @@ unsafe extern "system" fn player_write(_h: usize, o: *const TransferOptions, cd:
     let name = unsafe { text(o.filename) };
     let (chunk, data_cb, progress_cb) = (if o.chunk == 0 { 4096 } else { o.chunk } as usize, o.data_callback, o.progress_callback);
     let req = new_request(&name);
+    let handle = handle_of(&req);
     trace("EOS_PlayerDataStorage_WriteFile", || name.clone());
     later(move || {
         let c_name = std::ffi::CString::new(name.replace('\0', "")).unwrap_or_default();
@@ -446,7 +459,7 @@ unsafe extern "system" fn player_write(_h: usize, o: *const TransferOptions, cd:
         let mut buf = vec![0u8; chunk];
         let mut result = SUCCESS;
         loop {
-            if request(req).is_some_and(|r| r.canceled.load(Ordering::Relaxed)) {
+            if req.canceled.load(Ordering::Relaxed) {
                 result = CANCELED;
                 break;
             }
@@ -485,13 +498,11 @@ unsafe extern "system" fn player_write(_h: usize, o: *const TransferOptions, cd:
                 result = FAILED;
             }
         }
-        if let Some(r) = request(req) {
-            r.done.store(true, Ordering::Relaxed);
-        }
+        req.done.store(true, Ordering::Relaxed);
         let info = FileDone { result, client_data: cd, local, filename: c_name.as_ptr() };
         unsafe { call(cb, &info) };
     });
-    req
+    handle
 }
 
 unsafe extern "system" fn player_delete(_h: usize, o: *const NameOptions, cd: usize, cb: usize) {
@@ -544,7 +555,7 @@ unsafe extern "system" fn request_cancel(h: usize) -> i32 {
 }
 
 unsafe extern "system" fn request_release(h: usize) {
-    release(h);
+    REQUESTS.lock().unwrap().retain(|r| handle_of(r) != h);
 }
 
 /// MD5, hex (the metadata's MD5Hash).
@@ -588,6 +599,30 @@ pub(crate) fn md5_hex(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A handle is looked up, never read as an address: one the game released (the SDK
+    /// lets it, mid-transfer) or never had is no request, and the transfer's own share
+    /// of a released request is still good.
+    #[test]
+    fn released_and_made_up_transfer_handles_are_refused() {
+        use super::*;
+        let req = new_request("save.dat");
+        let h = handle_of(&req);
+        unsafe {
+            assert_eq!(request_state(h), REQUEST_IN_PROGRESS);
+            assert_eq!(request_state(0), INVALID_PARAMETERS);
+            assert_eq!(request_state(0xdead_beef), INVALID_PARAMETERS);
+            assert_eq!(request_cancel(0x1000), INVALID_PARAMETERS);
+            request_release(h);
+            assert_eq!(request_state(h), INVALID_PARAMETERS);
+            assert_eq!(request_cancel(h), INVALID_PARAMETERS);
+            let mut len = 0i32;
+            assert_eq!(request_filename(h, 0, std::ptr::null_mut(), &mut len), INVALID_PARAMETERS);
+        }
+        // What the running transfer holds outlives the handle.
+        req.done.store(true, Ordering::Relaxed);
+        assert_eq!(req.filename, "save.dat");
+    }
+
     #[test]
     fn md5_matches_rfc_1321() {
         assert_eq!(super::md5_hex(b""), "d41d8cd98f00b204e9800998ecf8427e");

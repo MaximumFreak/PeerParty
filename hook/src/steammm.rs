@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::ffi::c_char;
 use std::sync::{LazyLock, Mutex};
+use std::time::Instant;
 
 use peerparty_core::{Attr, Event, JoinResult, Lan, Lobby, MemberStatus, Permission, Query, Value};
 
@@ -128,7 +129,10 @@ struct State {
     joins: HashMap<String, u64>,
     /// core search -> lobby, for RequestLobbyData.
     data_requests: HashMap<u64, u64>,
-    chat: HashMap<u64, Vec<(u64, u8, Vec<u8>)>>,
+    /// Lobby chat for the game to read: (SteamID, entry type, body) by lobby.
+    chat: crate::lobbychat::Log<(u64, u8, Vec<u8>)>,
+    /// Chat from players not (yet) known to be members.
+    chat_inbox: crate::lobbychat::Inbox,
     /// The game server each lobby last announced, to spot a new one.
     servers: HashMap<u64, String>,
 }
@@ -493,7 +497,7 @@ vmethod! {
             let r = lan.leave(&core_id(lobby));
             log!("steam-lan LeaveLobby {lobby} -> {r:?}");
         }
-        S.lock().unwrap().chat.remove(&lobby);
+        S.lock().unwrap().chat.forget(lobby);
         publish_presence();
     }
 }
@@ -629,13 +633,11 @@ fn chat_socket(lobby: u64) -> String {
     format!("{CHAT_SOCKET}{lobby}")
 }
 
+/// The longest lobby chat message Steam sends (and so the longest we take).
+const CHAT_MAX: usize = 4096;
+
 fn add_chat(lobby: u64, user: u64, data: Vec<u8>) {
-    let chat_id = {
-        let mut st = S.lock().unwrap();
-        let log = st.chat.entry(lobby).or_default();
-        log.push((user, 1, data));
-        (log.len() - 1) as u32
-    };
+    let chat_id = S.lock().unwrap().chat.push(lobby, (user, 1, data));
     crate::steam::inject(
         LOBBY_CHAT_MSG,
         bytes(&LobbyChatMsgT {
@@ -650,7 +652,7 @@ fn add_chat(lobby: u64, user: u64, data: Vec<u8>) {
 vmethod! {
     fn send_lobby_chat_msg(_this: usize, lobby: u64, body: *const u8, len: i32) -> bool {
         let (Some(lan), Some(l)) = (lan(), view(lobby)) else { return false };
-        if body.is_null() || len <= 0 || len > 4096 {
+        if body.is_null() || len <= 0 || len as usize > CHAT_MAX {
             return false;
         }
         let data = unsafe { std::slice::from_raw_parts(body, len as usize) }.to_vec();
@@ -674,7 +676,7 @@ vmethod! {
         kind: *mut i32,
     ) -> i32 {
         let st = S.lock().unwrap();
-        let Some((from, k, body)) = st.chat.get(&lobby).and_then(|c| c.get(chat_id.max(0) as usize)) else {
+        let Some((from, k, body)) = (chat_id >= 0).then(|| st.chat.get(lobby, chat_id as u32)).flatten() else {
             return 0;
         };
         let n = body.len().min(cap.max(0) as usize);
@@ -809,14 +811,25 @@ fn chat_update(lobby: u64, changed: u64, making_change: u64, state: u32) {
     );
 }
 
-/// Runs from the game's Steam dispatch before events: lobby chat that arrived.
+/// Runs from the game's Steam dispatch before events: lobby chat that arrived, from
+/// members of lobbies we're in (lobbychat.rs).
 pub fn tick() {
     let Some(lan) = lan() else { return };
+    let mut fresh = Vec::new();
     while let Some(mut p) = lan.receive_where(None, |s| s.starts_with(CHAT_SOCKET)) {
-        crate::steamlan::ids_in(p.peer, &mut p.data);
         if let Some(lobby) = p.socket[CHAT_SOCKET.len()..].parse::<u64>().ok() {
-            add_chat(lobby, steam_id(p.peer), p.data);
+            crate::steamlan::ids_in(p.peer, &mut p.data);
+            fresh.push((lobby, p.peer, p.data));
         }
+    }
+    let mut inbox = std::mem::take(&mut S.lock().unwrap().chat_inbox);
+    let me = lan.me();
+    let heard = inbox.sort(fresh, Instant::now(), CHAT_MAX, |lobby, who| {
+        lan.lobby(&core_id(lobby)).is_some_and(|l| l.member(me).is_some() && l.member(who).is_some())
+    });
+    S.lock().unwrap().chat_inbox = inbox;
+    for (lobby, who, data) in heard {
+        add_chat(lobby, steam_id(who), data);
     }
 }
 

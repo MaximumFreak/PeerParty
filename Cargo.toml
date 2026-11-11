@@ -4,7 +4,7 @@ members = ["launcher", "hook", "core"]
 
 [workspace.package]
 # Tagged `v<version>` in git; peerparty.exe adds the commits since that tag (launcher/build.rs).
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 
@@ -35,7 +35,9 @@ windows-sys = { version = "0.59", features = [
 
 # retour 0.3.1 writes a relocated RIP displacement over the last four bytes of the
 # instruction, which corrupts `cmp dword [rip+d], imm8` and crashed a game.
-# The vendored copy finds the real displacement offset.
+# The vendored copy finds the real displacement offset. It also takes its two locks
+# whether or not a panic once happened while one was held (the disassembler panics on
+# bytes it doesn't know): poisoned, every later hook in the game failed.
 [patch.crates-io]
 retour = { path = "vendor/retour" }
 

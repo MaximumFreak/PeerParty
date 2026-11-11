@@ -14,6 +14,7 @@ mod invite;
 mod ipc;
 mod ipfwd;
 mod json;
+mod lobbychat;
 mod log;
 mod modes;
 mod net;

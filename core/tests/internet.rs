@@ -373,7 +373,7 @@ fn a_room_member_cant_pass_as_another() {
         c.poll();
         std::thread::sleep(Duration::from_millis(50));
     }
-    let refused = IMPOSTOR_LOG.lock().unwrap().iter().any(|l| l.contains("claims to be") && l.contains("with another key"));
+    let refused = IMPOSTOR_LOG.lock().unwrap().iter().any(|l| l.contains("claims to be") && l.contains("isn't its key's id"));
     assert!(refused, "B never logged the refusal");
     c.shutdown();
     b.shutdown();

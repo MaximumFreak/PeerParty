@@ -304,7 +304,7 @@ unsafe extern "system" fn block_participant(_h: usize, o: *const BlockOptions, c
     let o = unsafe { &*o };
     let room = str_of(o.RoomName);
     let r = match ids::peer_of_puid(o.ParticipantId) {
-        Some(p) if voice::set_receiving(&key(&room), Some(p), o.bBlocked == 0) => SUCCESS,
+        Some(p) if voice::set_blocked(&key(&room), p, o.bBlocked != 0) => SUCCESS,
         _ => NOT_FOUND,
     };
     complete(cb, cd, r, o.LocalUserId, &room, PeerFlag { peer: o.ParticipantId, flag: o.bBlocked });
@@ -966,6 +966,8 @@ pub fn pump(lan: &Lan) {
                         unsafe { call(f, &info) };
                     }
                 }
+                // The SDK never delivers more; a game's buffer may be sized to it.
+                RoomEvent::Data(_, data) if data.len() > MAX_DATA as usize => {}
                 RoomEvent::Data(p, data) => {
                     for (f, cd) in listeners(Kind::RtcData, Some(room)) {
                         let info = DataReceivedInfo {

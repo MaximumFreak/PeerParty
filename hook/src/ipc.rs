@@ -69,6 +69,11 @@ pub fn hand_over() {
 
 static HANDED_OVER: AtomicBool = AtomicBool::new(false);
 
+/// Whether this process has let the launcher go to a program it started.
+pub fn handed_over() -> bool {
+    HANDED_OVER.load(Ordering::Relaxed)
+}
+
 /// Sends one message to the launcher (dropped when there's none).
 pub fn send(msg: Json) {
     if let Some(tx) = OUT.lock().unwrap().as_ref() {
@@ -150,6 +155,7 @@ fn run(base: String) {
     CONNECTED.store(false, Ordering::Relaxed);
     *OUT.lock().unwrap() = None;
     crate::overlay::set_visible(false);
+    crate::overlay::pads_released();
 }
 
 fn writer(mut up: std::fs::File, rx: Receiver<String>) {
@@ -237,7 +243,13 @@ fn command(msg: &Json) {
             if let Some(why) = msg.get("why").as_str().filter(|_| visible && !crate::overlay::visible()) {
                 log!("overlay: opened by {why}");
             }
-            crate::overlay::set_visible(visible);
+            crate::overlay::set_visible_holding(visible, matches!(msg.get("pads_held"), Json::Bool(true)));
+        }
+        // The buttons down when the overlay closed are up.
+        "pads_held" => {
+            if !matches!(msg.get("on"), Json::Bool(true)) {
+                crate::overlay::pads_released();
+            }
         }
         "note" => {
             // A line from the overlay host for the game's log.

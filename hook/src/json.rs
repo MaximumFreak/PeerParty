@@ -62,6 +62,7 @@ impl Json {
         let mut p = Parser {
             s: text.as_bytes(),
             i: 0,
+            depth: 0,
         };
         let v = p.value()?;
         p.ws();
@@ -131,9 +132,15 @@ fn write_str(out: &mut String, s: &str) {
     out.push('"');
 }
 
+/// Arrays and objects nest at most this deep. The parser calls itself for each level,
+/// and it reads what other players send (lobby data, match tickets) on the game's own
+/// threads: a few kilobytes of '[' ran the stack out, which ends the game with no error.
+const MAX_DEPTH: usize = 64;
+
 struct Parser<'a> {
     s: &'a [u8],
     i: usize,
+    depth: usize,
 }
 
 impl Parser<'_> {
@@ -153,6 +160,13 @@ impl Parser<'_> {
     }
 
     fn value(&mut self) -> Option<Json> {
+        self.depth += 1;
+        let v = if self.depth > MAX_DEPTH { None } else { self.one() };
+        self.depth -= 1;
+        v
+    }
+
+    fn one(&mut self) -> Option<Json> {
         self.ws();
         match *self.s.get(self.i)? {
             b'{' => {
@@ -216,8 +230,13 @@ impl Parser<'_> {
                                 b'u' => {
                                     let mut code = self.hex4()?;
                                     if (0xd800..0xdc00).contains(&code) && self.eat("\\u") {
+                                        // A high half followed by something that isn't a
+                                        // low half is no character.
                                         let low = self.hex4()?;
-                                        code = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00);
+                                        code = match low.checked_sub(0xdc00) {
+                                            Some(low) if low < 0x400 => 0x10000 + ((code - 0xd800) << 10) + low,
+                                            _ => 0xfffd,
+                                        };
                                     }
                                     out.push(char::from_u32(code).unwrap_or('\u{fffd}'));
                                 }
@@ -282,5 +301,36 @@ mod tests {
         assert!(v.get("missing").is_null());
         assert_eq!(Json::parse(&v.to_string()), Some(v));
         assert_eq!(Json::parse("{\"a\":1} x"), None);
+    }
+
+    #[test]
+    fn deep_nesting_is_refused_not_followed() {
+        let nest = |open: &str, close: &str, n: usize| format!("{}1{}", open.repeat(n), close.repeat(n));
+        assert!(Json::parse(&nest("[", "]", MAX_DEPTH - 1)).is_some());
+        assert!(Json::parse(&nest("{\"a\":", "}", MAX_DEPTH - 1)).is_some());
+        // On a small stack: without the limit this ends the test run, as it ended games.
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                for n in [MAX_DEPTH, 1000, 100_000] {
+                    assert_eq!(Json::parse(&nest("[", "]", n)), None);
+                    assert_eq!(Json::parse(&nest("{\"a\":", "}", n)), None);
+                    assert_eq!(Json::parse(&"[".repeat(n)), None);
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn half_a_surrogate_pair_is_no_character() {
+        // A string of escapes: each code as a backslash, 'u' and four hex digits.
+        let text = |codes: &[&str], tail: &str| format!("\"{}{tail}\"", codes.iter().map(|c| format!("{}u{c}", char::from(92u8))).collect::<String>());
+        assert_eq!(Json::parse(&text(&["d83d", "de00"], "")), Some(Json::str(char::from_u32(0x1f600).unwrap().to_string())));
+        let lone = char::from_u32(0xfffd).unwrap();
+        assert_eq!(Json::parse(&text(&["d83d", "0041"], "")), Some(Json::str(lone.to_string())));
+        assert_eq!(Json::parse(&text(&["d83d", "ffff"], "")), Some(Json::str(lone.to_string())));
+        assert_eq!(Json::parse(&text(&["d83d"], "x")), Some(Json::str(format!("{lone}x"))));
     }
 }

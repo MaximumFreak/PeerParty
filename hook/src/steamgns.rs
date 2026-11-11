@@ -525,22 +525,50 @@ fn ports_presence<'a>(listens: impl Iterator<Item = &'a Listen>) -> Vec<(String,
     kv
 }
 
-/// The LAN player listening on IP port `port`, preferring the one at `ip`.
+/// The LAN player listening on IP port `port` (see `choose_listener`).
 fn find_ip_listener(ip: Option<std::net::Ipv4Addr>, port: u16) -> Option<PeerId> {
     let lan = lan()?;
-    let listening: Vec<PeerId> = lan
+    let listening: Vec<Listener> = lan
         .peers()
         .into_iter()
-        .map(|(p, _)| p)
-        .filter(|p| {
-            lan.presence(*p).iter().any(|(k, v)| k == KEY_IP_PORTS && lists_port(v, port))
+        .filter_map(|(p, _)| {
+            let presence = lan.presence(p);
+            let ports = presence.iter().find(|(k, _)| k == KEY_IP_PORTS).map(|(_, v)| v.as_str())?;
+            let exact = ports.split(',').any(|x| x == port.to_string());
+            (exact || lists_port(ports, port)).then(|| Listener {
+                peer: p,
+                exact,
+                at_ip: ip.is_some_and(|ip| lan.peer_has_ip(p, std::net::IpAddr::V4(ip))),
+            })
         })
         .collect();
-    listening
-        .iter()
-        .copied()
-        .find(|p| ip.is_some_and(|ip| lan.peer_has_ip(*p, std::net::IpAddr::V4(ip))))
-        .or_else(|| listening.first().copied())
+    choose_listener(&listening)
+}
+
+/// A player listening on the port asked for: `exact` when they announced that port
+/// (else they announced "0", a socket on a port of the system's choosing); `at_ip`
+/// when the address asked for is theirs.
+#[derive(Clone, Copy, Debug)]
+struct Listener {
+    peer: PeerId,
+    exact: bool,
+    at_ip: bool,
+}
+
+/// Who an IP connection goes to: the one at the address (on that very port first),
+/// else the only one on that port, else the only one on a port of the system's
+/// choosing. Several and nothing to tell them apart: nobody, rather than a guess that
+/// joins the wrong game (the connection waits, and fails if it stays that way).
+fn choose_listener(c: &[Listener]) -> Option<PeerId> {
+    if let Some(l) = c.iter().filter(|l| l.at_ip).max_by_key(|l| l.exact) {
+        return Some(l.peer);
+    }
+    let exact: Vec<&Listener> = c.iter().filter(|l| l.exact).collect();
+    let set: Vec<&Listener> = if exact.is_empty() { c.iter().collect() } else { exact };
+    match set.as_slice() {
+        [one] => Some(one.peer),
+        _ => None,
+    }
 }
 
 fn lists_port(ports: &str, port: u16) -> bool {
@@ -1525,6 +1553,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_ip_connection_goes_to_the_listener_it_names_or_to_nobody() {
+        let (a, b, c) = (PeerId([1; 16]), PeerId([2; 16]), PeerId([3; 16]));
+        let l = |peer, exact, at_ip| Listener { peer, exact, at_ip };
+        assert_eq!(choose_listener(&[]), None);
+        assert_eq!(choose_listener(&[l(a, true, false)]), Some(a), "the only one");
+        assert_eq!(choose_listener(&[l(a, true, false), l(b, true, true)]), Some(b), "the one at the address");
+        assert_eq!(choose_listener(&[l(a, false, true), l(b, true, true)]), Some(b), "on that very port first");
+        assert_eq!(choose_listener(&[l(a, true, false), l(b, true, false)]), None, "two, nothing to tell them apart");
+        assert_eq!(choose_listener(&[l(a, false, false), l(b, true, false)]), Some(b), "an announced port beats a chosen one");
+        assert_eq!(choose_listener(&[l(a, false, false)]), Some(a), "a port of the system's choosing, alone");
+        assert_eq!(choose_listener(&[l(a, false, false), l(c, false, false)]), None);
+    }
+
+    #[test]
     fn structs_have_steams_layout() {
         assert_eq!(size_of::<Identity>(), 136);
         assert_eq!(size_of::<IpAddr>(), 18);
@@ -1573,13 +1615,17 @@ mod tests {
 
     /// A connection in the table, as `connect` or `incoming` would make it.
     fn add_conn(server: bool, remote_id: u64) -> u32 {
-        let mut s = S.lock().unwrap();
-        let h = new_handle(&mut s);
+        add_conn_to(&mut S.lock().unwrap(), server, remote_id)
+    }
+
+    /// `add_conn` under a lock the caller holds.
+    fn add_conn_to(s: &mut State, server: bool, remote_id: u64) -> u32 {
+        let h = new_handle(s);
         let mut c = new_conn(None, format!("{PREFIX}test:{h:x}"), 0, 0, IpAddr::default());
         c.server = server;
         c.remote_id = remote_id;
         s.conns.insert(h, c);
-        set_state(&mut s, h, CONNECTING);
+        set_state(s, h, CONNECTING);
         h
     }
 
@@ -1595,9 +1641,15 @@ mod tests {
     fn a_game_servers_status_changes_go_to_its_own_dispatch() {
         // A Steamworks.NET dedicated server reads them on the game server's
         // pipe only: queued for the game's, it never accepted anyone.
-        let (srv, game) = (add_conn(true, 0), add_conn(false, 0));
-        assert!(S.lock().unwrap().pending.iter().any(|(_, ev, server)| ev.conn == srv && *server));
-        assert!(S.lock().unwrap().pending.iter().any(|(_, ev, server)| ev.conn == game && !*server));
+        // Looked at under the lock they were queued under: tests run at once, and any
+        // other's `flush` delivers these too (the outcome below is the same either way).
+        let (srv, game) = {
+            let mut s = S.lock().unwrap();
+            let (srv, game) = (add_conn_to(&mut s, true, 0), add_conn_to(&mut s, false, 0));
+            assert!(s.pending.iter().any(|(_, ev, server)| ev.conn == srv && *server));
+            assert!(s.pending.iter().any(|(_, ev, server)| ev.conn == game && !*server));
+            (srv, game)
+        };
         flush();
         // Classic dispatch in tests: the game server's registered callbacks get it.
         assert_eq!(injected_for(srv), vec![true]);

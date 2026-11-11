@@ -22,9 +22,13 @@ pub struct Welcome {
     voice: bool,
     public_voice: bool,
     auto_accept: bool,
+    /// Run again from Settings: it starts from the settings as they are, and changes
+    /// only what is answered differently.
+    again: bool,
 }
 
 impl Welcome {
+    /// The first run: the recommended answers.
     pub fn new(p: &Prefs) -> Welcome {
         Welcome {
             step: 0,
@@ -36,22 +40,37 @@ impl Welcome {
             // Recommended off with strangers, whatever the stored default.
             public_voice: false,
             auto_accept: if p.public { p.auto_accept } else { true },
+            again: false,
         }
+    }
+
+    /// Settings > Run setup: every answer is the current setting, so Start with nothing
+    /// changed changes nothing (it used to turn auto-accept and the internet back on,
+    /// and voice with strangers off).
+    pub fn again(p: &Prefs) -> Welcome {
+        Welcome { public_voice: p.public_voice, auto_accept: p.auto_accept, again: true, ..Welcome::new(p) }
     }
 
     pub fn back(&mut self) {
         self.step = self.step.saturating_sub(1);
     }
 
-    /// The answers, as settings.
-    pub fn apply(&self, p: &mut Prefs) {
+    /// The answers, as settings. The room code it cleared, if it did (it may be nowhere
+    /// else on this PC; Play together offers it back).
+    pub fn apply(&self, p: &mut Prefs) -> Option<String> {
+        let had_room = RoomCode::parse(p.room.trim()).is_some();
+        // Internet play newly chosen turns the internet on; run again with the same
+        // answers, a pause the player chose stays.
+        let newly_online = (self.friends && !had_room) || (self.public && !p.public);
+        let mut cleared = None;
         p.name = self.name.trim().to_string();
         p.language = self.language.clone();
         if self.friends {
-            if RoomCode::parse(p.room.trim()).is_none() {
+            if !had_room {
                 p.room = RoomCode::generate().to_string();
             }
-        } else {
+        } else if !p.room.trim().is_empty() {
+            cleared = had_room.then(|| p.room.clone());
             p.room.clear();
         }
         p.public = self.public;
@@ -60,7 +79,8 @@ impl Welcome {
         }
         p.voice = self.voice;
         p.auto_accept = self.auto_accept;
-        p.internet = true;
+        p.internet = !self.again || p.internet || newly_online;
+        cleared
     }
 }
 
@@ -121,11 +141,19 @@ impl App {
                     }
                 });
                 ui.add_space(16.0);
-                match w.step {
-                    0 => self.welcome_hello(ui, &mut w, &mut done),
-                    1 => self.welcome_who(ui, &mut w),
-                    _ => self.welcome_done(ui, &w),
-                }
+                // The step scrolls when the window is too short for it (the smallest
+                // window, a large font, a long language); the dots and the buttons stay
+                // where they are. 190 is the card's margins, the dots, the buttons and a
+                // little air round the card. Each step starts at its top.
+                egui::ScrollArea::vertical()
+                    .id_salt(("welcome-step", w.step))
+                    .max_height((screen.height() - 190.0).max(160.0))
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| match w.step {
+                        0 => self.welcome_hello(ui, &mut w, &mut done),
+                        1 => self.welcome_who(ui, &mut w),
+                        _ => self.welcome_done(ui, &w),
+                    });
                 ui.add_space(20.0);
                 ui.horizontal(|ui| {
                     if w.step == 0 {
@@ -164,12 +192,16 @@ impl App {
             );
             let p = ui.painter();
             fx::spotlight(p, r, 18.0, pos2(r.center().x, r.top() + 2.0), r.width() * 0.6, ACCENT.gamma_multiply(0.12));
+            #[cfg(test)]
+            ui.ctx().data_mut(|d| d.insert_temp(tests::card_id(), r));
         });
         let _ = modal;
         match done {
             Some(apply) => {
                 if apply {
-                    w.apply(&mut self.settings.prefs);
+                    if let Some(room) = w.apply(&mut self.settings.prefs) {
+                        self.together.left_room(room);
+                    }
                     crate::i18n::set(&self.settings.prefs.language);
                     if w.friends {
                         self.open_view(View::Together, false);
@@ -265,6 +297,45 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::store::Settings;
+
+    /// Where the setup's card was last drawn (kept only in tests).
+    pub(super) fn card_id() -> egui::Id {
+        egui::Id::unique("welcome-card")
+    }
+
+    /// In the smallest window the launcher allows (900x560), every step of the setup,
+    /// at its longest, keeps its card on screen, Back and Next with it: the step scrolls
+    /// instead. PEERPARTY_LANG picks the language (de and ru are the longest).
+    #[test]
+    fn the_setup_fits_the_smallest_window() {
+        crate::i18n::set(&std::env::var("PEERPARTY_LANG").unwrap_or_else(|_| "en".into()));
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx);
+        let mut app = App::with(ctx.clone(), Settings::default(), false);
+        let mut w = Welcome::new(&app.settings.prefs);
+        // Step 1 at its longest: strangers on adds their voice switch.
+        (w.friends, w.public) = (true, true);
+        app.welcome = Some(w);
+        let mut frame = eframe::Frame::_new_kittest();
+        let (width, height) = (900.0, 560.0);
+        let mut t = 0.0;
+        for step in 0..3 {
+            app.welcome.as_mut().expect("the setup closed itself").step = step;
+            for _ in 0..3 {
+                t += 0.4;
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(width, height))),
+                    time: Some(t),
+                    ..Default::default()
+                };
+                ctx.run_ui(input, |ui| eframe::App::ui(&mut app, ui, &mut frame)).textures_delta.clear();
+            }
+            let card: egui::Rect = ctx.data(|d| d.get_temp(card_id())).expect("the setup wasn't drawn");
+            assert!(card.top() >= 0.0 && card.bottom() <= height, "step {step}: the card is {card:?} in a window {height} high");
+        }
+    }
 
     /// The answers become settings only through `apply`: friends make a room code
     /// (keeping one there is), none clears it, strangers get their own voice answer.
@@ -285,7 +356,34 @@ mod tests {
         w.apply(&mut p);
         assert_eq!(p.room, code, "an existing room is kept");
         w.friends = false;
-        w.apply(&mut p);
+        assert_eq!(w.apply(&mut p).as_deref(), Some(code.as_str()), "the room cleared is handed back");
         assert!(p.room.is_empty());
+        assert_eq!(w.apply(&mut p), None);
+    }
+
+    /// Run again from Settings, Start with every answer as it was changes no setting;
+    /// only internet play newly chosen turns a paused internet back on.
+    #[test]
+    fn running_the_setup_again_keeps_the_settings() {
+        let mut p = Prefs { auto_accept: false, public: true, public_voice: true, internet: false, voice: true, ..Prefs::default() };
+        p.room = RoomCode::generate().to_string();
+        let before = serde_json::to_value(&p).unwrap();
+        let w = Welcome::again(&p);
+        assert_eq!(w.apply(&mut p), None);
+        assert_eq!(serde_json::to_value(&p).unwrap(), before, "Start changed settings");
+        // At home only, auto-accept off: still off.
+        let mut p = Prefs { auto_accept: false, internet: false, ..Prefs::default() };
+        let mut w = Welcome::again(&p);
+        assert!(!w.auto_accept);
+        w.apply(&mut p);
+        assert!(!p.auto_accept && !p.internet);
+        // Friends newly chosen: a room, and the internet on to reach it.
+        w.friends = true;
+        w.apply(&mut p);
+        assert!(RoomCode::parse(&p.room).is_some() && p.internet);
+        // The first run still recommends: auto-accept at home, and the internet on.
+        let mut p = Prefs { auto_accept: false, internet: false, ..Prefs::default() };
+        Welcome::new(&p).apply(&mut p);
+        assert!(p.auto_accept && p.internet);
     }
 }

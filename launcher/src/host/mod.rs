@@ -47,10 +47,58 @@ const VK_F1: u32 = 0x70;
 const VK_F2: u32 = 0x71;
 const VK_F3: u32 = 0x72;
 const CHORD_HOLD: Duration = Duration::from_secs(1);
+/// Controller buttons (not the d-pad or the stick folded into it) still down when the
+/// overlay closes, the Start or B that closed it most often: the game's controllers stay
+/// held back until they're up, or this long (the hook gives up after 2 s by itself).
+const PAD_BUTTONS: u32 = !(pad::UP | pad::DOWN | pad::LEFT | pad::RIGHT);
+const PADS_HELD_MAX: Duration = Duration::from_secs(1);
 /// `Host::hotkeys`, by name.
 const HOTKEY_NAMES: [&str; 4] = ["Shift+Tab", "Shift+F3", "Shift+F1", "Shift+F2"];
+/// The store whose own in-game overlay opens on each of `HOTKEY_NAMES` (the hook's
+/// `foreign` names), and its name for a player.
+const HOTKEY_OWNERS: [(&str, &str); 4] = [("steam", "Steam"), ("epic", "Epic"), ("ea", "EA"), ("ubisoft", "Ubisoft")];
+
+/// Which of the hotkeys that are on (`on`) open the overlay in a game with `foreign`
+/// store overlays loaded. A key a loaded store overlay opens on is left to it (a game
+/// started from Steam with peerparty in its launch options has Steam's overlay, and
+/// one press opened both), unless nothing else would open PeerParty's: no other key,
+/// and no controller button or chord (`other`).
+fn usable_hotkeys(on: [bool; 4], foreign: &[String], other: bool) -> [bool; 4] {
+    let free: [bool; 4] = std::array::from_fn(|i| on[i] && !foreign.iter().any(|f| f == HOTKEY_OWNERS[i].0));
+    if free.contains(&true) || other { free } else { on }
+}
 /// Recording a chord gives up after this long with no chord held.
 const RECORD_FOR: Duration = Duration::from_secs(10);
+
+/// How long an open overlay may go undrawn inside the game before it closes itself. The
+/// hook says it draws within a quarter of a second of the game's next frame; a game
+/// that shows no frame for this long (a loading screen) gets the overlay closed too,
+/// which is the better mistake.
+const UNSEEN_FOR: Duration = Duration::from_millis(2500);
+
+/// Since when the open overlay has been handed to the game's frames without the hook
+/// saying it draws there. The clock starts at the first hand-over, not each frame's.
+#[derive(Default)]
+struct Unseen(Option<Instant>);
+
+impl Unseen {
+    /// The overlay was handed to the game's frames.
+    fn handed(&mut self, ingame: bool, now: Instant) {
+        if !ingame {
+            self.0.get_or_insert(now);
+        }
+    }
+
+    /// The hook draws it, or the overlay closed.
+    fn reset(&mut self) {
+        self.0 = None;
+    }
+
+    /// Open and undrawn for too long: to the player the game has frozen.
+    fn too_long(&self, ingame: bool, now: Instant) -> bool {
+        !ingame && self.0.is_some_and(|t| now.saturating_duration_since(t) >= UNSEEN_FOR)
+    }
+}
 
 /// The settings that apply to this game: the global ones with its own answers on top.
 pub fn effective(settings: &Settings, game: &GameOptions) -> Prefs {
@@ -101,6 +149,8 @@ struct Host {
     // Hotkey edges.
     keys_down: [bool; 4],
     pad_prev: u32,
+    /// The overlay closed with controller buttons down (`PAD_BUTTONS`), at this time.
+    pads_held: Option<Instant>,
     chord_since: Option<Instant>,
     chord_fired: bool,
     /// Recording a chord: when it started, the buttons held and since when.
@@ -112,6 +162,8 @@ struct Host {
     first_state: bool,
     frame: Option<frame::Shared>,
     ingame: bool,
+    /// Whether the open overlay is drawn in the game it was handed to (`UNSEEN_FOR`).
+    unseen: Unseen,
     /// Game Bar's overlay over the game (it never takes the foreground), and whether it
     /// was open at the last tick: the overlay leaves the input to it meanwhile.
     gamebar: gamebar::GameBar,
@@ -133,6 +185,8 @@ struct Host {
     /// Opening hotkeys held at the last tick, seen whether or not they could open the
     /// overlay, so a press that couldn't says why in the game's log.
     diag_keys: [bool; 4],
+    /// A hotkey left to a store's overlay has been mentioned (once a run).
+    key_left_told: bool,
     /// The controllers last named in the game's log.
     pads_logged: Vec<String>,
     /// Ticks that panicked (each is caught; the first few go to the game's log).
@@ -146,7 +200,8 @@ struct Host {
 /// read from the registry).
 const FIREWALL_EVERY: Duration = Duration::from_secs(20);
 
-/// Runs until the game process exits. Returns when it has.
+/// Runs until the game has ended: `process` is signalled then (the game's process, or
+/// tree.rs's event for the game's programs). Returns when it has.
 pub fn run(process: HANDLE, pid: u32, pipe: pipe::Pipe, exe: &Path, prefs: Prefs, packaged: bool) {
     unsafe {
         windows_sys::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
@@ -183,6 +238,7 @@ pub fn run(process: HANDLE, pid: u32, pipe: pipe::Pipe, exe: &Path, prefs: Prefs
         started: Instant::now(),
         keys_down: [false; 4],
         pad_prev: 0,
+        pads_held: None,
         chord_since: None,
         chord_fired: false,
         recording: None,
@@ -193,6 +249,7 @@ pub fn run(process: HANDLE, pid: u32, pipe: pipe::Pipe, exe: &Path, prefs: Prefs
         first_state: true,
         frame: None,
         ingame: false,
+        unseen: Unseen::default(),
         gamebar: gamebar::GameBar::new(),
         under_gamebar: false,
         exe: firewall::process_exe(pid).unwrap_or_else(|| exe.to_path_buf()),
@@ -203,6 +260,7 @@ pub fn run(process: HANDLE, pid: u32, pipe: pipe::Pipe, exe: &Path, prefs: Prefs
         unreachable: 0,
         fixing: None,
         diag_keys: [false; 4],
+        key_left_told: false,
         pads_logged: Vec::new(),
         panics: 0,
         fonts: false,
@@ -365,12 +423,21 @@ impl Host {
         pid == self.pid
     }
 
-    /// Every hotkey that's on works in every game. Games started through PeerParty
-    /// aren't started through Steam, Epic or EA, so their own overlays don't come up
-    /// on these keys even when their module is loaded.
+    /// The hotkeys that open the overlay in this game: the ones that are on, but not one
+    /// a store overlay loaded in the game opens on too (`usable_hotkeys`).
     fn hotkeys(&self) -> [(bool, u32); 4] {
         let hk = &self.prefs.hotkeys;
-        [(hk.shift_tab, VK_TAB), (hk.shift_f3, VK_F3), (hk.shift_f1, VK_F1), (hk.shift_f2, VK_F2)]
+        let on = usable_hotkeys([hk.shift_tab, hk.shift_f3, hk.shift_f1, hk.shift_f2], &self.overlay.state.foreign, self.guide_opens() || self.chord_opens());
+        [(on[0], VK_TAB), (on[1], VK_F3), (on[2], VK_F1), (on[3], VK_F2)]
+    }
+
+    /// The first hotkey that is on but left to a store's overlay in this game, with
+    /// that store's name.
+    fn key_left(&self) -> Option<(&'static str, &'static str)> {
+        let hk = &self.prefs.hotkeys;
+        let on = [hk.shift_tab, hk.shift_f3, hk.shift_f1, hk.shift_f2];
+        let usable = self.hotkeys();
+        (0..4).find(|&i| on[i] && !usable[i].0).map(|i| (HOTKEY_NAMES[i], HOTKEY_OWNERS[i].1))
     }
 
     /// The hotkeys that are on.
@@ -446,6 +513,7 @@ impl Host {
         let front = self.in_front();
         let rect = if front { self.game_rect() } else { None };
         let gamebar = front && self.gamebar.open(rect);
+        let mut polled = false;
         if gamebar != self.under_gamebar {
             self.under_gamebar = gamebar;
             self.gamebar_changed(gamebar);
@@ -453,6 +521,13 @@ impl Host {
         if self.visible {
             if !front {
                 self.hide();
+            } else if self.unseen.too_long(self.ingame, Instant::now()) {
+                // Open, holding the keyboard, mouse and controllers, and on no screen:
+                // to the player the game has frozen. Close, and say why where it can
+                // be read (the log; a toast once the game leaves fullscreen).
+                self.pipe.send(json!({"t": "note", "text": "overlay: closed again: it was to be drawn inside the game's frames (the game is fullscreen, or drawing is set to in-game) and the game's graphics API isn't one PeerParty draws into"}));
+                self.hide();
+                self.overlay.toast(crate::t!("toast.cant_draw"), crate::t!("toast.cant_draw_detail"));
             } else if gamebar {
                 // Game Bar has the controller, keyboard and mouse. Buttons pressed in
                 // it don't act here once it closes.
@@ -463,6 +538,7 @@ impl Host {
             }
         } else if front && self.prefs.overlay && !gamebar {
             self.check_open();
+            polled = true;
         } else {
             self.why_not_open(front, gamebar);
             // A Home or hotkey still down when the game comes back to the front (Guide
@@ -471,7 +547,20 @@ impl Host {
             self.keys_down = [true; 4];
         }
         if !self.visible {
+            self.release_pads(polled);
             self.frame_toasts();
+        }
+    }
+
+    /// The buttons down when the overlay closed: once they're up, the game gets its
+    /// controllers back. `polled`: this tick's reading is in `pad_prev` already (a second
+    /// `poll` would eat a Home press).
+    fn release_pads(&mut self, polled: bool) {
+        let Some(since) = self.pads_held else { return };
+        let pad = if polled { self.pad_prev } else { self.pads.poll() };
+        if pads_let_go(pad, since, Instant::now()) {
+            self.pads_held = None;
+            self.pipe.send(json!({"t": "pads_held", "on": false}));
         }
     }
 
@@ -493,6 +582,9 @@ impl Host {
                 }
                 let st = ui::GameState::from_json(msg);
                 self.ingame = msg.get("present").and_then(Value::as_str).is_some_and(|s| !s.is_empty());
+                if self.ingame {
+                    self.unseen.reset();
+                }
                 // Notifications for what's new since the last state.
                 if !self.first_state && self.prefs.toasts && !self.visible {
                     for p in &st.pending {
@@ -518,6 +610,15 @@ impl Host {
                 self.first_state = false;
                 self.overlay.state = st;
                 self.overlay.hotkey_hint = self.close_hint();
+                // A hotkey left to a store's overlay: said once, with what opens ours.
+                if let Some((key, store)) = self.key_left().filter(|_| !self.key_left_told) {
+                    self.key_left_told = true;
+                    self.pipe.send(json!({"t": "note", "text": format!("overlay: {key} isn't used in this game: {store}'s overlay is loaded and opens on it too")}));
+                    if self.prefs.toasts {
+                        let hint = self.open_hint();
+                        self.overlay.toast(crate::t!("toast.key_left", key = key, store = store), crate::t!("toast.key_left_detail", keys = hint));
+                    }
+                }
                 self.dirty = true;
             }
             Some("note") => {
@@ -673,6 +774,8 @@ impl Host {
         self.pad_prev = self.pads.poll();
         self.repeat = None;
         self.shift = false;
+        // Opening ends a hold from the last close (in the hook too).
+        self.pads_held = None;
         input::capture(true);
         self.pipe.send(json!({"t": "overlay", "visible": true, "why": why}));
         if let Some(w) = self.toast_window.as_mut() {
@@ -685,9 +788,16 @@ impl Host {
             return;
         }
         self.visible = false;
+        self.unseen.reset();
         self.recording = None;
         input::capture(false);
-        self.pipe.send(json!({"t": "overlay", "visible": false}));
+        // Keys and buttons still held when it closed don't reopen it, and the buttons
+        // don't reach the game as a fresh press (`PAD_BUTTONS`).
+        self.keys_down = [true; 4];
+        self.pad_prev = self.pads.poll();
+        let held = self.pad_prev & PAD_BUTTONS != 0;
+        self.pads_held = held.then(Instant::now);
+        self.pipe.send(json!({"t": "overlay", "visible": false, "pads_held": held}));
         if let Some(w) = self.window.as_mut() {
             w.hide();
         }
@@ -695,9 +805,6 @@ impl Host {
             f.hide();
         }
         self.overlay.tip = None;
-        // Keys still held when it closed don't reopen it.
-        self.keys_down = [true; 4];
-        self.pad_prev = self.pads.poll();
     }
 
     fn save_prefs(&mut self) {
@@ -1012,6 +1119,7 @@ impl Host {
     /// does, or (automatically) when the game is in exclusive fullscreen, where a window
     /// over it can't show.
     fn use_ingame(&self) -> bool {
+        // (Whether the hook can draw there isn't known until it has: `UNSEEN_FOR`.)
         match self.prefs.draw.as_str() {
             "window" => false,
             "ingame" => true,
@@ -1033,6 +1141,7 @@ impl Host {
                 if let Some(w) = self.window.as_mut() {
                     w.hide();
                 }
+                self.unseen.handed(self.ingame, Instant::now());
                 return;
             }
         }
@@ -1165,13 +1274,82 @@ fn find_window(pid: u32) -> HWND {
     f.best
 }
 
+/// Whether the game can have its controllers back after the overlay closed with buttons
+/// down at `since`: the buttons are up (the d-pad and stick don't count), or it's been
+/// long enough.
+fn pads_let_go(pad: u32, since: Instant, now: Instant) -> bool {
+    pad & PAD_BUTTONS == 0 || now.duration_since(since) >= PADS_HELD_MAX
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::firewall::{Rule, Verdict};
 
+    /// The Start or B that closed the overlay holds the game's controllers back until
+    /// it's up; a stick or d-pad push doesn't, and nothing holds them for long.
+    #[test]
+    fn a_button_that_closed_the_overlay_is_held_until_up() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        assert!(!pads_let_go(pad::START, t0, at(100)));
+        assert!(!pads_let_go(pad::EAST | pad::LEFT, t0, at(900)));
+        assert!(pads_let_go(0, t0, at(16)), "up");
+        assert!(pads_let_go(pad::UP | pad::RIGHT, t0, at(16)), "the d-pad and stick don't count");
+        assert!(pads_let_go(pad::START, t0, at(1000)), "held at most PADS_HELD_MAX");
+        for b in [pad::SOUTH, pad::EAST, pad::WEST, pad::NORTH, pad::LB, pad::RB, pad::BACK, pad::START, pad::HOME] {
+            assert!(b & PAD_BUTTONS != 0);
+        }
+    }
+
     fn block(policy: bool) -> Rule {
         Rule { id: "x".into(), name: "game".into(), inbound: true, active: true, policy, ..Default::default() }
+    }
+
+    /// The overlay handed to a game that never draws it closes 2.5 s after the first
+    /// hand-over (frames handed over meanwhile don't restart the clock); one the hook
+    /// draws, or that closed, doesn't.
+    #[test]
+    fn an_overlay_the_game_never_draws_closes_itself() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut u = Unseen::default();
+        assert!(!u.too_long(false, at(10_000)), "never handed over");
+        u.handed(false, at(0));
+        for ms in (0..2500).step_by(16) {
+            u.handed(false, at(ms));
+            assert!(!u.too_long(false, at(ms)), "{ms} ms");
+        }
+        assert!(u.too_long(false, at(2500)));
+        // The hook says it draws: never too long, and the clock is gone.
+        assert!(!u.too_long(true, at(5000)));
+        u.reset();
+        assert!(!u.too_long(false, at(5000)));
+        // Handed over while the hook draws: no clock at all.
+        u.handed(true, at(5000));
+        assert!(!u.too_long(false, at(9000)));
+        // Opened again later: a new clock.
+        u.handed(false, at(9000));
+        assert!(!u.too_long(false, at(11_000)));
+        assert!(u.too_long(false, at(11_500)));
+    }
+
+    /// Shift+Tab is Steam's overlay key too: with Steam's overlay in the game it's left
+    /// to Steam, unless nothing else would open PeerParty's. A store not loaded keeps
+    /// its key ours.
+    #[test]
+    fn a_store_overlays_key_is_left_to_it() {
+        let steam = vec!["steam".to_string()];
+        let on = [true, true, false, false];
+        assert_eq!(usable_hotkeys(on, &[], false), on);
+        assert_eq!(usable_hotkeys(on, &steam, false), [false, true, false, false]);
+        assert_eq!(usable_hotkeys(on, &["epic".to_string(), "ea".to_string()], false), [true, false, false, false]);
+        // Only Shift+Tab on: with a controller button it goes; with nothing else it stays.
+        let only = [true, false, false, false];
+        assert_eq!(usable_hotkeys(only, &steam, true), [false; 4]);
+        assert_eq!(usable_hotkeys(only, &steam, false), only);
+        let state = ui::GameState::from_json(&json!({"t": "state", "foreign": ["steam", "epic"]}));
+        assert_eq!(state.foreign, ["steam", "epic"]);
     }
 
     /// What the Internet page's firewall row says for each kind of check result.

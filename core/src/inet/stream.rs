@@ -9,6 +9,10 @@ use std::time::{Duration, Instant};
 
 /// Bytes in one segment: with the headers, a packet stays under 1200 bytes.
 pub const MAX_SEG: usize = 1100;
+/// The biggest segment we take. Ours are MAX_SEG; a peer may hold RECV_WINDOW segments
+/// ahead of a gap it never fills, so their size is what bounds that memory (4 MiB at
+/// this size, where 64 KiB segments would be 128 MiB a session).
+pub const MAX_SEG_IN: usize = 2048;
 /// Bytes the sender queues before the writer is told to wait.
 pub const MAX_QUEUED: usize = 4 << 20;
 const MAX_IN_FLIGHT: usize = 1024;

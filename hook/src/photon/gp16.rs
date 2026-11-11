@@ -421,29 +421,29 @@ fn read_payload(r: &mut Rd, tc: u8, depth: usize) -> R<Value> {
         ARRAY => read_array(r, depth)?,
         EVENT => {
             let code = r.u8()?;
-            Value::Event(Box::new(EventMsg { code, params: read_params(r)? }))
+            Value::Event(Box::new(EventMsg { code, params: params_at(r, depth + 1)? }))
         }
         REQUEST => {
             let code = r.u8()?;
-            Value::Request(Box::new(Request { code, params: read_params(r)? }))
+            Value::Request(Box::new(Request { code, params: params_at(r, depth + 1)? }))
         }
-        RESPONSE => Value::Response(Box::new(read_response_body(r)?)),
+        RESPONSE => Value::Response(Box::new(response_at(r, depth + 1)?)),
         _ => return Err("unknown v1.6 type code"),
     })
 }
 
 fn read_table(r: &mut Rd, depth: usize) -> R<Table> {
     let n = count16(r)?;
-    let mut t = Vec::with_capacity(cap(n, r));
+    let mut t = TableIn::with_capacity(cap(n, r));
     for _ in 0..n {
         let k = read_typed(r, depth + 1)?;
         let v = read_typed(r, depth + 1)?;
         // The client drops null keys too.
         if !k.is_null() {
-            table_set(&mut t, k, v);
+            t.set(k, v)?;
         }
     }
-    Ok(t)
+    Ok(t.done())
 }
 
 fn read_entries(r: &mut Rd, k: u8, v: u8, depth: usize) -> R<Vec<(Value, Value)>> {
@@ -537,24 +537,33 @@ fn read_array(r: &mut Rd, depth: usize) -> R<Value> {
 }
 
 pub fn read_params(r: &mut Rd) -> R<Params> {
+    params_at(r, 1)
+}
+
+/// A message's parameters, `depth` values down (see `gp18::params_at`).
+fn params_at(r: &mut Rd, depth: usize) -> R<Params> {
     let n = count16(r)?;
     let mut p = Vec::with_capacity(cap(n, r));
     for _ in 0..n {
         let k = r.u8()?;
-        let v = read_typed(r, 1)?;
+        let v = read_typed(r, depth)?;
         set_param(&mut p, k, v);
     }
     Ok(p)
 }
 
 pub fn read_response_body(r: &mut Rd) -> R<Response> {
+    response_at(r, 1)
+}
+
+fn response_at(r: &mut Rd, depth: usize) -> R<Response> {
     let code = r.u8()?;
     let ret = i16::from_be_bytes(r.be()?);
-    let debug = match read_typed(r, 1)? {
+    let debug = match read_typed(r, depth)? {
         Value::Str(s) => Some(s),
         _ => None,
     };
-    Ok(Response { code, ret, debug, params: read_params(r)? })
+    Ok(Response { code, ret, debug, params: params_at(r, depth)? })
 }
 
 /// A disconnect message: code, debug message, parameters (no operation code).
@@ -577,4 +586,49 @@ pub fn write_disconnect_body(w: &mut Vec<u8>, d: &Response) -> R<()> {
         _ => w.push(NULL),
     }
     write_params(w, &d.params)
+}
+
+#[cfg(test)]
+mod depth_tests {
+    use super::*;
+
+    /// One level: a message as a value, holding one parameter whose value comes next.
+    fn level(outer: u8) -> Vec<u8> {
+        match outer {
+            RESPONSE => vec![RESPONSE, 1, 0, 0, NULL, 0, 1, 9],
+            _ => vec![outer, 1, 0, 1, 9],
+        }
+    }
+
+    /// A request inside a parameter inside a request, and so on: each started the depth
+    /// count again, so a few kilobytes from anyone who could connect ran the stack out,
+    /// which ends the game. On a small stack here, so it would end the test run instead.
+    #[test]
+    fn messages_nested_in_values_count_as_nesting() {
+        std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                for outer in [REQUEST, EVENT, RESPONSE] {
+                    let nested = |levels: usize| {
+                        let mut b = Vec::new();
+                        for _ in 0..levels {
+                            b.extend_from_slice(&level(outer));
+                        }
+                        b.push(NULL);
+                        b
+                    };
+                    assert!(read_value(&mut Rd::new(&nested(MAX_DEPTH - 1))).is_ok());
+                    for levels in [MAX_DEPTH + 2, 3000, 100_000] {
+                        assert_eq!(read_value(&mut Rd::new(&nested(levels))), Err("value nested too deep"));
+                        // As the parameter of a message, which is where a client puts it.
+                        let mut params = [0u8, 1, 9].to_vec();
+                        params.extend_from_slice(&nested(levels));
+                        assert_eq!(read_params(&mut Rd::new(&params)), Err("value nested too deep"));
+                    }
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 }

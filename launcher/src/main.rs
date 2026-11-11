@@ -43,9 +43,11 @@
 //! mutex gets a per-process name), for testing two players on one machine.
 //!
 //! `--copy-saves` starts a second copy on the same PC from the first copy's progress:
-//! saves the game keeps under the player's id are copied to the second copy's LAN id
-//! the first time the game looks for them (newer files only), for games that don't
-//! offer multiplayer from a fresh save.
+//! saves the game keeps under the player's id are copied whole to the second copy's LAN
+//! id when the game first looks for them, the second copy's own save moved aside to
+//! `<save>.peerparty-before` first, for games that don't offer multiplayer from a fresh
+//! save. Only a start given `--copy-saves` copies: a `PEERPARTY_COPY_SAVES` left in the
+//! environment is cleared, so a game library, a .bat or a shortcut never replace a save.
 //!
 //! A Steam game started outside Steam needs its app id. PeerParty looks for it in order:
 //! `--appid`, the `SteamAppId` variable, the app manifest of the Steam library the game is in
@@ -61,13 +63,18 @@
 compile_error!("peerparty.exe is x64 only; it injects 32-bit games itself");
 
 mod firewall;
+mod gameroot;
 mod host;
 mod hooks;
 mod i18n;
+mod icon_art;
 mod packaged;
 mod platform;
+mod tree;
 mod ui;
+mod update;
 mod wow64;
+mod wrapper;
 
 use std::env;
 use std::ffi::{OsStr, OsString, c_void};
@@ -85,7 +92,7 @@ use windows_sys::Win32::System::Threading::{
     QueueUserAPC, ResumeThread, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
 };
 
-const USAGE: &str = "usage: peerparty [--room CODE] [--public] [--log-dir DIR] [--appid N] [--multi-instance] [--copy-saves] <game.exe> [args...]\n         plays the game through peerparty: the local network, plus the internet with --room or --public\n       peerparty --invite   (invites every other player to the game in front)\n       peerparty --new-room   (makes a room code for internet play)\n       peerparty --net-test   (checks this PC's internet path: STUN, NAT type, the DHT)\n       peerparty --pads   (lists the controllers the overlay reads, and their buttons)\n       peerparty --firewall <game.exe>   (whether Windows Firewall lets other players connect to it)\n       peerparty --fix-firewall <game.exe> [--public]   (as administrator: lets them, on private and domain networks, and public ones with --public)\n       peerparty --blocked | --block FINGERPRINT | --unblock FINGERPRINT|all   (public players you blocked)\n       peerparty --friends | --friend FINGERPRINT | --unfriend FINGERPRINT|all   (friends for PEERPARTY_PUBLIC_FRIENDS_ONLY=1)";
+const USAGE: &str = "usage: peerparty [--room CODE] [--public] [--set key=value] [--log-dir DIR] [--appid N] [--multi-instance] [--copy-saves] <game.exe> [args...]\n         plays the game through peerparty: the local network, plus the internet with --room or --public\n         a simple .bat or .cmd that starts the game works too: peerparty starts the program it runs\n         --set changes one setting for this run: name=Alex, voice=off, internet=off, overlay=off, auto_accept=on, ... (docs/usage.md)\n       peerparty --invite   (invites every other player to the game in front)\n       peerparty --new-room   (makes a room code for internet play)\n       peerparty --net-test   (checks this PC's internet path: STUN, NAT type, the DHT)\n       peerparty --pads   (lists the controllers the overlay reads, and their buttons)\n       peerparty --firewall <game.exe>   (whether Windows Firewall lets other players connect to it)\n       peerparty --fix-firewall <game.exe> [--public]   (as administrator: lets them, on private and domain networks, and public ones with --public)\n       peerparty --blocked | --block FINGERPRINT | --unblock FINGERPRINT|all   (public players you blocked)\n       peerparty --friends | --friend FINGERPRINT | --unfriend FINGERPRINT|all   (friends for PEERPARTY_PUBLIC_FRIENDS_ONLY=1)";
 
 /// `--blocked`, `--block FP`, `--unblock FP|all`: the public-sessions block list.
 /// `--friends`, `--friend FP`, `--unfriend FP|all`: the same for the friends list.
@@ -157,28 +164,74 @@ fn net_test() -> Result<u32, String> {
 
 /// The event the hook's invite thread watches (hook/src/invite.rs).
 const INVITE_EVENT: &str = "Local\\peerparty.invite";
+/// The hook's `EVENT_LAST` and `EVENT_ACK` (hook/src/invite.rs).
+const INVITE_LAST_EVENT: &str = "Local\\peerparty.invite.last";
+const INVITE_ACK_EVENT: &str = "Local\\peerparty.invite.ack";
 
-/// Sets the invite event long enough for every hooked game to see it, then clears it.
-fn signal_invite() -> Result<u32, String> {
-    use windows_sys::Win32::System::Threading::{CreateEventW, ResetEvent, SetEvent};
-    let name = wide(OsStr::new(INVITE_EVENT));
+/// Asks a running game to invite every player on the network: the game in front, or
+/// with `last` the one that was last in front (for the launcher's own button, pressed
+/// while the launcher is). Whether a game took it up: a game not in front, or none
+/// running, doesn't, and saying "sent" then sent the player looking for an invite that
+/// never went.
+pub fn signal_invite(last: bool) -> Result<bool, String> {
+    signal_named(if last { INVITE_LAST_EVENT } else { INVITE_EVENT }, INVITE_ACK_EVENT, 1500)
+}
+
+/// Sets `event` until a game answers on `ack` or `wait_ms` is up, then clears both. An
+/// answer left from before doesn't count: `ack` is cleared first.
+fn signal_named(event: &str, ack: &str, wait_ms: u32) -> Result<bool, String> {
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::Threading::{CreateEventW, ResetEvent, SetEvent, WaitForSingleObject};
+    let open = |name: &str| {
+        let name = wide(OsStr::new(name));
+        unsafe { CreateEventW(ptr::null(), 1, 0, name.as_ptr()) }
+    };
     unsafe {
-        let event = CreateEventW(ptr::null(), 1, 0, name.as_ptr());
-        if event.is_null() {
-            return Err(os_error("CreateEvent"));
+        let (event, ack) = (open(event), open(ack));
+        if event.is_null() || ack.is_null() {
+            let e = os_error("CreateEvent");
+            for h in [event, ack] {
+                if !h.is_null() {
+                    CloseHandle(h);
+                }
+            }
+            return Err(e);
         }
+        ResetEvent(ack);
         SetEvent(event);
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        // A game's trigger thread wakes on the event; one that is busy takes a moment.
+        let taken = WaitForSingleObject(ack, wait_ms) == WAIT_OBJECT_0;
         ResetEvent(event);
+        ResetEvent(ack);
         CloseHandle(event);
+        CloseHandle(ack);
+        Ok(taken)
     }
-    eprintln!("peerparty: invite sent to the game in front");
-    Ok(0)
+}
+
+/// Windows looks for a DLL beside the exe before it looks in System32, and peerparty.exe
+/// is run from wherever it was downloaded to: a file named like a system DLL, dropped
+/// into Downloads by any web page, would be loaded into it, and into the copy of it
+/// that "Fix firewall" starts as administrator. Nothing peerparty.exe needs is beside
+/// it (it is one file), so the folder is taken out of the search, first thing.
+///
+/// That covers what is loaded from here on. What Windows loads before `main` is the
+/// linker's part (build.rs): the DLLs the exe names that Windows doesn't always take
+/// from System32 are loaded on first use instead, which is after this, and so are the
+/// DLLs those bring along. tools/dll-search-check.ps1 shows whether it holds.
+fn only_system_dlls() {
+    use windows_sys::Win32::System::LibraryLoader::{LOAD_LIBRARY_SEARCH_SYSTEM32, LOAD_LIBRARY_SEARCH_USER_DIRS, SetDefaultDllDirectories};
+    unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_USER_DIRS) };
 }
 
 fn main() -> ExitCode {
-    if env::args_os().len() == 1 {
-        return match ui::run() {
+    only_system_dlls();
+    // No arguments: the window. `--updated`: the window, started by the update that
+    // put this exe in place (update.rs).
+    let args: Vec<OsString> = env::args_os().skip(1).collect();
+    if args.is_empty() || (args.len() == 1 && args[0] == "--updated") {
+        update::clean_up();
+        return match ui::run(!args.is_empty()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(_) => ExitCode::from(1),
         };
@@ -285,7 +338,14 @@ fn run() -> Result<u32, String> {
                 let arg = if w == "--blocked" || w == "--friends" { None } else { Some(args.next().ok_or(USAGE)?.to_string_lossy().into_owned()) };
                 return block_list(&w, arg);
             }
-            Some("--invite") => return signal_invite(),
+            Some("--invite") => {
+                return if signal_invite(false)? {
+                    eprintln!("peerparty: the game in front is inviting every player on your network");
+                    Ok(0)
+                } else {
+                    Err("no game took the invite: it goes to a game started through peerparty whose window is in front".into())
+                };
+            }
             Some("--firewall") => {
                 args.next();
                 let exe = PathBuf::from(args.next().ok_or(USAGE)?);
@@ -301,13 +361,21 @@ fn run() -> Result<u32, String> {
             Some("--fix-firewall") => {
                 args.next();
                 let exe = PathBuf::from(args.next().ok_or(USAGE)?);
-                let public = args.next().is_some_and(|a| a == "--public");
+                let rest: Vec<String> = args.by_ref().map(|a| a.to_string_lossy().into_owned()).collect();
+                let public = rest.iter().any(|a| a == "--public");
+                // The launcher's pipe for why it failed (this runs hidden).
+                let report = rest.iter().position(|a| a == "--report").and_then(|i| rest.get(i + 1));
                 return match firewall::fix(&exe, public) {
                     Ok(msg) => {
                         eprintln!("peerparty: {msg}");
                         Ok(0)
                     }
-                    Err(e) => Err(e),
+                    Err(e) => {
+                        if let Some(pipe) = report {
+                            firewall::report(pipe, &e);
+                        }
+                        Err(format!("the firewall change failed: {e}"))
+                    }
                 };
             }
             Some("--pads") => {
@@ -319,7 +387,11 @@ fn run() -> Result<u32, String> {
                 let rest: Vec<String> = args.skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
                 return packaged::attach(&rest);
             }
-            Some("-h" | "--help") => return Err(USAGE.into()),
+            // Asked for: on standard output, and not an error.
+            Some("-h" | "--help" | "/?") => {
+                println!("{USAGE}");
+                return Ok(0);
+            }
             _ => break,
         }
     }
@@ -328,6 +400,20 @@ fn run() -> Result<u32, String> {
 
     let exe = fs::canonicalize(&exe).map_err(|e| format!("{}: {e}", exe.display()))?;
     let exe = strip_verbatim(&exe);
+    // What the player chose (a .bat stays the game's name in Settings and Recent).
+    let listed = exe.clone();
+    // A .bat or .cmd: the program it runs is the game (wrapper.rs).
+    let (exe, game_args, script_cwd) = if wrapper::is_script(&exe) {
+        let w = wrapper::read(&exe, &game_args)?;
+        let real = fs::canonicalize(&w.exe).map_err(|e| format!("{}: {e}", w.exe.display()))?;
+        eprintln!("peerparty: {} runs {}: starting that", exe.display(), w.exe.display());
+        for (k, v) in &w.vars {
+            unsafe { env::set_var(k, v) };
+        }
+        (strip_verbatim(&real), w.args, w.cwd)
+    } else {
+        (exe, game_args, None)
+    };
     // A packaged game's program can only be run, not read (its files allow execute but not
     // read data), and `--attach` works out its bitness from the running process.
     let pkg = packaged::find(&exe);
@@ -350,7 +436,7 @@ fn run() -> Result<u32, String> {
     // The player's settings for this game (the launcher window's, ui.json), with
     // `--set` on top. Variables already set (a .bat's own) win over both.
     let settings = ui::store::Settings::load();
-    let game = settings.options(&ui::store::key_of(&exe));
+    let game = settings.options(&ui::store::key_of(&listed));
     let mut prefs = host::effective(&settings, &game);
     for (k, v) in &sets {
         apply_set(&mut prefs, k, v);
@@ -404,7 +490,7 @@ fn run() -> Result<u32, String> {
             env::set_var("PEERPARTY_INTERNET", "0");
             eprintln!("peerparty: internet play switched off: local network only (switch it on in the overlay's Internet page, or Settings)");
         }
-        // Voice with public players: on unless turned off (an environment value wins).
+        // Voice with public players: off unless turned on (an environment value wins).
         if env::var_os("PEERPARTY_PUBLIC_VOICE").is_none() {
             env::set_var("PEERPARTY_PUBLIC_VOICE", if prefs.public_voice { "1" } else { "0" });
         }
@@ -440,6 +526,8 @@ fn run() -> Result<u32, String> {
         env::set_var("PEERPARTY_ACTIVE", "1");
         if copy_saves {
             env::set_var("PEERPARTY_COPY_SAVES", "1");
+        } else {
+            env::remove_var("PEERPARTY_COPY_SAVES");
         }
     }
 
@@ -458,10 +546,22 @@ fn run() -> Result<u32, String> {
         cmdline.push(" ");
         cmdline.push(quote(a));
     }
-    let cwd = exe.parent().unwrap_or(Path::new("."));
+    let cwd = script_cwd.as_deref().or(exe.parent()).unwrap_or(Path::new("."));
 
-    let pi = unsafe { start_injected(&exe, &cmdline, cwd, &dll, x86)? };
-    remember(&exe);
+    // The game's folder: programs started from it get PeerParty too (the hook's
+    // child.rs), and PeerParty runs until the last of them ends (tree.rs).
+    let root = match env::var_os("PEERPARTY_GAME_ROOT") {
+        Some(r) => Some(PathBuf::from(r)),
+        None => gameroot::find(&exe, &settings.folders).map(|(r, how)| {
+            eprintln!("peerparty: the game's folder is {} (from {how}); programs started from it get peerparty too", r.display());
+            unsafe { env::set_var("PEERPARTY_GAME_ROOT", &r) };
+            r
+        }),
+    };
+    let tree = tree::Tree::new(root.as_deref());
+
+    let pi = unsafe { start_injected(&exe, &cmdline, cwd, &dll, x86, tree.as_ref())? };
+    remember(&listed);
     eprintln!(
         "peerparty: started {} (pid {}, {}), logs in {}",
         exe.display(),
@@ -470,23 +570,31 @@ fn run() -> Result<u32, String> {
         log_dir.display()
     );
 
+    let watch = tree.map(|t| t.watch(pi.hProcess, pi.dwProcessId, exe.clone()));
+    let done = watch.as_ref().map_or(pi.hProcess, |w| w.0);
     if let Some(pipe) = pipe {
-        host::run(pi.hProcess, pi.dwProcessId, pipe, &exe, prefs, false);
+        host::run(done, pi.dwProcessId, pipe, &exe, prefs, false);
     }
     unsafe {
-        let mut code = 0u32;
-        let known = WaitForSingleObject(pi.hProcess, INFINITE) != WAIT_FAILED
-            && GetExitCodeProcess(pi.hProcess, &mut code) != 0;
-        if !known {
-            code = 1;
+        let waited = WaitForSingleObject(done, INFINITE) != WAIT_FAILED;
+        let ended = watch.as_ref().and_then(|w| w.1.lock().unwrap_or_else(|e| e.into_inner()).take()).unwrap_or_else(|| {
+            let mut code = 0u32;
+            let known = waited && GetExitCodeProcess(pi.hProcess, &mut code) != 0;
+            tree::Ended { pid: pi.dwProcessId, exe: exe.clone(), code: known.then_some(code), ran: run_time(pi.hProcess), starter: None }
+        });
+        if let Some((pid, starter, code)) = &ended.starter {
+            let code = code.map(|c| format!(" with exit code {c}")).unwrap_or_default();
+            log_exit(&log_dir, starter, *pid, &format!("{} ended{code}; the game went on in {} (pid {})", starter.display(), ended.exe.display(), ended.pid));
         }
-        let ran = run_time(pi.hProcess);
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
-        let line = exit_line(known.then_some(code), ran);
+        if let Some(w) = &watch {
+            CloseHandle(w.0);
+        }
+        let line = exit_line(ended.code, ended.ran);
         eprintln!("peerparty: {line}");
-        log_exit(&log_dir, &exe, pi.dwProcessId, &line);
-        Ok(code)
+        log_exit(&log_dir, &ended.exe, ended.pid, &line);
+        Ok(ended.code.unwrap_or(1))
     }
 }
 
@@ -675,6 +783,7 @@ unsafe fn start_injected(
     cwd: &Path,
     dll: &Path,
     x86: bool,
+    tree: Option<&tree::Tree>,
 ) -> Result<PROCESS_INFORMATION, String> {
     unsafe {
         let app = wide(exe.as_os_str());
@@ -716,6 +825,10 @@ unsafe fn start_injected(
         };
         if let Err(what) = injected {
             return Err(fail(what));
+        }
+        // Before it runs, so every program it starts is in the job too.
+        if tree.is_some_and(|t| !t.add(pi.hProcess)) {
+            eprintln!("peerparty: can't watch the programs the game starts ({}); waiting for this one only", std::io::Error::last_os_error());
         }
         if ResumeThread(pi.hThread) == u32::MAX {
             return Err(fail(format!(
@@ -931,6 +1044,12 @@ fn quote(arg: &OsStr) -> OsString {
     if !s.is_empty() && !s.contains([' ', '\t', '"']) {
         return arg.to_os_string();
     }
+    crt_quote(&s).into()
+}
+
+/// `s` in quotes as the C runtime reads them back: a `"` inside is `\"`, and the
+/// backslashes before a quote (the closing one too) are doubled.
+pub fn crt_quote(s: &str) -> String {
     let mut out = String::from("\"");
     let mut backslashes = 0;
     for c in s.chars() {
@@ -950,7 +1069,7 @@ fn quote(arg: &OsStr) -> OsString {
     }
     out.extend(std::iter::repeat_n('\\', backslashes * 2));
     out.push('"');
-    out.into()
+    out
 }
 
 fn wide(s: &OsStr) -> Vec<u16> {
@@ -960,6 +1079,57 @@ fn wide(s: &OsStr) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The launcher's names for the invite events are the hook's.
+    #[test]
+    fn invite_event_names_match_the_hook() {
+        let hook = include_str!("../../hook/src/invite.rs");
+        for (name, value) in [("EVENT_NAME", INVITE_EVENT), ("EVENT_LAST", INVITE_LAST_EVENT), ("EVENT_ACK", INVITE_ACK_EVENT)] {
+            let line = format!("pub const {name}: &str = \"{}\";", value.replace('\\', "\\\\"));
+            assert!(hook.contains(&line), "hook/src/invite.rs has no `{line}`");
+        }
+    }
+
+    /// An invite reports whether a game took it: no game is a "no" (after the wait), an
+    /// answer left from an earlier invite doesn't count, a game's answer is a "yes", and
+    /// the event is cleared after either (a game started later isn't triggered by it).
+    /// Names of its own, so a game running on this PC isn't asked.
+    #[test]
+    fn an_invite_says_whether_a_game_took_it() {
+        use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
+        let id = std::process::id();
+        let (event, ack) = (format!("Local\\peerparty.test.invite.{id}"), format!("Local\\peerparty.test.invite.ack.{id}"));
+        let open = |name: &str| {
+            let name = wide(OsStr::new(name));
+            let h = unsafe { CreateEventW(ptr::null(), 1, 0, name.as_ptr()) };
+            assert!(!h.is_null());
+            h as usize
+        };
+        let (ev, ak) = (open(&event), open(&ack));
+        // Nobody listening, and an old answer still set.
+        unsafe { SetEvent(ak as _) };
+        let start = std::time::Instant::now();
+        assert_eq!(signal_named(&event, &ack, 300), Ok(false));
+        assert!(start.elapsed() >= std::time::Duration::from_millis(250));
+        assert_eq!(unsafe { WaitForSingleObject(ev as _, 0) }, WAIT_TIMEOUT, "the event was left set");
+        // A game that answers, the way hook/src/invite.rs does.
+        let game = std::thread::spawn(move || {
+            let woke = unsafe { WaitForSingleObject(ev as _, 5000) } == WAIT_OBJECT_0;
+            if woke {
+                unsafe { SetEvent(ak as _) };
+            }
+            woke
+        });
+        assert_eq!(signal_named(&event, &ack, 5000), Ok(true));
+        assert!(game.join().unwrap());
+        assert_eq!(unsafe { WaitForSingleObject(ev as _, 0) }, WAIT_TIMEOUT, "the event was left set");
+        assert_eq!(unsafe { WaitForSingleObject(ak as _, 0) }, WAIT_TIMEOUT, "the answer was left set");
+        unsafe {
+            CloseHandle(ev as _);
+            CloseHandle(ak as _);
+        }
+    }
 
     /// `--set internet=off|on` flips the internet switch for one run; it's on by default.
     #[test]

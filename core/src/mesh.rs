@@ -50,6 +50,23 @@ const BEACON_EVERY: Duration = Duration::from_secs(1);
 /// shorter one (`TestTiming`); an idle connection must outlive it, because the timeout
 /// is cleared once the Hello is done.
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// The first frame on a connection is a Hello (a game key, an id, a name): anything
+/// bigger isn't one. Before the Hello nothing says who is there, so a connection doesn't
+/// get to make us set aside a whole MAX_FRAME for it.
+const HELLO_MAX: usize = 64 * 1024;
+/// The biggest frame to or from a public stranger after the Hello. What games send runs
+/// far below it (the largest message an SDK documents is about 1 MB); MAX_FRAME is for
+/// friends, and in a 32-bit game a stranger's 16 MiB frames, decoded, held a good part
+/// of its memory. Both sides of a public session are public to each other, so a sender
+/// drops a frame this big instead of having its connection cut.
+pub(crate) const PUBLIC_FRAME_MAX: usize = 2 << 20;
+/// Room made for a frame's body before its bytes arrive: a length alone doesn't get a
+/// peer a big allocation, sending the bytes does.
+const FRAME_PREALLOC: usize = 64 * 1024;
+/// Connections whose Hello we're still waiting for, at most: each has a thread until it
+/// says hello or HANDSHAKE_TIMEOUT passes, and anything that can reach the port can open
+/// them. More are closed at once (a real peer dials again within a second).
+const MAX_HANDSHAKES: usize = 128;
 /// Bytes queued for one peer that hasn't taken them yet. A peer that stops reading (a
 /// hung game, a broken path) is cut at this point instead of growing our memory without
 /// end: it reconnects and starts again. Four of the largest frames.
@@ -108,6 +125,8 @@ pub struct Conn {
     data: Arc<UdpSocket>,
     /// Where the peer's data socket is: from its Hello, then from its pings.
     udp: Mutex<Option<SocketAddr>>,
+    /// Where its Hello said, for peers on this PC (see `elsewhere`).
+    udp_said: Option<SocketAddr>,
     /// The peer answered a ping: datagrams reach it.
     udp_ok: AtomicBool,
     pings: AtomicU32,
@@ -140,6 +159,12 @@ impl Conn {
         let _ = self.scrub.set(with);
     }
 
+    /// The biggest frame this connection carries: PUBLIC_FRAME_MAX for a public
+    /// stranger's (the ones `scrub_as` was set for), else MAX_FRAME.
+    fn frame_max(&self) -> usize {
+        if self.scrub.get().is_some() { PUBLIC_FRAME_MAX } else { MAX_FRAME }
+    }
+
     /// Queues a message. Never blocks; a dead connection drops it.
     pub fn send(&self, msg: &Msg) {
         let frame = match self.scrub.get() {
@@ -150,9 +175,9 @@ impl Conn {
             }
             _ => msg.encode(),
         };
-        // The peer closes the connection on a frame over MAX_FRAME (`read_frame`), losing
-        // everything queued behind it; drop just this one instead.
-        if frame.len() > MAX_FRAME {
+        // The peer closes the connection on a frame over its limit (`read_frame_max`),
+        // losing everything queued behind it; drop just this one instead.
+        if frame.len() > self.frame_max() {
             return;
         }
         let guard = self.tx.lock().unwrap();
@@ -217,9 +242,11 @@ impl Conn {
     }
 
     /// Takes a connection that lost a tie-break out of service gently: nothing new is
-    /// queued, what is already queued still goes out, then our side stops writing. The
-    /// reader keeps delivering what the peer had sent on it until the peer closes it too.
-    /// RETIRE_GRACE later it is cut regardless, for a peer that never closes it.
+    /// queued and what is already queued still goes out. The reader keeps delivering what
+    /// the peer had sent on it until the peer closes it too. It isn't half-closed: the
+    /// peer may not have the winning connection yet, and an end on this one would look
+    /// to it like us leaving (its channels lost, then a fresh join). The peer retires it
+    /// too once it has the winner; RETIRE_GRACE later it is cut regardless.
     pub fn retire(self: &Arc<Self>) {
         if self.retired.swap(true, Ordering::Relaxed) {
             return;
@@ -309,6 +336,15 @@ impl PeerSeq {
     }
 }
 
+/// Whether a datagram claiming to be a peer's comes from somewhere other than that
+/// peer. Across a network that's another address than its TCP connection's. On this PC
+/// every peer has the same address (a second copy of the game, and every internet
+/// player, whose tunnel ends here), so there it's another port than the one the peer's
+/// Hello named: or one internet player could speak as another, or as the copy beside us.
+fn elsewhere(from: SocketAddr, tcp: SocketAddr, said: Option<SocketAddr>) -> bool {
+    from.ip() != tcp.ip() || (from.ip().is_loopback() && said.is_some_and(|s| s != from))
+}
+
 /// Whether a datagram from an address other than the peer's TCP connection's may count
 /// (a PC with several addresses answers from whichever its routes pick): only when it
 /// carries an epoch that went to, or came from, the peer over UDP. A pong must echo our
@@ -375,6 +411,8 @@ fn parse_caps(body: &[u8]) -> Option<(u8, u32, Option<u32>)> {
 pub(crate) struct Config {
     pub game: String,
     pub me: PeerId,
+    /// The key `me` is the hash of: what our hello is proved with.
+    pub key: Arc<crate::inet::public::IdentityKey>,
     pub name: String,
     pub discovery_port: u16,
     /// Extra beacon targets for networks broadcast doesn't cross (VPNs, other subnets).
@@ -462,6 +500,9 @@ pub(crate) struct Mesh {
     dialing: Arc<Mutex<HashSet<PeerId>>>,
     data: Arc<UdpSocket>,
     pub(crate) upgrades: Arc<Upgrades>,
+    /// Our listener and sockets are ours, not the game's: the typed-IP forwarder never
+    /// delivers a peer's traffic to them (see `own`).
+    _own: Vec<crate::own::Held>,
 }
 
 const DGRAM_HEADER: usize = 2 + 2 + 1 + 16;
@@ -484,7 +525,7 @@ fn datagram(kind: u8, from: PeerId, body: &[u8]) -> Vec<u8> {
 
 /// A channel message as one datagram, built in one buffer: sequenced (with our `epoch`
 /// and a sequence number of 0 for `set_seq` to fill in once it is sent) or plain.
-fn unreliable_datagram(from: PeerId, epoch: Option<u32>, msg: &Msg) -> Vec<u8> {
+pub(crate) fn unreliable_datagram(from: PeerId, epoch: Option<u32>, msg: &Msg) -> Vec<u8> {
     let kind = if epoch.is_some() { DGRAM_SEQ } else { DGRAM_MSG };
     let mut d = datagram_head(kind, from, SEQ_HEADER + 256);
     if let Some(epoch) = epoch {
@@ -499,6 +540,11 @@ fn set_seq(d: &mut [u8], seq: u32) {
     if let Some(s) = d.get_mut(DGRAM_HEADER + 4..DGRAM_HEADER + SEQ_HEADER) {
         s.copy_from_slice(&seq.to_le_bytes());
     }
+}
+
+/// Whether `d` is one of our datagrams and says `peer` sent it.
+pub(crate) fn datagram_is_from(d: &[u8], peer: PeerId) -> bool {
+    parse_datagram(d).is_some_and(|(_, id, _)| id == peer)
 }
 
 /// (kind, sender, body) of one of our datagrams.
@@ -540,6 +586,7 @@ pub(crate) fn start(cfg: Config, sink: Arc<dyn Sink>) -> io::Result<Mesh> {
     let udp = discovery_socket(cfg.discovery_port)?;
     let data = Arc::new(UdpSocket::bind((crate::bind_ip(), 0))?);
     data.set_read_timeout(Some(Duration::from_millis(500)))?;
+    let own = vec![crate::own::tcp(port), crate::own::udp(cfg.discovery_port), crate::own::udp(data.local_addr()?.port())];
     let stop = Arc::new(AtomicBool::new(false));
     let cfg = Arc::new(cfg);
     let dialing = Arc::new(Mutex::new(HashSet::new()));
@@ -564,7 +611,7 @@ pub(crate) fn start(cfg: Config, sink: Arc<dyn Sink>) -> io::Result<Mesh> {
                     // for by an epoch (see foreign_ok): a datagram claiming its id from
                     // elsewhere could otherwise redirect our traffic (a ping) or inject
                     // channel data.
-                    let elsewhere = from.ip() != conn.addr.ip();
+                    let elsewhere = elsewhere(from, conn.addr, conn.udp_said);
                     let theirs = conn.seq_in.lock().unwrap().epoch();
                     if elsewhere && !foreign_ok(kind, body, conn.epoch, theirs) {
                         foreign += 1;
@@ -652,15 +699,31 @@ pub(crate) fn start(cfg: Config, sink: Arc<dyn Sink>) -> io::Result<Mesh> {
         thread::Builder::new()
             .name("peerparty-accept".into())
             .spawn(move || {
+                let waiting = Arc::new(AtomicUsize::new(0));
+                let mut turned_away: u64 = 0;
                 for stream in listener.incoming() {
                     if stop.load(Ordering::Relaxed) {
                         break;
                     }
                     let Ok(stream) = stream else { continue };
+                    if waiting.load(Ordering::Relaxed) >= MAX_HANDSHAKES {
+                        // Dropped, which closes it.
+                        turned_away += 1;
+                        if turned_away <= 3 || turned_away.is_power_of_two() {
+                            sink.log(&format!(
+                                "lan: {MAX_HANDSHAKES} connections haven't said hello yet: closed another ({turned_away} so far)"
+                            ));
+                        }
+                        continue;
+                    }
+                    waiting.fetch_add(1, Ordering::Relaxed);
                     let (cfg, sink) = (cfg.clone(), sink.clone());
                     let data = data.clone();
+                    let waiting = waiting.clone();
                     thread::spawn(move || {
-                        if let Err(e) = handshake(stream, &cfg, &sink, &data, None) {
+                        let result = handshake(stream, &cfg, &sink, &data, None);
+                        waiting.fetch_sub(1, Ordering::Relaxed);
+                        if let Err(e) = result {
                             sink.log(&format!("lan accept failed: {e}"));
                         }
                     });
@@ -738,7 +801,7 @@ pub(crate) fn start(cfg: Config, sink: Arc<dyn Sink>) -> io::Result<Mesh> {
             })?;
     }
 
-    Ok(Mesh { port, stop, cfg, sink, dialing, data, upgrades })
+    Ok(Mesh { port, stop, cfg, sink, dialing, data, upgrades, _own: own })
 }
 
 /// Dials a peer we heard about, unless a dial to it is already under way.
@@ -875,23 +938,33 @@ fn handshake(
         sink.log(&format!("lan: no TCP keepalive on a connection: {e}"));
     }
     stream.set_read_timeout(Some(cfg.handshake_timeout))?;
+    let nonce: [u8; 16] = crate::inet::crypto::random_array();
     let hello = Msg::Hello {
         version: VERSION,
         game: cfg.game.clone(),
         id: cfg.me,
         name: cfg.name.clone(),
         udp: data.local_addr().map_or(0, |a| a.port()),
+        key: cfg.key.public(),
+        nonce,
     };
     let mut writer = stream.try_clone()?;
-    write_frame(&mut writer, &hello.encode())?;
+    // Whoever dialed says who it is first. The one dialed answers only a caller that
+    // turns out to be a copy of this game: its Hello carries this player's name and id,
+    // which aren't for whatever connects to the port and waits.
+    if expect.is_some() {
+        write_frame(&mut writer, &hello.encode())?;
+    }
     let mut reader = stream.try_clone()?;
-    let frame = read_frame(&mut reader)?;
+    let frame = read_frame_max(&mut reader, HELLO_MAX)?;
     let Some(Msg::Hello {
         version,
         game,
         id,
         name,
         udp,
+        key: their_key,
+        nonce: their_nonce,
     }) = Msg::decode(&frame)
     else {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "no hello"));
@@ -901,6 +974,24 @@ fn handshake(
             io::ErrorKind::InvalidData,
             "wrong peer or game",
         ));
+    }
+    if expect.is_none() {
+        write_frame(&mut writer, &hello.encode())?;
+    }
+    // An id is only a number anyone can say; what makes this connection that player's
+    // is the key the id is the hash of, shown by signing what the two of us just made
+    // up. Both sides send theirs, then read the other's. Without it, whoever could
+    // reach this port could come in as any player it knew the id of: as a friend, and
+    // from the LAN in place of the friend's own connection from the internet.
+    let proof = cfg.key.sign_hello(&cfg.game, (cfg.me, &nonce), (id, &their_nonce));
+    write_frame(&mut writer, &Msg::Proof { sig: proof }.encode())?;
+    let proved = match Msg::decode(&read_frame_max(&mut reader, HELLO_MAX)?) {
+        Some(Msg::Proof { sig }) => crate::inet::public::hello_proves(&their_key, &sig, &cfg.game, (id, &their_nonce), (cfg.me, &nonce)),
+        _ => false,
+    };
+    if !proved {
+        sink.log(&format!("lan: a connection from {} said it was {id} and couldn't prove it: dropped", crate::inet::redact::lan(addr)));
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "the peer didn't prove its id"));
     }
     // A cloned handle keeps its own receive timeout; the reader is the one that matters.
     reader.set_read_timeout(None)?;
@@ -917,6 +1008,7 @@ fn handshake(
         local: cfg.me,
         data: data.clone(),
         udp: Mutex::new((udp != 0).then(|| SocketAddr::new(addr.ip(), udp))),
+        udp_said: (udp != 0).then(|| SocketAddr::new(addr.ip(), udp)),
         udp_ok: AtomicBool::new(false),
         pings: AtomicU32::new(0),
         retired: AtomicBool::new(false),
@@ -968,21 +1060,21 @@ fn handshake(
                 }
             }
             // The queue closed: a retired connection has sent everything queued and only
-            // stops writing, so its reader still gets what the peer sends; a closed one
-            // is already shut both ways.
-            let how = if failed {
-                std::net::Shutdown::Both
-            } else {
-                std::net::Shutdown::Write
-            };
-            let _ = writer.shutdown(how);
+            // stops writing (no end sent: see `Conn::retire`), so its reader still gets
+            // what the peer sends; a closed one is already shut both ways.
+            if failed {
+                let _ = writer.shutdown(std::net::Shutdown::Both);
+            }
         })?;
     let sink = sink.clone();
     thread::Builder::new()
         .name("peerparty-recv".into())
         .spawn(move || {
             let mut malformed: u64 = 0;
-            while let Ok(frame) = read_frame(&mut reader) {
+            // Set before this thread starts (`Sink::connected`), and fixed for the
+            // connection: a better path is a new connection.
+            let max = conn.frame_max();
+            while let Ok(frame) = read_frame_max(&mut reader, max) {
                 match Msg::decode(&frame) {
                     Some(msg) => sink.message(&conn, msg, true),
                     None => {
@@ -1038,18 +1130,23 @@ fn write_frame(w: &mut impl Write, body: &[u8]) -> io::Result<()> {
     w.write_all(rest)
 }
 
-fn read_frame(r: &mut impl Read) -> io::Result<Vec<u8>> {
+/// A frame of at most `max` bytes: a longer one is an error before any of it is read
+/// (or room made for it). Room for the body grows as its bytes arrive.
+fn read_frame_max(r: &mut impl Read, max: usize) -> io::Result<Vec<u8>> {
     let mut len = [0u8; 4];
     r.read_exact(&mut len)?;
     let len = u32::from_le_bytes(len) as usize;
-    if len > MAX_FRAME {
+    if len > max {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "frame too large",
         ));
     }
-    let mut body = vec![0u8; len];
-    r.read_exact(&mut body)?;
+    let mut body = Vec::with_capacity(len.min(FRAME_PREALLOC));
+    r.take(len as u64).read_to_end(&mut body)?;
+    if body.len() != len {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
     Ok(body)
 }
 
@@ -1197,6 +1294,7 @@ mod tests {
             local: PeerId::random(),
             data: Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap()),
             udp: Mutex::new(None),
+            udp_said: None,
             udp_ok: AtomicBool::new(false),
             pings: AtomicU32::new(0),
             retired: AtomicBool::new(false),
@@ -1276,6 +1374,20 @@ mod tests {
     }
 
     #[test]
+    fn a_datagram_from_another_port_on_this_pc_is_from_elsewhere() {
+        let at = |s: &str| s.parse::<SocketAddr>().unwrap();
+        // Across a network: the address decides, any port.
+        assert!(!elsewhere(at("192.168.1.7:4000"), at("192.168.1.7:51000"), Some(at("192.168.1.7:4000"))));
+        assert!(!elsewhere(at("192.168.1.7:4001"), at("192.168.1.7:51000"), Some(at("192.168.1.7:4000"))));
+        assert!(elsewhere(at("192.168.1.8:4000"), at("192.168.1.7:51000"), Some(at("192.168.1.7:4000"))));
+        // On this PC every peer is 127.0.0.1: only the port its Hello named is the peer.
+        assert!(!elsewhere(at("127.0.0.1:4000"), at("127.0.0.1:51000"), Some(at("127.0.0.1:4000"))));
+        assert!(elsewhere(at("127.0.0.1:4001"), at("127.0.0.1:51000"), Some(at("127.0.0.1:4000"))));
+        // A copy that named no port (it has no data socket) is told apart by address.
+        assert!(!elsewhere(at("127.0.0.1:4001"), at("127.0.0.1:51000"), None));
+    }
+
+    #[test]
     fn unreliable_datagrams_parse_back() {
         let msg = Msg::ChanData {
             socket: "party:g".into(),
@@ -1334,10 +1446,36 @@ mod tests {
             write_frame(&mut w, &body).unwrap();
             write_frame(&mut w, &[]).unwrap();
             let mut r = &w.out[..];
-            assert_eq!(read_frame(&mut r).unwrap(), body, "max {max}");
-            assert_eq!(read_frame(&mut r).unwrap(), Vec::<u8>::new());
+            assert_eq!(read_frame_max(&mut r, MAX_FRAME).unwrap(), body, "max {max}");
+            assert_eq!(read_frame_max(&mut r, MAX_FRAME).unwrap(), Vec::<u8>::new());
             assert!(r.is_empty());
         }
+    }
+
+    /// A frame that says it's bigger than allowed is refused from its length alone.
+    #[test]
+    fn an_oversized_frame_is_refused_unread() {
+        let mut big = ((HELLO_MAX + 1) as u32).to_le_bytes().to_vec();
+        big.extend_from_slice(b"only a few bytes follow");
+        let mut r = &big[..];
+        let e = read_frame_max(&mut r, HELLO_MAX).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(r.len(), big.len() - 4, "nothing past the length was read");
+        // The same length is fine for an ordinary frame (it then needs its bytes).
+        let mut r = &big[..];
+        assert_eq!(read_frame_max(&mut r, MAX_FRAME).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        let mut ok = (HELLO_MAX as u32).to_le_bytes().to_vec();
+        ok.resize(4 + HELLO_MAX, 7);
+        assert_eq!(read_frame_max(&mut &ok[..], HELLO_MAX).unwrap().len(), HELLO_MAX);
+        // A public stranger's frames stop at PUBLIC_FRAME_MAX.
+        let mut big = ((PUBLIC_FRAME_MAX + 1) as u32).to_le_bytes().to_vec();
+        big.resize(4 + PUBLIC_FRAME_MAX + 1, 1);
+        assert_eq!(read_frame_max(&mut &big[..], PUBLIC_FRAME_MAX).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(read_frame_max(&mut &big[..], MAX_FRAME).unwrap().len(), PUBLIC_FRAME_MAX + 1);
+        // The largest length with nothing behind it: an error, not 16 MiB set aside.
+        let mut lie = (MAX_FRAME as u32).to_le_bytes().to_vec();
+        lie.extend_from_slice(&[0; 100]);
+        assert_eq!(read_frame_max(&mut &lie[..], MAX_FRAME).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]

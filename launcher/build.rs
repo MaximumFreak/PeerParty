@@ -3,14 +3,18 @@
 //! target directory inside the outer one: cargo locks per target directory, and a
 //! shared one would deadlock.
 //!
-//! Also gives the exe a version resource: the version number only, nothing else in its
-//! file properties. The number is the package version plus a build number, the commits
-//! since git's `v<version>` tag (`git describe`), so a peerparty.exe names its commit:
-//! 0.1.0.5 is five commits after v0.1.0.
+//! Also gives the exe its resources: the icon (drawn from `src/icon_art.rs`, the window's
+//! too), a manifest (run as the user, never elevated; the Windows versions it knows),
+//! and a version resource naming it PeerParty. The version is the package version plus
+//! a build number, the commits since git's `v<version>` tag (`git describe`), so a
+//! peerparty.exe names its commit: 0.1.0.5 is five commits after v0.1.0.
 
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+#[path = "src/icon_art.rs"]
+mod icon_art;
 
 const HOOKS: [(&str, &str); 2] = [
     ("x86_64-pc-windows-msvc", "PEERPARTY_HOOK64"),
@@ -76,6 +80,21 @@ fn main() {
     }
 
     version_resource(&root, &out);
+    // Where the exe's DLLs come from (see `only_system_dlls` in main.rs for why). The
+    // ones it names are looked for in System32 only (0x800, LOAD_LIBRARY_SEARCH_SYSTEM32).
+    // That flag doesn't reach the DLLs those load in turn, so the ones Windows doesn't
+    // always take from System32 (all but its "known DLLs") are loaded on first use,
+    // by which time `main` has said where DLLs may come from. A new one that a
+    // dependency starts to name belongs in this list: tools/dll-search-check.ps1 says so.
+    if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rustc-link-arg-bins=/DEPENDENTLOADFLAG:0x800");
+        // advapi32 is a known DLL itself, but its random number function is another
+        // DLL's under its name, and that one is fetched when the name is looked up.
+        for dll in ["dwmapi", "uxtheme", "opengl32", "hid", "iphlpapi", "bcrypt", "bcryptprimitives", "advapi32"] {
+            println!("cargo:rustc-link-arg-bins=/DELAYLOAD:{dll}.dll");
+        }
+        println!("cargo:rustc-link-arg-bins=delayimp.lib");
+    }
     println!("cargo:rerun-if-env-changed=PEERPARTY_HOOK_RUSTFLAGS");
     println!("cargo:rerun-if-env-changed=PEERPARTY_HOOKS");
 
@@ -131,8 +150,8 @@ fn build_number(root: &Path, version: &str) -> u32 {
     text.trim().rsplitn(3, '-').nth(1).and_then(|n| n.parse().ok()).unwrap_or(0)
 }
 
-/// A VERSIONINFO with only the file and product version: the package's plus the build
-/// number.
+/// The exe's icon, manifest and VERSIONINFO (the package version plus the build
+/// number, and PeerParty's name), in one resource script.
 fn version_resource(root: &Path, out: &Path) {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
@@ -142,8 +161,18 @@ fn version_resource(root: &Path, out: &Path) {
     let (major, minor, patch) = (n("CARGO_PKG_VERSION_MAJOR"), n("CARGO_PKG_VERSION_MINOR"), n("CARGO_PKG_VERSION_PATCH"));
     let nums = format!("{major},{minor},{patch},{build}");
     let v = format!("{major}.{minor}.{patch}.{build}");
+    println!("cargo:rerun-if-changed=src/icon_art.rs");
+    let ico = out.join("peerparty.ico");
+    std::fs::write(&ico, ico_file(&[16, 20, 24, 32, 40, 48, 64, 256])).expect("writing peerparty.ico");
+    let manifest = out.join("peerparty.manifest");
+    std::fs::write(&manifest, MANIFEST).expect("writing peerparty.manifest");
+    // rc.exe strings: backslashes doubled.
+    let rc_path = |p: &Path| p.display().to_string().replace('\\', "\\\\");
+    let (ico, manifest) = (rc_path(&ico), rc_path(&manifest));
     let rc = format!(
-        r#"1 VERSIONINFO
+        r#"1 ICON "{ico}"
+1 24 "{manifest}"
+1 VERSIONINFO
 FILEVERSION {nums}
 PRODUCTVERSION {nums}
 FILEOS 0x40004
@@ -153,7 +182,13 @@ BEGIN
   BEGIN
     BLOCK "040904b0"
     BEGIN
+      VALUE "CompanyName", "PeerParty"
+      VALUE "FileDescription", "PeerParty"
       VALUE "FileVersion", "{v}"
+      VALUE "InternalName", "peerparty"
+      VALUE "LegalCopyright", "MIT License"
+      VALUE "OriginalFilename", "peerparty.exe"
+      VALUE "ProductName", "PeerParty"
       VALUE "ProductVersion", "{v}"
     END
   END
@@ -170,4 +205,76 @@ END
         .set_resource_file(path.to_str().unwrap())
         .compile()
         .expect("compiling the version resource (rc.exe from the Windows SDK)");
+}
+
+/// Runs as the user who started it (never asks for elevation, and Windows' installer
+/// detection leaves it alone), and names the Windows versions it was built for. DPI
+/// awareness is set in code (`host`, and the window's own), not here.
+const MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity type="win32" name="PeerParty.peerparty" version="1.0.0.0"/>
+  <description>PeerParty</description>
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/>
+      <supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}"/>
+      <supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}"/>
+    </application>
+  </compatibility>
+</assembly>
+"#;
+
+/// An `.ico` with one 32-bit BMP image per size, drawn by `icon_art`.
+fn ico_file(sizes: &[usize]) -> Vec<u8> {
+    let images: Vec<Vec<u8>> = sizes.iter().map(|&s| bmp_image(s)).collect();
+    let mut f = Vec::new();
+    // ICONDIR: reserved, type 1 (icon), count.
+    f.extend_from_slice(&0u16.to_le_bytes());
+    f.extend_from_slice(&1u16.to_le_bytes());
+    f.extend_from_slice(&(sizes.len() as u16).to_le_bytes());
+    let mut offset = 6 + 16 * sizes.len();
+    for (&s, img) in sizes.iter().zip(&images) {
+        // ICONDIRENTRY: 256 is written as 0.
+        let dim = if s >= 256 { 0 } else { s as u8 };
+        f.extend_from_slice(&[dim, dim, 0, 0]);
+        f.extend_from_slice(&1u16.to_le_bytes()); // planes
+        f.extend_from_slice(&32u16.to_le_bytes()); // bits per pixel
+        f.extend_from_slice(&(img.len() as u32).to_le_bytes());
+        f.extend_from_slice(&(offset as u32).to_le_bytes());
+        offset += img.len();
+    }
+    for img in images {
+        f.extend_from_slice(&img);
+    }
+    f
+}
+
+/// BITMAPINFOHEADER, bottom-up BGRA pixels, then an empty AND mask (the alpha channel
+/// does the masking).
+fn bmp_image(size: usize) -> Vec<u8> {
+    let rgba = icon_art::icon_rgba(size);
+    let mask_row = size.div_ceil(32) * 4;
+    let mut b = Vec::with_capacity(40 + size * size * 4 + mask_row * size);
+    b.extend_from_slice(&40u32.to_le_bytes());
+    b.extend_from_slice(&(size as i32).to_le_bytes());
+    b.extend_from_slice(&(2 * size as i32).to_le_bytes()); // XOR + AND
+    b.extend_from_slice(&1u16.to_le_bytes());
+    b.extend_from_slice(&32u16.to_le_bytes());
+    b.extend_from_slice(&[0u8; 24]); // BI_RGB, sizes, resolution, palette
+    for y in (0..size).rev() {
+        for x in 0..size {
+            let i = (y * size + x) * 4;
+            b.extend_from_slice(&[rgba[i + 2], rgba[i + 1], rgba[i], rgba[i + 3]]);
+        }
+    }
+    b.resize(b.len() + mask_row * size, 0);
+    b
 }

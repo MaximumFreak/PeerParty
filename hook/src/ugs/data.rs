@@ -81,14 +81,17 @@ fn percent_decode(s: &str) -> String {
     let mut i = 0;
     while i < b.len() {
         match b[i] {
+            // Bytes, not a slice of the text: the two after a '%' can end inside a
+            // character, and slicing there panics (with the store's lock held).
             b'%' if i + 2 < b.len() => {
-                match u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                    Ok(v) => {
-                        out.push(v);
+                let hex = |c: u8| (c as char).to_digit(16);
+                match (hex(b[i + 1]), hex(b[i + 2])) {
+                    (Some(hi), Some(lo)) => {
+                        out.push((hi * 16 + lo) as u8);
                         i += 3;
                         continue;
                     }
-                    Err(_) => out.push(b'%'),
+                    _ => out.push(b'%'),
                 }
             }
             b'+' => out.push(b' '),
@@ -258,6 +261,13 @@ pub fn remote_config(method: &str, path: &str) -> Reply {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_percent_before_part_of_a_character_is_kept() {
+        let e = char::from_u32(0xe9).unwrap();
+        assert_eq!(percent_decode(&format!("a%41+%e{e}%{e}{e}%4")), format!("aA %e{e}%{e}{e}%4"));
+        assert_eq!(query_param(&format!("/x?keys=%{e}&k=1"), "keys"), Some(format!("%{e}")));
+    }
 
     fn with_dir<T>(f: impl FnOnce() -> T) -> T {
         static LOCK: Mutex<()> = Mutex::new(());

@@ -87,10 +87,14 @@ fn me() -> Option<peerparty_core::PeerId> {
     lan().map(|l| l.me())
 }
 
+/// EOS_USERINFO_MAX_DISPLAYNAME_UTF8_LENGTH.
+const MAX_NAME_BYTES: usize = 64;
+
 fn name_of(peer: peerparty_core::PeerId) -> String {
-    lan()
+    let name = lan()
         .and_then(|l| l.peer_name(peer))
-        .unwrap_or_else(|| format!("Player {}", &peer.hex()[..6]))
+        .unwrap_or_else(|| format!("Player {}", &peer.hex()[..6]));
+    super::clamp(&name, MAX_NAME_BYTES).to_string()
 }
 
 unsafe extern "system" fn free(p: usize) {

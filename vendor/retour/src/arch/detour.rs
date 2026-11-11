@@ -24,7 +24,7 @@ impl Detour {
     }
 
     // Lock this so OS operations are not performed in parallell
-    let mut pool = memory::POOL.lock().unwrap();
+    let mut pool = memory::POOL.lock().unwrap_or_else(|e| e.into_inner());
 
     if !util::is_executable_address(target)? || !util::is_executable_address(detour)? {
       Err(Error::NotExecutable)?;
@@ -85,7 +85,7 @@ impl Detour {
 
   /// Enables or disables the detour.
   unsafe fn toggle(&self, enabled: bool) -> Result<()> {
-    let _guard = memory::POOL.lock().unwrap();
+    let _guard = memory::POOL.lock().unwrap_or_else(|e| e.into_inner());
 
     if self.enabled.load(Ordering::SeqCst) == enabled {
       return Ok(());

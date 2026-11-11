@@ -262,12 +262,50 @@ impl Checker {
     }
 }
 
+/// `s` as a PowerShell single-quoted string. PowerShell ends such a string at any of five
+/// characters: the plain apostrophe and the four typographic single quotes (U+2018 to
+/// U+201B; a folder named with a curly apostrophe has one), each written twice to stand
+/// for itself. The fix runs as administrator, with a path and rule names that come from
+/// the PC's folders and registry: one such quote left single would end the string and
+/// run whatever followed it.
+pub fn ps_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            out.push(c);
+        }
+        out.push(c);
+    }
+    out.push('\'');
+    out
+}
+
+/// A rule's name for `-Name`, which takes wildcards: `[`, `]`, `*`, `?` and the backtick
+/// that escapes them are escaped, so the name means itself. Windows names the rules its
+/// own prompt leaves after the program's path, and game folders have brackets
+/// (`Some Game [v1.2]`): unescaped, such a name matches no rule and the fix fails.
+pub fn ps_literal_name(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '`' | '[' | ']' | '*' | '?') {
+            out.push('`');
+        }
+        out.push(c);
+    }
+    ps_quote(&out)
+}
+
 /// The PowerShell that fixes it: turns `disable` off, removes `remove` (our earlier
 /// rules), and adds an Allow rule for `exe` on `profiles`.
 pub fn fix_script(disable: &[&str], remove: &[&str], exe: &str, profiles: u32) -> String {
-    let q = |s: &str| format!("'{}'", s.replace('\'', "''"));
-    let list = |ids: &[&str]| ids.iter().map(|i| q(i)).collect::<Vec<_>>().join(",");
-    let mut s = String::from("$ErrorActionPreference='Stop'; Import-Module NetSecurity; ");
+    let q = ps_quote;
+    let list = |ids: &[&str]| ids.iter().map(|i| ps_literal_name(i)).collect::<Vec<_>>().join(",");
+    // Windows' own NetSecurity module, by its path: a module of that name in the user's
+    // Documents would otherwise be found first, by a prompt running as administrator.
+    let mut s = String::from(
+        r"$ErrorActionPreference='Stop'; $m = Join-Path $PSHOME 'Modules\NetSecurity\NetSecurity.psd1'; if (Test-Path -LiteralPath $m) { Import-Module $m } else { Import-Module NetSecurity }; ",
+    );
     if !disable.is_empty() {
         s.push_str(&format!("Disable-NetFirewallRule -Name {}; ", list(disable)));
     }
@@ -303,21 +341,32 @@ pub fn fix(exe: &Path, public: bool) -> Result<String, String> {
     let all = rules();
     let (disable, remove, policy) = plan(&all, exe, profiles);
     let script = fix_script(&disable, &remove, &exe.to_string_lossy(), profiles);
-    let out = std::process::Command::new("powershell.exe")
+    let out = std::process::Command::new(powershell())
         .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &script])
         .creation_flags_no_window()
         .output()
-        .map_err(|e| format!("couldn't run PowerShell: {e}"))?;
+        .map_err(|e| format!("PowerShell: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
-        let line = err.lines().find(|l| !l.trim().is_empty()).unwrap_or("it failed").trim().to_string();
-        return Err(format!("the firewall change failed: {line}"));
+        let line = err.lines().find(|l| !l.trim().is_empty()).unwrap_or("PowerShell").trim().to_string();
+        return Err(line);
     }
     let mut msg = format!("turned off {} block rule(s) and allowed {} in", disable.len(), exe.display());
     if policy > 0 {
         msg.push_str(&format!("; {policy} rule(s) from Group Policy still block it (only its administrator can change those)"));
     }
     Ok(msg)
+}
+
+/// Windows PowerShell, by its full path in the system folder: a bare `powershell.exe` is
+/// looked for beside peerparty.exe first (a Downloads folder, often), and this runs as
+/// administrator.
+fn powershell() -> PathBuf {
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+    let mut buf = [0u16; 260];
+    let n = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    let system = if n > 0 && n < buf.len() { PathBuf::from(String::from_utf16_lossy(&buf[..n])) } else { PathBuf::from(r"C:\Windows\System32") };
+    system.join("WindowsPowerShell").join("v1.0").join("powershell.exe")
 }
 
 trait NoWindow {
@@ -340,6 +389,61 @@ pub enum Outcome {
     Failed(String),
 }
 
+/// The start of the name of the pipe the elevated fix says why it failed on. The fix
+/// runs hidden, so otherwise only its exit code would come back. A pipe the launcher
+/// makes, not a file: an administrator writing to a file named on its command line could
+/// be pointed at any file.
+const REPORT_PIPE: &str = r"\\.\pipe\peerparty-fix-";
+
+/// The launcher's end of that pipe.
+struct Report(windows_sys::Win32::Foundation::HANDLE, String);
+
+impl Report {
+    fn new() -> Option<Report> {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_INBOUND};
+        use windows_sys::Win32::System::Pipes::{CreateNamedPipeW, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE};
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+        let name = format!("{REPORT_PIPE}{}-{nanos}", std::process::id());
+        let h = unsafe {
+            CreateNamedPipeW(wide(&name).as_ptr(), PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_TYPE_BYTE | PIPE_REJECT_REMOTE_CLIENTS, 1, 0, 4096, 0, std::ptr::null())
+        };
+        (h != INVALID_HANDLE_VALUE).then(|| Report(h, name))
+    }
+
+    /// What the fix wrote, once it has exited.
+    fn read(&self) -> Option<String> {
+        use windows_sys::Win32::Storage::FileSystem::ReadFile;
+        use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+        let mut avail = 0u32;
+        if unsafe { PeekNamedPipe(self.0, std::ptr::null_mut(), 0, std::ptr::null_mut(), &mut avail, std::ptr::null_mut()) } == 0 || avail == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; avail.min(4096) as usize];
+        let mut got = 0u32;
+        if unsafe { ReadFile(self.0, buf.as_mut_ptr(), buf.len() as u32, &mut got, std::ptr::null_mut()) } == 0 {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&buf[..got as usize]).trim().to_string();
+        (!text.is_empty()).then_some(text)
+    }
+}
+
+impl Drop for Report {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+/// `--fix-firewall ... --report PIPE`: the elevated fix tells the launcher why it
+/// failed. Only to a pipe the launcher made (`REPORT_PIPE`), never a file.
+pub fn report(pipe: &str, why: &str) -> bool {
+    use std::io::Write;
+    pipe.starts_with(REPORT_PIPE)
+        && !pipe[REPORT_PIPE.len()..].contains(['\\', '/', '.'])
+        && std::fs::OpenOptions::new().write(true).open(pipe).and_then(|mut f| f.write_all(why.as_bytes())).is_ok()
+}
+
 /// Runs `peerparty --fix-firewall` elevated (Windows shows its administrator prompt) and
 /// waits for it. Blocks: call it off the UI thread.
 pub fn fix_elevated(peerparty: &Path, exe: &Path, public: bool) -> Outcome {
@@ -352,6 +456,10 @@ pub fn fix_elevated(peerparty: &Path, exe: &Path, public: bool) -> Outcome {
     if public {
         params.push_str(" --public");
     }
+    let report = Report::new();
+    if let Some(r) = &report {
+        params.push_str(&format!(" --report {}", r.1));
+    }
     let params = wide(&params);
     let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
     info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
@@ -362,10 +470,10 @@ pub fn fix_elevated(peerparty: &Path, exe: &Path, public: bool) -> Outcome {
     info.nShow = 0; // SW_HIDE
     if unsafe { ShellExecuteExW(&mut info) } == 0 {
         let e = unsafe { GetLastError() };
-        return if e == 1223 { Outcome::Declined } else { Outcome::Failed(format!("couldn't start the fix (error {e})")) };
+        return if e == 1223 { Outcome::Declined } else { Outcome::Failed(crate::t!("firewall.fix_not_started", error = e)) };
     }
     if info.hProcess.is_null() {
-        return Outcome::Failed("the fix didn't start".into());
+        return Outcome::Failed(crate::t!("firewall.fix_not_started", error = unsafe { GetLastError() }));
     }
     let mut code = 1u32;
     unsafe {
@@ -373,11 +481,12 @@ pub fn fix_elevated(peerparty: &Path, exe: &Path, public: bool) -> Outcome {
         GetExitCodeProcess(info.hProcess, &mut code);
         CloseHandle(info.hProcess);
     }
-    match code {
-        0 => Outcome::Fixed,
+    match (code, report.and_then(|r| r.read())) {
+        (0, _) => Outcome::Fixed,
+        (_, Some(why)) => Outcome::Failed(crate::t!("firewall.fix_failed", error = why)),
         // peerparty.exe started from a drive the administrator can't see (a mapped network
-        // drive, say) never gets as far as the fix.
-        _ => Outcome::Failed(format!("the fix didn't work (exit code {code})")),
+        // drive, say) never gets as far as the fix, or saying why.
+        _ => Outcome::Failed(crate::t!("firewall.fix_exit", code = if code > 0xffff { format!("0x{code:08X}") } else { code.to_string() })),
     }
 }
 
@@ -393,8 +502,9 @@ fn shell_open(file: &str, params: &str) -> bool {
     r as usize > 32
 }
 
-/// The fix as the player's click does it: elevated, else the firewall's settings.
-/// Returns what to tell the player, and whether it was fixed.
+/// The fix as the player's click does it: elevated, else the firewall's settings (not
+/// when the player said no to the administrator prompt: that's their answer). Returns
+/// what to tell the player, and whether it was fixed.
 pub fn fix_or_open(peerparty: &Path, exe: &Path, public: bool) -> (String, bool) {
     let name = exe.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let why = match fix_elevated(peerparty, exe, public) {
@@ -414,7 +524,7 @@ pub fn fix_or_open(peerparty: &Path, exe: &Path, public: bool) -> (String, bool)
             };
             return (crate::t!("firewall.still_blocked", exe = name, why = left), false);
         }
-        Outcome::Declined => crate::t!("firewall.declined").to_string(),
+        Outcome::Declined => return (crate::t!("firewall.not_changed", exe = name, why = crate::t!("firewall.declined")), false),
         Outcome::Failed(e) => e,
     };
     if open_settings() {
@@ -548,6 +658,20 @@ fn com_profiles() -> Option<Profiles> {
 
 #[cfg(test)]
 mod tests {
+    /// The elevated fix's reason reaches the launcher through its pipe, and nothing but
+    /// one of those pipes is written to.
+    #[test]
+    fn a_failed_fix_says_why() {
+        let r = super::Report::new().expect("pipe");
+        assert_eq!(r.read(), None);
+        assert!(super::report(&r.1, "Access is denied.\r\n"));
+        assert_eq!(r.read().as_deref(), Some("Access is denied."));
+        let file = std::env::temp_dir().join(format!("peerparty-report-{}.txt", std::process::id()));
+        assert!(!super::report(&file.to_string_lossy(), "x"));
+        assert!(!super::report(&format!(r"{}..\..\x", super::REPORT_PIPE), "x"));
+        assert!(!file.exists());
+    }
+
     use super::*;
 
     fn none(s: &str) -> String {
@@ -684,6 +808,51 @@ mod tests {
         assert!(s.contains("-DisplayName 'peerparty: game.exe'"), "{s}");
         let s = fix_script(&[], &[], r"C:\g.exe", ALL);
         assert!(!s.contains("Disable-") && !s.contains("Remove-") && s.contains("-Profile Domain,Private,Public"), "{s}");
+        // A rule named after a path with brackets means that rule, not a pattern.
+        let s = fix_script(&[r"TCP Query User{X}c:\games\some game [v1.2]\game.exe"], &[], r"C:\Games\Some Game [v1.2]\game.exe", PRIVATE);
+        assert!(s.contains(r"Disable-NetFirewallRule -Name 'TCP Query User{X}c:\games\some game `[v1.2`]\game.exe';"), "{s}");
+        assert!(s.contains(r"-Program 'C:\Games\Some Game [v1.2]\game.exe'"), "{s}");
+    }
+
+    /// Runs `script` in Windows PowerShell the way the fix does; what it printed.
+    fn run_ps(script: &str) -> String {
+        let out = std::process::Command::new(powershell())
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .output()
+            .expect("Windows PowerShell runs");
+        assert!(out.status.success(), "{script}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// What PowerShell itself makes of our quoting: every string comes back as it went
+    /// in, as one string. The typographic quotes are the point: PowerShell ends a
+    /// single-quoted string at those too, and a path with one would otherwise run
+    /// whatever followed it, as administrator.
+    #[test]
+    fn powershell_reads_quoted_strings_back_whole() {
+        assert!(powershell().is_file(), "{}", powershell().display());
+        let nasty = [
+            "it's",
+            "a\u{2019}; exit 7; \u{2019}b",
+            "\u{2018}\u{201A}\u{201B}''\u{2019}",
+            "C:\\Games\\Fran\u{2019}s $(exit 9) `Games` [v1]\\game.exe",
+            "two \"double\" quotes",
+        ];
+        for s in nasty {
+            // As UTF-16 code units, so the console's code page has no say.
+            let got = run_ps(&format!("([int[]][char[]]{}) -join ','", ps_quote(s)));
+            let units: Vec<u16> = got.split(',').filter(|n| !n.is_empty()).map(|n| n.parse().unwrap()).collect();
+            assert_eq!(String::from_utf16_lossy(&units), s);
+        }
+    }
+
+    /// `-Name` takes wildcards: an escaped name matches itself and nothing else.
+    #[test]
+    fn powershell_takes_escaped_rule_names_literally() {
+        for (pattern, text, matches) in [("a[bc]d", "a[bc]d", true), ("a[bc]d", "abd", false), ("x*y?z`", "x*y?z`", true), ("x*y", "xAAy", false)] {
+            let got = run_ps(&format!("{} -like {}", ps_quote(text), ps_literal_name(pattern)));
+            assert_eq!(got == "True", matches, "{text} -like {pattern}: {got}");
+        }
     }
 
     /// This PC's own firewall, read only (no rule is changed): the parser takes every

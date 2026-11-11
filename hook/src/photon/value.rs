@@ -227,6 +227,30 @@ impl Value {
         }
     }
 
+    /// Roughly the memory a value takes, for limits on what clients may have kept.
+    pub fn weight(&self) -> usize {
+        let params = |p: &Params| p.iter().map(|(_, v)| 1 + v.weight()).sum::<usize>();
+        16 + match self {
+            Value::Str(s) => s.len(),
+            Value::Bytes(b) | Value::Custom(_, b) => b.len(),
+            Value::Bools(v) => v.len(),
+            Value::Shorts(v) => v.len() * 2,
+            Value::Ints(v) => v.len() * 4,
+            Value::Longs(v) => v.len() * 8,
+            Value::Floats(v) => v.len() * 4,
+            Value::Doubles(v) => v.len() * 8,
+            Value::Strs(v) => v.iter().map(|s| 24 + s.len()).sum(),
+            Value::Customs(_, v) => v.iter().map(|b| 24 + b.len()).sum(),
+            Value::Objects(v) | Value::Jagged(v) => v.iter().map(Value::weight).sum(),
+            Value::Hashtable(t) | Value::Dict(_, t) => table_weight(t),
+            Value::Hashtables(v) | Value::Dicts(_, v) => v.iter().map(|t| 24 + table_weight(t)).sum(),
+            Value::Request(q) => params(&q.params),
+            Value::Event(e) => params(&e.params),
+            Value::Response(r) => params(&r.params) + r.debug.as_ref().map_or(0, String::len),
+            _ => 0,
+        }
+    }
+
     pub fn as_strs(&self) -> Option<Vec<String>> {
         match self {
             Value::Strs(v) => Some(v.clone()),
@@ -242,10 +266,89 @@ pub fn table_get<'a>(t: &'a Table, key: &Value) -> Option<&'a Value> {
     t.iter().find(|(k, _)| k == key).map(|(_, v)| v)
 }
 
+pub fn table_weight(t: &[(Value, Value)]) -> usize {
+    t.iter().map(|(k, v)| k.weight() + v.weight()).sum()
+}
+
 pub fn table_set(t: &mut Table, key: Value, val: Value) {
     match t.iter_mut().find(|(k, _)| *k == key) {
         Some(slot) => slot.1 = val,
         None => t.push((key, val)),
+    }
+}
+
+/// A hashtable being read off the wire: `table_set`'s rule (a key sent twice keeps its
+/// place and takes the later value) without its cost, which is the table's length for
+/// every key and so the square of it for a table, seconds for one message from anyone
+/// who can connect. Past a few entries, keys of the kinds games use are found by hash.
+#[derive(Default)]
+pub struct TableIn {
+    t: Table,
+    seen: Option<std::collections::HashMap<Key, usize>>,
+    odd: usize,
+}
+
+#[derive(PartialEq, Eq, Hash)]
+enum Key {
+    Bool(bool),
+    Byte(u8),
+    Short(i16),
+    Int(i32),
+    Long(i64),
+    Str(String),
+}
+
+impl Key {
+    fn of(v: &Value) -> Option<Key> {
+        Some(match v {
+            Value::Bool(b) => Key::Bool(*b),
+            Value::Byte(b) => Key::Byte(*b),
+            Value::Short(n) => Key::Short(*n),
+            Value::Int(n) => Key::Int(*n),
+            Value::Long(n) => Key::Long(*n),
+            Value::Str(s) => Key::Str(s.clone()),
+            _ => return None,
+        })
+    }
+}
+
+impl TableIn {
+    const LINEAR: usize = 32;
+    /// Keys of other kinds (floats, arrays, tables) are still looked for one by one;
+    /// a big table may have this many.
+    const ODD: usize = 64;
+
+    pub fn with_capacity(n: usize) -> TableIn {
+        TableIn { t: Vec::with_capacity(n.min(1024)), seen: None, odd: 0 }
+    }
+
+    pub fn set(&mut self, key: Value, val: Value) -> R<()> {
+        if self.t.len() < Self::LINEAR {
+            table_set(&mut self.t, key, val);
+            return Ok(());
+        }
+        let seen = self.seen.get_or_insert_with(|| self.t.iter().enumerate().filter_map(|(i, (k, _))| Some((Key::of(k)?, i))).collect());
+        match Key::of(&key) {
+            Some(k) => match seen.entry(k) {
+                std::collections::hash_map::Entry::Occupied(e) => self.t[*e.get()].1 = val,
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(self.t.len());
+                    self.t.push((key, val));
+                }
+            },
+            None => {
+                self.odd += 1;
+                if self.odd > Self::ODD {
+                    return Err("too many hashtable keys of an unusual type");
+                }
+                table_set(&mut self.t, key, val);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn done(self) -> Table {
+        self.t
     }
 }
 
@@ -299,5 +402,52 @@ impl<'a> Rd<'a> {
     }
     pub fn u16le(&mut self) -> R<u16> {
         Ok(u16::from_le_bytes(self.be()?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Read by hash or one by one, a table comes out the same: first place, last value.
+    #[test]
+    fn a_table_read_by_hash_is_the_table_set_one() {
+        let key = |i: u32| {
+            let v = i / 6;
+            match i % 6 {
+                0 => Value::Str(format!("k{}", v % 90)),
+                1 => Value::Byte((v % 50) as u8),
+                2 => Value::Int((v % 40) as i32),
+                3 => Value::Long((v % 40) as i64),
+                4 => Value::Short((v % 30) as i16),
+                _ => Value::Bool(v % 2 == 0),
+            }
+        };
+        let (mut plain, mut fast) = (Table::new(), TableIn::with_capacity(0));
+        for i in 0..2000u32 {
+            let n = i.wrapping_mul(2_654_435_761) >> 7;
+            table_set(&mut plain, key(n), Value::Int(i as i32));
+            fast.set(key(n), Value::Int(i as i32)).unwrap();
+            // A few keys of a kind that isn't hashed, each sent twice.
+            if i % 100 == 0 {
+                let odd = Value::Float((i / 200) as f32);
+                table_set(&mut plain, odd.clone(), Value::Int(i as i32));
+                fast.set(odd, Value::Int(i as i32)).unwrap();
+            }
+        }
+        assert!(plain.len() > TableIn::LINEAR * 4);
+        assert_eq!(fast.done(), plain);
+
+        // Keys that can't be hashed are few in any real table; a big table of them is
+        // refused rather than searched.
+        let mut t = TableIn::with_capacity(0);
+        let many = (0..10_000).map(|i| t.set(Value::Double(f64::from(i)), Value::Null)).collect::<R<Vec<()>>>();
+        assert!(many.is_err());
+        // A hundred thousand ordinary keys take no time worth measuring.
+        let mut t = TableIn::with_capacity(0);
+        for i in 0..100_000 {
+            t.set(Value::Int(i), Value::Null).unwrap();
+        }
+        assert_eq!(t.done().len(), 100_000);
     }
 }

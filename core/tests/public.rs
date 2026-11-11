@@ -253,20 +253,27 @@ fn forged_and_tampered_adverts_never_connect() {
     sock.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
     let key = public::IdentityKey::generate();
     let other = public::IdentityKey::generate();
-    let me = PeerId([0x42; 16]);
+    // A player's id is its key's.
+    let me = PeerId::of_key(&key.public());
     let info = inet::testing::peer_info(me, &game, "Mallory");
+    let as_another = inet::testing::peer_info(PeerId::of_key(&other.public()), &game, "Mallory");
 
     // One handshake per forgery: returns A's blob for this attempt.
     let handshake = |eph: &crypto::Ephemeral| -> [u8; 48] {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut buf = [0u8; 2048];
+        // The first INIT is answered with a cookie, which the next one carries.
+        let mut init = inet::testing::init(&room, eph);
         loop {
-            sock.send_to(&inet::testing::init(&room, eph), target).unwrap();
+            sock.send_to(&init, target).unwrap();
             a.tick();
-            if let Ok((n, _)) = sock.recv_from(&mut buf)
-                && let Some(b) = inet::testing::confirm_sender(&room, eph, &buf[..n])
-            {
-                return b;
+            if let Ok((n, _)) = sock.recv_from(&mut buf) {
+                if let Some(b) = inet::testing::confirm_sender(&room, eph, &buf[..n]) {
+                    return b;
+                }
+                if let Some(again) = inet::testing::init_answering(&room, eph, &buf[..n]) {
+                    init = again;
+                }
             }
             assert!(Instant::now() < deadline, "no CONFIRM from the engine");
         }
@@ -293,6 +300,7 @@ fn forged_and_tampered_adverts_never_connect() {
             v
         }),
     ));
+    attempts.push(("another player's id", Box::new(|e, theirs| public::advert(&key, &room_id, &e.blob, theirs, &as_another))));
     attempts.push((
         "another handshake's",
         Box::new(|e, _| public::advert(&key, &room_id, &e.blob, &[9; 48], &info)),
@@ -378,7 +386,7 @@ struct Raw {
 }
 
 fn raw_connect(a: &Lan, target: SocketAddr, game: &str, key: &public::IdentityKey, name: &str, secs: u64) -> Raw {
-    raw_connect_as(a, target, game, key, PeerId(crypto::random_array()), name, secs)
+    raw_connect_as(a, target, game, key, PeerId::of_key(&key.public()), name, secs)
 }
 
 /// `raw_connect` with a given peer id (the same player started again).
@@ -389,14 +397,18 @@ fn raw_connect_as(a: &Lan, target: SocketAddr, game: &str, key: &public::Identit
     let eph = crypto::Ephemeral::new();
     let mut buf = [0u8; 2048];
     let deadline = Instant::now() + Duration::from_secs(secs);
+    let mut init = inet::testing::init(&room, &eph);
     let theirs = loop {
-        sock.send_to(&inet::testing::init(&room, &eph), target).unwrap();
+        sock.send_to(&init, target).unwrap();
         a.tick();
         a.poll();
-        if let Ok((n, _)) = sock.recv_from(&mut buf)
-            && let Some(b) = inet::testing::confirm_sender(&room, &eph, &buf[..n])
-        {
-            break b;
+        if let Ok((n, _)) = sock.recv_from(&mut buf) {
+            if let Some(b) = inet::testing::confirm_sender(&room, &eph, &buf[..n]) {
+                break b;
+            }
+            if let Some(again) = inet::testing::init_answering(&room, &eph, &buf[..n]) {
+                init = again;
+            }
         }
         if Instant::now() >= deadline {
             return Raw { id, sock, eph, theirs: [0; 48], connected: false };
@@ -486,6 +498,78 @@ fn junk_first_handshake_packets_get_nowhere() {
     std::thread::sleep(Duration::from_secs(3));
     let key = public::IdentityKey::generate();
     assert!(raw_connect(&a, target, &game, &key, "Real", 15).connected, "a real player couldn't connect after the junk");
+    a.shutdown();
+}
+
+/// A first handshake packet gets a cookie back, no bigger than itself, and no session:
+/// only an INIT that comes back with its cookie, from the address it was sent to and for
+/// the key it was sent for, gets one. First packets from made-up addresses (which never
+/// see their cookie) so take none of the handshake slots, and a real player gets in past
+/// any number of them.
+#[test]
+fn first_packets_get_a_cookie_and_no_session() {
+    let game = format!("test:public-cookie:{}", std::process::id());
+    let pa = base_port(50);
+    let a = start(&game, "a", base_port(51), public_cfg("Ann", pa, None, Vec::new()));
+    let target: SocketAddr = format!("127.0.0.1:{pa}").parse().unwrap();
+    let room = RoomCode::public();
+    let mut buf = [0u8; 2048];
+    // Senders that never come back with their cookie: three times the half-open slots.
+    let socks: Vec<UdpSocket> = (0..24)
+        .map(|_| {
+            let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+            s.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+            s
+        })
+        .collect();
+    let ephs: Vec<crypto::Ephemeral> = socks.iter().map(|_| crypto::Ephemeral::new()).collect();
+    let mut cookies = Vec::new();
+    for (s, e) in socks.iter().zip(&ephs) {
+        let init = inet::testing::init(&room, e);
+        s.send_to(&init, target).unwrap();
+        let (n, _) = s.recv_from(&mut buf).expect("no answer to a first INIT");
+        assert!(n <= init.len(), "the answer ({n} bytes) is bigger than the INIT ({})", init.len());
+        assert!(inet::testing::confirm_sender(&room, e, &buf[..n]).is_none(), "a first INIT was answered with a CONFIRM");
+        cookies.push(inet::testing::cookie_in(&room, &e.blob, &buf[..n]).expect("the answer isn't a cookie"));
+        assert!(s.recv_from(&mut buf).is_err(), "more than one answer to one INIT");
+    }
+    a.tick();
+    a.poll();
+    let st = a.public_status().unwrap();
+    assert!(st.peers.is_empty(), "first packets made sessions: {st:#?}");
+
+    // A cookie works only from where it was sent and for the key it was sent for.
+    let (s0, s1) = (&socks[0], &socks[1]);
+    let wrong: [(&UdpSocket, Vec<u8>); 3] = [
+        (s1, inet::testing::init_with_cookie(&room, &ephs[0].blob, &cookies[0])),
+        (s0, inet::testing::init_with_cookie(&room, &ephs[1].blob, &cookies[0])),
+        (s0, inet::testing::init_with_cookie(&room, &ephs[0].blob, &[0x5a; 16])),
+    ];
+    for (i, (s, p)) in wrong.iter().enumerate() {
+        s.send_to(p, target).unwrap();
+        let (n, _) = s.recv_from(&mut buf).expect("no answer");
+        assert!(inet::testing::confirm_sender(&room, &ephs[0], &buf[..n]).is_none(), "attempt {i} got a CONFIRM");
+        assert!(inet::testing::confirm_sender(&room, &ephs[1], &buf[..n]).is_none(), "attempt {i} got a CONFIRM");
+        let st = a.public_status().unwrap();
+        assert!(st.peers.is_empty(), "attempt {i} made a session: {st:#?}");
+    }
+
+    // The right one does get a CONFIRM, and the session.
+    s0.send_to(&inet::testing::init_with_cookie(&room, &ephs[0].blob, &cookies[0]), target).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok((n, _)) = s0.recv_from(&mut buf)
+            && inet::testing::confirm_sender(&room, &ephs[0], &buf[..n]).is_some()
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the INIT with its cookie got no CONFIRM");
+    }
+    assert_eq!(a.public_status().unwrap().peers.len(), 1);
+
+    // And a real player gets in.
+    let key = public::IdentityKey::generate();
+    assert!(raw_connect(&a, target, &game, &key, "Real", 15).connected, "a real player couldn't connect");
     a.shutdown();
 }
 
@@ -595,15 +679,43 @@ fn hostile_mesh_messages_in_a_live_public_session() {
     let target: SocketAddr = format!("127.0.0.1:{pa}").parse().unwrap();
     let room = RoomCode::public();
     let mut spec = Lobby::new("eos.lobby");
+    // Not a lobby a stranger may simply join (asking is one of the things it sends).
+    spec.permission = Permission::InviteOnly;
     spec.attrs = vec![Attr { key: "host".into(), value: Value::Str("mine".into()), public: true }];
     let victim = a.create_lobby(spec).unwrap();
     let mut joined_any = false;
     for round in 0..4u64 {
-        let r = raw_connect(&a, target, &game, &public::IdentityKey::generate(), &format!("Hostile{round}"), 5);
+        let key = public::IdentityKey::generate();
+        let r = raw_connect(&a, target, &game, &key, &format!("Hostile{round}"), 5);
         assert!(r.connected, "round {round}: no session");
-        let stream = inet::testing::hostile_mesh_stream(r.id, &game, a.me(), &victim.id, 0xC0FFEE + round, 400);
+        // Hellos first, each way; this player's is then proved against the number in
+        // the engine's (that it is who its key says is the one thing it can't fake).
+        let mine = [round as u8 + 1; 16];
+        let hello = inet::testing::mesh_hello(&key, &game, &mine);
+        let mut got = Vec::new();
+        let mut buf = [0u8; 2048];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut sent = Instant::now() - Duration::from_secs(1);
+        let nonce = loop {
+            // Again until it is answered: nothing here acknowledges or resends.
+            if sent.elapsed() > Duration::from_millis(300) {
+                let _ = r.sock.send_to(&inet::testing::segment(&room, &r.eph, &r.theirs, 1 + got.len() as u64, 0, &hello).unwrap(), target);
+                sent = Instant::now();
+            }
+            a.tick();
+            a.poll();
+            if let Ok((n, _)) = r.sock.recv_from(&mut buf) {
+                got.push(buf[..n].to_vec());
+            }
+            if let Some(n) = inet::testing::hello_nonce(&room, &r.eph, &r.theirs, &got) {
+                break n;
+            }
+            assert!(Instant::now() < deadline, "round {round}: the engine's hello never came");
+        };
+        let stream = inet::testing::hostile_mesh_stream(&key, &game, &mine, a.me(), &nonce, &victim.id, 0xC0FFEE + round, 400);
+        let first = 10_000 + got.len() as u64;
         for (seq, chunk) in stream.chunks(1100).enumerate() {
-            let p = inet::testing::segment(&room, &r.eph, &r.theirs, seq as u64 + 1, seq as u32, chunk).unwrap();
+            let p = inet::testing::segment(&room, &r.eph, &r.theirs, first + seq as u64, seq as u32 + 1, chunk).unwrap();
             let _ = r.sock.send_to(&p, target);
             if seq % 16 == 15 {
                 a.tick();
@@ -710,7 +822,57 @@ fn typed_ip_games_reach_a_public_player() {
         }
         assert!(Instant::now() < deadline, "the reply never arrived");
     }
+
+    // What A's game keeps to its own PC (a socket bound to loopback only: a debug
+    // console, an admin page) isn't for a stranger. Everything binds loopback in the
+    // tests, so the check is turned on here; above, it was off.
+    fa.keep_loopback_private(true);
+    let private = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    private.set_nonblocking(true).unwrap();
+    let tq = private.local_addr().unwrap().port();
+    let gq = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    gq.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+    let pq = gq.local_addr().unwrap().port();
+    // Sockets opened in the last 50 ms aren't looked for (fwd.rs OWNER_REFRESH): these
+    // are refused for being kept to this PC, not for being too new.
+    std::thread::sleep(Duration::from_millis(200));
+    let to = fb.tcp_dest(SocketAddrV4::new(sa, tq)).unwrap();
+    let mut c = TcpStream::connect(to).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    assert!(matches!(c.read(&mut back), Ok(0) | Err(_)), "a stream to a loopback-only listener stayed open");
+    assert!(private.accept().is_err(), "a public player was connected to a loopback-only listener");
+    let until = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < until {
+        let via = fb.udp_dest(SocketAddrV4::new(sa, pq), pb).unwrap();
+        gb.send_to(b"poke", via).unwrap();
+        assert!(gq.recv_from(&mut buf).is_err(), "a public player's datagram reached a loopback-only socket");
+    }
+    // A conversation under way keeps going (with the check on from the start, as it is
+    // outside the tests, only one the game started: a stranger's first datagram to a
+    // port like this never makes one).
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        ga.send_to(b"again", alias).unwrap();
+        if let Ok((n, _)) = gb.recv_from(&mut buf)
+            && &buf[..n] == b"again"
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the game's own conversation stopped");
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        gb.send_to(b"answer", fb.udp_dest(SocketAddrV4::new(sa, pp), pb).unwrap()).unwrap();
+        if let Ok((n, _)) = ga.recv_from(&mut buf)
+            && &buf[..n] == b"answer"
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "an answer to the game's own datagrams was dropped");
+    }
     let logs = LOGS.lock().unwrap().join("\n");
+    assert!(logs.contains(&format!("refused a TCP stream to port {tq}: the game keeps that port to this PC")), "no TCP refusal line");
+    assert!(logs.contains(&format!("dropped datagrams for port {pq}: the game keeps that port to this PC")), "no UDP refusal line");
     for p in [base_port(27), base_port(29)] {
         assert!(!logs.contains(&format!("127.0.0.1:{p}")), "a public address in the log");
     }
@@ -838,8 +1000,8 @@ fn arrives(lans: &[&Lan], to: usize, socket: &str, secs: u64) -> Option<Vec<u8>>
 
 /// PlayFab Party game data (`party:<guid>`) is game traffic: it flows with public
 /// players both ways, whatever the voice setting. Voice (`rtc:`, PlayFab Party / Xbox
-/// chat included) flows by default, and not at all once voice with public players is
-/// off (`PEERPARTY_PUBLIC_VOICE=0`, the launcher's setting).
+/// chat included) flows once voice with public players is on (`PEERPARTY_PUBLIC_VOICE=1`,
+/// the launcher's setting), and not at all while it's off, which is how it starts.
 #[test]
 fn public_players_get_party_game_data_and_voice_unless_voice_is_off() {
     let game = format!("test:public-party:{}", std::process::id());
@@ -851,7 +1013,7 @@ fn public_players_get_party_game_data_and_voice_unless_voice_is_off() {
     let (ida, idb) = (a.me(), b.me());
     wait_all(&lans, &mut seen, 30, |s| joined(&s[0], idb) && joined(&s[1], ida));
     assert_eq!(a.peer_trust(idb), Some(Trust::Public));
-    assert!(a.public_voice() && b.public_voice(), "voice with public players is on by default");
+    assert!(!a.public_voice() && !b.public_voice(), "voice with public players is off until it's turned on");
 
     // Party game data, both ways (reliable and not).
     let game_sock = "party:6a1f2c3d-0000-4000-8000-000000000001";
@@ -862,8 +1024,14 @@ fn public_players_get_party_game_data_and_voice_unless_voice_is_off() {
     assert_eq!(b.send(ida, game_sock, 0, b"\x00datagram", false, true, true), SendResult::Sent);
     assert_eq!(arrives(&lans, 0, game_sock, 10).as_deref(), Some(&b"\x00datagram"[..]));
 
-    // Voice (PlayFab Party chat's room), by default.
+    // Voice (PlayFab Party chat's room): not as things start, at either end.
     let voice_sock = "rtc:party:6a1f2c3d-0000-4000-8000-000000000001";
+    assert_eq!(a.send(idb, "rtc:early", 1, b"early", true, true, true), SendResult::Dropped);
+    a.set_public_voice(true);
+    let _ = a.send(idb, "rtc:early", 1, b"early", true, true, true);
+    assert_eq!(arrives(&lans, 1, "rtc:early", 2), None, "voice got through to a player who hasn't turned it on");
+    // Both turn it on.
+    b.set_public_voice(true);
     assert_ne!(a.send(idb, voice_sock, 1, b"audio", true, true, true), SendResult::Dropped);
     assert_eq!(arrives(&lans, 1, voice_sock, 10).as_deref(), Some(&b"audio"[..]));
 
@@ -933,7 +1101,7 @@ fn a_restarted_player_replaces_its_quiet_old_session() {
     let a = start(&game, "a", base_port(39), public_cfg("Ann", pa, None, Vec::new()));
     let target: SocketAddr = format!("127.0.0.1:{pa}").parse().unwrap();
     let key = public::IdentityKey::generate();
-    let id = PeerId(crypto::random_array());
+    let id = PeerId::of_key(&key.public());
     let has = |s: &str| LOGS.lock().unwrap().iter().any(|l| l.contains(s));
     let wait_log = |s: &str, secs: u64| {
         let deadline = Instant::now() + Duration::from_secs(secs);
@@ -965,4 +1133,237 @@ fn a_restarted_player_replaces_its_quiet_old_session() {
     let n = st.peers.iter().filter(|p| p.connected && p.key.as_deref() == Some(&fp)).count();
     assert_eq!(n, 1, "{st:#?}");
     a.shutdown();
+}
+
+fn search(lans: &[&Lan], seen: &mut [Vec<Event>], who: usize, q: Query) -> Vec<Lobby> {
+    let id = lans[who].search(q);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        pump(lans, seen);
+        if let Some(Event::SearchDone { results, .. }) = seen[who].iter().find(|e| matches!(e, Event::SearchDone { search: s, .. } if *s == id)) {
+            return results.clone();
+        }
+        assert!(Instant::now() < deadline, "no search result");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn join_result(lans: &[&Lan], seen: &mut [Vec<Event>], who: usize, lobby: &str, secs: u64) -> JoinResult {
+    let from = seen[who].len();
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        pump(lans, seen);
+        if let Some(Event::JoinDone { result, .. }) = seen[who][from..].iter().find(|e| matches!(e, Event::JoinDone { lobby: l, .. } if l == lobby)) {
+            return *result;
+        }
+        assert!(Instant::now() < deadline, "the join never finished");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Frames to and from a public player stop at 2 MiB (mesh.rs PUBLIC_FRAME_MAX): a bigger
+/// message is dropped by its sender, rather than getting the session cut at the other
+/// end, and what's sent after it still arrives.
+#[test]
+fn a_public_players_messages_stop_at_the_public_frame_size() {
+    let game = format!("test:public-frames:{}", std::process::id());
+    let (pa, pb) = (base_port(56), base_port(57));
+    let a = start(&game, "a", base_port(58), public_cfg("Ann", pa, None, vec![format!("127.0.0.1:{pb}")]));
+    let b = start(&game, "b", base_port(59), public_cfg("Ben", pb, None, vec![format!("127.0.0.1:{pa}")]));
+    let lans = [&a, &b];
+    let mut seen = vec![Vec::new(), Vec::new()];
+    let (ida, idb) = (a.me(), b.me());
+    wait_all(&lans, &mut seen, 30, |s| joined(&s[0], idb) && joined(&s[1], ida));
+    let sock = "test:big";
+    let big = vec![7u8; 1 << 20];
+    assert_ne!(a.send(idb, sock, 0, &big, true, true, true), SendResult::Dropped);
+    assert_eq!(arrives(&lans, 1, sock, 30).map(|d| d.len()), Some(big.len()), "a 1 MiB message didn't arrive");
+    let _ = a.send(idb, sock, 0, &vec![8u8; 3 << 20], true, true, true);
+    assert_ne!(a.send(idb, sock, 0, b"after", true, true, true), SendResult::Dropped);
+    let got = arrives(&lans, 1, sock, 30);
+    assert!(got.as_deref() == Some(&b"after"[..]), "a 3 MiB message went through to a public player (got {:?} bytes)", got.map(|d| d.len()));
+    assert!(b.peers().iter().any(|(p, _)| *p == ida), "the session was cut");
+    for l in lans {
+        l.shutdown();
+    }
+}
+
+/// A join by id goes to every peer and only the owner should answer, but any peer can: a
+/// stranger hosting a lobby under a friend's lobby's id doesn't get to answer for it. The
+/// friend's answer counts, "full" too (not a timeout), and the stranger, which let us in,
+/// hears that we aren't coming. A stranger's own lobby can still be joined by id.
+#[test]
+fn a_stranger_cant_answer_a_join_for_a_friends_lobby() {
+    let game = format!("test:public-claim:{}", std::process::id());
+    let (pj, ps) = (base_port(54), base_port(55));
+    let lan = |name: &str, disc: u16, lan_discovery: bool, public: Option<inet::Config>| {
+        Lan::start(Options {
+            game: game.clone(),
+            identity: Identity::ephemeral(name),
+            discovery_port: disc,
+            extra_targets: Vec::new(),
+            log,
+            internet: None,
+            public,
+            lan_discovery,
+        })
+        .expect("start")
+    };
+    let o = lan("o", base_port(52), true, None);
+    let j = lan("j", base_port(52), true, Some(public_cfg("Jo", pj, None, vec![format!("127.0.0.1:{ps}")])));
+    let s = lan("s", base_port(53), false, Some(public_cfg("Sam", ps, None, vec![format!("127.0.0.1:{pj}")])));
+    let lans = [&o, &j, &s];
+    let mut seen = vec![Vec::new(), Vec::new(), Vec::new()];
+    let (io, ij, is) = (o.me(), j.me(), s.me());
+    wait_all(&lans, &mut seen, 60, |e| joined(&e[1], io) && joined(&e[1], is));
+    assert_eq!(j.peer_trust(io), Some(Trust::Lan));
+    assert_eq!(j.peer_trust(is), Some(Trust::Public));
+    assert!(o.peer_trust(is).is_none(), "the friend met the stranger");
+
+    // O's lobby only fits O; S hosts one under the same id, with room.
+    let id = format!("claimed-{}", std::process::id());
+    let lobby = |max: u32| {
+        let mut l = Lobby::new("test.lobby");
+        l.id = id.clone();
+        l.max_members = max;
+        l.join_by_id = true;
+        l
+    };
+    o.create_lobby(lobby(1)).unwrap();
+    s.create_lobby(lobby(4)).unwrap();
+    let t0 = Instant::now();
+    j.join_by_id("test.lobby", &id).unwrap();
+    assert_eq!(join_result(&lans, &mut seen, 1, &id, 10), JoinResult::Full, "the stranger's answer was taken");
+    assert!(t0.elapsed() < Duration::from_secs(3), "a full lobby took {:?} to say so", t0.elapsed());
+    assert!(j.lobby(&id).is_none());
+    let left = |e: &[Vec<Event>]| {
+        e[2].iter().any(|e| matches!(e, Event::MemberStatus { lobby, member, status: MemberStatus::Left } if *lobby == id && *member == ij))
+    };
+    wait_all(&lans, &mut seen, 10, left);
+    assert!(s.lobby(&id).unwrap().member(ij).is_none(), "a ghost member in the stranger's lobby");
+
+    // A lobby only the stranger has: its answer counts once nobody else's did.
+    let own = format!("strangers-{}", std::process::id());
+    let mut l = Lobby::new("test.lobby");
+    l.id = own.clone();
+    l.join_by_id = true;
+    s.create_lobby(l).unwrap();
+    j.join_by_id("test.lobby", &own).unwrap();
+    assert_eq!(join_result(&lans, &mut seen, 1, &own, 10), JoinResult::Ok);
+    assert_eq!(j.lobby(&own).map(|l| l.owner), Some(is));
+    for l in lans {
+        l.shutdown();
+    }
+}
+
+/// What a game makes a lobby (friends only, invite only) holds for strangers. Every
+/// public player has every other's id, and a search by member or by id used to hand
+/// over such a lobby, which the owner then let anyone into.
+#[test]
+fn strangers_get_into_private_lobbies_only_when_invited_or_from_a_shared_one() {
+    let game = format!("test:public-private:{}", std::process::id());
+    let (pa, pb) = (base_port(42), base_port(43));
+    let a = start(&game, "a", base_port(44), public_cfg("Ann", pa, None, vec![format!("127.0.0.1:{pb}")]));
+    let b = start(&game, "b", base_port(45), public_cfg("Ben", pb, None, vec![format!("127.0.0.1:{pa}")]));
+    let lans = [&a, &b];
+    let mut seen = vec![Vec::new(), Vec::new()];
+    let (ida, idb) = (a.me(), b.me());
+    wait_all(&lans, &mut seen, 30, |s| joined(&s[0], idb) && joined(&s[1], ida));
+    assert!(!a.knows(idb) && !b.knows(ida));
+
+    let make = |permission: Permission| {
+        let mut l = Lobby::new("steam.lobby");
+        l.permission = permission;
+        l.join_by_id = true;
+        a.create_lobby(l).unwrap()
+    };
+    let (invite_only, friends, open) = (make(Permission::InviteOnly), make(Permission::Presence), make(Permission::Public));
+    // "Friends" is listed like a public lobby, for everyone but strangers.
+    let listed = make(Permission::Friends);
+
+    // Looking for the host's lobbies, or for one by its id, finds only the public one.
+    let mut by_member = Query::new("steam.lobby");
+    by_member.member = Some(ida);
+    let found: Vec<String> = search(&lans, &mut seen, 1, by_member.clone()).into_iter().map(|l| l.id).collect();
+    assert_eq!(found, [open.id.clone()]);
+    let mut by_id = Query::new("steam.lobby");
+    by_id.lobby_id = Some(invite_only.id.clone());
+    assert!(search(&lans, &mut seen, 1, by_id).is_empty());
+
+    // Knowing the id anyway (ids get about) doesn't get a stranger in.
+    assert!(search(&lans, &mut seen, 1, Query::new("steam.lobby")).iter().all(|l| l.id == open.id));
+    for l in [&invite_only, &friends, &listed] {
+        b.join(l).unwrap();
+        assert_eq!(join_result(&lans, &mut seen, 1, &l.id, 10), JoinResult::NotAllowed);
+        b.join_by_id("steam.lobby", &l.id).unwrap();
+        assert_ne!(join_result(&lans, &mut seen, 1, &l.id, 10), JoinResult::Ok);
+        assert_eq!(a.lobby(&l.id).unwrap().members.len(), 1);
+    }
+
+    // The host invites: now this player may come in, and finds the lobby by its id.
+    assert_eq!(a.invite(Some(idb), "", Some(&invite_only)), 1);
+    assert!(a.knows(idb));
+    b.join_by_id("steam.lobby", &invite_only.id).unwrap();
+    assert_eq!(join_result(&lans, &mut seen, 1, &invite_only.id, 10), JoinResult::Ok);
+    // ... and being kicked takes the invite back (the lobby they shared is gone too).
+    a.kick(&invite_only.id, idb).unwrap();
+    wait_all(&lans, &mut seen, 10, |_| b.lobby(&invite_only.id).is_none());
+    assert!(!a.knows(idb));
+    b.join(&friends).unwrap();
+    assert_eq!(join_result(&lans, &mut seen, 1, &friends.id, 10), JoinResult::NotAllowed);
+
+    // From a lobby they share (the public one), the others open: a game's voice or
+    // party network behind its public lobby.
+    b.join(&open).unwrap();
+    assert_eq!(join_result(&lans, &mut seen, 1, &open.id, 10), JoinResult::Ok);
+    assert!(a.knows(idb) && b.knows(ida));
+    assert_eq!(search(&lans, &mut seen, 1, by_member).len(), 4);
+    assert_eq!(search(&lans, &mut seen, 1, Query::new("steam.lobby")).len(), 2, "the public one and the friends one");
+    b.join(&friends).unwrap();
+    assert_eq!(join_result(&lans, &mut seen, 1, &friends.id, 10), JoinResult::Ok);
+    for l in lans {
+        l.shutdown();
+    }
+}
+
+/// Every tunnel ends at this PC's own address, where the mesh takes a datagram for
+/// whichever player it names. One public player could so speak as another: here is the
+/// tunnel refusing a datagram that names anyone but the player it was proved to be.
+#[test]
+fn a_public_player_cant_send_datagrams_as_another() {
+    let game = format!("test:public-forged:{}", std::process::id());
+    let (pa, pb) = (base_port(46), base_port(47));
+    let a = start(&game, "a", base_port(48), public_cfg("Ann", pa, None, vec![format!("127.0.0.1:{pb}")]));
+    let b = start(&game, "b", base_port(49), public_cfg("Ben", pb, None, vec![format!("127.0.0.1:{pa}")]));
+    let lans = [&a, &b];
+    let mut seen = vec![Vec::new(), Vec::new()];
+    let (ida, idb) = (a.me(), b.me());
+    wait_all(&lans, &mut seen, 30, |s| joined(&s[0], idb) && joined(&s[1], ida));
+    // Ben and Ann talk on a channel of the game's.
+    let sock = "game:forged";
+    assert_ne!(b.send(ida, sock, 0, b"really Ben", true, true, true), SendResult::Dropped);
+    assert_eq!(arrives(&lans, 0, sock, 10).as_deref(), Some(&b"really Ben"[..]));
+
+    // A third player, connected to Ann, sends datagrams that say they are Ben's.
+    let target: SocketAddr = format!("127.0.0.1:{pa}").parse().unwrap();
+    let r = raw_connect(&a, target, &game, &public::IdentityKey::generate(), "Mallory", 10);
+    assert!(r.connected);
+    let room = RoomCode::public();
+    for c in 1..=20u64 {
+        let forged = inet::testing::forged_datagram(idb, sock, b"not Ben");
+        let own = inet::testing::forged_datagram(r.id, sock, b"as myself");
+        for (i, plain) in [forged, own].iter().enumerate() {
+            let p = inet::testing::data(&room, &r.eph, &r.theirs, c * 2 + i as u64, plain).unwrap();
+            r.sock.send_to(&p, target).unwrap();
+        }
+        pump(&lans, &mut seen);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(arrives(&lans, 0, sock, 2), None, "a datagram naming another player was taken as theirs");
+    // Ben is still heard.
+    assert_ne!(b.send(ida, sock, 0, b"still Ben", true, true, true), SendResult::Dropped);
+    assert_eq!(arrives(&lans, 0, sock, 10).as_deref(), Some(&b"still Ben"[..]));
+    for l in lans {
+        l.shutdown();
+    }
 }

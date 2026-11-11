@@ -46,6 +46,11 @@ pub enum Permission {
     /// Joinable through presence (a friend's "join game"), not listed in searches.
     Presence = 1,
     InviteOnly = 2,
+    /// Found and joined like a public one by everyone the player plays with (the LAN,
+    /// a room), and closed like the other two to public players, who are strangers:
+    /// for an SDK's "friends" lobbies, and for what stands behind a lobby (a party
+    /// network).
+    Friends = 3,
 }
 
 impl Permission {
@@ -53,6 +58,7 @@ impl Permission {
         match v {
             1 => Permission::Presence,
             2 => Permission::InviteOnly,
+            3 => Permission::Friends,
             _ => Permission::Public,
         }
     }
@@ -218,7 +224,7 @@ pub fn matches(lobby: &Lobby, q: &Query) -> bool {
     }
     // An open search only finds advertised lobbies. One aimed at an id or a player is
     // looking for that lobby in particular.
-    if q.lobby_id.is_none() && q.member.is_none() && lobby.permission != Permission::Public {
+    if q.lobby_id.is_none() && q.member.is_none() && !matches!(lobby.permission, Permission::Public | Permission::Friends) {
         return false;
     }
     q.filters.iter().all(|f| match f {
@@ -341,6 +347,10 @@ mod tests {
         let mut by_id = Query::new("eos.lobby");
         by_id.lobby_id = Some("ABC".into());
         assert!(matches(&l, &by_id));
+        // A friends lobby is listed like a public one (who may ask is the engine's part).
+        l.permission = Permission::Friends;
+        assert!(matches(&l, &Query::new("eos.lobby")));
+        assert_eq!(Permission::from_u8(Permission::Friends as u8), Permission::Friends);
     }
 
     #[test]

@@ -168,17 +168,28 @@ fn to_keys(m: &Mine) -> Vec<(String, String)> {
 }
 
 /// A peer's EOS presence from its LAN presence keys.
+/// EOS_PRESENCE_DATA_MAX_KEYS, _MAX_KEY_LENGTH and _MAX_VALUE_LENGTH;
+/// EOS_PRESENCE_RICH_TEXT_MAX_VALUE_LENGTH and the join info's limit are the last.
+const MAX_DATA_KEYS: usize = 32;
+const MAX_KEY_LEN: usize = 64;
+const MAX_VALUE_LEN: usize = 255;
+
+/// A player's presence from their LAN keys, held to the SDK's limits (another copy
+/// enforces them when it sets them, but what arrives is only what a peer sent).
 fn from_keys(kv: &[(String, String)]) -> Mine {
     let mut m = Mine::default();
     for (k, v) in kv.iter().filter(|(k, _)| k.starts_with(PREFIX)) {
+        let v = super::clamp(v, MAX_VALUE_LEN).to_string();
         if let Some(d) = k.strip_prefix(DATA) {
-            m.data.insert(d.into(), v.clone());
+            if d.len() <= MAX_KEY_LEN && (m.data.len() < MAX_DATA_KEYS || m.data.contains_key(d)) {
+                m.data.insert(d.into(), v);
+            }
         } else if k == KEY_STATUS {
             m.status = v.parse().ok();
         } else if k == KEY_RICH {
-            m.rich = Some(v.clone());
+            m.rich = Some(v);
         } else if k == KEY_JOIN {
-            m.join = Some(v.clone());
+            m.join = Some(v);
         }
     }
     m
@@ -489,6 +500,14 @@ pub fn on_event(lan: &Lan, ev: &Event) {
             connect,
             lobby: None,
         } if !connect.is_empty() && !super::custominvites::is_ours(connect) => {
+            // "Accepted" is what the game hears, and it joins on hearing it: so only
+            // when the player has accepted, here in the overlay or by letting invites
+            // through (never a stranger's). It used to fire for every invite, whoever
+            // sent it, and again when the player did accept.
+            if !crate::invite::decision(*from, connect, None).accept() {
+                trace("JoinGameAccepted", || format!("from {from}: waits for the player"));
+                return;
+            }
             let ui = NEXT_UI_EVENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             trace("JoinGameAccepted", || format!("from {from}: {connect}"));
             for (f, cd) in listeners(Kind::JoinGameAccepted, None) {
@@ -526,6 +545,21 @@ mod tests {
         assert_eq!(back.rich.as_deref(), Some("In the lobby"));
         assert_eq!(back.join.as_deref(), Some("lobby=abc"));
         assert_eq!(back.data.get("level").map(String::as_str), Some("3"));
+    }
+
+    /// What another player sent is held to the SDK's limits before the game sees it.
+    #[test]
+    fn received_presence_keeps_to_the_sdks_limits() {
+        let mut kv: Vec<(String, String)> = (0..100).map(|n| (format!("{DATA}k{n:03}"), "v".to_string())).collect();
+        kv.push((format!("{DATA}{}", "x".repeat(65)), "long key".into()));
+        kv.push((KEY_RICH.into(), "é".repeat(200)));
+        kv.push((KEY_JOIN.into(), "j".repeat(5000)));
+        let m = from_keys(&kv);
+        assert_eq!(m.data.len(), MAX_DATA_KEYS);
+        assert!(m.data.keys().all(|k| k.len() <= MAX_KEY_LEN));
+        let rich = m.rich.unwrap();
+        assert!(rich.len() <= MAX_VALUE_LEN && rich.chars().all(|c| c == 'é'), "cut at a character");
+        assert_eq!(m.join.unwrap().len(), MAX_VALUE_LEN);
     }
 
     #[test]

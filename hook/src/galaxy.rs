@@ -506,7 +506,10 @@ struct State {
     joins: HashMap<String, usize>,
     data_requests: HashMap<u64, (u64, usize)>,
     owners: HashMap<u64, PeerId>,
-    messages: HashMap<u64, Vec<(u64, Vec<u8>)>>,
+    /// Lobby messages for the game to read: (sender's GalaxyID, body) by lobby.
+    messages: crate::lobbychat::Log<(u64, Vec<u8>)>,
+    /// Lobby messages from players not (yet) known to be members.
+    inbox: crate::lobbychat::Inbox,
     /// Packets by channel, taken from the LAN.
     packets: HashMap<u8, VecDeque<(u64, Vec<u8>)>>,
     rich: BTreeMap<String, String>,
@@ -572,7 +575,7 @@ fn lan_id(peer: PeerId) -> u64 {
     (2u64 << 56) | (1u64 << 55) | v
 }
 
-/// A LAN player's GalaxyID: the one it told us, else its LAN one. Ours for ourselves.
+/// A LAN player's GalaxyID: its LAN one, made from its peer id. Ours for ourselves.
 fn galaxy_id(peer: PeerId) -> u64 {
     if lan().is_some_and(|l| l.me() == peer) {
         return my_id();
@@ -583,8 +586,19 @@ fn galaxy_id(peer: PeerId) -> u64 {
         .iter()
         .find(|(k, _)| k == KEY_ID)
         .and_then(|(_, v)| v.parse::<u64>().ok());
-    let id = told.unwrap_or_else(|| lan_id(peer));
+    let id = id_of(peer, told);
     S.lock().unwrap().ids.insert(id, peer);
+    id
+}
+
+/// A player's GalaxyID, given the one it published (`KEY_ID`). Every copy publishes
+/// the LAN id of its own peer id, so that's the only one taken: a published id is just
+/// what the player says, and could be anyone's, the lobby owner's included.
+fn id_of(peer: PeerId, told: Option<u64>) -> u64 {
+    let id = lan_id(peer);
+    if told.is_some_and(|t| t != id) {
+        log!("galaxy: {peer} published GalaxyID {}, not its own; using {id}", told.unwrap_or_default());
+    }
     id
 }
 
@@ -909,7 +923,8 @@ fn old_shape(iface: Iface, name: &str) -> Option<usize> {
 
 // Older IMatchmaking and IFriends shapes: the same calls without listeners. Those that
 // returned bool say it worked.
-vmethod! { fn create_lobby_2(this: usize, kind: u32, max: u32) { unsafe { create_lobby(this, kind, max, true, 1, 0, 0) } } }
+// SDKs before lobby topologies: the owner's leaving has always moved the lobby on here.
+vmethod! { fn create_lobby_2(this: usize, kind: u32, max: u32) { unsafe { create_lobby(this, kind, max, true, TOPOLOGY_HOST_MIGRATION, 0, 0) } } }
 vmethod! { fn create_lobby_4(this: usize, kind: u32, max: u32, joinable: bool, topology: u32) { unsafe { create_lobby(this, kind, max, joinable, topology, 0, 0) } } }
 vmethod! { fn request_lobby_list_0(this: usize) { unsafe { request_lobby_list(this, false, 0) } } }
 vmethod! { fn request_lobby_list_1(this: usize, allow_full: bool) { unsafe { request_lobby_list(this, allow_full, 0) } } }
@@ -1354,19 +1369,31 @@ fn data_updated(lobby: u64, ok: bool, listener: usize) {
     });
 }
 
+/// LobbyTopologyType: DEPRECATED_..._FCM_HOST_MIGRATION (0), FCM (1), STAR (2),
+/// CONNECTIONLESS (3), FCM_OWNERSHIP_TRANSITION (4).
+const TOPOLOGY_HOST_MIGRATION: u32 = 0;
+
+/// Whether a lobby of this topology gets a new owner when its owner leaves. In FCM and
+/// STAR lobbies the SDK closes the lobby instead, and games of those kinds count on it
+/// (the owner was the game's host). An unknown value keeps the lobby going.
+fn migrates(topology: u32) -> bool {
+    !matches!(topology, 1 | 2)
+}
+
 vmethod! {
-    fn create_lobby(_this: usize, kind: u32, max: u32, joinable: bool, _topology: u32, created: usize, entered: usize) {
+    fn create_lobby(_this: usize, kind: u32, max: u32, joinable: bool, topology: u32, created: usize, entered: usize) {
         ours();
         let Some(lan) = lan() else { return };
         let id = new_lobby_id();
         let mut l = Lobby::new(NS);
         l.id = core_id(id);
         l.max_members = max.clamp(1, 250);
+        l.host_migration = migrates(topology);
         l.permission = permission(kind, joinable);
         set_hidden(&mut l, KEY_TYPE, kind.to_string());
         set_hidden(&mut l, KEY_JOINABLE, (joinable as u8).to_string());
         let ok = lan.create_lobby(l).is_ok();
-        log!("galaxy lobby {id} created (type {kind}, max {max}): {ok}");
+        log!("galaxy lobby {id} created (type {kind}, max {max}, topology {topology}): {ok}");
         if ok {
             S.lock().unwrap().owners.insert(id, lan.me());
         }
@@ -1496,7 +1523,7 @@ vmethod! {
         if let Some(lan) = lan() {
             let _ = lan.leave(&core_id(id));
         }
-        S.lock().unwrap().messages.remove(&id);
+        S.lock().unwrap().messages.forget(id);
         log!("galaxy LeaveLobby {id}");
         let to = targets(LOBBY_LEFT, listener);
         // LOBBY_LEAVE_REASON_USER_LEFT; before 1.133 the argument was `bool ioFailure`.
@@ -1768,15 +1795,13 @@ vmethod! {
     }
 }
 
+/// The longest lobby message taken from another player.
+const MESSAGE_MAX: usize = 64 * 1024;
+
 fn received_message(lobby: u64, sender: u64, body: Vec<u8>) {
-    // A message's id is its place in the lobby's list, kept until we leave.
-    let (msg, len) = {
-        let mut st = S.lock().unwrap();
-        let list = st.messages.entry(lobby).or_default();
-        let len = body.len() as u32;
-        list.push((sender, body));
-        (list.len() as u32 - 1, len)
-    };
+    // A message's id is its place in the lobby's list (lobbychat.rs keeps the latest).
+    let len = body.len() as u32;
+    let msg = S.lock().unwrap().messages.push(lobby, (sender, body));
     let to = targets(LOBBY_MESSAGE, 0);
     later(move || {
         for l in to {
@@ -1789,7 +1814,7 @@ vmethod! {
     fn get_lobby_message(_this: usize, lobby: Gid, msg: u32, sender: *mut u64, buf: *mut c_char, len: u32) -> u32 {
         ours();
         let st = S.lock().unwrap();
-        let Some((from, body)) = st.messages.get(&gid(lobby)).and_then(|m| m.get(msg as usize)) else { return 0 };
+        let Some((from, body)) = st.messages.get(gid(lobby), msg) else { return 0 };
         if !sender.is_null() {
             unsafe { *sender = *from };
         }
@@ -2126,11 +2151,22 @@ fn pump() {
         on_event(&ev);
     }
     if let Some(lan) = lan() {
+        let mut fresh = Vec::new();
         while let Some(p) = lan.receive_where(None, |s| s == CHAT) {
             if p.data.len() >= 8 {
                 let lobby = u64::from_le_bytes(p.data[..8].try_into().unwrap());
-                received_message(lobby, galaxy_id(p.peer), p.data[8..].to_vec());
+                fresh.push((lobby, p.peer, p.data[8..].to_vec()));
             }
+        }
+        // Only from members of lobbies we're in (lobbychat.rs).
+        let mut inbox = std::mem::take(&mut S.lock().unwrap().inbox);
+        let me = lan.me();
+        let heard = inbox.sort(fresh, std::time::Instant::now(), MESSAGE_MAX, |lobby, who| {
+            lan.lobby(&core_id(lobby)).is_some_and(|l| l.member(me).is_some() && l.member(who).is_some())
+        });
+        S.lock().unwrap().inbox = inbox;
+        for (lobby, who, body) in heard {
+            received_message(lobby, galaxy_id(who), body);
         }
     }
     ext::pump();
@@ -2305,6 +2341,27 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A player's GalaxyID comes from its peer id, whatever it publishes.
+    #[test]
+    fn a_published_galaxy_id_is_not_taken() {
+        let (a, b) = (PeerId([1; 16]), PeerId([2; 16]));
+        assert_eq!(id_of(a, None), lan_id(a));
+        assert_eq!(id_of(a, Some(lan_id(a))), lan_id(a));
+        assert_eq!(id_of(a, Some(lan_id(b))), lan_id(a), "another player's id");
+        assert_eq!(id_of(a, Some(12345)), lan_id(a));
+        assert_ne!(lan_id(a), lan_id(b));
+    }
+
+    /// FCM and STAR lobbies close with their owner; the others move on.
+    #[test]
+    fn lobby_topology_decides_host_migration() {
+        assert!(migrates(TOPOLOGY_HOST_MIGRATION));
+        assert!(!migrates(1), "FCM");
+        assert!(!migrates(2), "STAR");
+        assert!(migrates(3), "CONNECTIONLESS");
+        assert!(migrates(4), "FCM_OWNERSHIP_TRANSITION");
+    }
 
     /// The layouts the SDK's headers give a version, by class.
     fn layouts_of(v: (u32, u32, u32)) -> Vec<&'static [&'static str]> {

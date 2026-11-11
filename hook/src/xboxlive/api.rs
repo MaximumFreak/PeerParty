@@ -15,6 +15,9 @@ use crate::json::Json;
 pub struct Player {
     pub xuid: u64,
     pub name: String,
+    /// A public player while voice and chat with strangers is off (the launcher's
+    /// setting): the game is told not to carry speech or text between them and us.
+    pub quiet: bool,
 }
 
 /// Everyone PeerParty can answer for: this copy's player and the LAN's.
@@ -123,14 +126,19 @@ pub fn route(service: &str, method: &str, path_and_query: &str, body: &Json, dir
         }
         // The title's own presence (POST, heartbeat) and its removal (DELETE).
         ("userpresence", ["users", _, "devices", "current", "titles", "current"]) => (200, String::new()),
-        // GET /users/xuid(X)/people/avoid | mute
-        ("privacy", ["users", _, "people", "avoid" | "mute"]) if get => ok(Json::obj(vec![("users", Json::Arr(vec![]))])),
+        // GET /users/xuid(X)/people/avoid | mute. Nobody is avoided; the muted are the
+        // strangers the player chose not to talk with.
+        ("privacy", ["users", _, "people", list @ ("avoid" | "mute")]) if get => {
+            let muted = dir.peers.iter().filter(|p| *list == "mute" && p.quiet).map(|p| Json::obj(vec![("xuid", xuid_json(p.xuid))])).collect();
+            ok(Json::obj(vec![("users", Json::Arr(muted))]))
+        }
         // GET /users/xuid(X)/permission/validate?setting=..&target=xuid(Y)
         ("privacy", ["users", _, "permission", "validate"]) if get => {
-            ok(Json::obj(vec![("isAllowed", Json::Bool(true)), ("reasons", Json::Arr(vec![]))]))
+            let target = query(q, "target").and_then(parse_xuid).unwrap_or(0);
+            ok(allowed(dir, target, query(q, "setting").unwrap_or_default(), true))
         }
         // POST /users/xuid(X)/permission/validate {"users":[{"xuid":..}],"permissions":[..]}
-        ("privacy", ["users", _, "permission", "validate"]) if post => ok(permissions(body)),
+        ("privacy", ["users", _, "permission", "validate"]) if post => ok(permissions(dir, body)),
         _ => not_found(),
     }
 }
@@ -256,18 +264,30 @@ fn presence_batch(dir: &Directory, body: &Json) -> Json {
     )
 }
 
-/// Every permission allowed for every user asked about, in the order asked.
-fn permissions(body: &Json) -> Json {
-    let n = body.get("permissions").as_arr().len();
+/// One permission check's answer. There is no Xbox Live to ask, so everything is
+/// allowed, but for one thing PeerParty knows: speech and text (the `CommunicateUsing*`
+/// permissions) with a public player, while the player has voice and chat with
+/// strangers off. A game that carries its own chat asks here whether it may.
+fn allowed(dir: &Directory, target: u64, permission: &str, with_reasons: bool) -> Json {
+    let quiet = permission.to_ascii_lowercase().starts_with("communicateusing") && dir.peers.iter().any(|p| p.xuid == target && p.quiet);
+    let mut out = vec![("isAllowed", Json::Bool(!quiet))];
+    if quiet || with_reasons {
+        let reasons = if quiet { vec![Json::obj(vec![("reason", Json::str("MuteListRestrictsTarget"))])] } else { vec![] };
+        out.push(("reasons", Json::Arr(reasons)));
+    }
+    Json::obj(out)
+}
+
+/// Each permission for each user asked about, in the order asked (see `allowed`).
+fn permissions(dir: &Directory, body: &Json) -> Json {
+    let asked: Vec<&str> = body.get("permissions").as_arr().iter().map(|p| p.as_str().unwrap_or_default()).collect();
     let responses: Vec<Json> = body
         .get("users")
         .as_arr()
         .iter()
         .map(|u| {
-            Json::obj(vec![
-                ("user", u.clone()),
-                ("permissions", Json::Arr((0..n).map(|_| Json::obj(vec![("isAllowed", Json::Bool(true))])).collect())),
-            ])
+            let target = xuids(&Json::Arr(vec![u.get("xuid").clone()])).first().copied().unwrap_or(0);
+            Json::obj(vec![("user", u.clone()), ("permissions", Json::Arr(asked.iter().map(|p| allowed(dir, target, p, false)).collect()))])
         })
         .collect();
     Json::obj(vec![("responses", Json::Arr(responses))])
@@ -279,10 +299,10 @@ mod tests {
 
     fn dir() -> Directory {
         Directory {
-            me: Player { xuid: 2533274800000001, name: "Timber".into() },
+            me: Player { xuid: 2533274800000001, name: "Timber".into(), quiet: false },
             peers: vec![
-                Player { xuid: 2533274800000002, name: "Timber (2)".into() },
-                Player { xuid: 2533274800000003, name: "A very long LAN player name".into() },
+                Player { xuid: 2533274800000002, name: "Timber (2)".into(), quiet: false },
+                Player { xuid: 2533274800000003, name: "A very long LAN player name".into(), quiet: false },
             ],
             title_id: 0x12345678,
             title_name: "Sample Game".into(),
@@ -396,6 +416,43 @@ mod tests {
         // BatchDeserialize needs one result per permission asked.
         assert_eq!(responses[1].get("permissions").as_arr().len(), 2);
         assert_eq!(responses[1].get("permissions").as_arr()[0].get("isAllowed"), &Json::Bool(true));
+    }
+
+    /// With voice and chat with strangers off, a game that asks whether it may carry
+    /// speech or text to a public player is told no, and nothing else changes.
+    #[test]
+    fn strangers_are_muted_while_chat_with_them_is_off() {
+        let mut d = dir();
+        d.peers[1].quiet = true;
+        let ask = |method: &str, path: &str, body: &str| {
+            let (status, text) = route("privacy", method, path, &Json::parse(body).unwrap_or(Json::Null), &d);
+            assert_eq!(status, 200);
+            Json::parse(&text).unwrap()
+        };
+        let me = "/users/xuid(2533274800000001)";
+        let muted = ask("GET", &format!("{me}/people/mute"), "");
+        assert_eq!(muted.get("users").as_arr().len(), 1);
+        assert_eq!(muted.get("users").as_arr()[0].get("xuid").as_str(), Some("2533274800000003"));
+        assert!(ask("GET", &format!("{me}/people/avoid"), "").get("users").as_arr().is_empty());
+        for (setting, target, want) in [
+            ("CommunicateUsingVoice", "2533274800000003", false),
+            ("CommunicateUsingText", "2533274800000003", false),
+            ("PlayMultiplayer", "2533274800000003", true),
+            ("CommunicateUsingVoice", "2533274800000002", true),
+        ] {
+            let j = ask("GET", &format!("{me}/permission/validate?setting={setting}&target=xuid({target})"), "");
+            assert_eq!(j.get("isAllowed"), &Json::Bool(want), "{setting} with {target}");
+            assert_eq!(j.get("reasons").as_arr().len(), usize::from(!want));
+        }
+        let body = r#"{"users":[{"xuid":"2533274800000003"},{"xuid":"2533274800000002"}],"permissions":["PlayMultiplayer","CommunicateUsingVoice"]}"#;
+        let j = ask("POST", &format!("{me}/permission/validate"), body);
+        let answers: Vec<Vec<bool>> = j
+            .get("responses")
+            .as_arr()
+            .iter()
+            .map(|r| r.get("permissions").as_arr().iter().map(|p| p.get("isAllowed") == &Json::Bool(true)).collect())
+            .collect();
+        assert_eq!(answers, [[true, false], [true, true]]);
     }
 
     #[test]
