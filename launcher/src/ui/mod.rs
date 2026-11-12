@@ -25,7 +25,7 @@ mod library;
 mod mainexe;
 mod padgate;
 mod pads;
-mod scan;
+pub mod scan;
 mod settings;
 pub mod store;
 pub mod theme;
@@ -242,6 +242,12 @@ struct App {
     firewall: firewall::Checker,
     /// "Also on public networks" for the firewall fix.
     fw_public: bool,
+    /// The settings "Reset to recommended" replaced, offered back until one of them
+    /// changes again or the window closes.
+    reset_undo: Option<store::Prefs>,
+    /// Per program: its game folder looked through, whether its Steam app id can't be
+    /// found, and when that was checked (steamid.rs).
+    steam_ids: HashMap<PathBuf, (crate::steamid::Game, bool, Instant)>,
     /// A firewall fix under way: what to say when it's done, and whether it worked.
     fixing: Option<Receiver<(String, bool)>>,
     /// The "Invite players at home" button's answer, while it is awaited.
@@ -316,6 +322,8 @@ impl App {
             top_bar_ids: HashSet::new(),
             firewall: firewall::Checker::default(),
             fw_public: false,
+            reset_undo: None,
+            steam_ids: HashMap::new(),
             fixing: None,
             inviting: None,
             spark: None,
@@ -621,20 +629,8 @@ impl App {
                 Err(_) => self.inviting = None,
             }
         }
-        let (due, wait): (Vec<PendingStart>, Vec<PendingStart>) = std::mem::take(&mut self.pending).into_iter().partition(|p| p.at <= now);
-        self.pending = wait;
-        let mut started = false;
-        for p in due {
-            started |= self.spawn(&p.key, &p.name, p.args, p.player);
-        }
-        if started {
-            // Two players on this PC: the window kept the countdown in view until now.
-            self.minimize_after_start();
-        }
-        if let Some(next) = self.pending.iter().map(|p| p.at).min() {
-            // The countdown shows seconds.
-            self.ctx.request_repaint_after(next.saturating_duration_since(now).min(Duration::from_secs(1)));
-        }
+        // Copies that ended first: a first copy that failed at once takes its waiting
+        // second copy with it, even when that one is due in this same frame.
         while let Ok((id, code)) = self.ended_rx.try_recv() {
             let Some(i) = self.sessions.iter().position(|s| s.id == id) else { continue };
             let s = self.sessions.remove(i);
@@ -651,6 +647,20 @@ impl App {
                 self.say(t!("snack.didnt_start", game = s.name, n = s.player, why = why), false);
             }
             self.reload_recent();
+        }
+        let (due, wait): (Vec<PendingStart>, Vec<PendingStart>) = std::mem::take(&mut self.pending).into_iter().partition(|p| p.at <= now);
+        self.pending = wait;
+        let mut started = false;
+        for p in due {
+            started |= self.spawn(&p.key, &p.name, p.args, p.player);
+        }
+        if started {
+            // Two players on this PC: the window kept the countdown in view until now.
+            self.minimize_after_start();
+        }
+        if let Some(next) = self.pending.iter().map(|p| p.at).min() {
+            // The countdown shows seconds.
+            self.ctx.request_repaint_after(next.saturating_duration_since(now).min(Duration::from_secs(1)));
         }
         if let Some(lasts) = self.snack.as_ref().and_then(|s| s.lasts().map(|l| (l, s.at))) {
             let left = lasts.0.saturating_sub(lasts.1.elapsed());
@@ -679,6 +689,14 @@ impl App {
                 Action::Hide(k, hide) => {
                     self.settings.hidden.retain(|h| *h != k);
                     if hide {
+                        // Said where it went, and its panel closed (outside the Hidden
+                        // list, where it no longer is).
+                        if let Some(name) = self.game(&k).map(|g| g.name.clone()) {
+                            self.say(t!("snack.hidden", game = name, list = t!("filter.hidden")), true);
+                        }
+                        if self.category != Category::Hidden && self.selected.as_deref() == Some(k.as_str()) {
+                            self.selected = None;
+                        }
                         self.settings.hidden.push(k);
                     }
                     self.save_settings();
@@ -985,17 +1003,12 @@ impl App {
         fx::light(&p, full.left_top() + vec2(40.0, 30.0), vec2(260.0, 220.0), ACCENT.gamma_multiply(0.10));
         p.rect_filled(Rect::from_min_max(pos2(full.right() - 1.0, full.top()), full.right_bottom()), 0.0, theme::line());
         ui.add_space(22.0);
-        ui.horizontal(|ui| {
-            ui.add_space(6.0);
-            let (mark, _) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::hover());
-            brand_mark(ui.painter(), mark);
-            ui.add_space(4.0);
-            ui.vertical(|ui| {
-                ui.label(egui::RichText::new("PeerParty").font(theme::strong(19.0)).color(TEXT));
-                ui.add_space(-7.0);
-                ui.label(egui::RichText::new(t!("brand.tagline")).size(11.5).color(TEXT3));
-            });
-        });
+        // The mark and the name, centred on each other and lined up with the nav items
+        // below: the mark over their icons, the name over their labels.
+        let (head, _) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::hover());
+        let mark = Rect::from_center_size(pos2(head.left() + 24.0, head.center().y), vec2(32.0, 32.0));
+        brand_mark(ui.painter(), mark);
+        ui.painter().text(pos2(head.left() + 46.0, head.center().y), egui::Align2::LEFT_CENTER, "PeerParty", theme::strong(20.0), TEXT);
         ui.add_space(22.0);
         for v in View::ALL {
             let sub = match v {
@@ -1238,7 +1251,9 @@ fn plan(command: Vec<String>, players: u8, running: bool, xbox: bool, copy_saves
 
 /// The .bat that starts a game through peerparty (`pp`, as the file names it) with
 /// `args`; with `second_after`, twice, that many seconds apart, for two players on this
-/// PC. Names beyond ASCII are written as UTF-8, which cmd reads once told to (it reads
+/// PC (`start /b`: peerparty.exe is a windowed program, so it changes nothing for it,
+/// and a console program in its place gets no window of its own). Names beyond ASCII
+/// are written as UTF-8, which cmd reads once told to (it reads
 /// the file in the console's own code page otherwise, and wouldn't find the game).
 fn bat_file(name: &str, pp: &str, args: &[String], second_after: Option<u32>) -> String {
     let line = args.iter().map(|a| bat_arg(a)).collect::<Vec<_>>().join(" ");
@@ -1246,7 +1261,7 @@ fn bat_file(name: &str, pp: &str, args: &[String], second_after: Option<u32>) ->
     let name: String = bat_text(name).chars().filter(|c| !c.is_control()).collect();
     let body = match second_after {
         Some(delay) => format!(
-            "rem Two instances of {name} on this PC through peerparty, for two players.\r\nstart \"\" \"{pp}\" {line}\r\ntimeout /t {delay} /nobreak >nul\r\nstart \"\" \"{pp}\" {line}\r\n"
+            "rem Two instances of {name} on this PC through peerparty, for two players.\r\nstart \"\" /b \"{pp}\" {line}\r\ntimeout /t {delay} /nobreak >nul\r\nstart \"\" /b \"{pp}\" {line}\r\n"
         ),
         None => format!("rem {name} through peerparty.\r\n\"{pp}\" {line} %*\r\nif errorlevel 1 pause\r\n"),
     };
@@ -1266,15 +1281,24 @@ fn source_name(s: Source) -> &'static str {
     }
 }
 
-/// PeerParty's mark: two nodes with a bright link, on a lit tile.
+/// PeerParty's mark: the app's own icon (`icon_art`), drawn for the exact number of
+/// pixels it covers, so it is as sharp as the exe's icon and simplified the same way
+/// when small, with a faint glow round it.
 fn brand_mark(p: &egui::Painter, r: Rect) {
-    fx::glow(p, r, 9.0, ACCENT.gamma_multiply(0.35), 12.0);
-    fx::gradient(p, r, 9.0, false, &[(0.0, ACCENT), (1.0, theme::VIOLET)]);
-    fx::gradient(p, r, 9.0, true, &[(0.0, Color32::from_white_alpha(46)), (0.55, Color32::TRANSPARENT)]);
-    let (a, b) = (r.left_center() + vec2(8.5, 0.0), r.right_center() - vec2(8.5, 0.0));
-    p.line_segment([a, b], egui::Stroke::new(2.4, Color32::WHITE));
-    p.circle_filled(a, 4.2, Color32::WHITE);
-    p.circle_filled(b, 4.2, Color32::WHITE);
+    let ppp = p.ctx().pixels_per_point();
+    let n = (r.width() * ppp).round().max(16.0) as usize;
+    let id = egui::Id::unique(("brand_mark", n));
+    let tex = p.ctx().data(|d| d.get_temp::<TextureHandle>(id)).unwrap_or_else(|| {
+        let img = egui::ColorImage::from_rgba_unmultiplied([n, n], &crate::icon_art::icon_rgba(n));
+        let tex = p.ctx().load_texture(format!("brand_mark_{n}"), img, TextureOptions::LINEAR);
+        p.ctx().data_mut(|d| d.insert_temp(id, tex.clone()));
+        tex
+    });
+    // On whole pixels, so the texture's pixels land on the screen's.
+    let min = pos2((r.min.x * ppp).round() / ppp, (r.min.y * ppp).round() / ppp);
+    let r = Rect::from_min_size(min, vec2(n as f32 / ppp, n as f32 / ppp));
+    fx::glow(p, r, r.width() * 14.0 / 64.0, theme::VIOLET.gamma_multiply(0.30), 12.0);
+    p.image(tex.id(), r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
 }
 
 /// One place in the sidebar: an icon, a name, a line under it, lit when it's the one

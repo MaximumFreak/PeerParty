@@ -198,12 +198,10 @@ pub fn random_text(len: usize, alphabet: &[u8]) -> String {
     out
 }
 
+/// Random bytes from the OS's secure random source.
 pub fn random_bytes(len: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(len + 16);
-    while out.len() < len {
-        out.extend_from_slice(&PeerId::random().0);
-    }
-    out.truncate(len);
+    let mut out = vec![0u8; len];
+    peerparty_core::inet::crypto::random(&mut out);
     out
 }
 
@@ -329,8 +327,19 @@ pub fn start_pump() {
                         touched.push(id);
                     }
                     Event::PeerLeft(_) => touched.extend(lobby::tracked()),
+                    // A player asking this copy's relay for an allocation (relay.rs).
+                    Event::ChanRequest { peer, socket } if socket == relay::SOCKET => {
+                        if let Some(lan) = net::lan() {
+                            if lan.knows(peer) {
+                                lan.accept(peer, relay::SOCKET);
+                            }
+                        }
+                    }
                     _ => {}
                 }
+            }
+            if let Some(lan) = net::lan() {
+                relay::serve(lan);
             }
             touched.sort();
             touched.dedup();

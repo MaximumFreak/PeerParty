@@ -101,6 +101,8 @@ pub(crate) enum Kind {
     RtcData,
     RtcDataParticipant,
     LobbyRtcConnection,
+    /// EOS_RTCAudio's AudioDevicesChanged: Windows' sound devices changed.
+    RtcAudioDevices,
     /// EOS_UI's display settings: PeerParty's overlay opening and closing.
     DisplaySettings,
 }

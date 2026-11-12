@@ -380,6 +380,21 @@ struct Network {
     pending_chats: Vec<(usize, usize)>,
 }
 
+/// A queued change's struct with room after it: bindings may read every change as their
+/// state change union, as many bytes as its largest member (PlayFab's open-source Unity
+/// plugin, PartyCSharpSDK.Interop, reads `PARTY_STATE_CHANGE_UNION`: 440 bytes on x64,
+/// PARTY_CREATE_NEW_NETWORK_COMPLETED_STATE_CHANGE). A change only its own size ends
+/// wherever the heap puts it, and a read past it that crosses into an unmapped page
+/// crashes the game (seen joining a network a second time).
+#[repr(C)]
+struct Padded<T> {
+    change: T,
+    _union_room: [u8; UNION_ROOM],
+}
+
+/// Bytes after every change: more than any wrapper's union needs past its struct.
+const UNION_ROOM: usize = 1024;
+
 /// One queued state change: the struct, plus memory it points into.
 struct Change {
     _data: Box<dyn std::any::Any + Send>,
@@ -610,12 +625,12 @@ impl State {
         texts: Vec<CString>,
         fix: impl FnOnce(&mut T, usize, usize, &[usize]),
     ) {
-        let mut data = Box::new(c);
+        let mut data = Box::new(Padded { change: c, _union_room: [0; UNION_ROOM] });
         let b = bytes.as_ptr() as usize;
         let p = ptrs.as_ptr() as usize;
         let t: Vec<usize> = texts.iter().map(|t| t.as_ptr() as usize).collect();
-        fix(&mut data, b, p, &t);
-        let ptr = &*data as *const T as usize;
+        fix(&mut data.change, b, p, &t);
+        let ptr = &data.change as *const T as usize;
         self.queue.push(Change {
             _data: data,
             ptr,
@@ -1032,6 +1047,21 @@ impl State {
 
 fn pump(s: &mut State) {
     let Some(lan) = net::lan() else { return };
+    // Messages first, then this tick's lobby changes: a player's last message (a game's
+    // disconnect, sent just before it leaves) reaches the game while its endpoint is
+    // still shown, as Party delivers a peer's messages before its endpoint goes.
+    // Messages that waited for an endpoint go before new ones, so each peer's reach the
+    // game in the order they were sent.
+    let started = Instant::now();
+    let mut todo = s.take_early();
+    while let Some(p) = lan.receive_where(None, |sock| sock.starts_with(SOCKET_PREFIX)) {
+        todo.push_back((p, Instant::now()));
+    }
+    let mut reconciled = Vec::new();
+    let mut reconcile = |s: &mut State, net: usize| s.reconcile(lan, net);
+    for (p, came) in todo {
+        receive(s, &mut reconcile, p, came, came < started, &mut reconciled);
+    }
     for ev in net::take(Front::Party) {
         if s.chat_used {
             // Voice rooms' channels, and players leaving them.
@@ -1113,18 +1143,6 @@ fn pump(s: &mut State) {
             }
             _ => {}
         }
-    }
-    // Messages that waited for an endpoint go first, so each peer's reach the game in
-    // the order they were sent.
-    let started = Instant::now();
-    let mut todo = s.take_early();
-    while let Some(p) = lan.receive_where(None, |sock| sock.starts_with(SOCKET_PREFIX)) {
-        todo.push_back((p, Instant::now()));
-    }
-    let mut reconciled = Vec::new();
-    let mut reconcile = |s: &mut State, net: usize| s.reconcile(lan, net);
-    for (p, came) in todo {
-        receive(s, &mut reconcile, p, came, came < started, &mut reconciled);
     }
     if s.chat_used {
         chat::pump_chat(s, lan);
@@ -2271,6 +2289,18 @@ unsafe extern "system" fn party_invitation_get_configuration(inv: usize, out: *m
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every change has room for the whole union a binding reads (440 bytes in
+    /// PlayFab's Unity plugin) after its start, however small its own struct.
+    #[test]
+    fn a_change_has_room_for_the_whole_union() {
+        let mut s = State::default();
+        s.push(7u32);
+        let c = &s.queue[0];
+        let boxed: &Padded<u32> = c._data.downcast_ref().expect("padded");
+        assert_eq!(c.ptr, &boxed.change as *const u32 as usize);
+        assert!(std::mem::size_of::<Padded<u32>>() >= 440);
+    }
 
     #[test]
     fn layouts_match_party_h() {

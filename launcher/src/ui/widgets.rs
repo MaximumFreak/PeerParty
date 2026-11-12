@@ -55,10 +55,21 @@ pub fn button(ui: &mut Ui, icon: Option<Icon>, label: &str, kind: Kind) -> Respo
     resp
 }
 
-/// A wide button that fills the width it's given.
+/// A wide button that fills the width it's given. A label too long for it (a longer
+/// language in the sidebar) is set smaller, down to 11 points, rather than run past
+/// its edges.
 pub fn wide_button(ui: &mut Ui, icon: Option<Icon>, label: &str, kind: Kind, height: f32) -> Response {
-    let galley = ui.painter().layout_no_wrap(label.to_string(), theme::strong(14.0), TEXT);
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
+    let width = ui.available_width();
+    let room = width - if icon.is_some() { 24.0 } else { 0.0 } - 20.0;
+    let mut size = 14.0;
+    let galley = loop {
+        let galley = ui.painter().layout_no_wrap(label.to_string(), theme::strong(size), TEXT);
+        if galley.size().x <= room || size <= 11.0 {
+            break galley;
+        }
+        size -= 0.5;
+    };
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, height), Sense::click());
     paint_button(ui, &resp, rect, icon, galley, kind, 10.0);
     resp
 }

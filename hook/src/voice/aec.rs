@@ -4,8 +4,8 @@
 //! output (a loopback of the render device) as the echo reference, so it cancels
 //! everything the speakers play: the other players' voices and the game's sound.
 //!
-//! The devices are the communications defaults (Sound settings' "default
-//! communications device"), found by their place in the active endpoint lists, which
+//! The devices are the ones voice uses (endpoints.rs: the game's choice, else the
+//! communications defaults), found by their place in the active endpoint lists, which
 //! is how the DSP numbers them. Output is 16 kHz mono 16-bit, PeerParty's device format.
 //! Silence plays on those speakers while it runs (see `Silence`).
 //!
@@ -19,19 +19,12 @@ use std::ffi::c_void;
 use super::DEVICE_RATE;
 use crate::log;
 
-type Hresult = i32;
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Guid(u32, u16, u16, [u8; 8]);
+use super::com::{self, CAPTURE, Guid, Hresult, IID_UNKNOWN, PropVariant, RENDER, release, vcall};
 
 const CLSID_AEC: Guid = Guid(0x745057C7, 0xF353, 0x4F2D, [0xA7, 0xEE, 0x58, 0x43, 0x44, 0x77, 0x73, 0x0E]);
 const IID_MEDIA_OBJECT: Guid = Guid(0xD8AD0F58, 0x5494, 0x4102, [0x97, 0xC5, 0xEC, 0x79, 0x8E, 0x59, 0xBC, 0xF4]);
 const IID_PROPERTY_STORE: Guid = Guid(0x886D8EEB, 0x8CF2, 0x4446, [0x8D, 0x02, 0xCD, 0xBA, 0x1D, 0xBD, 0xCF, 0x99]);
 const IID_MEDIA_BUFFER: Guid = Guid(0x59EFF8B9, 0x938C, 0x4A26, [0x82, 0xF2, 0x95, 0xCB, 0x84, 0xCD, 0xC8, 0x37]);
-const IID_UNKNOWN: Guid = Guid(0, 0, 0, [0xC0, 0, 0, 0, 0, 0, 0, 0x46]);
-const CLSID_MM_ENUMERATOR: Guid = Guid(0xBCDE0395, 0xE52F, 0x467C, [0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E]);
-const IID_MM_ENUMERATOR: Guid = Guid(0xA95664D2, 0x9614, 0x4F35, [0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6]);
 const IID_AUDIO_CLIENT: Guid = Guid(0x1CB9AD4C, 0xDBFA, 0x4C32, [0xB1, 0x78, 0xC2, 0xF5, 0x68, 0xA7, 0x03, 0xB2]);
 const IID_RENDER_CLIENT: Guid = Guid(0xF294ACFC, 0x3146, 0x4483, [0xA7, 0xBF, 0xAD, 0xDC, 0xA7, 0xC2, 0x60, 0xE2]);
 const MEDIATYPE_AUDIO: Guid = Guid(0x73647561, 0, 0x10, [0x80, 0, 0, 0xAA, 0, 0x38, 0x9B, 0x71]);
@@ -45,34 +38,6 @@ const FEATURE_MODE: u32 = 5;
 const FEATR_NS: u32 = 8;
 const FEATR_AGC: u32 = 9;
 
-#[link(name = "ole32")]
-unsafe extern "system" {
-    fn CoInitializeEx(reserved: *const c_void, flags: u32) -> Hresult;
-    fn CoCreateInstance(clsid: *const Guid, outer: *const c_void, ctx: u32, iid: *const Guid, out: *mut usize) -> Hresult;
-    fn CoTaskMemFree(p: *const c_void);
-}
-
-macro_rules! vcall {
-    ($obj:expr, $slot:expr, fn($($t:ty),*) -> $r:ty $(, $a:expr)*) => {{
-        let obj = $obj;
-        let f: unsafe extern "system" fn(usize $(, $t)*) -> $r = unsafe { std::mem::transmute(*(*(obj as *const *const usize)).add($slot)) };
-        unsafe { f(obj $(, $a)*) }
-    }};
-}
-
-fn release(obj: usize) {
-    if obj != 0 {
-        vcall!(obj, 2, fn() -> u32);
-    }
-}
-
-#[repr(C)]
-struct PropVariant {
-    vt: u16,
-    reserved: [u16; 3],
-    value: [u64; 2],
-}
-
 fn set_prop(store: usize, pid: u32, vt: u16, value: i32) -> bool {
     #[repr(C)]
     struct Key(Guid, u32);
@@ -82,51 +47,15 @@ fn set_prop(store: usize, pid: u32, vt: u16, value: i32) -> bool {
     vcall!(store, 6, fn(*const Key, *const PropVariant) -> Hresult, &key, &v) >= 0
 }
 
-/// The communications default endpoint of `flow` (0 render, 1 capture).
-fn default_device(enumerator: usize, flow: u32) -> Option<usize> {
-    let mut def = 0usize;
-    (vcall!(enumerator, 4, fn(u32, u32, *mut usize) -> Hresult, flow, 2, &mut def) >= 0 && def != 0).then_some(def)
-}
-
-/// The index of the communications default among the active endpoints of `flow`
-/// (0 render, 1 capture).
-fn default_index(enumerator: usize, flow: u32) -> Option<u32> {
-    let def = default_device(enumerator, flow)?;
-    let id = |dev: usize| -> Option<Vec<u16>> {
-        let mut p: *mut u16 = std::ptr::null_mut();
-        if vcall!(dev, 5, fn(*mut *mut u16) -> Hresult, &mut p) < 0 || p.is_null() {
-            return None;
-        }
-        let mut n = 0;
-        while unsafe { *p.add(n) } != 0 {
-            n += 1;
-        }
-        let v = unsafe { std::slice::from_raw_parts(p, n) }.to_vec();
-        unsafe { CoTaskMemFree(p as *const c_void) };
-        Some(v)
-    };
-    let want = id(def);
-    release(def);
-    let want = want?;
-    let mut coll = 0usize;
-    if vcall!(enumerator, 3, fn(u32, u32, *mut usize) -> Hresult, flow, 1, &mut coll) < 0 || coll == 0 {
-        return None;
-    }
-    let mut count = 0u32;
-    vcall!(coll, 3, fn(*mut u32) -> Hresult, &mut count);
+/// The place of endpoint `id` among the active endpoints of `flow`.
+fn index_of(enumerator: usize, flow: u32, id: &str) -> Option<u32> {
     let mut found = None;
-    for i in 0..count {
-        let mut dev = 0usize;
-        if vcall!(coll, 4, fn(u32, *mut usize) -> Hresult, i, &mut dev) >= 0 && dev != 0 {
-            let same = id(dev).as_ref() == Some(&want);
-            release(dev);
-            if same {
-                found = Some(i);
-                break;
-            }
+    for (i, dev) in com::active_devices(enumerator, flow).into_iter().enumerate() {
+        if found.is_none() && com::device_id(dev).as_deref() == Some(id) {
+            found = Some(i as u32);
         }
+        release(dev);
     }
-    release(coll);
     found
 }
 
@@ -160,8 +89,7 @@ static BUFFER_VTBL: BufferVtbl = BufferVtbl {
 
 unsafe extern "system" fn buf_qi(this: *mut Buffer, iid: *const Guid, out: *mut usize) -> Hresult {
     let iid = unsafe { &*iid };
-    let is = |g: &Guid| g.0 == iid.0 && g.1 == iid.1 && g.2 == iid.2 && g.3 == iid.3;
-    if is(&IID_MEDIA_BUFFER) || is(&IID_UNKNOWN) {
+    if iid.same(&IID_MEDIA_BUFFER) || iid.same(&IID_UNKNOWN) {
         unsafe {
             (*this).refs += 1;
             *out = this as usize;
@@ -266,7 +194,7 @@ impl Silence {
         let ok = vcall!(client, 8, fn(*mut *mut c_void) -> Hresult, &mut format) >= 0
             && vcall!(client, 3, fn(u32, u32, i64, i64, *const c_void, *const Guid) -> Hresult, 0, 0, 1_000_000, 0, format, std::ptr::null()) >= 0;
         if !format.is_null() {
-            unsafe { CoTaskMemFree(format) };
+            unsafe { com::CoTaskMemFree(format) };
         }
         let mut render = 0usize;
         let mut frames = 0u32;
@@ -315,27 +243,24 @@ pub struct Capture {
 unsafe impl Send for Capture {}
 
 impl Capture {
-    /// Starts the DSP on the communications default microphone and speakers. None when
-    /// Windows doesn't have it, or there's no microphone.
-    pub fn open() -> Option<Capture> {
-        unsafe { CoInitializeEx(std::ptr::null(), 0) }; // COINIT_MULTITHREADED; S_FALSE if already
-        let mut enumerator = 0usize;
-        let hr = unsafe { CoCreateInstance(&CLSID_MM_ENUMERATOR, std::ptr::null(), 1, &IID_MM_ENUMERATOR, &mut enumerator) };
-        if hr < 0 {
-            log!("voice: no audio endpoints ({hr:#x}); echo cancellation off");
+    /// Starts the DSP on microphone `mic` and speakers `speakers` (endpoint ids). None
+    /// when Windows doesn't have it, or there's no such microphone.
+    pub fn open(mic: &str, speakers: Option<&str>) -> Option<Capture> {
+        let Some(enumerator) = com::enumerator() else {
+            log!("voice: no audio endpoints; echo cancellation off");
             return None;
-        }
-        let mic = default_index(enumerator, 1);
-        let speakers = default_index(enumerator, 0);
-        let silence = default_device(enumerator, 0).and_then(|d| {
+        };
+        let silence = speakers.and_then(|id| com::device_by_id(enumerator, id)).and_then(|d| {
             let s = Silence::start(d);
             release(d);
             s
         });
+        let speakers = speakers.and_then(|id| index_of(enumerator, RENDER, id));
+        let mic = index_of(enumerator, CAPTURE, mic);
         release(enumerator);
         let mic = mic?;
         let mut dmo = 0usize;
-        let hr = unsafe { CoCreateInstance(&CLSID_AEC, std::ptr::null(), 1, &IID_MEDIA_OBJECT, &mut dmo) };
+        let hr = unsafe { com::CoCreateInstance(&CLSID_AEC, std::ptr::null(), 1, &IID_MEDIA_OBJECT, &mut dmo) };
         if hr < 0 {
             log!("voice: Windows' Voice Capture DSP isn't available ({hr:#x}); echo cancellation off");
             return None;
@@ -380,7 +305,6 @@ impl Capture {
             release(dmo);
             return None;
         }
-        log!("voice: microphone through Windows' echo cancellation and noise suppression (mic {mic}, speakers {speakers:?})");
         // A second of audio; the DSP hands out 10 ms at a time.
         let buf = Box::new(Buffer { vtbl: &BUFFER_VTBL, refs: 1, len: 0, data: vec![0; DEVICE_RATE as usize * 2] });
         Some(Capture { dmo, buf, silence })
@@ -426,7 +350,9 @@ mod tests {
     /// a microphone).
     #[test]
     fn the_dsp_hands_out_16k_audio() {
-        let Some(mut c) = Capture::open() else {
+        let snap = super::super::endpoints::snapshot();
+        let speakers = snap.output.communications.clone();
+        let Some(mut c) = snap.input.communications.as_deref().and_then(|mic| Capture::open(mic, speakers.as_deref())) else {
             eprintln!("no microphone or no DSP: skipped");
             return;
         };

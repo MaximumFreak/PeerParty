@@ -70,13 +70,23 @@ add("EOS_RTCData_AddNotifyDataReceived")(data, C.byref(ro), None,
     cb(DataGot, lambda i: ev["data"].append((text_id(i.ParticipantId), C.string_at(i.Data, i.DataLengthBytes)))))
 
 # devices
+# Windows' own microphones, each with an id and a name, the system default marked.
 n = fn("EOS_RTCAudio_GetInputDevicesCount", C.c_uint32, C.c_void_p, C.c_void_p)(audio, C.byref(IndexOpts(1, 0)))
-pinfo = C.POINTER(DeviceInfo)()
-r = fn("EOS_RTCAudio_CopyInputDeviceInformationByIndex", C.c_int32, C.c_void_p, C.c_void_p, C.c_void_p)(
-    audio, C.byref(IndexOpts(1, 0)), C.byref(pinfo))
-check("one default input device", n == 1 and r == 0 and pinfo.contents.bDefaultDevice == 1, (n, r, r == 0 and pinfo.contents.DeviceName))
-if r == 0:
+listed = []
+for i in range(n + 1):
+    pinfo = C.POINTER(DeviceInfo)()
+    r = fn("EOS_RTCAudio_CopyInputDeviceInformationByIndex", C.c_int32, C.c_void_p, C.c_void_p, C.c_void_p)(
+        audio, C.byref(IndexOpts(1, i)), C.byref(pinfo))
+    if r != 0:
+        listed.append(r)
+        break
+    d = pinfo.contents
+    listed.append((d.DeviceId, d.DeviceName, d.bDefaultDevice))
     fn("EOS_RTCAudio_InputDeviceInformation_Release", None, C.c_void_p)(pinfo)
+devices, past_end = listed[:-1], listed[-1]
+check("Windows' input devices, named, one default",
+      len(devices) == n and past_end != 0 and all(i and nm for i, nm, _ in devices)
+      and (n == 0 or sum(d for _, _, d in devices) == 1), (n, listed))
 
 done = {}
 jo = JoinOpts(1, me, ROOM, b"https://localhost", b"token", me, 0x4, 1, 1)

@@ -818,6 +818,7 @@ mod tests {
     fn run_ps(script: &str) -> String {
         let out = std::process::Command::new(powershell())
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .creation_flags_no_window()
             .output()
             .expect("Windows PowerShell runs");
         assert!(out.status.success(), "{script}: {}", String::from_utf8_lossy(&out.stderr));

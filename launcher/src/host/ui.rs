@@ -110,6 +110,10 @@ pub struct Peer {
     pub ip: String,
     /// Runs the same version of the game.
     pub same_build: bool,
+    /// A dedicated server, not a player: listed by its server name, with Join only.
+    pub server: bool,
+    /// Another copy on this PC (the player's own second copy or server).
+    pub this_pc: bool,
     /// How they reach us: "lan", "room" (a room code) or "public" (public sessions).
     pub via: String,
     /// A public player's key fingerprint.
@@ -196,6 +200,8 @@ impl GameState {
                     with_me: p.get("with_me").and_then(Value::as_bool).unwrap_or(false),
                     ip: s(p, "ip"),
                     same_build: p.get("same_build").and_then(Value::as_bool).unwrap_or(true),
+                    server: p.get("server").and_then(Value::as_bool).unwrap_or(false),
+                    this_pc: p.get("this_pc").and_then(Value::as_bool).unwrap_or(false),
                     via: s(p, "via"),
                     fp: s(p, "fp"),
                 })
@@ -506,6 +512,15 @@ pub struct Overlay {
     pub paints_background: bool,
 }
 
+/// The notice for someone new in the game: a player "is playing too", a dedicated
+/// server "is running", and nothing for another copy on this PC (the player's own).
+pub fn arrival_text(p: &Peer) -> Option<String> {
+    if p.this_pc && !p.server {
+        return None;
+    }
+    Some(if p.server { t!("toast.server_running", name = p.name) } else { t!("toast.playing_too", name = p.name) })
+}
+
 /// An invite's wording from the hook ("invited you", "asks to join you"), translated.
 pub fn invite_text(name: &str, kind: &str) -> String {
     match kind {
@@ -526,6 +541,8 @@ pub fn hook_text(s: &str) -> String {
         "A player asked to join you" => t!("hook.asked_to_join").into(),
         "Achievement unlocked" => t!("hook.achievement").into(),
         "Host or join a game first" => t!("overlay.host_first").into(),
+        // The hook's invite.rs LEARN_FIRST.
+        "Invite someone once from the game's friends list first. After that, Invite and Join work here" => t!("hook.learn_invite").into(),
         // The hook's invite.rs PHOTON_NO_INVITES, with the room after it.
         _ if s.starts_with("This game has no invites: players on your network join your session from the game's own menu (room ") => {
             let room = s.rsplit("(room ").next().unwrap_or_default().trim_end_matches(')');
@@ -697,15 +714,27 @@ impl Overlay {
                 if st.codes {
                     rows.push(self.paste_row());
                 }
-                let names: Vec<&str> = st.peers.iter().map(|p| p.name.as_str()).collect();
-                let who = if names.is_empty() {
-                    Row::action(t!("overlay.nobody_yet"), t!("overlay.nobody_yet_detail"), Action::Open(PageRef::Players), t!("overlay.open"))
-                } else {
+                // Players and dedicated servers are counted apart: a server isn't a player.
+                let list = |server: bool| -> Vec<&str> { st.peers.iter().filter(|p| p.server == server).map(|p| p.name.as_str()).collect() };
+                let shown = |names: &[&str]| {
                     let shown = names.iter().take(4).copied().collect::<Vec<_>>().join(", ");
                     let more = if names.len() > 4 { t!("overlay.and_more", n = names.len() - 4) } else { String::new() };
-                    Row::action(t!("overlay.players_here", n = names.len()), format!("{shown}{more}"), Action::Open(PageRef::Players), t!("overlay.open"))
+                    format!("{shown}{more}")
+                };
+                let names = list(false);
+                let servers = list(true);
+                let who = if !names.is_empty() {
+                    Row::action(t!("overlay.players_here", n = names.len()), shown(&names), Action::Open(PageRef::Players), t!("overlay.open"))
+                } else if servers.is_empty() {
+                    Row::action(t!("overlay.nobody_yet"), t!("overlay.nobody_yet_detail"), Action::Open(PageRef::Players), t!("overlay.open"))
+                } else {
+                    Row::info(t!("overlay.nobody_yet"), t!("overlay.nobody_yet_detail"))
                 };
                 rows.push(who.icon(Icon::People, if names.is_empty() { Tone::Plain } else { Tone::Good }));
+                if !servers.is_empty() {
+                    let row = Row::action(t!("overlay.servers_here", n = servers.len()), shown(&servers), Action::Open(PageRef::Players), t!("overlay.open"));
+                    rows.push(Row { id: "servers here".into(), ..row.icon(Icon::Home, Tone::Good) });
+                }
                 let lobby = match &st.lobby {
                     Some(l) if l.kind == "photon.room" => {
                         let members: Vec<String> = l.members.iter().map(|(_, n, owner)| if *owner { t!("overlay.host_name", name = n) } else { n.clone() }).collect();
@@ -747,7 +776,19 @@ impl Overlay {
                     rows.push(Row::info(t!("overlay.no_players"), t!("overlay.no_players_detail")));
                 }
                 for (i, p) in st.peers.iter().enumerate() {
-                    let mut detail = if p.with_me { t!("overlay.in_your_lobby").to_string() } else if p.status.is_empty() { t!("overlay.playing").to_string() } else { p.status.clone() };
+                    // A server can't be invited anywhere.
+                    if p.server && self.invite_mode {
+                        continue;
+                    }
+                    let mut detail = if p.server {
+                        t!("overlay.dedicated_server").to_string()
+                    } else if p.with_me {
+                        t!("overlay.in_your_lobby").to_string()
+                    } else if p.status.is_empty() {
+                        t!("overlay.playing").to_string()
+                    } else {
+                        p.status.clone()
+                    };
                     if p.public() {
                         detail.push_str(&format!("  \u{b7}  {}", t!("overlay.public_player")));
                     } else if p.via == "room" {
@@ -755,14 +796,19 @@ impl Overlay {
                     } else if let Some(ip) = p.shown_ip() {
                         detail.push_str(&format!("  \u{b7}  {ip}"));
                     }
-                    if !p.same_build {
+                    if !p.same_build && !p.server {
                         detail.push_str(&format!("  \u{b7}  {}", t!("overlay.other_version")));
                     }
                     let icon = if p.public() { Icon::Globe } else if p.via == "room" { Icon::People } else { Icon::Home };
                     // A joins them (X invites them here); opened from the game's own
                     // invite button, A invites; someone already in your lobby, A shows
                     // their details.
-                    let r = if p.with_me {
+                    let r = if p.server && p.public() {
+                        Row::action(p.name.clone(), detail, Action::Join(i), t!("overlay.join")).second(Action::Profile(i), t!("overlay.details"))
+                    } else if p.server {
+                        // Join asks the game to join the server (the hook's steamgs.rs).
+                        Row::action(p.name.clone(), detail, Action::Join(i), t!("overlay.join"))
+                    } else if p.with_me {
                         Row::action(p.name.clone(), detail, Action::Profile(i), t!("overlay.details"))
                     } else if self.invite_mode {
                         Row::action(p.name.clone(), detail, Action::Invite(i), t!("overlay.invite"))
@@ -1552,6 +1598,54 @@ mod tests {
         assert!(out.is_empty());
         o.act(Action::Block(1), &mut prefs, &mut out);
         assert!(matches!(&out[..], [Cmd::Hook(v)] if v["t"] == "block" && v["peer"] == "cc"));
+    }
+
+    /// A dedicated server is listed by its own name as a server: no version warning
+    /// (its program is never the client's), Join only, and nothing to invite it to.
+    #[test]
+    fn a_dedicated_server_is_listed_as_a_server() {
+        let mut o = Overlay::new("Game".into());
+        o.state = GameState::from_json(&serde_json::json!({
+            "t": "state",
+            "me": {"id": "aa", "name": "Kim"},
+            "peers": [
+                {"id": "bb", "name": "My World", "server": true, "ip": "192.168.1.20", "via": "lan", "same_build": false},
+                {"id": "cc", "name": "Sam", "ip": "192.168.1.31", "via": "lan", "same_build": false}
+            ]
+        }));
+        o.open(Page::Players, false);
+        let rows = o.rows(&Prefs::default());
+        let server = rows.iter().find(|r| r.title == "My World").expect("the server is listed");
+        assert_eq!(server.detail, "Dedicated server  \u{b7}  192.168.1.20");
+        assert!(server.main == Action::Join(0) && server.second_label.is_empty());
+        let sam = rows.iter().find(|r| r.title == "Sam").unwrap();
+        assert!(sam.detail.contains("a different version of the game"), "a player still gets the warning");
+        assert!(!sam.second_label.is_empty(), "a player can still be invited");
+        o.open(Page::Players, true);
+        let rows = o.rows(&Prefs::default());
+        assert!(!rows.iter().any(|r| r.title == "My World"), "nothing to invite a server to");
+        // Home counts the player and the server apart.
+        o.open(Page::Home, false);
+        let rows = o.rows(&Prefs::default());
+        assert!(rows.iter().any(|r| r.title == "1 other player" && r.detail == "Sam"));
+        assert!(rows.iter().any(|r| r.title == "1 dedicated server" && r.detail == "My World"));
+    }
+
+    /// A new player is "playing too", a new server "is running", and the player's
+    /// own other copy on this PC gets no notice.
+    #[test]
+    fn arrival_notices_tell_players_servers_and_your_own_copies_apart() {
+        let st = GameState::from_json(&serde_json::json!({
+            "t": "state",
+            "peers": [
+                {"id": "bb", "name": "Sam"},
+                {"id": "cc", "name": "My World", "server": true, "this_pc": true},
+                {"id": "dd", "name": "Kim (2)", "this_pc": true}
+            ]
+        }));
+        assert_eq!(arrival_text(&st.peers[0]).as_deref(), Some("Sam is playing too"));
+        assert_eq!(arrival_text(&st.peers[1]).as_deref(), Some("Dedicated server My World is running"));
+        assert_eq!(arrival_text(&st.peers[2]), None);
     }
 
     /// The Network page's internet switch: it shows the game's state,

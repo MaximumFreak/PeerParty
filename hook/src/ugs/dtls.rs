@@ -10,7 +10,9 @@
 //! fit TLS_PSK_WITH_AES_128_GCM_SHA256 (RFC 5487), the one suite answered here.
 //!
 //! The handshake (RFC 6347 on RFC 5246, PSK as RFC 4279):
-//!   client: ClientHello                           (no HelloVerifyRequest is sent)
+//!   client: ClientHello
+//!   server: HelloVerifyRequest(cookie)            (`check_hello`, no state kept)
+//!   client: ClientHello(cookie)
 //!   server: ServerHello, ServerHelloDone          (no ServerKeyExchange: no hint)
 //!   client: ClientKeyExchange(identity), ChangeCipherSpec, Finished
 //!   server: ChangeCipherSpec, Finished
@@ -19,8 +21,10 @@
 //! retransmitted flight gets the last server flight again. Handshake messages must
 //! arrive whole (MbedTLS doesn't fragment messages this small).
 //!
-//! There's no cookie exchange, no replay window and no renegotiation: the LAN is
-//! trusted, and the relay is only reached by the games of the people playing.
+//! The cookie (RFC 6347 4.2.1) is an HMAC of the client's address and random with a
+//! secret of the relay's: a session, and its memory, exists only for an address that
+//! answered from where it claims to be. Encrypted records pass a replay window (RFC
+//! 6347 4.1.2.6) once authenticated. There's no renegotiation.
 
 use std::time::Instant;
 
@@ -33,11 +37,15 @@ const CT_APP: u8 = 23;
 
 const HS_CLIENT_HELLO: u8 = 1;
 const HS_SERVER_HELLO: u8 = 2;
+const HS_HELLO_VERIFY_REQUEST: u8 = 3;
 const HS_SERVER_HELLO_DONE: u8 = 14;
 const HS_CLIENT_KEY_EXCHANGE: u8 = 16;
 const HS_FINISHED: u8 = 20;
 
 const DTLS12: [u8; 2] = [0xFE, 0xFD];
+/// HelloVerifyRequest's version, whatever is negotiated (RFC 6347 4.2.1).
+const DTLS10: [u8; 2] = [0xFE, 0xFF];
+const COOKIE_LEN: usize = 16;
 pub const PSK_AES_128_GCM_SHA256: u16 = 0x00A8;
 const EXT_EMS: u16 = 0x0017;
 const EXT_RENEGOTIATION: u16 = 0xFF01;
@@ -51,6 +59,51 @@ const ALERT_UNKNOWN_PSK_IDENTITY: u8 = 115;
 /// A datagram that starts like a DTLS record (not a Relay message, whose first byte is 0xDA).
 pub fn is_dtls(pkt: &[u8]) -> bool {
     pkt.len() >= 13 && (CT_CCS..=CT_APP).contains(&pkt[0]) && pkt[1] == 0xFE
+}
+
+/// What a datagram from an address without a session is.
+#[derive(Debug, PartialEq)]
+pub enum Hello {
+    /// Not a ClientHello: nothing is kept or answered.
+    Other,
+    /// A ClientHello with this address's cookie: start a session.
+    Verified,
+    /// A ClientHello without it: send this HelloVerifyRequest back, and keep nothing.
+    Verify(Vec<u8>),
+}
+
+fn cookie(secret: &[u8], peer: &[u8], random: &[u8; 32]) -> Vec<u8> {
+    let mut m = peer.to_vec();
+    m.extend_from_slice(random);
+    hmac_sha256(secret, &m)[..COOKIE_LEN].to_vec()
+}
+
+/// The cookie exchange (RFC 6347 4.2.1), statelessly: `peer` is the sender's address
+/// (any stable bytes), `secret` the relay's.
+pub fn check_hello(secret: &[u8], peer: &[u8], d: &[u8]) -> Hello {
+    let Some(&(kind, _, seq, frag)) = records(d).first() else { return Hello::Other };
+    if kind != CT_HANDSHAKE || seq >> 48 != 0 {
+        return Hello::Other;
+    }
+    let Some(&(t, msg_seq, body, _)) = handshake_msgs(frag).as_ref().and_then(|m| m.first()) else { return Hello::Other };
+    if t != HS_CLIENT_HELLO {
+        return Hello::Other;
+    }
+    let Some(hello) = ClientHello::parse(body) else { return Hello::Other };
+    let want = cookie(secret, peer, &hello.random);
+    if hello.cookie.len() == want.len() && hello.cookie.iter().zip(&want).fold(0u8, |a, (x, y)| a | (x ^ y)) == 0 {
+        return Hello::Verified;
+    }
+    let mut b = DTLS10.to_vec();
+    b.push(want.len() as u8);
+    b.extend_from_slice(&want);
+    let m = handshake_msg(HS_HELLO_VERIFY_REQUEST, msg_seq, &b);
+    // The ClientHello's record sequence number, as RFC 6347 asks.
+    let mut out = vec![CT_HANDSHAKE, DTLS10[0], DTLS10[1]];
+    out.extend_from_slice(&seq.to_be_bytes());
+    out.extend_from_slice(&(m.len() as u16).to_be_bytes());
+    out.extend_from_slice(&m);
+    Hello::Verify(out)
 }
 
 /// TLS 1.2's PRF with SHA-256 (RFC 5246 section 5).
@@ -211,6 +264,11 @@ pub struct Session {
     server: Option<Cipher>,
     /// The next record sequence number per epoch.
     send_seq: [u64; 2],
+    /// Our first handshake message's message_seq: the ClientHello's (1 after a cookie).
+    msg_seq: u16,
+    /// The client's epoch-1 records seen: the highest sequence number, and the 64 below it.
+    replay_top: Option<u64>,
+    replay_bits: u64,
     /// The last flight, sent again when the client repeats its own.
     flight: Option<Vec<u8>>,
     pub last_seen: Instant,
@@ -230,6 +288,9 @@ impl Session {
             client: None,
             server: None,
             send_seq: [0; 2],
+            msg_seq: 0,
+            replay_top: None,
+            replay_bits: 0,
             flight: None,
             last_seen: now,
         }
@@ -237,6 +298,33 @@ impl Session {
 
     pub fn is_open(&self) -> bool {
         self.state == State::Open
+    }
+
+    /// Whether an authenticated epoch-1 record was seen before (or is too old to tell),
+    /// and if not, notes it.
+    fn replayed(&mut self, seq: u64) -> bool {
+        let n = seq & 0xFFFF_FFFF_FFFF;
+        match self.replay_top {
+            None => {
+                self.replay_top = Some(n);
+                self.replay_bits = 1;
+                false
+            }
+            Some(top) if n > top => {
+                let shift = n - top;
+                self.replay_bits = if shift >= 64 { 1 } else { self.replay_bits << shift | 1 };
+                self.replay_top = Some(n);
+                false
+            }
+            Some(top) => {
+                let back = top - n;
+                if back >= 64 || self.replay_bits >> back & 1 == 1 {
+                    return true;
+                }
+                self.replay_bits |= 1 << back;
+                false
+            }
+        }
     }
 
     /// A datagram from the client. `psk_for` gives the key for a PSK identity.
@@ -250,9 +338,14 @@ impl Session {
         let mut resend = false;
         for (kind, version, seq, frag) in records(d) {
             let epoch = (seq >> 48) as u16;
-            let body = match (epoch, &self.client) {
+            let opened = match (epoch, &self.client) {
+                (1, Some(c)) => Some(c.open(seq, kind, version, frag)),
+                _ => None,
+            };
+            let body = match (epoch, opened) {
                 (0, _) => frag.to_vec(),
-                (1, Some(c)) => match c.open(seq, kind, version, frag) {
+                (1, Some(o)) => match o {
+                    Some(_) if self.replayed(seq) => continue,
                     Some(b) => b,
                     // The first encrypted record is the client's Finished: if it doesn't
                     // open, the two sides derived different keys.
@@ -264,14 +357,20 @@ impl Session {
                 },
                 _ => continue,
             };
+            // Our epoch-0 records number on from the client's ClientHello: after a cookie
+            // exchange the HelloVerifyRequest took that number, and a client drops a
+            // record numbered like one it has had (RFC 6347 4.2.1).
+            if epoch == 0 && self.state == State::Hello {
+                self.send_seq[0] = self.send_seq[0].max(seq & 0xFFFF_FFFF_FFFF);
+            }
             match kind {
                 CT_HANDSHAKE => {
                     let Some(msgs) = handshake_msgs(&body) else {
                         r.problem = Some("a fragmented handshake message (not handled)".into());
                         continue;
                     };
-                    for (t, _, b, whole) in msgs {
-                        if self.handshake(t, epoch, b, whole, psk_for, &mut r, &mut resend) {
+                    for (t, ms, b, whole) in msgs {
+                        if self.handshake(t, ms, epoch, b, whole, psk_for, &mut r, &mut resend) {
                             return r;
                         }
                     }
@@ -299,9 +398,11 @@ impl Session {
     }
 
     /// One handshake message. Returns true when the session ended.
+    #[allow(clippy::too_many_arguments)]
     fn handshake(
         &mut self,
         kind: u8,
+        msg_seq: u16,
         epoch: u16,
         body: &[u8],
         whole: &[u8],
@@ -331,6 +432,7 @@ impl Session {
                     );
                 }
                 self.client_random = hello.random;
+                self.msg_seq = msg_seq;
                 self.server_random = random_bytes(32).try_into().unwrap();
                 self.ems = hello.extensions.contains(&EXT_EMS);
                 self.renegotiation =
@@ -355,8 +457,8 @@ impl Session {
                     sh.extend_from_slice(&(ext.len() as u16).to_be_bytes());
                     sh.extend_from_slice(&ext);
                 }
-                let sh = handshake_msg(HS_SERVER_HELLO, 0, &sh);
-                let done = handshake_msg(HS_SERVER_HELLO_DONE, 1, &[]);
+                let sh = handshake_msg(HS_SERVER_HELLO, self.msg_seq, &sh);
+                let done = handshake_msg(HS_SERVER_HELLO_DONE, self.msg_seq + 1, &[]);
                 self.transcript.extend_from_slice(&sh);
                 self.transcript.extend_from_slice(&done);
                 let mut flight = self.record(CT_HANDSHAKE, 0, &sh);
@@ -397,7 +499,7 @@ impl Session {
                 }
                 self.transcript.extend_from_slice(whole);
                 let verify = prf(&self.master, "server finished", &sha256(&self.transcript), 12);
-                let fin = handshake_msg(HS_FINISHED, 2, &verify);
+                let fin = handshake_msg(HS_FINISHED, self.msg_seq + 2, &verify);
                 let mut flight = self.record(CT_CCS, 0, &[1]);
                 flight.extend_from_slice(&self.record(CT_HANDSHAKE, 1, &fin));
                 self.flight = Some(flight.clone());
@@ -448,6 +550,7 @@ impl Session {
 
 struct ClientHello {
     random: [u8; 32],
+    cookie: Vec<u8>,
     suites: Vec<u16>,
     extensions: Vec<u16>,
 }
@@ -458,8 +561,9 @@ impl ClientHello {
         let mut at = 34;
         let sid = *b.get(at)? as usize;
         at += 1 + sid;
-        let cookie = *b.get(at)? as usize;
-        at += 1 + cookie;
+        let n = *b.get(at)? as usize;
+        let cookie = b.get(at + 1..at + 1 + n)?.to_vec();
+        at += 1 + n;
         let n = u16::from_be_bytes(b.get(at..at + 2)?.try_into().ok()?) as usize;
         let suites = b.get(at + 2..at + 2 + n)?.chunks(2).filter(|c| c.len() == 2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
         at += 2 + n;
@@ -474,7 +578,7 @@ impl ClientHello {
                 at += 4 + u16::from_be_bytes([b[at + 2], b[at + 3]]) as usize;
             }
         }
-        Some(ClientHello { random, suites, extensions })
+        Some(ClientHello { random, cookie, suites, extensions })
     }
 }
 
@@ -497,6 +601,9 @@ pub mod client {
         out: Option<Cipher>,
         inn: Option<Cipher>,
         seq: [u64; 2],
+        /// The next handshake message's message_seq.
+        msg_seq: u16,
+        cookie: Vec<u8>,
         pub open: bool,
     }
 
@@ -512,8 +619,15 @@ pub mod client {
                 out: None,
                 inn: None,
                 seq: [0; 2],
+                msg_seq: 0,
+                cookie: vec![],
                 open: false,
             }
+        }
+
+        fn next_msg(&mut self) -> u16 {
+            self.msg_seq += 1;
+            self.msg_seq - 1
         }
 
         fn record(&mut self, kind: u8, epoch: u16, data: &[u8]) -> Vec<u8> {
@@ -533,7 +647,9 @@ pub mod client {
         pub fn hello(&mut self) -> Vec<u8> {
             let mut b = DTLS12.to_vec();
             b.extend_from_slice(&self.random);
-            b.extend_from_slice(&[0, 0]); // session id, cookie
+            b.push(0); // session id
+            b.push(self.cookie.len() as u8);
+            b.extend_from_slice(&self.cookie);
             let suites = [0xC02Bu16, PSK_AES_128_GCM_SHA256, 0x00A9, SCSV_RENEGOTIATION];
             b.extend_from_slice(&((suites.len() * 2) as u16).to_be_bytes());
             for s in suites {
@@ -546,8 +662,10 @@ pub mod client {
             }
             b.extend_from_slice(&(ext.len() as u16).to_be_bytes());
             b.extend_from_slice(&ext);
-            let m = handshake_msg(HS_CLIENT_HELLO, 0, &b);
-            self.transcript.extend_from_slice(&m);
+            let ms = self.next_msg();
+            let m = handshake_msg(HS_CLIENT_HELLO, ms, &b);
+            // A ClientHello answered by a HelloVerifyRequest isn't in the transcript.
+            self.transcript = m.clone();
             self.record(CT_HANDSHAKE, 0, &m)
         }
 
@@ -559,9 +677,15 @@ pub mod client {
                 let body = if seq >> 48 == 0 { frag.to_vec() } else { self.inn.as_ref().unwrap().open(seq, kind, version, frag).expect("server record opens") };
                 match kind {
                     CT_HANDSHAKE => {
-                        for (t, _, b, whole) in handshake_msgs(&body).unwrap() {
+                        for (t, ms, b, whole) in handshake_msgs(&body).unwrap() {
                             match t {
+                                HS_HELLO_VERIFY_REQUEST => {
+                                    assert_eq!(ms, 0, "HelloVerifyRequest's message_seq");
+                                    self.cookie = b[3..3 + b[2] as usize].to_vec();
+                                    reply = Some(self.hello());
+                                }
                                 HS_SERVER_HELLO => {
+                                    assert_eq!(ms, self.msg_seq - 1, "ServerHello's message_seq is the ClientHello's");
                                     self.transcript.extend_from_slice(whole);
                                     let sr: [u8; 32] = b[2..34].try_into().unwrap();
                                     assert_eq!(u16::from_be_bytes([b[35], b[36]]), PSK_AES_128_GCM_SHA256);
@@ -572,7 +696,8 @@ pub mod client {
                                     let sr: [u8; 32] = self.master[..32].try_into().unwrap();
                                     let mut cke = (self.identity.len() as u16).to_be_bytes().to_vec();
                                     cke.extend_from_slice(&self.identity);
-                                    let m = handshake_msg(HS_CLIENT_KEY_EXCHANGE, 1, &cke);
+                                    let ms = self.next_msg();
+                                    let m = handshake_msg(HS_CLIENT_KEY_EXCHANGE, ms, &cke);
                                     self.transcript.extend_from_slice(&m);
                                     let pms = psk_premaster(&self.psk);
                                     self.master = if self.ems {
@@ -588,7 +713,8 @@ pub mod client {
                                     self.out = Some(c);
                                     self.inn = Some(s);
                                     let v = prf(&self.master, "client finished", &sha256(&self.transcript), 12);
-                                    let fin = handshake_msg(HS_FINISHED, 2, &v);
+                                    let ms = self.next_msg();
+                                    let fin = handshake_msg(HS_FINISHED, ms, &v);
                                     self.transcript.extend_from_slice(&fin);
                                     out.extend_from_slice(&self.record(CT_HANDSHAKE, 1, &fin));
                                     reply = Some(out);
@@ -655,12 +781,44 @@ mod tests {
         assert!(c.open);
         // Flight 3 again: flight 4 again.
         assert_eq!(s.recv(&flight3, now, &lookup).send, r.send);
-        // Data both ways.
-        let r = s.recv(&c.seal(b"bind me"), now, &lookup);
+        // Data both ways; a record replayed, or older than the window, is dropped.
+        let first = c.seal(b"bind me");
+        let r = s.recv(&first, now, &lookup);
         assert_eq!(r.data, vec![b"bind me".to_vec()]);
+        assert!(s.recv(&first, now, &lookup).data.is_empty(), "replayed");
+        let later: Vec<Vec<u8>> = (0..70).map(|i| c.seal(&[i])).collect();
+        assert_eq!(s.recv(&later[69], now, &lookup).data, vec![vec![69u8]]);
+        assert_eq!(s.recv(&later[10], now, &lookup).data, vec![vec![10u8]], "late but inside the window");
+        assert!(s.recv(&later[10], now, &lookup).data.is_empty(), "replayed");
+        assert!(s.recv(&later[2], now, &lookup).data.is_empty(), "older than the window");
         let down = s.seal(&[0xDA, 0x72, 0, 1]).unwrap();
         assert_eq!(c.recv(&down).1, vec![vec![0xDA, 0x72, 0, 1]]);
         assert_eq!(s.identity, id);
+    }
+
+    #[test]
+    fn a_cookie_is_asked_for_and_checked_without_keeping_state() {
+        let secret = [5u8; 32];
+        let mut c = Client::new(&[3u8; 16], &[7u8; 64], true);
+        let first = c.hello();
+        let Hello::Verify(hvr) = check_hello(&secret, b"10.0.0.2:5000", &first) else { panic!("no HelloVerifyRequest") };
+        let (again, _) = c.recv(&hvr);
+        let again = again.unwrap();
+        assert_eq!(check_hello(&secret, b"10.0.0.2:5000", &again), Hello::Verified);
+        // The same cookie from another address, or under another secret, isn't one.
+        assert!(matches!(check_hello(&secret, b"10.0.0.9:5000", &again), Hello::Verify(_)));
+        assert!(matches!(check_hello(&[6u8; 32], b"10.0.0.2:5000", &again), Hello::Verify(_)));
+        assert_eq!(check_hello(&secret, b"x", &[23, 0xFE, 0xFD, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0]), Hello::Other);
+        // The session then completes with message_seq following the second ClientHello.
+        let lookup = |i: &[u8]| (i == [3u8; 16]).then(|| vec![7u8; 64]);
+        let now = Instant::now();
+        let mut s = Session::new(now);
+        let r = s.recv(&again, now, &lookup);
+        let (f3, _) = c.recv(&r.send[0]);
+        let r = s.recv(&f3.unwrap(), now, &lookup);
+        assert!(r.opened, "{:?}", r.problem);
+        c.recv(&r.send[0]);
+        assert!(c.open);
     }
 
     #[test]
@@ -692,7 +850,10 @@ mod tests {
             std::path::PathBuf::from(r"C:\Program Files\Git\usr\bin\openssl.exe"),
         ];
         candidates.into_iter().find(|p| {
+            use std::os::windows::process::CommandExt;
             std::process::Command::new(p)
+                // No console window of its own (tests mustn't flash one on screen).
+                .creation_flags(0x0800_0000)
                 .arg("version")
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -724,12 +885,29 @@ mod tests {
             let psk = psk.clone();
             std::thread::spawn(move || {
                 let lookup = move |i: &[u8]| (i == identity).then(|| psk.clone());
-                let mut s = Session::new(Instant::now());
+                let secret = random_bytes(32);
+                let mut session: Option<Session> = None;
+                let mut verified = false;
                 let mut got = vec![];
                 let deadline = Instant::now() + Duration::from_secs(20);
                 let mut buf = [0u8; 2048];
                 while Instant::now() < deadline && !got.ends_with(b"\n") {
                     let Ok((n, from)) = sock.recv_from(&mut buf) else { continue };
+                    // As the relay does: a session only for an address that echoed its cookie.
+                    if session.is_none() {
+                        match check_hello(&secret, from.to_string().as_bytes(), &buf[..n]) {
+                            Hello::Verify(hvr) => {
+                                sock.send_to(&hvr, from).unwrap();
+                                continue;
+                            }
+                            Hello::Other => continue,
+                            Hello::Verified => {
+                                verified = true;
+                                session = Some(Session::new(Instant::now()));
+                            }
+                        }
+                    }
+                    let s = session.as_mut().unwrap();
                     let r = s.recv(&buf[..n], Instant::now(), &lookup);
                     for p in r.send {
                         sock.send_to(&p, from).unwrap();
@@ -742,11 +920,16 @@ mod tests {
                     }
                     assert!(r.problem.is_none(), "{:?}", r.problem);
                 }
+                let s = session.expect("a session");
+                assert!(verified);
                 (s.is_open(), s.ems, got)
             })
         };
         let psk_hex: String = psk.iter().map(|b| format!("{b:02x}")).collect();
+        use std::os::windows::process::CommandExt;
         let mut child = Command::new(openssl)
+            // No console window of its own (tests mustn't flash one on screen).
+            .creation_flags(0x0800_0000)
             .args(["s_client", "-dtls1_2", "-connect", &format!("127.0.0.1:{port}"), "-cipher", "PSK-AES128-GCM-SHA256"])
             .args(["-psk", &psk_hex, "-psk_identity", std::str::from_utf8(identity).unwrap(), "-quiet"])
             .stdin(Stdio::piped())

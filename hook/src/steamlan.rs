@@ -424,14 +424,15 @@ pub fn peer_of(id: u64) -> Option<PeerId> {
 /// PeerParty's identity), so every PC's game sees a different SteamID and account ID
 /// even when steam_api gives every player the same one; or, with the game's SteamID
 /// kept (`steamid` mode, `own_id_on`), the one steam_api gives. A LAN one for a second
-/// copy.
+/// copy, and for a dedicated server (which never holds the PC's first slot).
 pub fn my_steam_id() -> u64 {
     let known = ME.load(Ordering::Relaxed);
     if known != 0 {
         return known;
     }
     let Some(lan) = net::lan() else { return 0 };
-    let real = if lan.slot() == 0 { real_steam_id() } else { None };
+    let first = lan.slot() == 0 && !lan.server();
+    let real = if first { real_steam_id() } else { None };
     let own = real.is_some_and(|r| own_id_on() && r != lan_steam_id(lan.me()));
     let id = if own { lan_steam_id(lan.me()) } else { real.unwrap_or_else(|| lan_steam_id(lan.me())) };
     if let (true, Some(game)) = (own, real) {
@@ -442,14 +443,14 @@ pub fn my_steam_id() -> u64 {
         crate::saves::adopt_steam(id, game, &crate::saves::earlier_own_steam_ids());
     }
     // The first copy waits for the game to fetch its ISteamUser before settling.
-    if real.is_some() || lan.slot() != 0 {
+    if real.is_some() || !first {
         ME.store(id, Ordering::Relaxed);
         {
             let mut b = BOOK.lock().unwrap();
             b.mine = id;
             b.dirty = true;
         }
-        if lan.slot() != 0 {
+        if !first && !lan.server() {
             // --copy-saves: saves under this LAN SteamID start from the first copy's: under
             // its own SteamID for this PC when it has one, else (or when that has no
             // save yet) steam_api's.
@@ -469,6 +470,8 @@ pub fn my_steam_id() -> u64 {
                 format!("this PC's own, account {}; steam_api's is {}", id as u32, real.unwrap_or(0))
             } else if real.is_some() {
                 "the game's own from steam_api".to_string()
+            } else if lan.server() {
+                "a LAN one: this is a dedicated server".to_string()
             } else {
                 "a LAN one: another copy has this PC's".to_string()
             }
@@ -642,37 +645,31 @@ fn real_steam_client() -> bool {
 /// A game asked for an auth ticket. Steam answers with
 /// `GetAuthSessionTicketResponse_t`; when no steamclient module is in the process,
 /// PeerParty does, since some games wait for it before signing in to their services.
+///
+/// A real Steam client's failure (handle 0) is passed on as it is; with no client, 0 is
+/// what an unanswered call gives, and PeerParty hands out a handle of its own.
 pub fn auth_ticket_issued(ticket: u32) -> u32 {
-    let ticket = if ticket == 0 { 0x5050_0001 } else { ticket };
-    if !real_steam_client() {
-        log!("steam-lan auth ticket {ticket:#x}: nothing else answers it, answering GetAuthSessionTicketResponse_t");
-        crate::steam::inject(
-            GET_AUTH_SESSION_TICKET_RESPONSE,
-            bytes(&TicketResponse {
-                ticket,
-                result: RESULT_OK,
-            }),
-        );
+    if real_steam_client() {
+        return ticket;
     }
+    let ticket = if ticket == 0 { 0x5050_0001 } else { ticket };
+    log!("steam-lan auth ticket {ticket:#x}: nothing else answers it, answering GetAuthSessionTicketResponse_t");
+    crate::steam::inject(GET_AUTH_SESSION_TICKET_RESPONSE, bytes(&TicketResponse { ticket, result: RESULT_OK }));
     ticket
 }
 
 /// The web API flavour (`GetTicketForWebApiResponse_t`), which newer games and EOS
 /// sign-in through Steam wait for.
 pub fn web_ticket_issued(ticket: u32) -> u32 {
-    let ticket = if ticket == 0 { 0x5050_0002 } else { ticket };
-    if !real_steam_client() {
-        log!("steam-lan web API ticket {ticket:#x}: nothing else answers it, answering GetTicketForWebApiResponse_t");
-        let mut r = Box::new(WebTicketResponse {
-            ticket,
-            result: RESULT_OK,
-            len: 16,
-            data: [0; 2560],
-        });
-        r.data[..8].copy_from_slice(&my_steam_id().to_le_bytes());
-        r.data[8..16].copy_from_slice(b"peerpart");
-        crate::steam::inject(GET_TICKET_FOR_WEB_API_RESPONSE, bytes(&*r));
+    if real_steam_client() {
+        return ticket;
     }
+    let ticket = if ticket == 0 { 0x5050_0002 } else { ticket };
+    log!("steam-lan web API ticket {ticket:#x}: nothing else answers it, answering GetTicketForWebApiResponse_t");
+    let mut r = Box::new(WebTicketResponse { ticket, result: RESULT_OK, len: 16, data: [0; 2560] });
+    r.data[..8].copy_from_slice(&my_steam_id().to_le_bytes());
+    r.data[8..16].copy_from_slice(b"peerpart");
+    crate::steam::inject(GET_TICKET_FOR_WEB_API_RESPONSE, bytes(&*r));
     ticket
 }
 

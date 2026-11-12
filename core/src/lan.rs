@@ -31,6 +31,8 @@ const JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Received packets kept for the game at most: a game that stops reading, or a socket
 /// nobody reads, would otherwise grow the inbox without limit. The oldest go first.
 const INBOX_MAX_PACKETS: usize = 65_536;
+/// How long what a peer sent on a channel before closing it stays readable.
+const CLOSED_KEEP: Duration = Duration::from_secs(30);
 const INBOX_MAX_BYTES: usize = 64 << 20;
 /// What one public player's packets may take of the inbox: past it, its new ones are
 /// dropped, so a stranger sending faster than the game reads can't push friends'
@@ -161,7 +163,14 @@ enum Role {
 struct Held {
     lobby: Lobby,
     role: Role,
+    /// A snapshot from the member that would inherit the lobby, saying the owner has
+    /// gone, received before we noticed it ourselves, and when: applied if we notice it
+    /// soon after (`peer_lost`), so the heir's first State isn't lost.
+    heir_state: Option<(Lobby, Instant)>,
 }
+
+/// How long an heir's early snapshot is kept for the owner's loss to be noticed here.
+const HEIR_STATE_KEEP: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ChanState {
@@ -360,6 +369,13 @@ impl Peer {
 }
 
 /// How good a path is: a better one replaces a worse one without the peer leaving.
+/// Peers ordered as `Lan::peers_by_standing` says: most trusted first, then longest here.
+fn by_standing(peers: impl Iterator<Item = (Trust, Instant, PeerId)>) -> Vec<PeerId> {
+    let mut v: Vec<_> = peers.map(|(t, joined, id)| (std::cmp::Reverse(rank(t)), joined, id)).collect();
+    v.sort();
+    v.into_iter().map(|(_, _, id)| id).collect()
+}
+
 fn rank(t: Trust) -> u8 {
     match t {
         Trust::Lan => 2,
@@ -377,6 +393,9 @@ struct State {
     next_search: u64,
     chans: HashMap<(PeerId, String), Chan>,
     inbox: Inbox,
+    /// Channels the peer closed with packets still unread, and when: what nobody has
+    /// read after CLOSED_KEEP goes, unless the channel opened again.
+    closed_unread: Vec<((PeerId, String), Instant)>,
     events: VecDeque<Event>,
     my_presence: Vec<(String, String)>,
     presence: HashMap<PeerId, Vec<(String, String)>>,
@@ -392,6 +411,7 @@ struct Inner {
     me: PeerId,
     name: String,
     slot: u32,
+    server: bool,
     game: String,
     state: Mutex<State>,
     log: fn(&str),
@@ -885,8 +905,9 @@ static GLOBAL: OnceLock<Lan> = OnceLock::new();
 
 impl Lan {
     /// The process-wide engine, started on first use. Front ends in one process share
-    /// it; the first one's game key wins.
-    pub fn global(game: &str, log: fn(&str)) -> io::Result<Lan> {
+    /// it; the first one's game key wins. `server`: this process is a dedicated server,
+    /// which takes a server identity slot (`Identity::claim_server`), not a player's.
+    pub fn global(game: &str, server: bool, log: fn(&str)) -> io::Result<Lan> {
         if let Some(lan) = GLOBAL.get() {
             return Ok(lan.clone());
         }
@@ -902,7 +923,11 @@ impl Lan {
             .collect();
         let lan = Lan::start_with(Options {
             game: game.into(),
-            identity: Identity::claim(&Identity::default_dir()),
+            identity: if server {
+                Identity::claim_server(&Identity::default_dir())
+            } else {
+                Identity::claim(&Identity::default_dir())
+            },
             discovery_port: mesh::DISCOVERY_PORT,
             extra_targets: extra,
             log,
@@ -936,6 +961,7 @@ impl Lan {
             me: opts.identity.id,
             name: opts.identity.name.clone(),
             slot: opts.identity.slot,
+            server: opts.identity.server,
             game: opts.game.clone(),
             state: Mutex::new(State::default()),
             log: opts.log,
@@ -1101,8 +1127,14 @@ impl Lan {
     }
 
     /// Which of this PC's identity slots we took: 0 for the first copy running here.
+    /// A dedicated server's slots are apart from players' (`server`).
     pub fn slot(&self) -> u32 {
         self.inner.slot
+    }
+
+    /// Whether this copy is a dedicated server (its identity is a server slot's).
+    pub fn server(&self) -> bool {
+        self.inner.server
     }
 
     pub fn tcp_port(&self) -> u16 {
@@ -1123,10 +1155,7 @@ impl Lan {
     /// newcomer, or a stranger, then doesn't take it from the peer that had it.
     pub fn peers_by_standing(&self) -> Vec<PeerId> {
         let s = self.inner.state.lock().unwrap();
-        let mut v: Vec<(std::cmp::Reverse<u8>, Instant, PeerId)> =
-            s.peers.iter().map(|(id, p)| (std::cmp::Reverse(rank(self.inner.trust(&p.conn))), p.joined, *id)).collect();
-        v.sort();
-        v.into_iter().map(|(_, _, id)| id).collect()
+        by_standing(s.peers.iter().map(|(id, p)| (self.inner.trust(&p.conn), p.joined, *id)))
     }
 
     pub fn peer_name(&self, id: PeerId) -> Option<String> {
@@ -1284,6 +1313,7 @@ impl Lan {
     pub fn tick(&self) {
         let now = Instant::now();
         let mut s = self.inner.state.lock().unwrap();
+        s.forget_closed_unread(now);
         let expired: Vec<u64> = s
             .searches
             .iter()
@@ -1356,6 +1386,7 @@ impl Lan {
             Held {
                 lobby: lobby.clone(),
                 role: Role::Hosting,
+                heir_state: None,
             },
         );
         Ok(lobby)
@@ -1432,6 +1463,7 @@ impl Lan {
             Held {
                 lobby: target.clone(),
                 role: Role::Joining,
+                heir_state: None,
             },
         );
         s.joins
@@ -1457,6 +1489,7 @@ impl Lan {
             Held {
                 lobby: placeholder,
                 role: Role::Joining,
+                heir_state: None,
             },
         );
         s.joins.insert(id.into(), Instant::now() + JOIN_TIMEOUT);
@@ -1678,6 +1711,17 @@ impl Lan {
         {
             drop(s);
             self.inner.note_drop(peer, socket, "not sent: voice to a public player, and voice chat with public players is off");
+            return SendResult::Dropped;
+        }
+        // Bigger than one message to this peer can be (`Conn::frame_max`, with room for
+        // the socket's name and the framing): the connection would drop it unseen, so
+        // the game hears it wasn't sent.
+        if let Some(p) = s.peers.get(&peer)
+            && data.len() + socket.len() + 64 > p.conn.frame_max()
+        {
+            let max = p.conn.frame_max();
+            drop(s);
+            self.inner.note_drop(peer, socket, &format!("not sent: {} bytes in one message, more than the {max} a message to this player can carry", data.len()));
             return SendResult::Dropped;
         }
         let key = (peer, socket.to_string());
@@ -1974,6 +2018,22 @@ impl State {
         });
     }
 
+    /// What peers sent on channels they closed, unread after CLOSED_KEEP: gone, unless
+    /// the channel opened again (then it's the new channel's to read).
+    fn forget_closed_unread(&mut self, now: Instant) {
+        if self.closed_unread.is_empty() {
+            return;
+        }
+        let (old, keep): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.closed_unread).into_iter().partition(|(_, at)| now.duration_since(*at) >= CLOSED_KEEP);
+        self.closed_unread = keep;
+        for (key, _) in old {
+            if !self.chans.contains_key(&key) {
+                self.inbox.retain(|p| !(p.peer == key.0 && p.socket == key.1));
+            }
+        }
+    }
+
     fn close_chan(&mut self, key: (PeerId, String), local: bool) {
         if self.chans.remove(&key).is_none() {
             return;
@@ -1986,8 +2046,14 @@ impl State {
                 },
             );
         }
-        self.inbox
-            .retain(|p| !(p.peer == key.0 && p.socket == key.1));
+        // Closing our end drops what we hadn't read. When the peer closes, what it sent
+        // before closing stays readable, as on a TCP stream: a game's last message
+        // (a disconnect) is often sent just before it leaves.
+        if local {
+            self.inbox.retain(|p| !(p.peer == key.0 && p.socket == key.1));
+        } else {
+            self.closed_unread.push((key.clone(), Instant::now()));
+        }
         self.events.push_back(Event::ChanClosed {
             peer: key.0,
             socket: key.1,
@@ -2046,16 +2112,20 @@ impl State {
                 if held.role != Role::Hosting {
                     return;
                 }
+                // Asked again by a member (its JoinReply was lost): answered, but the
+                // others aren't told it joined twice.
+                if held.lobby.member(from).is_some() {
+                    self.send_to(from, &Msg::JoinReply { lobby: id, result: JoinResult::Ok });
+                    return;
+                }
                 let allowed = known || held.lobby.permission == Permission::Public;
-                if !allowed && held.lobby.member(from).is_none() && !self.waiting.iter().any(|(p, l, _)| *p == from && *l == id) && self.waiting.len() < JOINS_WAITING {
+                if !allowed && !self.waiting.iter().any(|(p, l, _)| *p == from && *l == id) && self.waiting.len() < JOINS_WAITING {
                     self.waiting.push((from, id, Instant::now() + JOIN_WAIT));
                     return;
                 }
                 self.waiting.retain(|(p, l, _)| !(*p == from && *l == id));
                 let held = self.lobbies.get_mut(&id).unwrap();
-                let result = if held.lobby.member(from).is_some() {
-                    JoinResult::Ok
-                } else if !allowed {
+                let result = if !allowed {
                     JoinResult::NotAllowed
                 } else if held.lobby.open_slots() == 0 {
                     JoinResult::Full
@@ -2122,11 +2192,25 @@ impl State {
                 let Some(held) = self.lobbies.get_mut(&new.id) else {
                     return;
                 };
+                // The member that inherits the lobby when its owner goes may say so
+                // before we notice the owner has gone: kept for when we do (`peer_lost`),
+                // never applied while the owner is still here.
+                if held.role == Role::Joined
+                    && held.lobby.owner != from
+                    && held.lobby.host_migration
+                    && new.owner == from
+                    && new.member(held.lobby.owner).is_none()
+                    && lobby::elect(&held.lobby.members, held.lobby.owner) == Some(from)
+                {
+                    held.heir_state = Some((new, Instant::now()));
+                    return;
+                }
                 // Only the owner we know speaks for the lobby, which also lets it name
                 // its successor.
                 if held.role == Role::Hosting || held.lobby.owner != from {
                     return;
                 }
+                held.heir_state = None;
                 let old = std::mem::replace(&mut held.lobby, new.clone());
                 if held.role == Role::Joined && new.owner == me {
                     held.role = Role::Hosting;
@@ -2373,6 +2457,29 @@ impl State {
                     }
                     Some(h) => {
                         held.lobby.owner = h;
+                        // The heir's snapshot, if it got here first.
+                        if let Some((new, at)) = held.heir_state.take()
+                            && new.owner == h
+                            && at.elapsed() < HEIR_STATE_KEEP
+                            && h != me
+                        {
+                            if new.member(me).is_some() {
+                                let old = std::mem::replace(&mut held.lobby, new.clone());
+                                self.events.push_back(Event::MemberStatus {
+                                    lobby: id.clone(),
+                                    member: peer,
+                                    status: MemberStatus::Disconnected,
+                                });
+                                self.events.push_back(Event::MemberStatus {
+                                    lobby: id.clone(),
+                                    member: h,
+                                    status: MemberStatus::Promoted,
+                                });
+                                // Both name `h` as the owner: what else changed.
+                                self.diff(&old, &new);
+                                continue;
+                            }
+                        }
                         if h == me {
                             held.role = Role::Hosting;
                             let lobby = held.lobby.clone();
@@ -2801,7 +2908,7 @@ mod tests {
         let now = Instant::now();
         let mut l = Lobby::new("eos.lobby");
         l.id = "hosted".into();
-        s.lobbies.insert(l.id.clone(), Held { lobby: l, role: Role::Hosting });
+        s.lobbies.insert(l.id.clone(), Held { lobby: l, role: Role::Hosting, heir_state: None });
         for i in 0..JOINS_WAITING {
             s.waiting.push((gone, format!("closed {i}"), now + JOIN_WAIT));
         }
@@ -2810,6 +2917,76 @@ mod tests {
         assert!(s.waiting.is_empty(), "{:?}", s.waiting);
         assert!(s.events.is_empty());
     }
+    /// The heir's first State, sent as soon as it noticed the owner gone, isn't lost on a
+    /// member that notices a moment later; one from any other member, or while the owner
+    /// is still here, changes nothing.
+    #[test]
+    fn the_heirs_first_state_waits_for_the_owners_loss() {
+        let (heir, me, owner, other) = (PeerId([2; 16]), PeerId([6; 16]), PeerId([5; 16]), PeerId([7; 16]));
+        let member = |id| Member { id, attrs: Vec::new() };
+        let mut l = Lobby::new("eos.lobby");
+        l.id = "x".into();
+        l.owner = owner;
+        l.members = vec![member(owner), member(heir), member(me), member(other)];
+        let mut s = State::default();
+        s.lobbies.insert(l.id.clone(), Held { lobby: l.clone(), role: Role::Joined, heir_state: None });
+
+        let mut by_heir = l.clone();
+        by_heir.owner = heir;
+        by_heir.members.retain(|m| m.id != owner);
+        by_heir.attrs.push(Attr { key: "map".into(), value: lobby::Value::Str("new".into()), public: true });
+        let mut by_other = by_heir.clone();
+        by_other.owner = other;
+        s.handle(me, other, Msg::State { lobby: by_other }, true);
+        s.handle(me, heir, Msg::State { lobby: by_heir.clone() }, true);
+        assert_eq!(s.lobbies["x"].lobby, l, "nothing changes while the owner is here");
+        assert!(s.events.is_empty());
+
+        s.peer_lost(me, owner);
+        assert_eq!(s.lobbies["x"].lobby, by_heir, "the heir's snapshot, attributes and all");
+        let events: Vec<_> = s.events.drain(..).collect();
+        assert!(events.iter().any(|e| matches!(e, Event::MemberStatus { member, status: MemberStatus::Disconnected, .. } if *member == owner)));
+        assert!(events.iter().any(|e| matches!(e, Event::MemberStatus { member, status: MemberStatus::Promoted, .. } if *member == heir)));
+        assert!(events.iter().any(|e| matches!(e, Event::LobbyUpdated { .. })), "{events:?}");
+    }
+
+    /// A stand-in address goes to the most trusted peer, then the one here longest: a
+    /// stranger who came first doesn't keep it from a friend or a LAN player.
+    #[test]
+    fn peers_stand_by_trust_then_time() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let id = |b: u8| PeerId([b; 16]);
+        let order = by_standing(
+            [
+                (Trust::Public, at(0), id(1)),
+                (Trust::Room, at(5), id(2)),
+                (Trust::Lan, at(9), id(3)),
+                (Trust::Room, at(1), id(4)),
+                (Trust::Public, at(3), id(5)),
+                (Trust::Lan, at(2), id(6)),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(order, [id(6), id(3), id(4), id(2), id(1), id(5)]);
+    }
+
+    /// A member asking to join again (its answer was lost) is answered without the
+    /// others being told it joined twice.
+    #[test]
+    fn a_repeated_join_is_quiet() {
+        let (me, guest) = (PeerId([1; 16]), PeerId([2; 16]));
+        let mut l = Lobby::new("eos.lobby");
+        l.id = "x".into();
+        l.owner = me;
+        l.members = vec![Member { id: me, attrs: Vec::new() }, Member { id: guest, attrs: Vec::new() }];
+        let mut s = State::default();
+        s.lobbies.insert(l.id.clone(), Held { lobby: l.clone(), role: Role::Hosting, heir_state: None });
+        s.handle(me, guest, Msg::Join { lobby: "x".into() }, true);
+        assert!(s.events.is_empty(), "{:?}", s.events);
+        assert_eq!(s.lobbies["x"].lobby, l);
+    }
+
     #[test]
     fn a_public_players_invites_are_rationed() {
         let t0 = Instant::now();

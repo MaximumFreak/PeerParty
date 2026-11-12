@@ -202,7 +202,10 @@ foreach ($i in 1..2) {{
         );
         let file = std::env::temp_dir().join(format!("peerparty-playfab-test-{}.ps1", std::process::id()));
         std::fs::write(&file, script).unwrap();
+        use std::os::windows::process::CommandExt;
         let out = std::process::Command::new("powershell")
+            // No console window of its own (tests mustn't flash one on screen).
+            .creation_flags(0x0800_0000)
             .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
             .arg(&file)
             .output()

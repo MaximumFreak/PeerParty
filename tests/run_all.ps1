@@ -10,7 +10,7 @@
 #      same Photon DLLs and the same test sources skips `dotnet build`.
 #   4. the two-copy SDK tests (tests/sdk/run_pair.ps1): EOS RTC, EOS lobby voice, EOS custom
 #      invites, PlayFab Party chat, PlayFabCore sign-in, PlayFab's web API, Unity Gaming
-#      Services, GOG Galaxy, Steam licence checks (with the Steam client running), and
+#      Services, Vivox voice (Unity's VivoxNative.dll), GOG Galaxy, Steam licence checks (with the Steam client running), and
 #      typed-IP games on async sockets (two copies in a room)
 #
 # SDK pairs and Photon run four at a time. Each pair gets its own PEERPARTY_GAME, so they
@@ -374,6 +374,7 @@ try {
         @{ Name = 'party_chat'; Py = 'party_chat_test.py'; Var = 'PPTEST_PARTY_DLL'; Files = @('PartyWin.dll'); File = $true; Env = @('PEERPARTY_VOICE=0') },
         @{ Name = 'pf_core'; Py = 'pf_core_test.py'; Var = 'PPTEST_PFCORE_DIR'; Files = @('libHttpClient.Win32.dll', 'PlayFabCore.Win32.dll'); File = $false; Env = @(); Roles = @('A') },
         @{ Name = 'ugs'; Py = 'ugs_test.py'; Var = $null; Files = @(); File = $false; Env = @('PEERPARTY_UGS=1') },
+        @{ Name = 'vivox'; Py = 'vivox_test.py'; Var = 'PPTEST_VIVOX_DIR'; Files = @('VivoxNative.dll', 'vivoxsdk.dll'); File = $false; Env = @('PEERPARTY_VIVOX=1', 'PEERPARTY_VOICE=0') },
         @{ Name = 'pf_rest'; Py = 'pf_rest_test.py'; Var = $null; Files = @(); File = $false; Env = @('PEERPARTY_PLAYFAB=1') },
         @{ Name = 'galaxy'; Py = 'galaxy_test.py'; Var = 'PPTEST_GALAXY_DLL'; Files = @('Galaxy64.dll'); File = $true; Env = @() },
         # Needs the Steam client running and PPTEST_STEAM_APPID = a game the account owns.

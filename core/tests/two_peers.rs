@@ -211,6 +211,23 @@ fn two_copies_meet_lobby_and_talk() {
     }
     assert_eq!(got.len(), 5);
 
+    // On a channel of its own, B sends a last message and closes at once: A still
+    // reads it after the close.
+    assert_eq!(b.send(a.me(), "last", 2, b"first", true, true, true), SendResult::Held);
+    wait(&a, &mut ea, |e| *e == Event::ChanRequest { peer: b.me(), socket: "last".into() });
+    a.accept(b.me(), "last");
+    wait(&b, &mut eb, |e| matches!(e, Event::ChanOpen { socket, .. } if socket == "last"));
+    assert_eq!(b.send(a.me(), "last", 2, b"bye", true, true, true), SendResult::Sent);
+    b.close_socket("last");
+    wait(&a, &mut ea, |e| {
+        matches!(e, Event::ChanClosed { reason: CloseReason::ByPeer, socket, .. } if socket == "last")
+    });
+    let mut read = Vec::new();
+    while let Some(p) = a.receive(Some(2)) {
+        read.push(p.data);
+    }
+    assert_eq!(read, [b"first".to_vec(), b"bye".to_vec()], "what B sent before closing");
+
     // A vanishes: B's channel closes and B inherits the lobby.
     let a_port = a.tcp_port();
     a.shutdown();

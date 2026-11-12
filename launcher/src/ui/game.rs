@@ -124,6 +124,16 @@ impl App {
                 } else {
                     widgets::note(ui, Icon::Info, TEXT3, t!("game.xbox_one_copy"));
                 }
+                if let Some(exe) = self.steam_id_missing(&g, &key) {
+                    ui.add_space(10.0);
+                    widgets::note(ui, Icon::Warning, theme::WARN, t!("game.no_steam_id"));
+                    ui.horizontal(|ui| {
+                        ui.add_space(22.0);
+                        if widgets::button(ui, Some(Icon::Folder), t!("game.no_steam_id_folder"), Kind::Secondary).clicked() {
+                            actions.push(Action::Reveal(exe));
+                        }
+                    });
+                }
                 ui.add_space(12.0);
                 self.who_can_join(ui, &key, &mut actions);
                 ui.add_space(12.0);
@@ -240,6 +250,30 @@ impl App {
         }
     }
 
+    /// The program, when this is a Steam game (a `steam_api` in its folder) whose app id
+    /// can't be found (steamid.rs), so Steam won't know which game it is. Not for Epic's
+    /// or GOG's copies, which can carry an unused `steam_api` from the Steam version.
+    /// The folder is looked through once; the id again every few seconds while the panel
+    /// shows, so adding a steam_appid.txt clears the note.
+    fn steam_id_missing(&mut self, g: &super::scan::Game, key: &str) -> Option<std::path::PathBuf> {
+        if matches!(g.source, Source::Xbox | Source::Epic | Source::Gog) {
+            return None;
+        }
+        let exe = self.settings.options(key).exe.unwrap_or_else(|| g.exe.clone());
+        let now = std::time::Instant::now();
+        let fresh = |at: std::time::Instant| now.duration_since(at) < Duration::from_secs(5);
+        let entry = self.steam_ids.entry(exe.clone()).or_insert_with(|| {
+            let look = crate::steamid::Game::look(&exe, Some(&g.dir));
+            let missing = look.missing(&exe);
+            (look, missing, now)
+        });
+        if entry.0.uses_steam && !fresh(entry.2) {
+            entry.1 = entry.0.missing(&exe);
+            entry.2 = now;
+        }
+        entry.1.then_some(exe)
+    }
+
     /// Who can play with you in this game: people on this network (unless the firewall
     /// keeps them out, fixed here), friends with your room code, anyone online.
     fn who_can_join(&mut self, ui: &mut egui::Ui, key: &str, actions: &mut Vec<Action>) {
@@ -353,9 +387,14 @@ impl App {
         ui.label(egui::RichText::new(t!("game.adv_game_key")).size(13.0).color(TEXT2));
         widgets::text_field(ui, &mut o.game_key, t!("game.adv_game_key_hint"), ui.available_width(), 120).on_hover_text(t!("game.adv_game_key_tip"));
         widgets::section(ui, t!("game.adv_command"));
-        let cmd: Vec<String> = self.command(g, o).into_iter().map(|a| if a.contains(' ') { format!("\"{a}\"") } else { a }).collect();
-        let mut text = format!("peerparty {}", cmd.join(" "));
-        ui.add(egui::TextEdit::multiline(&mut text).font(egui::TextStyle::Monospace).desired_rows(2).desired_width(f32::INFINITY).background_color(theme::FIELD));
+        // The whole command, as a prompt runs it: peerparty.exe's own path, and each
+        // argument quoted the way peerparty reads it back. Shown read-only (it can be
+        // selected and copied, not typed into: the options above change it).
+        let quote = |a: &str| if a.is_empty() || a.contains([' ', '\t', '"']) { crate::crt_quote(a) } else { a.to_string() };
+        let mut cmd = vec![quote(&self.peerparty.to_string_lossy())];
+        cmd.extend(self.command(g, o).iter().map(|a| quote(a)));
+        let text = cmd.join(" ");
+        ui.add(egui::TextEdit::multiline(&mut text.as_str()).font(egui::TextStyle::Monospace).desired_rows(2).desired_width(f32::INFINITY).background_color(theme::FIELD));
         ui.horizontal_wrapped(|ui| {
             if widgets::button(ui, Some(Icon::Copy), t!("common.copy"), Kind::Secondary).clicked() {
                 ui.ctx().copy_text(text.clone());

@@ -29,6 +29,8 @@ pub enum Front {
     Galaxy,
     /// Unity Gaming Services' Lobby and Relay (ugs/), drained from their own thread.
     Ugs,
+    /// Vivox voice chat (vivox.rs), drained from the game's message polling.
+    Vivox,
 }
 
 impl Front {
@@ -42,6 +44,7 @@ impl Front {
             Front::PfLobby => "PlayFab Lobby",
             Front::Galaxy => "GOG Galaxy",
             Front::Ugs => "Unity Gaming Services",
+            Front::Vivox => "Vivox",
         }
     }
 }
@@ -63,18 +66,23 @@ fn core_log(line: &str) {
 }
 
 /// Peers meet peers of the same game: `PEERPARTY_GAME`, or else its exe's name, less a
-/// dedicated server's "_server"-style ending (mygame_server.exe meets mygame.exe).
-fn game_key() -> String {
-    let stem = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| "game".into());
+/// dedicated server's "_server"-style ending (mygame_server.exe meets mygame.exe,
+/// MyGameServer-Win64-Shipping.exe meets MyGame-Win64-Shipping.exe).
+pub(crate) fn game_key() -> String {
+    let stem = exe_stem();
     let env = std::env::var("PEERPARTY_GAME").ok();
     let key = key_for(&stem, env.as_deref());
     if env.is_none_or(|e| e.trim().is_empty()) && key != format!("exe:{}", stem.to_ascii_lowercase()) {
         log!("lan game key {key} (a dedicated server's exe, {stem}, under its client's name; PEERPARTY_GAME overrides)");
     }
     key
+}
+
+fn exe_stem() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "game".into())
 }
 
 /// The game key for exe stem `stem` and `PEERPARTY_GAME` value `env`.
@@ -86,12 +94,118 @@ fn key_for(stem: &str, env: Option<&str>) -> String {
         }
     }
     let stem = stem.to_ascii_lowercase();
-    let client = ["_dedicatedserver", "-dedicatedserver", "dedicatedserver", "_server", "-server", " server", "server"]
-        .iter()
-        .find_map(|end| stem.strip_suffix(end))
-        .map(|s| s.trim_end_matches(['_', '-', ' ']))
-        .filter(|s| s.len() >= 3);
-    format!("exe:{}", client.unwrap_or(&stem))
+    match server_exe(&stem) {
+        ServerExe::Of(client) => format!("exe:{client}"),
+        _ => format!("exe:{stem}"),
+    }
+}
+
+/// What an exe's name says about it being a dedicated server.
+#[derive(Debug, PartialEq, Eq)]
+enum ServerExe {
+    /// Not a server's name.
+    No,
+    /// A server's, with its client's name: the server word taken out, the build tail
+    /// kept (mygame_server -> mygame, MyGameServer-Win64-Shipping ->
+    /// mygame-win64-shipping, MyGameServer_x64 -> mygame_x64).
+    Of(String),
+    /// A server's, with no client name in it (srcds, hlds, DedicatedServer).
+    Only,
+}
+
+/// Build words after a name (Unreal's `-Win64-Shipping`, `-Cmd`, `_x64`,
+/// `_nullrenderer`), looked past to find the server word before them.
+const BUILD_TAIL: &[&str] =
+    &["win64", "win32", "x64", "x86", "shipping", "cmd", "test", "development", "debuggame", "debug", "nullrenderer"];
+
+/// Endings that make a name a server's, longest first.
+const SERVER_WORD: &[&str] = &["dedicatedserver", "dedicated_server", "dedicated-server", "dedicated server", "dedicated", "server"];
+
+/// Names that are a dedicated server's whole: Valve's Source and GoldSrc servers, and
+/// servers named only for what they are.
+const SERVER_ONLY: &[&str] = &["srcds", "hlds", "server", "dedicated", "dedicatedserver", "dedicated_server", "dedicated server"];
+
+const SEPARATORS: [char; 4] = ['_', '-', ' ', '.'];
+
+/// Reads a lowercase exe stem: the build tail is looked past, then a server word (or a
+/// whole server name) decides. Too little left before the word (xserver, observer)
+/// isn't a client's name, so not a server's either.
+fn server_exe(stem: &str) -> ServerExe {
+    // Peel build words off the end ("mygameserver-win64-shipping-cmd").
+    let mut base = stem;
+    while let Some(cut) = base.rfind(SEPARATORS) {
+        if !BUILD_TAIL.contains(&&base[cut + 1..]) {
+            break;
+        }
+        base = &base[..cut];
+    }
+    if SERVER_ONLY.contains(&base) {
+        return ServerExe::Only;
+    }
+    // The tail goes back on the client's name, less a console build's "-cmd".
+    let mut tail = String::new();
+    let mut rest = &stem[base.len()..];
+    while let Some(sep) = rest.chars().next() {
+        let word_end = rest[1..].find(SEPARATORS).map_or(rest.len(), |i| i + 1);
+        if &rest[1..word_end] != "cmd" {
+            tail.push(sep);
+            tail.push_str(&rest[1..word_end]);
+        }
+        rest = &rest[word_end..];
+    }
+    for word in SERVER_WORD {
+        if let Some(before) = base.strip_suffix(word) {
+            let client = before.trim_end_matches(SEPARATORS);
+            return if client.len() >= 3 { ServerExe::Of(format!("{client}{tail}")) } else { ServerExe::No };
+        }
+    }
+    ServerExe::No
+}
+
+/// The presence key a dedicated server says so in ("1"): the overlay shows it as a
+/// server, not a player, and doesn't compare its build with a client's.
+pub const SERVER_KEY: &str = "peerparty:server";
+
+/// The presence key a game server's host names it in (its advertised name), which the
+/// overlay shows in place of the host's player name for a dedicated server.
+pub const SERVER_NAME_KEY: &str = "peerparty:server_name";
+
+/// Whether this process is a dedicated server, decided when the LAN starts:
+/// `PEERPARTY_DEDICATED` (1 or 0) says so; else it started a Steam game server without
+/// starting Steam's client API (what a Steam dedicated server is, whatever its exe is
+/// called: some games run their own exe as one, with a switch); else its exe's name does
+/// (`server_exe`). A server takes a server identity slot, never a player's (core's
+/// `Identity::claim_server`).
+pub fn dedicated() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let stem = exe_stem();
+        let env = std::env::var("PEERPARTY_DEDICATED").ok();
+        let steam_alone = crate::steamgs::server_started() && !crate::steam::client_started();
+        let (on, why) = dedicated_for(&stem, env.as_deref(), steam_alone);
+        log!("lan: {} ({why})", if on { "a dedicated server" } else { "a player's copy" });
+        on
+    })
+}
+
+fn dedicated_for(stem: &str, env: Option<&str>, steam_alone: bool) -> (bool, &'static str) {
+    match env.map(str::trim) {
+        Some("1") => return (true, "PEERPARTY_DEDICATED=1"),
+        Some("0") => return (false, "PEERPARTY_DEDICATED=0"),
+        _ => {}
+    }
+    if steam_alone {
+        return (true, "it started a Steam game server and no Steam client");
+    }
+    match server_exe(&stem.to_ascii_lowercase()) {
+        ServerExe::No => (false, "neither its exe's name nor a Steam game server says server"),
+        _ => (true, "its exe's name is a dedicated server's"),
+    }
+}
+
+/// Whether a LAN peer is a dedicated server (its presence says so).
+pub fn is_server_peer(peer: peerparty_core::PeerId) -> bool {
+    lan_if_started().is_some_and(|l| l.presence(peer).iter().any(|(k, v)| k == SERVER_KEY && v == "1"))
 }
 
 /// Whether `PEERPARTY_SKIP` (comma-separated: swap, invite, eos, steam, party, pfmp,
@@ -127,8 +241,12 @@ pub fn lan() -> Option<&'static Lan> {
     if !enabled() {
         return None;
     }
-    LAN.get_or_init(|| match Lan::global(&game_key(), core_log) {
+    LAN.get_or_init(|| match Lan::global(&game_key(), dedicated(), core_log) {
         Ok(l) => {
+            if l.server() {
+                log!("lan: this copy takes a server slot of its own, not a player's");
+                PRESENCE.lock().unwrap().insert("server", vec![(SERVER_KEY.into(), "1".into())]);
+            }
             crate::saves::learn_lan(&l);
             crate::saves::adopt_earlier_ids(&l);
             let build = build_id();
@@ -311,9 +429,13 @@ pub fn build_id() -> String {
 }
 
 /// Whether a peer runs the same game build (unknown counts as the same: an older
-/// PeerParty doesn't say).
+/// PeerParty doesn't say). A dedicated server and its clients are different programs,
+/// so their builds are never compared.
 pub fn same_build(peer: peerparty_core::PeerId) -> bool {
     let Some(lan) = lan_if_started() else { return true };
+    if lan.server() || is_server_peer(peer) {
+        return true;
+    }
     let theirs = lan.presence(peer).into_iter().find(|(k, _)| k == BUILD_KEY).map(|(_, v)| v);
     let mine = PRESENCE.lock().unwrap().get("build").and_then(|v| v.first().map(|(_, b)| b.clone()));
     match (theirs, mine) {
@@ -490,13 +612,13 @@ fn wants(front: Front, ev: &Event, fronts: &[Front]) -> bool {
                     None => !connect.is_empty() && crate::eos::takes_presence_joins(),
                 }
         }
-        Front::Party | Front::PlayFab | Front::PfLobby | Front::Ugs => false,
+        Front::Party | Front::PlayFab | Front::PfLobby | Front::Ugs | Front::Vivox => false,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Said, VERSION_LINES, VERSION_PEERS, key_for, note_version, says_version};
+    use super::{Said, ServerExe, VERSION_LINES, VERSION_PEERS, dedicated_for, key_for, note_version, says_version, server_exe};
 
     /// Two waiters on one queue: each takes its own answer and leaves the other's.
     #[test]
@@ -554,10 +676,65 @@ mod tests {
         assert_eq!(key_for("server", None), "exe:server");
         assert_eq!(key_for("xserver", None), "exe:xserver");
         assert_eq!(key_for("SomeLongGameName", None), "exe:somelonggamename");
+        // A build tail stays on the client's name, so Unreal and 64-bit builds meet.
+        assert_eq!(key_for("HammerfallServer-Win64-Shipping", None), "exe:hammerfall-win64-shipping");
+        assert_eq!(key_for("Hammerfall-Win64-Shipping", None), "exe:hammerfall-win64-shipping");
+        assert_eq!(key_for("DuskvaleServer_x64", None), "exe:duskvale_x64");
+        assert_eq!(key_for("orbit3server_x64", None), "exe:orbit3_x64");
+        assert_eq!(key_for("ForgeServer-Win64-Shipping-Cmd", None), "exe:forge-win64-shipping");
+        // A game's own build tail with no server word is left alone.
+        assert_eq!(key_for("Game-Win64-Shipping", None), "exe:game-win64-shipping");
         // PEERPARTY_GAME wins, as before; blank is unset.
         assert_eq!(key_for("mygame_server", Some("MyGame.exe")), "exe:mygame");
         assert_eq!(key_for("mygame_server", Some("other ")), "exe:other");
         assert_eq!(key_for("mygame_server", Some("  ")), "exe:mygame");
+    }
+
+    /// The shapes Windows dedicated servers' exes are named in (made-up games): a
+    /// "server" or "dedicated" word before any build tail, launchers and their -Cmd
+    /// builds, Valve's servers; and clients that must not read as servers.
+    #[test]
+    fn dedicated_server_exe_shapes_read_as_servers() {
+        let servers = [
+            "mygame_server", "ember_server", "hollow_server", "trucker_server", "trucker2_server",
+            "SkyGameServer", "SkyAscendedServer", "NightfallServer", "9DaysServer", "TerraformServer",
+            "CaveServer", "VoidServer", "EchoServer", "OutpostServer", "QRXServer", "FjordServer",
+            "TeamGameServer", "PostwarServer", "OrbitReforgerServer", "XYZGameServer", "orbit3server",
+            "orbit3server_x64", "DuskvaleServer_x64", "IronDedicated", "StarEngineersDedicated",
+            "CastleEngineersDedicated", "EmpireDedicated", "TheGroveDedicatedServer",
+            "shipyard_DedicatedServer", "dontsleep_dedicated_server_nullrenderer_x64",
+            "PalaceServer", "PalaceServer-Win64-Shipping-Cmd", "PalaceServer-Win64-Test-Cmd",
+            "SandboxServer-Win64-Shipping", "ForgeServer-Win64-Shipping-Cmd", "AstralServer-Win64-Shipping",
+            "MinesServer-Win64-Shipping", "HammerfallServer-Win64-Shipping", "SiegeServer-Win64-Shipping",
+            "LabFactorServer-Win64-Shipping", "WingsServer-Win64-Shipping", "IsleServer-Win64-Shipping",
+            "TinylandServer-Win64-Shipping", "FogServer-Win64-Shipping", "FieldOpsServer-Win64-Shipping",
+            "PathOfBeastsServer-Win64-Shipping", "srcds", "srcds_win64", "srcds_x64", "hlds", "DedicatedServer",
+            "Server",
+        ];
+        for s in servers {
+            assert_ne!(server_exe(&s.to_ascii_lowercase()), ServerExe::No, "{s}");
+        }
+        let clients = [
+            "mygame", "SkyGame", "IronClient", "Palace-Win64-Shipping", "ForgeGame-Win64-Shipping",
+            "game2", "hlgame", "game_win64", "Wanderer", "Duskvale_x64", "orbit3_x64", "Observer", "xserver",
+            "StarEngineers", "Game-Win64-Test", "LateShift",
+        ];
+        for c in clients {
+            assert_eq!(server_exe(&c.to_ascii_lowercase()), ServerExe::No, "{c}");
+        }
+    }
+
+    #[test]
+    fn a_dedicated_server_is_told_by_steam_its_exe_or_the_variable() {
+        assert!(dedicated_for("mygame_server", None, false).0);
+        assert!(!dedicated_for("mygame", None, false).0);
+        // A Steam game server with no Steam client: a server, whatever the exe's name.
+        assert!(dedicated_for("Wanderer", None, true).0);
+        assert!(dedicated_for("game2", None, true).0);
+        // PEERPARTY_DEDICATED says either way; anything else leaves it to the rest.
+        assert!(dedicated_for("srv", Some("1"), false).0);
+        assert!(!dedicated_for("mygame_server", Some(" 0 "), true).0);
+        assert!(dedicated_for("mygame_server", Some("yes"), false).0);
     }
 
     #[test]

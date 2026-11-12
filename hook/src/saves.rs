@@ -1,4 +1,5 @@
 //! Starting a save from another id's, for games that key their saves by user id.
+//! Also `file_name`, for the stores that keep files a game names (EOS, Galaxy).
 //!
 //! Three cases, one mechanism:
 //!
@@ -173,7 +174,7 @@ pub fn adopt_steam(own: u64, game: u64, earlier: &[u64]) {
 /// The LAN came up as the first copy: saves keyed by its EOS id or PlayFab id start,
 /// once, from the ones under the ids the slot had before (module docs).
 pub fn adopt_earlier_ids(lan: &peerparty_core::Lan) {
-    if lan.slot() != 0 {
+    if lan.slot() != 0 || lan.server() {
         return;
     }
     let earlier = peerparty_core::Identity::previous_ids(&peerparty_core::Identity::default_dir(), 0);
@@ -339,9 +340,9 @@ fn steam_names(own: u64, game: u64) -> Vec<(String, String)> {
 }
 
 /// The LAN came up: a copy in a slot other than the first maps its ids (EOS and
-/// PlayFab, from its peer id) to the first slot's.
+/// PlayFab, from its peer id) to the first slot's. A dedicated server keeps its own.
 pub fn learn_lan(lan: &peerparty_core::Lan) {
-    if !enabled() || lan.slot() == 0 || lan.slot() == u32::MAX {
+    if !enabled() || lan.slot() == 0 || lan.slot() == u32::MAX || lan.server() {
         return;
     }
     let Some(main) = first_slot() else { return };
@@ -789,9 +790,114 @@ unsafe extern "system" fn detour_mkdir_a(name: *const u8, sa: usize) -> i32 {
     unsafe { MKDIR_A.get().unwrap().call(name, sa) }
 }
 
+/// A file name a game gave (a cloud-storage file), as one file in one folder: path
+/// separators, `:` and characters Windows refuses become `_`, a trailing dot or space
+/// (which Windows drops, so two names would share a file) gets a `_` after it, and a
+/// device name (`CON`, `NUL`, `COM1.sav`...), which would open the device instead of a
+/// file, gets one in front. Empty, `.` and `..` are no name.
+pub fn file_name(name: &str) -> Option<String> {
+    let mut n: String = name.chars().map(|c| if c < ' ' || "/\\:<>\"|?*".contains(c) { '_' } else { c }).collect();
+    if n.is_empty() || n == "." || n == ".." {
+        return None;
+    }
+    if n.ends_with(['.', ' ']) {
+        n.push('_');
+    }
+    let stem = n.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
+    let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem[3..].chars().count() == 1
+            && stem[3..].chars().all(|c| c.is_ascii_digit() || "¹²³".contains(c)));
+    if device {
+        n.insert(0, '_');
+    }
+    Some(n)
+}
+
+/// A store file that is there but can't be read as one (damaged, or not ours) is moved
+/// aside to `<name>.unreadable-<seconds>`, so the empty store that replaces it doesn't
+/// overwrite what may still be recovered by hand. Logged with `what`.
+pub fn set_aside_unreadable(path: &Path, what: &str) {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".unreadable-{secs}"));
+    let aside = path.with_file_name(name);
+    match std::fs::rename(path, &aside) {
+        Ok(()) => log!("{what}: {} couldn't be read; kept as {} and started empty", path.display(), aside.display()),
+        Err(e) => log!("{what}: {} couldn't be read, nor moved aside ({e})", path.display()),
+    }
+}
+
+/// Writes a whole file (a save store) so that a crash, a power cut or a full disk
+/// mid-write leaves the old one whole: the data goes to a file in a `.peerparty-writing`
+/// folder beside it, is flushed to the disk, then takes the old one's place in one step
+/// (a rename within the volume). Listings of the store see files only, not that folder.
+pub fn write_whole(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::AtomicU64;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let dir = path.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
+    let name = path.file_name().ok_or(std::io::ErrorKind::InvalidInput)?;
+    let work = dir.join(".peerparty-writing");
+    std::fs::create_dir_all(&work)?;
+    let mut tmp_name = std::ffi::OsString::from(format!("{}-{}-", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+    tmp_name.push(name);
+    let tmp = work.join(tmp_name);
+    let written = std::fs::File::create(&tmp).and_then(|mut f| {
+        f.write_all(data)?;
+        f.sync_all()
+    });
+    let done = written.and_then(|()| std::fs::rename(&tmp, path));
+    if done.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    let _ = std::fs::remove_dir(&work);
+    done
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A whole write replaces the file and leaves nothing beside it; one that can't
+    /// finish leaves the old file as it was.
+    #[test]
+    fn a_whole_write_replaces_the_file_in_one_step() {
+        let dir = std::env::temp_dir().join(format!("peerparty-write-whole-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("store.json");
+        write_whole(&file, b"one").unwrap();
+        write_whole(&file, b"two").unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"two");
+        let names: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(names, ["store.json"], "nothing left beside it");
+        // A file open without delete sharing can't be replaced: the old one stays.
+        let held = std::fs::File::open(&file).unwrap();
+        let blocked = write_whole(&file, b"three");
+        drop(held);
+        if blocked.is_err() {
+            assert_eq!(std::fs::read(&file).unwrap(), b"two");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stored_file_names_stay_one_ordinary_file() {
+        assert_eq!(file_name("../save.dat").as_deref(), Some(".._save.dat"));
+        assert_eq!(file_name(r"a\b:c").as_deref(), Some("a_b_c"));
+        assert_eq!(file_name("what?<x>|\"*\u{1}").as_deref(), Some("what__x_____"));
+        assert_eq!(file_name("slot1.").as_deref(), Some("slot1._"));
+        assert_eq!(file_name("slot1 ").as_deref(), Some("slot1 _"));
+        assert_eq!(file_name("CON").as_deref(), Some("_CON"));
+        assert_eq!(file_name("nul.sav").as_deref(), Some("_nul.sav"));
+        assert_eq!(file_name("com1.dat").as_deref(), Some("_com1.dat"));
+        assert_eq!(file_name("LPT¹").as_deref(), Some("_LPT¹"));
+        assert_eq!(file_name("console.sav").as_deref(), Some("console.sav"));
+        assert_eq!(file_name("com10").as_deref(), Some("com10"));
+        assert_eq!(file_name(".."), None);
+        assert_eq!(file_name(""), None);
+    }
 
     fn pair(ours: &str, from: &str, once: bool) -> Pair {
         Pair { ours: ours.into(), from: from.into(), once, fallback: false }

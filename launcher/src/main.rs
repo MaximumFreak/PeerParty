@@ -13,13 +13,14 @@
 //!
 //! - x64 games: an APC queued on the suspended main thread ("early bird").
 //! - x86 games (WOW64): an early-bird APC can run before the 32-bit kernel32 is
-//!   loaded, so instead the entry point is patched with `jmp $`. Once the main thread
-//!   spins there, every static import is loaded; the 32-bit `LoadLibraryW` is looked
-//!   up in the game's own kernel32 and run on a remote thread. Then the entry bytes go
-//!   back and the main thread continues.
+//!   loaded, so instead the main thread starts on a `jmp $` of the launcher's own (its
+//!   start address changed, the game's image untouched). Once it spins there, every
+//!   static import is loaded; the 32-bit `LoadLibraryW` is looked up in the game's own
+//!   kernel32 and run on a remote thread. Then the main thread jumps on to the entry
+//!   point.
 //!
 //! ```text
-//! peerparty [--room CODE] [--log-dir DIR] [--appid N] [--multi-instance] [--copy-saves] <game.exe> [args...]
+//! peerparty [--room CODE] [--log-dir DIR] [--multi-instance] [--copy-saves] <game.exe> [args...]
 //! peerparty --invite
 //! peerparty --new-room | --net-test | --blocked | --block FP | --unblock FP|all
 //! peerparty --friends | --friend FP | --unfriend FP|all
@@ -49,11 +50,8 @@
 //! save. Only a start given `--copy-saves` copies: a `PEERPARTY_COPY_SAVES` left in the
 //! environment is cleared, so a game library, a .bat or a shortcut never replace a save.
 //!
-//! A Steam game started outside Steam needs its app id. PeerParty looks for it in order:
-//! `--appid`, the `SteamAppId` variable, the app manifest of the Steam library the game is in
-//! (`steamapps\common\<dir>`), a `steam_appid.txt` next to the exe, then any Steam
-//! library's manifest whose install folder has the name of one of the exe's folders (a
-//! copy moved out of Steam).
+//! A Steam game started outside Steam needs its app id: steamid.rs finds it, and says
+//! when it can't.
 //!
 //! As a Steam launch option: `"…\peerparty.exe" %command%`.
 
@@ -70,6 +68,7 @@ mod i18n;
 mod icon_art;
 mod packaged;
 mod platform;
+mod steamid;
 mod tree;
 mod ui;
 mod update;
@@ -92,7 +91,7 @@ use windows_sys::Win32::System::Threading::{
     QueueUserAPC, ResumeThread, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
 };
 
-const USAGE: &str = "usage: peerparty [--room CODE] [--public] [--set key=value] [--log-dir DIR] [--appid N] [--multi-instance] [--copy-saves] <game.exe> [args...]\n         plays the game through peerparty: the local network, plus the internet with --room or --public\n         a simple .bat or .cmd that starts the game works too: peerparty starts the program it runs\n         --set changes one setting for this run: name=Alex, voice=off, internet=off, overlay=off, auto_accept=on, ... (docs/usage.md)\n       peerparty --invite   (invites every other player to the game in front)\n       peerparty --new-room   (makes a room code for internet play)\n       peerparty --net-test   (checks this PC's internet path: STUN, NAT type, the DHT)\n       peerparty --pads   (lists the controllers the overlay reads, and their buttons)\n       peerparty --firewall <game.exe>   (whether Windows Firewall lets other players connect to it)\n       peerparty --fix-firewall <game.exe> [--public]   (as administrator: lets them, on private and domain networks, and public ones with --public)\n       peerparty --blocked | --block FINGERPRINT | --unblock FINGERPRINT|all   (public players you blocked)\n       peerparty --friends | --friend FINGERPRINT | --unfriend FINGERPRINT|all   (friends for PEERPARTY_PUBLIC_FRIENDS_ONLY=1)";
+const USAGE: &str = "usage: peerparty [--room CODE] [--public] [--set key=value] [--log-dir DIR] [--multi-instance] [--copy-saves] <game.exe> [args...]\n         plays the game through peerparty: the local network, plus the internet with --room or --public\n         a simple .bat or .cmd that starts the game works too: peerparty starts the program it runs\n         --set changes one setting for this run: name=Alex, voice=off, internet=off, overlay=off, auto_accept=on, ... (docs/usage.md)\n       peerparty --invite   (invites every other player to the game in front)\n       peerparty --new-room   (makes a room code for internet play)\n       peerparty --net-test   (checks this PC's internet path: STUN, NAT type, the DHT)\n       peerparty --pads   (lists the controllers the overlay reads, and their buttons)\n       peerparty --firewall <game.exe>   (whether Windows Firewall lets other players connect to it)\n       peerparty --fix-firewall <game.exe> [--public]   (as administrator: lets them, on private and domain networks, and public ones with --public)\n       peerparty --blocked | --block FINGERPRINT | --unblock FINGERPRINT|all   (public players you blocked)\n       peerparty --friends | --friend FINGERPRINT | --unfriend FINGERPRINT|all   (friends for PEERPARTY_PUBLIC_FRIENDS_ONLY=1)";
 
 /// `--blocked`, `--block FP`, `--unblock FP|all`: the public-sessions block list.
 /// `--friends`, `--friend FP`, `--unfriend FP|all`: the same for the friends list.
@@ -231,6 +230,7 @@ fn main() -> ExitCode {
     let args: Vec<OsString> = env::args_os().skip(1).collect();
     if args.is_empty() || (args.len() == 1 && args[0] == "--updated") {
         update::clean_up();
+        hooks::clean_up();
         return match ui::run(!args.is_empty()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(_) => ExitCode::from(1),
@@ -288,7 +288,6 @@ fn attach_console() {
 fn run() -> Result<u32, String> {
     let mut args = env::args_os().skip(1).peekable();
     let mut log_dir = None;
-    let mut appid = None;
     let mut multi_instance = false;
     let mut copy_saves = false;
     let mut sets: Vec<(String, String)> = Vec::new();
@@ -303,10 +302,6 @@ fn run() -> Result<u32, String> {
             Some("--log-dir") => {
                 args.next();
                 log_dir = Some(PathBuf::from(args.next().ok_or(USAGE)?));
-            }
-            Some("--appid") => {
-                args.next();
-                appid = Some(args.next().ok_or(USAGE)?);
             }
             Some("--multi-instance") => {
                 args.next();
@@ -421,22 +416,35 @@ fn run() -> Result<u32, String> {
     let log_dir = log_dir.unwrap_or_else(|| env::temp_dir().join("peerparty").join("logs"));
     fs::create_dir_all(&log_dir).map_err(|e| format!("{}: {e}", log_dir.display()))?;
 
-    // The child inherits these. Steam sets SteamAppId itself; started outside Steam, the
-    // game needs it.
-    let appid = appid.or_else(|| {
-        if env::var_os("SteamAppId").is_some() {
-            return None;
-        }
-        let found = steam_app_id(&exe);
-        if let Some(id) = &found {
-            eprintln!("peerparty: Steam app id {id} (from the Steam library)");
-        }
-        found.map(OsString::from)
-    });
     // The player's settings for this game (the launcher window's, ui.json), with
     // `--set` on top. Variables already set (a .bat's own) win over both.
     let settings = ui::store::Settings::load();
     let game = settings.options(&ui::store::key_of(&listed));
+    // The game's folder: programs started from it get PeerParty too (the hook's
+    // child.rs), and PeerParty runs until the last of them ends (tree.rs). Not for a
+    // packaged game, which follows its own package's programs.
+    let root = match env::var_os("PEERPARTY_GAME_ROOT") {
+        _ if pkg.is_some() => None,
+        Some(r) => Some(PathBuf::from(r)),
+        None => gameroot::find(&exe, &settings.folders).map(|(r, how)| {
+            eprintln!("peerparty: the game's folder is {} (from {how}); programs started from it get peerparty too", r.display());
+            unsafe { env::set_var("PEERPARTY_GAME_ROOT", &r) };
+            r
+        }),
+    };
+    // The child inherits these. Steam sets SteamAppId itself; started outside Steam, the
+    // game needs it (steamid.rs).
+    let id_known = env::var_os("SteamAppId").is_some() || pkg.is_some();
+    let steam = if id_known { steamid::Game::none() } else { steamid::Game::look(&exe, root.as_deref()) };
+    let appid = if id_known { None } else { steam.app_id(&exe) };
+    if let Some(id) = &appid {
+        eprintln!("peerparty: Steam app id {id}");
+    } else if !id_known && steam.uses_steam {
+        eprintln!(
+            "peerparty: this game uses Steam, but its Steam app id wasn't found (it isn't in a Steam library, and no steam_appid.txt is in its folder): Steam may refuse to start it, or it plays without Steam multiplayer. Put a steam_appid.txt holding the id (the number in the address of its Steam store page) next to {}",
+            exe.display()
+        );
+    }
     let mut prefs = host::effective(&settings, &game);
     for (k, v) in &sets {
         apply_set(&mut prefs, k, v);
@@ -548,16 +556,6 @@ fn run() -> Result<u32, String> {
     }
     let cwd = script_cwd.as_deref().or(exe.parent()).unwrap_or(Path::new("."));
 
-    // The game's folder: programs started from it get PeerParty too (the hook's
-    // child.rs), and PeerParty runs until the last of them ends (tree.rs).
-    let root = match env::var_os("PEERPARTY_GAME_ROOT") {
-        Some(r) => Some(PathBuf::from(r)),
-        None => gameroot::find(&exe, &settings.folders).map(|(r, how)| {
-            eprintln!("peerparty: the game's folder is {} (from {how}); programs started from it get peerparty too", r.display());
-            unsafe { env::set_var("PEERPARTY_GAME_ROOT", &r) };
-            r
-        }),
-    };
     let tree = tree::Tree::new(root.as_deref());
 
     let pi = unsafe { start_injected(&exe, &cmdline, cwd, &dll, x86, tree.as_ref())? };
@@ -892,128 +890,6 @@ pub(crate) unsafe fn inject_x64(pi: &PROCESS_INFORMATION, dll: &Path) -> Result<
     }
 }
 
-/// The app id of a game installed in a Steam library: the exe sits somewhere under
-/// `<library>\steamapps\common\<installdir>`, and the library's
-/// `appmanifest_<id>.acf` names that installdir.
-fn steam_app_id(exe: &Path) -> Option<String> {
-    library_app_id(exe)
-        .or_else(|| appid_txt(exe))
-        .or_else(|| any_library_app_id(exe))
-}
-
-/// The app id from the manifest of the Steam library the exe is installed in.
-fn library_app_id(exe: &Path) -> Option<String> {
-    let install = exe.ancestors().find(|a| {
-        let common = a.parent();
-        let steamapps = common.and_then(Path::parent);
-        common.and_then(Path::file_name).is_some_and(|n| n.eq_ignore_ascii_case("common"))
-            && steamapps
-                .and_then(Path::file_name)
-                .is_some_and(|n| n.eq_ignore_ascii_case("steamapps"))
-    })?;
-    let dir = install.file_name()?.to_string_lossy().to_string();
-    let steamapps = install.parent()?.parent()?;
-    for entry in fs::read_dir(steamapps).ok()?.flatten() {
-        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-        if !(name.starts_with("appmanifest_") && name.ends_with(".acf")) {
-            continue;
-        }
-        let Ok(text) = fs::read_to_string(entry.path()) else {
-            continue;
-        };
-        if acf_value(&text, "installdir").is_some_and(|d| d.eq_ignore_ascii_case(&dir)) {
-            return acf_value(&text, "appid");
-        }
-    }
-    None
-}
-
-/// `steam_appid.txt` next to the exe (steam_api reads it too; this is for the log).
-fn appid_txt(exe: &Path) -> Option<String> {
-    let text = fs::read_to_string(exe.parent()?.join("steam_appid.txt")).ok()?;
-    let id = text.trim();
-    (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())).then(|| id.to_string())
-}
-
-/// Steam's install folder, from the registry, else its default place.
-fn steam_dir() -> Option<PathBuf> {
-    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_SZ, RegGetValueW};
-    let key = wide(OsStr::new(r"Software\Valve\Steam"));
-    let value = wide(OsStr::new("SteamPath"));
-    let mut buf = [0u16; 520];
-    let mut len = (buf.len() * 2) as u32;
-    let rc = unsafe {
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            key.as_ptr(),
-            value.as_ptr(),
-            RRF_RT_REG_SZ,
-            ptr::null_mut(),
-            buf.as_mut_ptr().cast(),
-            &mut len,
-        )
-    };
-    if rc == 0 {
-        let n = (len as usize / 2).saturating_sub(1);
-        return Some(PathBuf::from(String::from_utf16_lossy(&buf[..n])));
-    }
-    let default = PathBuf::from(r"C:\Program Files (x86)\Steam");
-    default.is_dir().then_some(default)
-}
-
-/// Every Steam library's `steamapps` folder.
-fn steam_libraries() -> Vec<PathBuf> {
-    let Some(steam) = steam_dir() else {
-        return Vec::new();
-    };
-    let mut libs = vec![steam.join("steamapps")];
-    if let Ok(vdf) = fs::read_to_string(steam.join("steamapps").join("libraryfolders.vdf")) {
-        for line in vdf.lines() {
-            if let Some(path) = acf_value(line, "path") {
-                let lib = PathBuf::from(path).join("steamapps");
-                if !libs.iter().any(|l| l.as_os_str().eq_ignore_ascii_case(lib.as_os_str())) {
-                    libs.push(lib);
-                }
-            }
-        }
-    }
-    libs
-}
-
-/// The app id of whichever installed Steam game's install folder has the name of one of
-/// the exe's folders (nearest first), for a copy that lives outside the Steam library.
-fn any_library_app_id(exe: &Path) -> Option<String> {
-    let manifests: Vec<String> = steam_libraries()
-        .iter()
-        .filter_map(|lib| fs::read_dir(lib).ok())
-        .flat_map(|dir| dir.flatten())
-        .filter(|e| {
-            let n = e.file_name().to_string_lossy().to_ascii_lowercase();
-            n.starts_with("appmanifest_") && n.ends_with(".acf")
-        })
-        .filter_map(|e| fs::read_to_string(e.path()).ok())
-        .collect();
-    for folder in exe.ancestors().skip(1).filter_map(Path::file_name) {
-        let folder = folder.to_string_lossy();
-        for text in &manifests {
-            if acf_value(text, "installdir").is_some_and(|d| d.eq_ignore_ascii_case(&folder)) {
-                return acf_value(text, "appid");
-            }
-        }
-    }
-    None
-}
-
-/// A top-level `"key"  "value"` from a Steam .acf (KeyValues) file.
-fn acf_value(text: &str, key: &str) -> Option<String> {
-    text.lines().find_map(|line| {
-        let mut parts = line.trim().split('"').filter(|p| !p.trim().is_empty());
-        let k = parts.next()?;
-        let v = parts.next()?;
-        k.eq_ignore_ascii_case(key).then(|| v.replace("\\\\", "\\"))
-    })
-}
-
 /// IMAGE_FILE_HEADER.Machine of a PE file.
 fn pe_machine(exe: &Path) -> Result<u16, String> {
     let buf = fs::read(exe).map_err(|e| format!("{}: {e}", exe.display()))?;
@@ -1174,28 +1050,5 @@ mod tests {
         let started = find_log(&dir, 99).unwrap();
         assert!(started.file_name().unwrap().to_string_lossy().starts_with("game-"));
         let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn reads_app_manifests() {
-        let acf = "\"AppState\"\n{\n\t\"appid\"\t\t\"1234560\"\n\t\"installdir\"\t\t\"Sample Game!\"\n}\n";
-        assert_eq!(acf_value(acf, "appid").as_deref(), Some("1234560"));
-        assert_eq!(acf_value(acf, "installdir").as_deref(), Some("Sample Game!"));
-        assert_eq!(acf_value(acf, "name"), None);
-    }
-
-    #[test]
-    fn finds_the_app_id_of_a_game_in_a_steam_library() {
-        let lib = env::temp_dir().join(format!("peerparty-acf-{}", std::process::id()));
-        let game = lib.join("steamapps").join("common").join("Some Game").join("bin");
-        fs::create_dir_all(&game).unwrap();
-        fs::write(
-            lib.join("steamapps").join("appmanifest_42.acf"),
-            "\"AppState\"\n{\n\t\"appid\"\t\t\"42\"\n\t\"installdir\"\t\t\"Some Game\"\n}\n",
-        )
-        .unwrap();
-        assert_eq!(steam_app_id(&game.join("game.exe")).as_deref(), Some("42"));
-        assert_eq!(steam_app_id(&lib.join("elsewhere.exe")), None);
-        let _ = fs::remove_dir_all(&lib);
     }
 }

@@ -161,7 +161,11 @@ class Wire:
 # ---- Relay: com.unity.transport's messages.
 SIG = struct.pack("<H", 29402)
 def hdr(kind): return SIG + bytes([0, kind])
-def bind_msg(data): return hdr(0) + bytes([0]) + struct.pack("<H", 0) + bytes([255]) + data + bytes(32)
+def bind_msg(data, key):
+    # RelayServerData.ComputeBindHMAC: HMAC-SHA256 with the allocation's key over the first 263 bytes.
+    import hashlib, hmac
+    m = hdr(0) + bytes([0]) + struct.pack("<H", 0) + bytes([255]) + data
+    return m + hmac.new(key, m, hashlib.sha256).digest()
 def connect_msg(me, host_data): return hdr(3) + me + bytes([255]) + host_data
 def relay_msg(frm, to, payload): return hdr(10) + frm + to + struct.pack(">H", len(payload)) + payload
 def disconnect_msg(frm, to): return hdr(9) + frm + to
@@ -226,7 +230,7 @@ if ROLE == "A":
     u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     u.bind(("0.0.0.0", 0))
     rhost = endpoint(alloc)
-    u.sendto(bind_msg(base64.b64decode(alloc["connectionData"])), rhost)
+    u.sendto(bind_msg(base64.b64decode(alloc["connectionData"]), base64.b64decode(alloc["key"])), rhost)
     check("host bound to the relay", udp_wait(u, 1) is not None, rhost)
     put_file("code", CODE)
 
@@ -286,7 +290,7 @@ else:
     u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     u.bind(("0.0.0.0", 0))
     rhost = endpoint(alloc)
-    u.sendto(bind_msg(base64.b64decode(alloc["connectionData"])), rhost)
+    u.sendto(bind_msg(base64.b64decode(alloc["connectionData"]), base64.b64decode(alloc["key"])), rhost)
     check("client bound to the host's relay", udp_wait(u, 1) is not None, rhost)
     u.sendto(connect_msg(my_id, host_data), rhost)
     acc = udp_wait(u, 6)

@@ -595,7 +595,9 @@ impl Host {
                     }
                     for p in &st.peers {
                         if !self.seen_peers.contains(&p.id) {
-                            self.overlay.toast(crate::t!("toast.playing_too", name = p.name), p.reach());
+                            if let Some(text) = ui::arrival_text(p) {
+                                self.overlay.toast(text, p.reach());
+                            }
                         }
                     }
                 }

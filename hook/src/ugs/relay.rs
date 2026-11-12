@@ -21,23 +21,32 @@
 //!
 //! Connection data is opaque to clients, so PeerParty writes its own into it: "LBRL",
 //! a version, host or joiner, the allocation id and the host's connection limit. The
-//! relay reads ids from there and needs no shared allocation table. The Bind HMAC is
-//! not checked (its key comes from the id, which isn't secret), so an allocation is
-//! held to the address that bound it (`REBIND_AFTER`), and packets pass only between a
-//! joiner and the host it connected to. Allocations list `udp` and `dtls` endpoints, both
-//! with `secure: false`: Unity Transport's RelayServerData(allocation, type) and the
-//! SDK's AllocationUtils.ToRelayServerData take `isSecure` from the endpoint, so games
-//! asking for "dtls" (the Multiplayer SDK's default) run the plain protocol.
+//! relay reads ids from there. Packets pass only between a joiner and the host it
+//! connected to. Allocations list `udp` and `dtls` endpoints, both with `secure: false`:
+//! Unity Transport's RelayServerData(allocation, type) and the SDK's
+//! AllocationUtils.ToRelayServerData take `isSecure` from the endpoint, so games asking
+//! for "dtls" (the Multiplayer SDK's default) run the plain protocol.
+//!
+//! Keys: every allocation has a random 64-byte key, as Unity's do, and the relay knows
+//! only the keys it handed out. The host's copy makes its own allocation; a joiner's
+//! copy asks the code's host, over the core's channel `ugs-relay` (`ask_host`), for an
+//! allocation on that relay, and the host's copy makes it and answers that player only
+//! (one it plays with: `Lan::knows`). So nobody else on the network learns a joiner's
+//! key, and allocation ids, which are in every packet, prove nothing. A Bind must carry
+//! the HMAC Unity Transport computes with the key (RelayServerData.ComputeBindHMAC:
+//! HMAC-SHA256 over the Bind's first 263 bytes, accept mode zeroed): one without it, or
+//! for an allocation the relay didn't make, is dropped. An allocation stays with the
+//! address that bound it: another address may take it over only with a Bind the relay
+//! hasn't seen (a new nonce), or once the old address has said nothing for
+//! `REBIND_AFTER`, so a copied Bind moves nothing.
 //!
 //! A game that makes the relay secure itself (RelayServerData's explicit constructor or
 //! UnityTransport.SetRelayServerData with isSecure true) speaks DTLS to it: DTLS 1.2,
 //! the allocation id as PSK identity and the allocation's `key` as the PSK (dtls.rs).
 //! The same socket answers it: a datagram that starts like a DTLS record opens a DTLS
 //! session for its address, the Relay messages inside go through the same `Server`,
-//! and whatever goes back to that address is sealed in its session. Each allocation's
-//! key is derived from its id (`relay_key`), so the host's relay knows a joiner's key
-//! though the joiner's copy made the allocation. Plain and DTLS clients can share a
-//! host. WebSocket relays (`wss`, WebGL) aren't offered.
+//! and whatever goes back to that address is sealed in its session. Plain and DTLS
+//! clients can share a host. WebSocket relays (`wss`, WebGL) aren't offered.
 //!
 //! Design reference (MIT): github.com/abdelfattahradwan/blitz-relay has a host-owned room
 //! per code, gone with its host, and a forwarding table per room. It doesn't speak
@@ -63,10 +72,15 @@ const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 /// Bound allocations that send nothing for this long are dropped (clients ping).
 const IDLE: Duration = Duration::from_secs(120);
 /// An allocation belongs to the address that bound it, until that address has said
-/// nothing for this long (a client that came back on another port binds again). The
-/// Bind HMAC isn't checked and ids aren't secret, so without this any packet naming an
-/// allocation moved it to its sender: one ping took over a player's traffic.
+/// nothing for this long, or a Bind with a nonce the relay hasn't seen comes from
+/// elsewhere (a client that came back on another port binds again).
 const REBIND_AFTER: Duration = Duration::from_secs(20);
+/// A joiner's allocation that is never bound is forgotten after this long.
+const UNBOUND_KEY_LIFE: Duration = Duration::from_secs(600);
+/// The core channel joiners' copies ask a code's host on, and its two directions.
+pub const SOCKET: &str = "ugs-relay";
+const CH_ASK: u8 = 1;
+const CH_ANSWER: u8 = 2;
 /// Allocations bound and DTLS sessions open at once: far more than a game's players,
 /// and an end to what datagrams from made-up addresses can have the relay keep.
 const MAX_BOUND: usize = 1024;
@@ -114,17 +128,22 @@ pub fn parse_connection_data(d: &[u8]) -> Option<(AllocId, bool, u16)> {
     Some((d[6..22].try_into().ok()?, d[5] == 0, u16::from_le_bytes([d[22], d[23]])))
 }
 
-/// The HMAC key handed out with an allocation (64 bytes): derived from its id, so any
-/// copy's relay knows it (DTLS uses it as the pre-shared key). The LAN is trusted.
-pub fn relay_key(id: &AllocId) -> Vec<u8> {
-    let mut key = Vec::with_capacity(64);
-    for i in 0..2u8 {
-        let mut m = b"peerparty relay key ".to_vec();
-        m.push(i);
-        m.extend_from_slice(id);
-        key.extend_from_slice(&crate::photon::crypto::sha256(&m));
-    }
-    key
+/// A new allocation's key (64 bytes, as Unity's RelayHMACKey).
+pub fn new_key() -> Vec<u8> {
+    random_bytes(64)
+}
+
+/// A Bind's HMAC as Unity Transport computes it (RelayServerData.ComputeBindHMAC): over
+/// the message's first 263 bytes (header, accept mode as 0, nonce, length, connection
+/// data) with the allocation's key.
+pub fn bind_hmac(key: &[u8], bind: &[u8]) -> Option<[u8; 32]> {
+    let mut m = bind.get(..263)?.to_vec();
+    m[4] = 0;
+    Some(crate::photon::crypto::hmac_sha256(key, &m))
+}
+
+fn same(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 fn id_at(pkt: &[u8], at: usize) -> Option<AllocId> {
@@ -148,19 +167,35 @@ fn pair(kind: u8, from: &AllocId, to: &AllocId) -> Vec<u8> {
 /// The relay itself, without sockets: packets in, packets out.
 #[derive(Default)]
 pub struct Server {
-    /// Where each bound allocation is, and when it last spoke.
-    bound: HashMap<AllocId, (SocketAddr, Instant)>,
+    /// Every allocation this relay made: its key, and when (a joiner's that is never
+    /// bound goes after `UNBOUND_KEY_LIFE`).
+    keys: HashMap<AllocId, (Vec<u8>, Instant)>,
+    /// Where each bound allocation is, when it last spoke, and the nonce of the Bind
+    /// that put it there.
+    bound: HashMap<AllocId, (SocketAddr, Instant, u16)>,
     /// Host allocations made on this copy, and their connection limits.
     hosts: HashMap<AllocId, u16>,
     /// Joiner -> host, once connected.
     links: HashMap<AllocId, AllocId>,
     /// DTLS sessions, by client address.
     tls: HashMap<SocketAddr, dtls::Session>,
+    /// The secret DTLS cookies are made with (made on first use).
+    cookie_secret: Vec<u8>,
 }
 
 impl Server {
-    pub fn add_host(&mut self, id: AllocId, max: u16) {
+    pub fn add_host(&mut self, id: AllocId, max: u16, key: Vec<u8>, now: Instant) {
         self.hosts.insert(id, max);
+        self.keys.insert(id, (key, now));
+    }
+
+    /// A joiner's allocation on this relay. False when the relay holds too many.
+    pub fn add_client(&mut self, id: AllocId, key: Vec<u8>, now: Instant) -> bool {
+        if self.keys.len() >= MAX_BOUND && !self.keys.contains_key(&id) {
+            return false;
+        }
+        self.keys.insert(id, (key, now));
+        true
     }
 
     pub fn clients_of(&self, host: &AllocId) -> usize {
@@ -171,7 +206,16 @@ impl Server {
     pub fn expire(&mut self, now: Instant) {
         self.tls.retain(|_, s| now.duration_since(s.last_seen) < IDLE);
         let before = self.bound.len();
-        self.bound.retain(|_, (_, at)| now.duration_since(*at) < IDLE);
+        let gone: Vec<AllocId> = self.bound.iter().filter(|(_, (_, at, _))| now.duration_since(*at) >= IDLE).map(|(id, _)| *id).collect();
+        for id in &gone {
+            self.bound.remove(id);
+            // A joiner gone quiet is gone: its game makes a new allocation to come back.
+            if !self.hosts.contains_key(id) {
+                self.keys.remove(id);
+            }
+        }
+        let (bound, hosts) = (&self.bound, &self.hosts);
+        self.keys.retain(|id, (_, made)| hosts.contains_key(id) || bound.contains_key(id) || now.duration_since(*made) < UNBOUND_KEY_LIFE);
         if self.bound.len() != before {
             let bound = &self.bound;
             self.links.retain(|c, _| bound.contains_key(c));
@@ -200,14 +244,30 @@ impl Server {
     pub fn datagram(&mut self, from: SocketAddr, pkt: &[u8], now: Instant) -> Vec<(SocketAddr, Vec<u8>)> {
         let mut out = vec![];
         let msgs = if dtls::is_dtls(pkt) {
-            if !self.tls.contains_key(&from) && self.tls.len() >= MAX_TLS {
-                return out;
+            if !self.tls.contains_key(&from) {
+                if self.tls.len() >= MAX_TLS {
+                    return out;
+                }
+                // Nothing is kept for an address until it has echoed its cookie, so
+                // datagrams from made-up addresses use up nothing.
+                if self.cookie_secret.is_empty() {
+                    self.cookie_secret = random_bytes(32);
+                }
+                match dtls::check_hello(&self.cookie_secret, from.to_string().as_bytes(), pkt) {
+                    dtls::Hello::Verify(hvr) => return vec![(from, hvr)],
+                    dtls::Hello::Other => return out,
+                    dtls::Hello::Verified => {}
+                }
             }
             let s = self.tls.entry(from).or_insert_with(|| {
                 log!("ugs relay: DTLS handshake from {from}");
                 dtls::Session::new(now)
             });
-            let r = s.recv(pkt, now, &|identity: &[u8]| Some(relay_key(identity.try_into().ok()?)));
+            let keys = &self.keys;
+            let r = s.recv(pkt, now, &|identity: &[u8]| {
+                let id: AllocId = identity.try_into().ok()?;
+                keys.get(&id).map(|(k, _)| k.clone())
+            });
             if r.opened {
                 log!("ugs relay: DTLS session with {from} open (allocation {})", hex(&s.identity));
             }
@@ -241,21 +301,31 @@ impl Server {
         }
         match pkt[3] {
             BIND => {
-                let Some(data) = pkt.get(8..8 + 255) else { return vec![] };
-                match parse_connection_data(data) {
-                    Some((id, _, _)) => {
-                        match self.bound.get(&id) {
-                            // Someone else's, and they're still there.
-                            Some((at, seen)) if *at != from && now.duration_since(*seen) < REBIND_AFTER => return vec![],
-                            Some(_) => {}
-                            None if self.bound.len() >= MAX_BOUND => return vec![],
-                            None => log!("ugs relay: allocation {} bound from {from}", hex(&id)),
-                        }
-                        self.bound.insert(id, (from, now));
-                        vec![(from, header(BIND_RECEIVED).to_vec())]
-                    }
-                    None => vec![(from, error(&[0; 16], ERR_NOT_FOUND))],
+                let (Some(data), Some(mac)) = (pkt.get(8..8 + 255), pkt.get(263..295)) else { return vec![] };
+                let nonce = u16::from_le_bytes([pkt[5], pkt[6]]);
+                let Some((id, _, _)) = parse_connection_data(data) else {
+                    return vec![(from, error(&[0; 16], ERR_NOT_FOUND))];
+                };
+                // Not an allocation this relay made, or not signed with its key: the
+                // sender doesn't have the key, so nothing is said back.
+                let Some((key, _)) = self.keys.get(&id) else {
+                    crate::log::throttled("ugs relay unknown bind", 3, |n| log!("ugs relay: Bind from {from} for an allocation this relay didn't make, dropped n={n}"));
+                    return vec![];
+                };
+                if !bind_hmac(key, pkt).is_some_and(|h| same(&h, mac)) {
+                    crate::log::throttled("ugs relay bad hmac", 3, |n| log!("ugs relay: Bind from {from} for {} without its key's HMAC, dropped n={n}", hex(&id)));
+                    return vec![];
                 }
+                match self.bound.get(&id) {
+                    // Someone else's, still there, and this Bind is one already seen.
+                    Some((at, seen, last)) if *at != from && now.duration_since(*seen) < REBIND_AFTER && *last == nonce => return vec![],
+                    Some((at, _, _)) if *at != from => log!("ugs relay: allocation {} bound again, from {from}", hex(&id)),
+                    Some(_) => {}
+                    None if self.bound.len() >= MAX_BOUND => return vec![],
+                    None => log!("ugs relay: allocation {} bound from {from} (Bind HMAC checks out)", hex(&id)),
+                }
+                self.bound.insert(id, (from, now, nonce));
+                vec![(from, header(BIND_RECEIVED).to_vec())]
             }
             PING => {
                 let Some(id) = id_at(pkt, 4) else { return vec![] };
@@ -298,7 +368,7 @@ impl Server {
                     return vec![(from, error(&src, ERR_CLIENT_MISMATCH))];
                 }
                 match self.bound.get(&dst) {
-                    Some((to, _)) if self.linked(&src, &dst) => vec![(*to, pkt.to_vec())],
+                    Some((to, _, _)) if self.linked(&src, &dst) => vec![(*to, pkt.to_vec())],
                     _ => vec![(from, error(&src, ERR_NOT_CONNECTED))],
                 }
             }
@@ -314,7 +384,7 @@ impl Server {
                     self.links.remove(&dst);
                 }
                 match self.bound.get(&dst) {
-                    Some((to, _)) => vec![(*to, pkt.to_vec())],
+                    Some((to, _, _)) => vec![(*to, pkt.to_vec())],
                     None => vec![],
                 }
             }
@@ -390,6 +460,11 @@ struct Alloc {
     code: Option<String>,
 }
 
+/// This copy's requests to codes' hosts for an allocation: None while waiting, then the
+/// answer (None again inside: refused).
+type Answer = Option<Option<(AllocId, Vec<u8>)>>;
+static ANSWERS: LazyLock<(Mutex<HashMap<u64, Answer>>, std::sync::Condvar)> = LazyLock::new(Default::default);
+
 static ALLOCS: LazyLock<Mutex<HashMap<String, Alloc>>> = LazyLock::new(Mutex::default);
 
 type Reply = (u16, String);
@@ -420,12 +495,12 @@ fn endpoints(host: &str, port: u16) -> Json {
     )
 }
 
-fn allocation(id: &AllocId, data: &[u8], host: &str, port: u16, region: &str, host_data: Option<&[u8]>) -> Json {
+fn allocation(id: &AllocId, key: &[u8], data: &[u8], host: &str, port: u16, region: &str, host_data: Option<&[u8]>) -> Json {
     let mut a = vec![
         ("allocationId", Json::str(guid(id))),
         ("serverEndpoints", endpoints(host, port)),
         ("relayServer", Json::obj(vec![("ipV4", Json::str(host)), ("port", Json::Num(port as f64))])),
-        ("key", Json::str(base64(&relay_key(id)))),
+        ("key", Json::str(base64(key))),
         ("connectionData", Json::str(base64(data))),
         ("allocationIdBytes", Json::str(base64(id))),
         ("region", Json::str(region)),
@@ -445,14 +520,15 @@ fn allocate(body: &Json) -> Reply {
         return err(503, 15010, "No Suitable Relay", "PeerParty couldn't open its relay socket");
     };
     let id: AllocId = random_bytes(16).try_into().unwrap();
+    let key = new_key();
     let data = connection_data(&id, true, max as u16);
-    r.server.lock().unwrap().add_host(id, max as u16);
+    r.server.lock().unwrap().add_host(id, max as u16, key.clone(), Instant::now());
     let region = body.get("region").as_str().unwrap_or("lan").to_string();
     ALLOCS.lock().unwrap().insert(guid(&id), Alloc { id, data: data.clone(), code: None });
     log!("ugs relay: allocation {} for {max} connection(s), relay on port {}", guid(&id), r.port);
     let out = Json::obj(vec![
         ("meta", meta(201)),
-        ("data", Json::obj(vec![("allocation", allocation(&id, &data, "127.0.0.1", r.port, &region, None))])),
+        ("data", Json::obj(vec![("allocation", allocation(&id, &key, &data, "127.0.0.1", r.port, &region, None))])),
     ]);
     (201, out.to_string())
 }
@@ -527,17 +603,88 @@ fn join(body: &Json) -> Reply {
     let Some(host_data) = super::base64_decode(&attr("data")).filter(|d| d.len() == 255) else {
         return err(404, 15009, "Join Code Not Found", "the code's host data is unreadable");
     };
-    let id: AllocId = random_bytes(16).try_into().unwrap();
+    // The allocation is the host's relay's to make: only it and this player learn the key.
+    let made = if l.owner == lan.me() { make_client(&code) } else { ask_host(lan, l.owner, &code) };
+    let Some((id, key)) = made else {
+        log!("ugs relay: the host of code {code} gave no allocation");
+        return err(404, 15009, "Join Code Not Found", "the code's host didn't answer");
+    };
     let data = connection_data(&id, false, 0);
-    log!("ugs relay: joined code {code}: relay {ip}:{port}, allocation {}", guid(&id));
+    log!("ugs relay: joined code {code}: relay {ip}:{port}, allocation {} (made by the host's relay)", guid(&id));
     let out = Json::obj(vec![
         ("meta", meta(200)),
         (
             "data",
-            Json::obj(vec![("allocation", allocation(&id, &data, &ip.to_string(), port, "lan", Some(&host_data)))]),
+            Json::obj(vec![("allocation", allocation(&id, &key, &data, &ip.to_string(), port, "lan", Some(&host_data)))]),
         ),
     ]);
     (200, out.to_string())
+}
+
+/// A joiner's allocation on this copy's relay, for one of this copy's join codes.
+fn make_client(code: &str) -> Option<(AllocId, Vec<u8>)> {
+    if !ALLOCS.lock().unwrap().values().any(|a| a.code.as_deref() == Some(code)) {
+        return None;
+    }
+    let r = relay()?;
+    let id: AllocId = random_bytes(16).try_into().unwrap();
+    let key = new_key();
+    r.server.lock().unwrap().add_client(id, key.clone(), Instant::now()).then_some((id, key))
+}
+
+/// Asks the host of a join code for an allocation on its relay (the core's channel to
+/// that player, which only the two of them read). None if it refuses or doesn't answer.
+fn ask_host(lan: &peerparty_core::Lan, host: peerparty_core::PeerId, code: &str) -> Option<(AllocId, Vec<u8>)> {
+    super::start_pump();
+    let ask: u64 = u64::from_le_bytes(random_bytes(8).try_into().unwrap());
+    let mut m = ask.to_le_bytes().to_vec();
+    m.extend_from_slice(code.as_bytes());
+    let (lock, cv) = &*ANSWERS;
+    lock.lock().unwrap().insert(ask, None);
+    lan.send(host, SOCKET, CH_ASK, &m, true, true, true);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut w = lock.lock().unwrap();
+    loop {
+        if w.get(&ask).is_some_and(|a| a.is_some()) {
+            return w.remove(&ask).flatten().flatten();
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            w.remove(&ask);
+            return None;
+        }
+        w = cv.wait_timeout(w, left).unwrap().0;
+    }
+}
+
+/// From the UGS pump: answers players asking this copy's relay for an allocation, and
+/// takes the answers to this copy's own asking.
+pub fn serve(lan: &peerparty_core::Lan) {
+    while let Some(p) = lan.receive_where(Some(CH_ASK), |s| s == SOCKET) {
+        let Some(ask) = p.data.get(..8) else { continue };
+        let code = String::from_utf8_lossy(&p.data[8..]).to_string();
+        let mut reply = ask.to_vec();
+        // Only someone this copy plays with: a LAN or room player, or a public one in a
+        // lobby with us.
+        if lan.knows(p.peer) {
+            if let Some((id, key)) = make_client(&code) {
+                log!("ugs relay: allocation {} for {} on code {code}", guid(&id), p.peer);
+                reply.extend_from_slice(&id);
+                reply.extend_from_slice(&key);
+            }
+        }
+        lan.send(p.peer, SOCKET, CH_ANSWER, &reply, true, true, true);
+    }
+    while let Some(p) = lan.receive_where(Some(CH_ANSWER), |s| s == SOCKET) {
+        let Some(ask) = p.data.get(..8).map(|b| u64::from_le_bytes(b.try_into().unwrap())) else { continue };
+        let made = (p.data.len() == 8 + 16 + 64).then(|| (p.data[8..24].try_into().unwrap(), p.data[24..].to_vec()));
+        let (lock, cv) = &*ANSWERS;
+        // Only an answer someone here is waiting for.
+        if let Some(slot @ None) = lock.lock().unwrap().get_mut(&ask) {
+            *slot = Some(made);
+            cv.notify_all();
+        }
+    }
 }
 
 fn regions() -> Reply {
@@ -573,15 +720,36 @@ mod tests {
         SocketAddr::from(([127, 0, 0, 1], p))
     }
 
-    fn bind(id: &AllocId, host: bool) -> Vec<u8> {
+    /// A test allocation's key.
+    fn key(id: &AllocId) -> Vec<u8> {
+        (0..64u8).map(|i| i ^ id[0]).collect()
+    }
+
+    /// A Bind as Unity Transport writes it (RelayMessageBind.Write), signed with `key`.
+    fn bind_signed(id: &AllocId, host: bool, nonce: u16, key: &[u8]) -> Vec<u8> {
         let mut p = header(BIND).to_vec();
         p.push(0);
-        p.extend_from_slice(&0u16.to_le_bytes());
+        p.extend_from_slice(&nonce.to_le_bytes());
         p.push(255);
         p.extend_from_slice(&connection_data(id, host, 2));
-        p.extend_from_slice(&[0u8; 32]);
+        let mac = bind_hmac(key, &p).unwrap();
+        p.extend_from_slice(&mac);
         assert_eq!(p.len(), 295, "RelayMessageBind.Length");
         p
+    }
+
+    fn bind(id: &AllocId, host: bool) -> Vec<u8> {
+        bind_signed(id, host, 0, &key(id))
+    }
+
+    /// A relay that made `host` (a host allocation) and `clients`.
+    fn server(host: AllocId, max: u16, clients: &[AllocId], now: Instant) -> Server {
+        let mut s = Server::default();
+        s.add_host(host, max, key(&host), now);
+        for c in clients {
+            assert!(s.add_client(*c, key(c), now));
+        }
+        s
     }
 
     fn connect(client: &AllocId, host: &AllocId) -> Vec<u8> {
@@ -617,9 +785,8 @@ mod tests {
     #[test]
     fn bind_connect_relay_and_disconnect() {
         let now = Instant::now();
-        let mut s = Server::default();
         let (host, a, b, c) = ([1u8; 16], [2u8; 16], [3u8; 16], [4u8; 16]);
-        s.add_host(host, 2);
+        let mut s = server(host, 2, &[a, b, c], now);
         // Bind: BindReceived back to the sender.
         for (id, port, is_host) in [(host, 1, true), (a, 2, false), (b, 3, false), (c, 4, false)] {
             let out = s.handle(addr(port), &bind(&id, is_host), now);
@@ -656,7 +823,9 @@ mod tests {
         assert_eq!(s.handle(addr(2), &bye, now), vec![(addr(1), bye.clone())]);
         assert_eq!(s.handle(addr(4), &connect(&c, &host), now)[0].1[3], ACCEPTED);
         // Rebinding from a new port moves the allocation, once its old port has gone
-        // quiet (the test below is about before that).
+        // quiet, or at once with a new Bind (the tests below are about the rest).
+        let fresh = bind_signed(&c, false, 1, &key(&c));
+        assert_eq!(s.handle(addr(40), &fresh, now)[0].1, header(BIND_RECEIVED));
         let later = now + REBIND_AFTER;
         assert_eq!(s.handle(addr(20), &bind(&b, false), later)[0].1, header(BIND_RECEIVED));
         let down = relay_msg(&host, &b, b"to its new port");
@@ -670,9 +839,8 @@ mod tests {
     #[test]
     fn an_allocation_stays_with_the_address_that_bound_it() {
         let now = Instant::now();
-        let mut s = Server::default();
         let (host, a, x) = ([1u8; 16], [2u8; 16], [9u8; 16]);
-        s.add_host(host, 4);
+        let mut s = server(host, 4, &[a, x], now);
         s.handle(addr(1), &bind(&host, true), now);
         s.handle(addr(2), &bind(&a, false), now);
         assert_eq!(s.handle(addr(2), &connect(&a, &host), now)[0].1[3], ACCEPTED);
@@ -686,7 +854,14 @@ mod tests {
             let out = s.handle(thief, &forged, soon);
             assert!(out.iter().all(|(to, p)| *to == thief && p.get(3) != Some(&RELAY)), "{out:?}");
         }
+        // A Bind copied off the network (the same nonce) moves nothing; one the thief
+        // makes without the key, or with another allocation's, isn't even answered.
         assert!(s.handle(thief, &bind(&a, false), soon).is_empty());
+        assert!(s.handle(thief, &bind_signed(&a, false, 7, &[0u8; 64]), soon).is_empty());
+        assert!(s.handle(thief, &bind_signed(&a, false, 7, &key(&x)), soon).is_empty());
+        let mut flipped = bind_signed(&a, false, 7, &key(&a));
+        flipped[20] ^= 1;
+        assert!(s.handle(thief, &flipped, soon).is_empty());
         // The joiner's traffic still goes to the joiner, and the joiner is still connected.
         let down = relay_msg(&host, &a, b"for the joiner");
         assert_eq!(s.handle(addr(1), &down, soon), vec![(addr(2), down)]);
@@ -698,19 +873,61 @@ mod tests {
         let aimed = relay_msg(&a, &x, &[0u8; 1000]);
         assert_eq!(s.handle(addr(2), &aimed, soon), vec![(addr(2), error(&a, ERR_NOT_CONNECTED))]);
 
-        // And what one sender can have the relay keep has an end.
+        // Allocations the relay didn't make can't be bound at all, and what it keeps
+        // has an end.
         for i in 0..(MAX_BOUND as u32 + 50) {
             let mut id = [0xEEu8; 16];
             id[..4].copy_from_slice(&i.to_le_bytes());
-            s.handle(addr(1000 + (i % 60_000) as u16), &bind(&id, false), soon);
+            assert!(s.handle(addr(1000 + (i % 60_000) as u16), &bind(&id, false), soon).is_empty());
+            s.add_client(id, key(&id), soon);
         }
-        assert_eq!(s.bound.len(), MAX_BOUND);
+        assert_eq!(s.keys.len(), MAX_BOUND);
+        assert!(s.bound.len() <= MAX_BOUND);
+    }
+
+    /// Unity Transport's HMAC (RelayServerData.ComputeBindHMAC) for a known key, nonce
+    /// and connection data, worked by hand from its definition: HMAC-SHA256 over
+    /// DA 72 00 00 | 00 | nonce (little-endian) | FF | 255 bytes of connection data.
+    #[test]
+    fn the_bind_hmac_is_unity_transports() {
+        let key: Vec<u8> = (0..64).collect();
+        let data = connection_data(&[0x42; 16], false, 0);
+        let mut m = vec![0xDA, 0x72, 0x00, 0x00, 0x00, 0x34, 0x12, 0xFF];
+        m.extend_from_slice(&data);
+        let want = crate::photon::crypto::hmac_sha256(&key, &m);
+        let mut pkt = header(BIND).to_vec();
+        pkt.push(1); // accept mode: not part of the HMAC
+        pkt.extend_from_slice(&0x1234u16.to_le_bytes());
+        pkt.push(255);
+        pkt.extend_from_slice(&data);
+        assert_eq!(bind_hmac(&key, &pkt), Some(want));
+        assert_eq!(bind_hmac(&key, &pkt[..100]), None);
+    }
+
+    #[test]
+    fn joiners_allocations_are_made_by_the_hosts_relay_and_never_bound_ones_expire() {
+        let now = Instant::now();
+        let (host, a) = ([1u8; 16], [2u8; 16]);
+        let mut s = server(host, 4, &[a], now);
+        s.expire(now + UNBOUND_KEY_LIFE + Duration::from_secs(1));
+        assert!(s.keys.contains_key(&host) && !s.keys.contains_key(&a));
+        assert!(s.handle(addr(2), &bind(&a, false), now).is_empty());
+        // A bound joiner keeps its key while it talks; once it has gone quiet it's gone.
+        assert!(s.add_client(a, key(&a), now));
+        assert_eq!(s.handle(addr(2), &bind(&a, false), now)[0].1, header(BIND_RECEIVED));
+        s.expire(now + IDLE - Duration::from_secs(1));
+        assert!(s.keys.contains_key(&a));
+        s.expire(now + IDLE + Duration::from_secs(1));
+        assert!(!s.keys.contains_key(&a) && s.keys.contains_key(&host));
     }
 
     /// A DTLS client's handshake with the relay, done in place.
     fn dtls_bind(s: &mut Server, port: u16, id: &AllocId, host: bool, now: Instant) -> dtls::client::Client {
-        let mut c = dtls::client::Client::new(id, &relay_key(id), true);
+        let mut c = dtls::client::Client::new(id, &key(id), true);
         let out = s.datagram(addr(port), &c.hello(), now);
+        assert!(!s.tls.contains_key(&addr(port)), "no session before the cookie");
+        let (again, _) = c.recv(&out[0].1);
+        let out = s.datagram(addr(port), &again.unwrap(), now);
         let (f3, _) = c.recv(&out[0].1);
         let out = s.datagram(addr(port), &f3.unwrap(), now);
         c.recv(&out[0].1);
@@ -724,9 +941,8 @@ mod tests {
     #[test]
     fn dtls_and_plain_clients_share_a_host() {
         let now = Instant::now();
-        let mut s = Server::default();
         let (host, a, b) = ([1u8; 16], [2u8; 16], [3u8; 16]);
-        s.add_host(host, 4);
+        let mut s = server(host, 4, &[a, b], now);
         let mut h = dtls_bind(&mut s, 1, &host, true, now);
         let mut ca = dtls_bind(&mut s, 2, &a, false, now);
         s.datagram(addr(3), &bind(&b, false), now);
@@ -748,6 +964,8 @@ mod tests {
         // A wrong key ends the session without a word in the clear.
         let mut bad = dtls::client::Client::new(&[9u8; 16], &[0u8; 64], true);
         let out = s.datagram(addr(9), &bad.hello(), now);
+        let (again, _) = bad.recv(&out[0].1);
+        let out = s.datagram(addr(9), &again.unwrap(), now);
         let (f3, _) = bad.recv(&out[0].1);
         s.datagram(addr(9), &f3.unwrap(), now);
         assert!(!s.tls.contains_key(&addr(9)));
@@ -760,9 +978,10 @@ mod tests {
         let now = Instant::now();
         let mut s = Server::default();
         let (host, a) = ([1u8; 16], [2u8; 16]);
+        s.add_client(a, key(&a), now);
         s.handle(addr(2), &bind(&a, false), now);
         assert_eq!(s.handle(addr(2), &connect(&a, &host), now)[0].1, error(&a, ERR_NOT_FOUND));
-        s.add_host(a, 4);
+        s.add_host(a, 4, key(&a), now);
         let mut p = header(CONNECT_REQUEST).to_vec();
         p.extend_from_slice(&a);
         p.push(255);
@@ -776,8 +995,7 @@ mod tests {
     #[test]
     fn idle_allocations_expire() {
         let t0 = Instant::now();
-        let mut s = Server::default();
-        s.add_host([1; 16], 1);
+        let mut s = server([1; 16], 1, &[[2; 16]], t0);
         s.handle(addr(1), &bind(&[1; 16], true), t0);
         s.handle(addr(2), &bind(&[2; 16], false), t0);
         s.handle(addr(2), &connect(&[2; 16], &[1; 16]), t0);
@@ -790,9 +1008,12 @@ mod tests {
     #[test]
     fn allocations_parse_as_the_sdk_models_expect() {
         let id = [5u8; 16];
-        let a = allocation(&id, &connection_data(&id, false, 0), "10.0.0.2", 4000, "lan", Some(&connection_data(&[6; 16], true, 2)));
+        let k = new_key();
+        let a = allocation(&id, &k, &connection_data(&id, false, 0), "10.0.0.2", 4000, "lan", Some(&connection_data(&[6; 16], true, 2)));
         assert_eq!(super::super::base64_decode(a.get("allocationIdBytes").as_str().unwrap()).unwrap(), id.to_vec());
-        assert_eq!(super::super::base64_decode(a.get("key").as_str().unwrap()).unwrap(), relay_key(&id), "RelayHMACKey, 64 bytes");
+        assert_eq!(super::super::base64_decode(a.get("key").as_str().unwrap()).unwrap(), k, "RelayHMACKey, 64 bytes");
+        assert_eq!(k.len(), 64);
+        assert_ne!(k, new_key(), "random per allocation");
         assert_eq!(super::super::base64_decode(a.get("connectionData").as_str().unwrap()).unwrap().len(), 255);
         let eps = a.get("serverEndpoints").as_arr();
         assert!(eps.iter().any(|e| e.get("connectionType").as_str() == Some("dtls") && e.get("secure") == &Json::Bool(false)));

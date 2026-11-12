@@ -4,7 +4,7 @@ members = ["launcher", "hook", "core"]
 
 [workspace.package]
 # Tagged `v<version>` in git; peerparty.exe adds the commits since that tag (launcher/build.rs).
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 

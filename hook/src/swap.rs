@@ -35,6 +35,8 @@ struct Module {
 
 static MODULES: Mutex<Vec<Module>> = Mutex::new(Vec::new());
 static PATCHED: LazyLock<Mutex<HashSet<(usize, usize)>>> = LazyLock::new(Mutex::default);
+/// (importer, SDK) pairs whose imports point here.
+static IMPORTERS: LazyLock<Mutex<HashSet<(usize, usize)>>> = LazyLock::new(Mutex::default);
 
 type GetProcAddressFn = unsafe extern "system" fn(usize, *const u8) -> usize;
 type GetProcAddressForCallerFn = unsafe extern "system" fn(usize, *const u8, usize) -> usize;
@@ -207,6 +209,7 @@ fn substitute(module: usize, name: *const u8) -> Option<usize> {
 
 unsafe extern "system" fn detour_get_proc(module: usize, name: *const u8) -> usize {
     crate::watch::looked_up(module);
+    crate::vivox::looked_up(module);
     if let Some(f) = substitute(module, name) {
         return f;
     }
@@ -243,8 +246,15 @@ unsafe extern "system" fn detour_get_proc_for_caller(
     unsafe { hook.call(module, name, caller) }
 }
 
+/// How many modules have had their imports of the SDK at `base` pointed here.
+pub fn importers_patched(base: usize) -> usize {
+    IMPORTERS.lock().unwrap().iter().filter(|(_, b)| *b == base).count()
+}
+
 /// Points every module's static imports of a registered SDK at the resolver's
-/// functions. Each (importer, SDK) pair is done once.
+/// functions. Each (importer, SDK) pair is done once, once the loader has bound the
+/// importer's slots: a slot written before that would be overwritten by the loader
+/// (a DLL that imports the SDK is often still loading when the SDK is registered).
 pub fn patch_imports() {
     patch_get_proc_imports();
     let sdks: Vec<(usize, String, Resolver)> = MODULES
@@ -264,7 +274,15 @@ pub fn patch_imports() {
             let mut cache: HashMap<String, Option<usize>> = HashMap::new();
             let mut n = 0;
             let imports = unsafe { crate::pe::imports(module as *const u8) };
-            for imp in imports.iter().filter(|i| i.dll.eq_ignore_ascii_case(sdk)) {
+            let theirs: Vec<_> = imports.iter().filter(|i| i.dll.eq_ignore_ascii_case(sdk)).collect();
+            if theirs.iter().any(|i| unsafe { i.slot.read() } == i.unbound) {
+                PATCHED.lock().unwrap().remove(&(module, *base));
+                continue;
+            }
+            if !theirs.is_empty() {
+                IMPORTERS.lock().unwrap().insert((module, *base));
+            }
+            for imp in theirs {
                 let f = *cache
                     .entry(imp.name.clone())
                     .or_insert_with(|| resolve(&imp.name));

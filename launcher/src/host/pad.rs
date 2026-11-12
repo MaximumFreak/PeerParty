@@ -51,22 +51,34 @@ pub struct State {
 }
 
 impl State {
-    /// The stick counts as the d-pad past half way.
+    /// The buttons, with the stick as the d-pad (`stick`, from rest).
     pub fn with_stick(self) -> u32 {
-        let mut b = self.buttons;
-        if self.ly > 0.5 {
-            b |= UP;
+        self.buttons | self.stick(0)
+    }
+
+    /// The stick as one d-pad direction: the axis pushed further, so a diagonal push
+    /// doesn't press two (and switch a tab while moving down a list). It presses past
+    /// half way and lets go under 0.35, so a stick resting near the line doesn't flicker
+    /// between pressed and not. `held`: the direction it gave at the last poll.
+    pub fn stick(self, held: u32) -> u32 {
+        let along = |d: u32| match d {
+            UP => self.ly,
+            DOWN => -self.ly,
+            LEFT => -self.lx,
+            RIGHT => self.lx,
+            _ => 0.0,
+        };
+        if held != 0 && along(held) > 0.35 {
+            return held;
         }
-        if self.ly < -0.5 {
-            b |= DOWN;
+        let (x, y) = if self.lx.abs() >= self.ly.abs() { (self.lx, 0.0) } else { (0.0, self.ly) };
+        match () {
+            _ if x > 0.5 => RIGHT,
+            _ if x < -0.5 => LEFT,
+            _ if y > 0.5 => UP,
+            _ if y < -0.5 => DOWN,
+            _ => 0,
         }
-        if self.lx < -0.5 {
-            b |= LEFT;
-        }
-        if self.lx > 0.5 {
-            b |= RIGHT;
-        }
-        b
     }
 }
 
@@ -85,6 +97,8 @@ struct Hid {
     alive: Arc<AtomicBool>,
     /// Home was down at the last poll, or hasn't been seen up yet.
     home: bool,
+    /// The direction its stick gave at the last poll (`State::stick`).
+    stick: u32,
 }
 
 pub struct Pads {
@@ -99,6 +113,8 @@ pub struct Pads {
     last_buttons: u32,
     /// Home was down at the last poll, or hasn't been seen up yet, per XInput slot.
     x_home: [bool; 4],
+    /// The direction each XInput pad's stick gave at the last poll (`State::stick`).
+    x_stick: [u32; 4],
     /// Some controller's Home went down since the last poll.
     pub home_pressed: bool,
     /// Which controller that was, for the log.
@@ -116,6 +132,7 @@ impl Pads {
             style: Style::Xbox,
             last_buttons: 0,
             x_home: [true; 4],
+            x_stick: [0; 4],
             home_pressed: false,
             home_by: String::new(),
         }
@@ -150,6 +167,7 @@ impl Pads {
                 if !ok {
                     self.tried[i] = Some(Instant::now());
                     self.x_home[i] = true;
+                    self.x_stick[i] = 0;
                     continue;
                 }
                 let b = from_xinput(&s);
@@ -162,7 +180,8 @@ impl Pads {
                 if b.buttons != 0 && b.buttons != self.last_buttons {
                     self.style = Style::Xbox;
                 }
-                all |= b.with_stick();
+                self.x_stick[i] = b.stick(self.x_stick[i]);
+                all |= b.buttons | self.x_stick[i];
             }
         }
         let mut hid = self.hid.lock().unwrap();
@@ -175,7 +194,8 @@ impl Pads {
                 self.home_by = format!("HID {:04x}:{:04x}", h.vid, h.pid);
             }
             h.home = home;
-            let b = s.with_stick();
+            h.stick = s.stick(h.stick);
+            let b = s.buttons | h.stick;
             if s.buttons != 0 && s.buttons != self.last_buttons {
                 self.style = h.style;
             }
@@ -538,6 +558,7 @@ fn open_hid(list: &Arc<Mutex<Vec<Hid>>>, path: String) {
         state: state.clone(),
         alive: alive.clone(),
         home: true,
+        stick: 0,
     });
     let (vid, pid, len) = (attr.VendorID, attr.ProductID, caps.InputReportByteLength as usize);
     let ranges = Ranges { x: value_range(pre, 0x30), y: value_range(pre, 0x31), hat: value_range(pre, 0x39) };
@@ -646,6 +667,20 @@ mod tests {
         assert_eq!(from_xinput(&x).buttons, SOUTH | START | UP);
         // Stick folds into the d-pad.
         assert_eq!(State { buttons: 0, lx: 0.0, ly: -0.9 }.with_stick(), DOWN);
+    }
+
+    /// A diagonal push is one direction, the axis pushed further; a held direction
+    /// lets go only under 0.35, and turning the stick hands over to the next.
+    #[test]
+    fn the_stick_is_one_direction_with_hysteresis() {
+        let st = |lx: f32, ly: f32| State { buttons: 0, lx, ly };
+        assert_eq!(st(0.6, -0.8).stick(0), DOWN, "down and a little right is down");
+        assert_eq!(st(0.8, -0.6).stick(0), RIGHT);
+        assert_eq!(st(0.0, 0.45).stick(0), 0, "not yet half way");
+        assert_eq!(st(0.0, 0.45).stick(UP), UP, "held: still up");
+        assert_eq!(st(0.0, 0.3).stick(UP), 0, "let go");
+        assert_eq!(st(0.7, 0.4).stick(UP), UP, "turning: up holds while it's past 0.35");
+        assert_eq!(st(0.8, 0.2).stick(UP), RIGHT, "then right takes over");
     }
 
     /// Generic pads' values read by their descriptor's ranges.

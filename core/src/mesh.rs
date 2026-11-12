@@ -161,7 +161,7 @@ impl Conn {
 
     /// The biggest frame this connection carries: PUBLIC_FRAME_MAX for a public
     /// stranger's (the ones `scrub_as` was set for), else MAX_FRAME.
-    fn frame_max(&self) -> usize {
+    pub(crate) fn frame_max(&self) -> usize {
         if self.scrub.get().is_some() { PUBLIC_FRAME_MAX } else { MAX_FRAME }
     }
 

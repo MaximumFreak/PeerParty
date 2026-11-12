@@ -215,7 +215,9 @@ fn command(msg: &Json) {
             }
         }
         "join" => {
-            if let Some(p) = peer_arg(msg, "peer") {
+            if let Some(p) = peer_arg(msg, "peer")
+                && !crate::steamgs::join_server(p)
+            {
                 crate::invite::request_join(p);
             }
         }
@@ -384,9 +386,18 @@ fn state() -> String {
                 _ => "lan",
             };
             let fp = lan.and_then(|l| l.peer_key(p)).unwrap_or_default();
+            // A dedicated server goes by the name it advertises, if it has one.
+            let server = crate::net::is_server_peer(p);
+            let this_pc = on_this_pc(p);
+            let name = presence
+                .iter()
+                .find(|(k, v)| server && k == crate::net::SERVER_NAME_KEY && !v.trim().is_empty())
+                .map_or(name, |(_, v)| v.clone());
             Json::obj(vec![
                 ("id", Json::str(p.hex())),
                 ("name", Json::str(name)),
+                ("server", Json::Bool(server)),
+                ("this_pc", Json::Bool(this_pc)),
                 ("with_me", Json::Bool(with_me)),
                 ("status", Json::str(status)),
                 ("ip", Json::str(ip)),
@@ -456,4 +467,22 @@ fn state() -> String {
         .collect();
     fields.push(("pending", Json::Arr(pending)));
     Json::obj(fields).to_string()
+}
+
+/// Whether a peer is another copy on this PC (its id is one of this PC's identity
+/// slots'): the player's own second copy or server, not someone else. Looked up once
+/// per peer: a copy's key file is written before it meets anyone.
+fn on_this_pc(peer: peerparty_core::PeerId) -> bool {
+    static SEEN: std::sync::Mutex<Vec<(peerparty_core::PeerId, bool)>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap();
+    if let Some((_, here)) = seen.iter().find(|(p, _)| *p == peer) {
+        return *here;
+    }
+    let dir = peerparty_core::Identity::default_dir();
+    let here = peerparty_core::Identity::ids_on_this_pc(&dir).contains(&peer);
+    if seen.len() > 256 {
+        seen.clear();
+    }
+    seen.push((peer, here));
+    here
 }

@@ -8,7 +8,9 @@
 //! identity, so each copy keeps the same ids across runs and other copies can work out
 //! anyone's entity id (Party endpoints carry it). Calls PeerParty has no data for (title
 //! data, CloudScript, catalogs, groups) succeed with nothing in them, the way a title
-//! with nothing configured answers.
+//! with nothing configured answers. A CloudScript function that deletes the player's
+//! account (its name says delete and account) deletes nothing and answers
+//! `NOT_NEEDED` as its result: there is no PlayFab account to delete.
 //!
 //! The player's own statistics and user data are kept on disk
 //! (`%LOCALAPPDATA%\peerparty\playfab\<game>\<entity id>.json`); leaderboards list the
@@ -117,7 +119,13 @@ fn with_saved<T>(f: impl FnOnce(&mut Saved) -> T) -> T {
     let s = &mut st.saved;
     if !s.loaded {
         s.loaded = true;
-        if let Some(j) = saved_path().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|t| Json::parse(&t)) {
+        let path = saved_path();
+        let text = path.as_ref().and_then(|p| std::fs::read(p).ok());
+        let parsed = text.as_ref().and_then(|t| Json::parse(std::str::from_utf8(t).ok()?));
+        if let (Some(p), Some(_), None) = (&path, &text, &parsed) {
+            crate::saves::set_aside_unreadable(p, "playfab");
+        }
+        if let Some(j) = parsed {
             if let Json::Obj(pairs) = j.get("Statistics") {
                 s.stats = pairs.iter().filter_map(|(k, v)| Some((k.clone(), v.as_f64()?))).collect();
             }
@@ -141,7 +149,7 @@ fn save(s: &Saved) {
     if let Some(d) = p.parent() {
         let _ = std::fs::create_dir_all(d);
     }
-    if std::fs::write(&p, j.to_string()).is_err() {
+    if crate::saves::write_whole(&p, j.to_string().as_bytes()).is_err() {
         log!("playfab: couldn't save the player's data to {}", p.display());
     }
 }
@@ -285,7 +293,7 @@ pub fn handle(req: &Request) -> (u16, String) {
         "/Client/ExecuteCloudScript" | "/CloudScript/ExecuteEntityCloudScript" => ok(Json::obj(vec![
             ("FunctionName", body.get("FunctionName").clone()),
             ("Revision", Json::Num(0.0)),
-            ("FunctionResult", Json::Null),
+            ("FunctionResult", script_result(body.get("FunctionName").as_str().unwrap_or_default())),
             ("Logs", Json::Arr(vec![])),
             ("ExecutionTimeSeconds", Json::Num(0.0)),
             ("ProcessorTimeSeconds", Json::Num(0.0)),
@@ -295,7 +303,7 @@ pub fn handle(req: &Request) -> (u16, String) {
         ])),
         "/CloudScript/ExecuteFunction" => ok(Json::obj(vec![
             ("FunctionName", body.get("FunctionName").clone()),
-            ("FunctionResult", Json::Null),
+            ("FunctionResult", script_result(body.get("FunctionName").as_str().unwrap_or_default())),
             ("ExecutionTimeMilliseconds", Json::Num(0.0)),
         ])),
         "/Client/GetLeaderboard" | "/Client/GetFriendLeaderboard" => leaderboard(&body, true),
@@ -788,6 +796,26 @@ fn lan_lobbies(lan: &peerparty_core::Lan, ns: &str) -> Vec<Lobby> {
     Vec::new()
 }
 
+/// The address a player's PlayFab lobby advertises for game port `port`: a search
+/// value of theirs that reads as an `ip:port` with that port (a dedicated server's
+/// public address, which a game looks the server up by). Blocks for a LAN search.
+pub(crate) fn lobby_address(owner: PeerId, port: u16) -> Option<String> {
+    let lan = net::lan()?;
+    let lobbies = lan_lobbies(lan, crate::pfmp::NS);
+    let found = address_in(lobbies.iter().filter(|l| l.owner == owner), port);
+    log!("playfab lobby address of {owner} for port {port}: {}", found.as_deref().unwrap_or("none"));
+    found
+}
+
+fn address_in<'a>(lobbies: impl Iterator<Item = &'a Lobby>, port: u16) -> Option<String> {
+    lobbies
+        .flat_map(|l| l.attrs.iter())
+        .filter(|a| a.key.starts_with("s:"))
+        .map(|a| a.value.text())
+        .find(|v| v.trim().parse::<std::net::SocketAddrV4>().is_ok_and(|a| a.port() == port))
+        .map(|v| v.trim().to_string())
+}
+
 /// The events requests wait for in the PlayFab queue (here and pfmp.rs's REST joins).
 pub(crate) fn waited_for(e: &Event) -> bool {
     matches!(e, Event::SearchDone { .. } | Event::JoinDone { .. })
@@ -1163,9 +1191,47 @@ pub(crate) fn iso(t: SystemTime) -> String {
     )
 }
 
+/// What a game is told when it asks a CloudScript function to delete the player's
+/// account: in English, as games show a script's text as it comes.
+pub const NOT_NEEDED: &str = "Not needed while using PeerParty";
+
+/// A CloudScript function's result: none (a title with no scripts), except for one
+/// that deletes the player's account, which deletes nothing and says it isn't needed.
+fn script_result(name: &str) -> Json {
+    if deletes_account(name) {
+        log!("playfab CloudScript {name}: nothing deleted, answered \"{NOT_NEEDED}\"");
+        Json::str(NOT_NEEDED)
+    } else {
+        Json::Null
+    }
+}
+
+fn deletes_account(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.contains("delete") && n.contains("account")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lobby_advertises_the_address_for_its_game_port() {
+        let mut l = Lobby::new(crate::pfmp::NS);
+        let s = |k: &str, v: &str| Attr { key: format!("s:{k}"), value: Value::Str(v.into()), public: true };
+        l.attrs = vec![s("string_key5", "My World"), s("string_key9", "1.2.3.4:99"), s("string_key10", "203.0.113.5:2456")];
+        assert_eq!(address_in([&l].into_iter(), 2456).as_deref(), Some("203.0.113.5:2456"));
+        assert_eq!(address_in([&l].into_iter(), 2457), None);
+    }
+
+    #[test]
+    fn an_account_deleting_script_deletes_nothing_and_says_so() {
+        // The result is a plain string, which a game shows as the reason.
+        assert!(matches!(script_result("deleteMyAccount"), Json::Str(s) if s == NOT_NEEDED));
+        assert!(deletes_account("DeleteAccount") && deletes_account("delete_user_account"));
+        assert!(!deletes_account("deletePlayerSave") && !deletes_account("reportUser"));
+        assert!(matches!(script_result("reportUser"), Json::Null));
+    }
 
     #[test]
     fn store_calls_fail_as_unavailable() {

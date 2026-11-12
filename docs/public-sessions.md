@@ -19,9 +19,11 @@ Turn it on with any of:
   setting off for one run);
 - `PEERPARTY_PUBLIC=1`, also for one run.
 
-`PEERPARTY_PUBLIC_NAME` sets the name public players see. Without it, the name chosen in
-Settings is used, else `Player-` and the start of your key's fingerprint. The Windows user
-name is never used.
+Players in public sessions see a name of its own, in their game and overlay: Play together >
+Anyone online > **Name strangers see** (`PEERPARTY_PUBLIC_NAME`), so your own name can stay
+private. Without it, **Your name** is used, else `Player-` and the start of your key's
+fingerprint. The Windows user name is never used. People at home and friends in your room
+always see **Your name**.
 
 Blocking: in the overlay, open a public player's Details (Friends page) and choose
 **Block this player**. From a prompt: `peerparty --blocked` lists blocked fingerprints,

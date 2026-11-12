@@ -45,6 +45,7 @@ mod typing;
 mod ugs;
 #[cfg(test)]
 mod untrusted_tests;
+mod vivox;
 mod voice;
 mod watch;
 mod xboxlive;

@@ -191,7 +191,8 @@ fn consider(m: Mod) {
             .count();
         // The call-logging hooks are diagnostics only. Steam's own client DLL is never
         // patched: PeerParty's Steam layer works through steam_api.
-        let watch = kind != sdk::Sdk::SteamClient && !crate::net::skip("calls");
+        // Nor is Vivox's: its calls are taken over by name only (vivox.rs).
+        let watch = kind != sdk::Sdk::SteamClient && kind != sdk::Sdk::Vivox && !crate::net::skip("calls");
         let mut typed = if watch {
             crate::steam::attach(kind, &table.code)
         } else {
@@ -225,6 +226,11 @@ fn consider(m: Mod) {
             let mine = crate::galaxy::attach(m.base as usize, &m.name, &table.code);
             typed.hooked += mine.len();
             typed.skip.extend(mine);
+        }
+        // Whether PeerParty answers is decided at the game's first Vivox call, not here
+        // under the loader lock (it asks whether the game's Unity sign-in is ours).
+        if kind == sdk::Sdk::Vivox && crate::net::enabled() && !crate::net::skip("vivox") {
+            typed.skip.extend(crate::vivox::attach(m.base as usize, &m.name, &table.code));
         }
         if kind == sdk::Sdk::SteamApi && crate::net::enabled() && !crate::net::skip("steam") && !crate::modes::official_now("steam") {
             crate::steamlan::attach(m.base as usize, &m.name, &table.code);
@@ -360,14 +366,17 @@ type DllMain = unsafe extern "system" fn(usize, u32, usize) -> i32;
 /// (where it unpacks) runs with GetProcAddress unhooked, and the module is hooked as soon as it returns, before
 /// `LoadLibrary` returns to the game. The module's own code isn't touched.
 fn wrap_entry(base: usize) -> bool {
-    let Some(entry) = ldr_entry(base) else { return false };
-    let entry = unsafe { &mut *entry };
-    let original = entry.entry_point as usize;
-    if original == 0 || original == packed_entry as *const () as usize {
-        return false;
-    }
+    let original = under_loader_lock(|| {
+        let entry = unsafe { &mut *ldr_entry(base)? };
+        let original = entry.entry_point as usize;
+        if original == 0 || original == packed_entry as *const () as usize {
+            return None;
+        }
+        entry.entry_point = packed_entry as *mut core::ffi::c_void;
+        Some(original)
+    });
+    let Some(original) = original else { return false };
     WRAPPED.lock().unwrap().insert(base, original);
-    entry.entry_point = packed_entry as *mut core::ffi::c_void;
     true
 }
 
@@ -536,26 +545,76 @@ pub(crate) fn modules() -> Vec<(usize, String)> {
 }
 
 fn loaded_modules() -> Vec<Mod> {
-    ldr_entries()
-        .into_iter()
-        .map(|e| {
-            let e = unsafe { &*e };
-            Mod {
-                base: e.dll_base,
-                full: utf16(&e.full_dll_name),
-                name: utf16(&e.base_dll_name),
-            }
-        })
-        .collect()
+    under_loader_lock(|| {
+        ldr_entries()
+            .into_iter()
+            .map(|e| {
+                let e = unsafe { &*e };
+                Mod {
+                    base: e.dll_base,
+                    full: utf16(&e.full_dll_name),
+                    name: utf16(&e.base_dll_name),
+                }
+            })
+            .collect()
+    })
 }
 
-/// The loader's record of the module at `base`.
+/// Runs `f` holding the loader lock, so no other thread loads or unloads a module (and
+/// frees its record) while `f` walks the loader's list. The lock is only tried for, for
+/// up to about 200 ms: a thread holding it (a module's DllMain, or `on_dll`) may be
+/// waiting for a lock the caller holds, and waiting on it outright could deadlock the
+/// game. Not got by then, `f` runs without it, as it always did before. On a thread that
+/// already holds it (`on_dll` runs under it) it's taken again at once.
+fn under_loader_lock<R>(f: impl FnOnce() -> R) -> R {
+    type Lock = unsafe extern "system" fn(u32, *mut u32, *mut usize) -> i32;
+    type Unlock = unsafe extern "system" fn(u32, usize) -> i32;
+    static FNS: LazyLock<Option<(Lock, Unlock)>> = LazyLock::new(|| {
+        let ntdll = unsafe { GetModuleHandleW(wide("ntdll.dll").as_ptr()) };
+        if ntdll.is_null() {
+            return None;
+        }
+        let lock = unsafe { GetProcAddress(ntdll, c"LdrLockLoaderLock".as_ptr().cast()) }?;
+        let unlock = unsafe { GetProcAddress(ntdll, c"LdrUnlockLoaderLock".as_ptr().cast()) }?;
+        Some(unsafe { (mem::transmute::<_, Lock>(lock), mem::transmute::<_, Unlock>(unlock)) })
+    });
+    const TRY_ONLY: u32 = 2;
+    const ACQUIRED: u32 = 1;
+    let Some((lock, unlock)) = *FNS else { return f() };
+    let mut cookie = 0usize;
+    let mut held = false;
+    for attempt in 0..200 {
+        let mut disposition = 0u32;
+        let status = unsafe { lock(TRY_ONLY, &mut disposition, &mut cookie) };
+        if status < 0 {
+            break;
+        }
+        if disposition == ACQUIRED {
+            held = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(if attempt < 20 { 0 } else { 1 }));
+    }
+    let out = f();
+    if held {
+        unsafe { unlock(0, cookie) };
+    }
+    out
+}
+
+fn wide(s: &str) -> Vec<u16> {
+    OsStr::new(s).encode_wide().chain(Some(0)).collect()
+}
+
+/// The loader's record of the module at `base`. Call under `under_loader_lock`.
 fn ldr_entry(base: usize) -> Option<*mut LdrEntry> {
     ldr_entries()
         .into_iter()
         .find(|e| unsafe { (**e).dll_base as usize } == base)
 }
 
+/// The loader's list of modules. Call under `under_loader_lock`: a module unloaded
+/// mid-walk frees its record.
 fn ldr_entries() -> Vec<*mut LdrEntry> {
     let mut peb: *const u8;
     #[cfg(target_arch = "x86_64")]

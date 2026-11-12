@@ -15,10 +15,12 @@
 //!   receivers that gave the sender `RECEIVE_TEXT` (and haven't muted its text).
 //! - `PartyChatControlSendText` to a local target fails synchronously; text reaches a
 //!   target only through a network both are connected to.
-//! - Audio devices (`PartyChatControlSetAudioInput/Output`): any selection other than
-//!   none means "the default device" (voice.rs's waveIn/waveOut); the input state is
-//!   "not found" when Windows has no microphone or `PEERPARTY_VOICE=0`. The microphone
-//!   only opens while a connected chat control has an input selected and isn't muted.
+//! - Audio devices (`PartyChatControlSetAudioInput/Output`): the system default, the
+//!   platform user's default (Windows' default communications device) or a device by
+//!   its endpoint id (manual) moves voice.rs's microphone or speakers there, and the
+//!   selection's device id is that endpoint's; the state is "not found" when Windows
+//!   has no such device or `PEERPARTY_VOICE=0`. The microphone only opens while a
+//!   connected chat control has an input selected and isn't muted.
 //! - Audio manipulation streams: the capture sink (game-made voice, sent like the
 //!   microphone), the render sink (game-mixed audio to the speakers) and remote voice
 //!   source streams (a remote chat control's voice handed to the game as 24 kHz mono
@@ -90,6 +92,7 @@ const ALL_PERMISSIONS: u32 = 0x1F;
 
 // PARTY_AUDIO_DEVICE_SELECTION_TYPE
 const SELECTION_NONE: u32 = 0;
+const SELECTION_SYSTEM_DEFAULT: u32 = 1;
 const SELECTION_MANUAL: u32 = 3;
 
 // PARTY_AUDIO_INPUT_STATE / PARTY_AUDIO_OUTPUT_STATE (same numbers for these three)
@@ -1229,25 +1232,30 @@ unsafe fn set_device(chat: usize, ty: u32, context: *const c_char, async_id: usi
     }
     let mut s = STATE.lock().unwrap();
     let c = try_party!(local_mut(&mut s, chat));
-    // Manual and per-user selections get Windows' default device on the LAN. Counting
-    // devices opens nothing; the microphone only opens once audio flows.
-    let present = || voice::devices_allowed() && if input { voice::input_present() } else { voice::output_present() };
-    let state = if ty == SELECTION_NONE {
-        DEVICE_NONE
-    } else if present() {
-        DEVICE_INITIALIZED
+    // The device the selection names, if Windows has it. Looking opens nothing; the
+    // microphone only opens once audio flows.
+    let choice = match ty {
+        SELECTION_SYSTEM_DEFAULT => voice::Choice::System,
+        SELECTION_MANUAL => voice::Choice::Device(context.clone()),
+        _ => voice::Choice::Communications,
+    };
+    let found = if ty == SELECTION_NONE || !voice::devices_allowed() {
+        None
     } else {
-        DEVICE_NOT_FOUND
+        voice::snapshot().side(!input).resolve(&choice).map(|e| e.id.clone())
     };
-    let device_id = match (state == DEVICE_INITIALIZED, input) {
-        (false, _) => "",
-        (true, true) => "peerparty:default-microphone",
-        (true, false) => "peerparty:default-speakers",
+    let state = match (ty, &found) {
+        (SELECTION_NONE, _) => DEVICE_NONE,
+        (_, Some(_)) => DEVICE_INITIALIZED,
+        (_, None) => DEVICE_NOT_FOUND,
     };
+    if found.is_some() {
+        voice::choose_device(!input, choice);
+    }
     let new = Selection {
         ty,
         context: cstring(&context),
-        device_id: cstring(device_id),
+        device_id: cstring(found.as_deref().unwrap_or("")),
         state,
     };
     let old = std::mem::replace(if input { &mut c.input } else { &mut c.output }, new);

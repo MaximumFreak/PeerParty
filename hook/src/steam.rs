@@ -47,6 +47,14 @@ type ApiResultFn =
     unsafe extern "C" fn(i32, u64, *mut core::ffi::c_void, i32, i32, *mut bool) -> bool;
 
 static INIT: OnceLock<GenericDetour<InitFn>> = OnceLock::new();
+/// The game started Steam's client API (any SteamAPI_Init form), set before it runs:
+/// a dedicated server starts only a game server (net.rs `dedicated`).
+static CLIENT_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the game has started Steam's client API.
+pub fn client_started() -> bool {
+    CLIENT_STARTED.load(std::sync::atomic::Ordering::Relaxed)
+}
 static INIT_SAFE: OnceLock<GenericDetour<InitFn>> = OnceLock::new();
 static INIT_FLAT: OnceLock<GenericDetour<InitFlatFn>> = OnceLock::new();
 static INTERNAL_INIT: OnceLock<GenericDetour<InternalInitFn>> = OnceLock::new();
@@ -147,10 +155,23 @@ pub fn complete(call: u64, id: i32, data: Vec<u8>) {
 fn push(call: u64, id: i32, data: Vec<u8>, server: bool) {
     let mut q = INJECT.lock().unwrap();
     // A game that never dispatches (or a dedicated server that never runs the client's
-    // dispatch) mustn't make this grow forever: the oldest of the other kind goes first.
+    // dispatch) mustn't make this grow forever: the oldest of the other kind goes first,
+    // a plain callback before a call result (a game waits on a call result's answer,
+    // and a later callback of the same kind usually says what a dropped one did).
     if q.len() >= 256 {
-        let at = q.iter().position(|p| p.server != server).unwrap_or(0);
-        q.remove(at);
+        let plain = |p: &Pending| p.call == 0;
+        let at = q
+            .iter()
+            .position(|p| p.server != server && plain(p))
+            .or_else(|| q.iter().position(plain))
+            .or_else(|| q.iter().position(|p| p.server != server))
+            .unwrap_or(0);
+        if let Some(gone) = q.remove(at) {
+            let kind = if gone.call == 0 { "callback" } else { "call result" };
+            log::throttled("steam-lan queue full", 4, |n| {
+                log!("steam-lan: 256 callbacks wait undelivered: the oldest {kind} {} was dropped (n={n})", gone.id)
+            });
+        }
     }
     q.push_back(Pending {
         call,
@@ -578,6 +599,7 @@ unsafe fn run_result(obj: usize, data: &mut [u8], call: u64) {
 
 unsafe extern "C" fn detour_init() -> bool {
     let Some(hook) = INIT.get() else { return false };
+    CLIENT_STARTED.store(true, std::sync::atomic::Ordering::Relaxed);
     let ok = unsafe { hook.call() };
     log::throttled("SteamAPI_Init", 4, |n| {
         log!("call SteamAPI_Init n={n} -> {ok}")
@@ -589,6 +611,7 @@ unsafe extern "C" fn detour_init_safe() -> bool {
     let Some(hook) = INIT_SAFE.get() else {
         return false;
     };
+    CLIENT_STARTED.store(true, std::sync::atomic::Ordering::Relaxed);
     let ok = unsafe { hook.call() };
     log::throttled("SteamAPI_InitSafe", 4, |n| {
         log!("call SteamAPI_InitSafe n={n} -> {ok}")
@@ -600,6 +623,7 @@ unsafe extern "C" fn detour_init_flat(err: *mut i8) -> i32 {
     let Some(hook) = INIT_FLAT.get() else {
         return 1;
     };
+    CLIENT_STARTED.store(true, std::sync::atomic::Ordering::Relaxed);
     let rc = unsafe { hook.call(err) };
     let msg = if err.is_null() {
         None
@@ -619,6 +643,7 @@ unsafe extern "C" fn detour_internal_init(versions: *const i8, err: *mut i8) -> 
     let Some(hook) = INTERNAL_INIT.get() else {
         return 1;
     };
+    CLIENT_STARTED.store(true, std::sync::atomic::Ordering::Relaxed);
     let interfaces = read::steam_version_blob(versions as usize);
     let rc = unsafe { hook.call(versions, err) };
     let msg = if err.is_null() {
@@ -744,9 +769,20 @@ unsafe extern "C" fn detour_manual_result(
     failed: *mut bool,
 ) -> bool {
     if ours(call) {
-        let Some((id, data)) = COMPLETED.lock().unwrap().remove(&call) else {
+        // Kept when asked for the wrong callback, as Steam does: the game can still ask
+        // again with the right one.
+        let mut completed = COMPLETED.lock().unwrap();
+        let Some((id, _)) = completed.get(&call) else {
             return false;
         };
+        if *id != expected {
+            if !failed.is_null() {
+                unsafe { *failed = true };
+            }
+            return false;
+        }
+        let Some((id, data)) = completed.remove(&call) else { return false };
+        drop(completed);
         let n = data.len().min(cub.max(0) as usize);
         unsafe {
             if !buf.is_null() {

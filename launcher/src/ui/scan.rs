@@ -109,7 +109,7 @@ pub fn acf_value(text: &str, key: &str) -> Option<String> {
     })
 }
 
-fn steam_libraries(steam: &Path) -> Vec<PathBuf> {
+pub fn steam_libraries(steam: &Path) -> Vec<PathBuf> {
     let mut libs = vec![steam.join("steamapps")];
     if let Ok(vdf) = fs::read_to_string(steam.join("steamapps").join("libraryfolders.vdf")) {
         for line in vdf.lines() {

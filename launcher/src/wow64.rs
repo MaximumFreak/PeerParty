@@ -1,11 +1,19 @@
 //! Injecting a 32-bit (WOW64) game from this x64 launcher.
 //!
-//! 1. Patch the entry point with `jmp $` (EB FE) and resume the suspended process.
-//! 2. Wait until the main thread spins on it. By then the loader has mapped every static
-//!    import, the 32-bit kernel32 included, and the game hasn't run any code of its own.
+//! 1. Point the suspended main thread's start address (eax of its first 32-bit context,
+//!    which `RtlUserThreadStart` calls) at a `jmp $` (EB FE) on a page of our own, and
+//!    resume the process.
+//! 2. Wait until the main thread spins there. By then the loader has mapped every static
+//!    import, the 32-bit kernel32 included, and run their start-ups, and the game hasn't
+//!    run any code of its own.
 //! 3. Find `LoadLibraryW` in the game's 32-bit kernel32 (its address differs from ours)
 //!    and run it on a remote thread with the hook DLL's path.
-//! 4. Put the entry bytes back. The caller resumes the main thread.
+//! 4. Turn our page into a `jmp` to the entry point. The caller resumes the main thread.
+//!
+//! The game's own image is never written: a DLL's start-up may read the exe's entry
+//! point and act on what it finds there, and with `jmp $` written there a game quit at
+//! once (code 53). Only if the start address isn't the entry point (not seen) is the
+//! entry point patched instead.
 
 use std::ffi::c_void;
 use std::path::Path;
@@ -14,9 +22,11 @@ use std::{mem, ptr, thread, time::Duration, time::Instant};
 use windows_sys::Win32::Foundation::{HANDLE, HMODULE, WAIT_OBJECT_0};
 use windows_sys::Win32::System::Diagnostics::Debug::{
     FlushInstructionCache, ReadProcessMemory, WOW64_CONTEXT, WOW64_CONTEXT_CONTROL,
-    WOW64_CONTEXT_INTEGER, Wow64GetThreadContext, WriteProcessMemory,
+    WOW64_CONTEXT_INTEGER, Wow64GetThreadContext, Wow64SetThreadContext, WriteProcessMemory,
 };
-use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtectEx};
+use windows_sys::Win32::System::Memory::{
+    MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, VirtualAllocEx, VirtualProtectEx,
+};
 use windows_sys::Win32::System::ProcessStatus::{
     K32EnumProcessModulesEx, K32GetModuleBaseNameW, LIST_MODULES_32BIT,
 };
@@ -44,26 +54,11 @@ pub unsafe fn inject(pi: &PROCESS_INFORMATION, dll: &Path) -> Result<(), String>
         // AddressOfEntryPoint: signature (4) + file header (20) + 16.
         let entry = base + read_u32(h, base + lfanew + 0x28)?;
 
-        let saved = read_bytes::<2>(h, entry)?;
-        let mut old = 0u32;
-        if VirtualProtectEx(
-            h,
-            entry as *const c_void,
-            2,
-            PAGE_EXECUTE_READWRITE,
-            &mut old,
-        ) == 0
-        {
-            return Err(os_error("VirtualProtectEx(entry point)"));
+        if ctx.Eax == entry {
+            park_on_stub(pi, &mut ctx, entry)?;
+        } else {
+            park_on_entry(pi, entry)?;
         }
-        write_code(h, entry, &[0xEB, 0xFE])?;
-
-        let parked = park(pi, entry);
-        // Whatever happened, the game must not keep spinning on our patch.
-        let restored = write_code(h, entry, &saved);
-        VirtualProtectEx(h, entry as *const c_void, 2, old, &mut old);
-        parked?;
-        restored?;
 
         let load_library = find_load_library(h)?;
         let path = write_remote(pi, &wide_bytes(dll.as_os_str()))?;
@@ -95,8 +90,56 @@ pub unsafe fn inject(pi: &PROCESS_INFORMATION, dll: &Path) -> Result<(), String>
     }
 }
 
-/// Resumes the main thread and suspends it again once it spins on the entry point.
-unsafe fn park(pi: &PROCESS_INFORMATION, entry: u32) -> Result<(), String> {
+/// Starts the main thread on a `jmp $` of our own and parks it there; then makes that a
+/// `jmp entry`, so it carries on exactly as it would have.
+unsafe fn park_on_stub(pi: &PROCESS_INFORMATION, ctx: &mut WOW64_CONTEXT, entry: u32) -> Result<(), String> {
+    unsafe {
+        let h = pi.hProcess;
+        let stub = VirtualAllocEx(h, ptr::null(), 5, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if stub.is_null() {
+            return Err(os_error("VirtualAllocEx(start stub)"));
+        }
+        // A WOW64 process's memory is all below 4 GB.
+        let stub = stub as usize as u32;
+        write_code(h, stub, &[0xEB, 0xFE])?;
+        ctx.Eax = stub;
+        if Wow64SetThreadContext(pi.hThread, ctx) == 0 {
+            return Err(os_error("Wow64SetThreadContext"));
+        }
+        let parked = park(pi, stub);
+        // Whatever happened, the game must not keep spinning on our stub.
+        let mut jump = [0xE9, 0, 0, 0, 0];
+        jump[1..].copy_from_slice(&entry.wrapping_sub(stub + 5).to_le_bytes());
+        let released = write_code(h, stub, &jump);
+        let mut old = 0u32;
+        VirtualProtectEx(h, stub as *const c_void, 5, PAGE_EXECUTE_READ, &mut old);
+        parked?;
+        released
+    }
+}
+
+/// Patches the entry point with `jmp $`, parks the main thread there, and puts the
+/// entry bytes back.
+unsafe fn park_on_entry(pi: &PROCESS_INFORMATION, entry: u32) -> Result<(), String> {
+    unsafe {
+        let h = pi.hProcess;
+        let saved = read_bytes::<2>(h, entry)?;
+        let mut old = 0u32;
+        if VirtualProtectEx(h, entry as *const c_void, 2, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+            return Err(os_error("VirtualProtectEx(entry point)"));
+        }
+        write_code(h, entry, &[0xEB, 0xFE])?;
+        let parked = park(pi, entry);
+        // Whatever happened, the game must not keep spinning on our patch.
+        let restored = write_code(h, entry, &saved);
+        VirtualProtectEx(h, entry as *const c_void, 2, old, &mut old);
+        parked?;
+        restored
+    }
+}
+
+/// Resumes the main thread and suspends it again once it spins on the `jmp $` at `at`.
+unsafe fn park(pi: &PROCESS_INFORMATION, at: u32) -> Result<(), String> {
     unsafe {
         let started = Instant::now();
         if ResumeThread(pi.hThread) == u32::MAX {
@@ -109,7 +152,7 @@ unsafe fn park(pi: &PROCESS_INFORMATION, entry: u32) -> Result<(), String> {
             }
             let mut ctx: WOW64_CONTEXT = mem::zeroed();
             ctx.ContextFlags = WOW64_CONTEXT_CONTROL;
-            if Wow64GetThreadContext(pi.hThread, &mut ctx) != 0 && ctx.Eip == entry {
+            if Wow64GetThreadContext(pi.hThread, &mut ctx) != 0 && ctx.Eip == at {
                 return Ok(());
             }
             if started.elapsed() > LOADER_TIMEOUT {
@@ -232,7 +275,7 @@ unsafe fn write_code(h: HANDLE, addr: u32, bytes: &[u8]) -> Result<(), String> {
             ptr::null_mut(),
         ) == 0
         {
-            return Err(os_error("WriteProcessMemory(entry point)"));
+            return Err(os_error("WriteProcessMemory(start code)"));
         }
         FlushInstructionCache(h, p, bytes.len());
         Ok(())

@@ -126,7 +126,7 @@ out: update the add-on to get it.
 ### From a prompt
 
 ```
-peerparty [--room CODE] [--log-dir DIR] [--appid N] [--multi-instance] [--copy-saves] [--set key=value]... <game.exe> [args...]
+peerparty [--room CODE] [--log-dir DIR] [--multi-instance] [--copy-saves] [--set key=value]... <game.exe> [args...]
 peerparty --new-room
 peerparty --net-test
 ```
@@ -187,12 +187,16 @@ both.
   itself through the launcher, is told to carry on when PeerParty started it.
 - When a game exits with a non-zero code, its log says so with the modules on the
   caller's stack (`exit: ...`), which explains an `abort()` that leaves no crash dump.
-- `--appid N`: rarely needed. A Steam game started outside the Steam client's own
-  launcher needs its app id. PeerParty finds it in order: `--appid`, the `SteamAppId` variable, the app
-  manifest of the Steam library the game is in, a `steam_appid.txt` next to the exe,
-  any Steam library's manifest whose install folder has the name of one of the exe's
-  folders. The Steam client still has to be running, and stays in charge of the game's
-  licence.
+- A Steam game started outside the Steam client needs its app id. PeerParty finds it in
+  order: the `SteamAppId` variable (Steam sets it), the app manifest of the Steam library
+  the game is in, a `steam_appid.txt` next to any program in the game's folder (the one
+  PeerParty starts first), any Steam library's manifest whose install folder has the name
+  of one of the exe's folders. Programs the game starts inherit the id, so next to a
+  starter or next to the program it starts both work. When none has it and the game uses
+  Steam (a `steam_api` in its folder; not Epic's or GOG's copies), the game's panel and
+  the log say so: put a `steam_appid.txt` holding the id (the number in the address of
+  its Steam store page) next to the game's program. The Steam client still has to be running, and stays in charge of the
+  game's licence.
 - `--multi-instance`: let a second copy start on the same PC (Unity's single-instance
   mutex).
 - `--copy-saves`: this copy starts from player 1's progress, for games that don't
@@ -225,6 +229,9 @@ both.
 - `PEERPARTY_UGS=0` / `=1`: never / always answer Unity Gaming Services' Authentication,
   Lobby and Relay locally (default: for games that ship Unity's Lobby, Relay or
   Multiplayer SDK).
+- `PEERPARTY_VIVOX=0` / `=1`: never / always answer Vivox voice chat on the LAN
+  (default: whenever Unity Gaming Services are answered locally, since Vivox would
+  refuse that sign-in).
 - `PEERPARTY_LOOPBACK=1`: every socket binds to 127.0.0.1 and no beacons are broadcast,
   so copies on one PC meet only through the peer board and Windows Firewall never asks.
   The tests set it (and `cargo` sets it for what it runs, .cargo/config.toml).
@@ -237,8 +244,21 @@ both.
   `calls` (the call logging in SDK modules). The launcher
   window's game panel has these as checkboxes (Advanced).
 - `PEERPARTY_GAME=name`: the game key players meet under, normally the exe's name
-  (less a dedicated server's "_server" ending); for a dedicated server whose exe
-  differs from its client's in some other way.
+  less a dedicated server's "server" word, with any build tail kept
+  (`mygame_server` meets `mygame`, `MyGameServer-Win64-Shipping` meets
+  `MyGame-Win64-Shipping`, `MyGameServer_x64` meets `MyGame_x64`); for a dedicated
+  server whose exe differs from its client's in some other way (Valve's `srcds`, or a
+  server named apart from its game).
+- `PEERPARTY_DEDICATED=1` (or `0`): this program is (or isn't) a dedicated server.
+  Normally PeerParty tells by itself: a program that starts a Steam game server and
+  never Steam's client API is one, whatever its exe is called (some games run their
+  own exe as a server, with a switch); otherwise its exe's name says so (a "server" or
+  "dedicated" word before any build tail like `-Win64-Shipping-Cmd` or `_x64`, or
+  `srcds` / `hlds`). A dedicated server takes
+  an identity slot of its own (`server-N` in `%LOCALAPPDATA%\peerparty\identity`,
+  named "<your name>'s server"), never a player's, so a server started before the game
+  doesn't leave the player with a numbered name and a second copy's ids. Other copies
+  list it in the overlay as a server.
 - `PEERPARTY_VOICE=0`: PeerParty never opens the microphone or speakers for voice
   chat (EOS voice rooms and PlayFab Party chat, their data and text, and game-fed
   audio still work; Party reports the input and output as "not found").
@@ -315,10 +335,13 @@ version that keeps Epic's append-only struct rule:
   room once the game uses lobby voice; participants, speaking, audio frames
   (`SendAudio` / `AudioBeforeRender`) and room data travel between the copies in it.
   Unless the game feeds and renders audio itself ("manual audio"), PeerParty records
-  the communications default microphone (only while a room is sending, and only frames
-  with voice in them) through Windows' echo cancellation and noise suppression (the
-  Voice Capture DSP; `PEERPARTY_VOICE_AEC=0` skips it) and plays the room's voices on
-  the communications default speakers, as raw 16 kHz PCM over the LAN.
+  the microphone (only while a room is sending, and only frames with voice in them)
+  through Windows' echo cancellation and noise suppression (the Voice Capture DSP;
+  `PEERPARTY_VOICE_AEC=0` skips it) and plays the room's voices on the speakers, as raw
+  16 kHz PCM over the LAN. The device lists are Windows' own microphones and speakers;
+  EOS's default is Sound settings' default device, and the game's device settings move
+  PeerParty's microphone and speakers (AudioDevicesChanged fires when Windows' list
+  changes).
 
 In a game started through PeerParty, the Steam layer (hook/src/steamobj.rs, steammm.rs, steamp2p.rs,
 steamlan.rs) works for native C++ games and for wrappers (Steamworks.NET, Facepunch):
@@ -367,8 +390,10 @@ In a game started through PeerParty, PlayFab (hook/src/party.rs, hook/src/pfmp.r
   voice room (voice.rs, `rtc:party:<guid>`). Chat permissions work as Party.h says:
   none by default, both sides must allow audio, text needs the receiver's
   `ReceiveText`, and incoming audio and text can be muted per chat control. Audio
-  input and output selections mean the communications default microphone and speakers (opened only
-  while a connected chat control has them selected and isn't muted); the capture,
+  input and output selections pick the microphone and speakers: the system default,
+  the platform user's default (Windows' default communications device) or a device by
+  its endpoint id (opened only while a connected chat control has them selected and
+  isn't muted; "not found" when Windows has no such device); the capture,
   render and remote voice streams of Party's audio manipulation work without them.
   Talking indicators, render volume, language and options are kept. Transcription and
   text-to-speech report unsupported, translation and text filtering do nothing. A game
@@ -387,7 +412,10 @@ In a game started through PeerParty, PlayFab (hook/src/party.rs, hook/src/pfmp.r
   uses its own curl, is untried.
 - Sign-in always succeeds, with PlayFab and entity ids from the player's LAN identity.
   Title data, profiles, CloudScript, catalogs, inventory, groups and telemetry succeed
-  with nothing in them, as for a title with nothing configured. Purchases, receipts,
+  with nothing in them, as for a title with nothing configured. A CloudScript function
+  that deletes the player's account (its name has "delete" and "account") deletes
+  nothing and returns "Not needed while using PeerParty", which the game shows as the
+  reason. Purchases, receipts,
   refunds, coupons, virtual currency, item grants, trades, consuming, moving or revoking
   items, opening containers and Economy v2's inventory changes fail as unavailable
   (`ServiceUnavailable`) in the Client and Server APIs, as they would offline, and so
@@ -471,19 +499,32 @@ Relay or Multiplayer SDK:
   their visibility, Wire events over a WebSocket); a relay allocation makes the host's
   copy the relay, and a join code finds it on the LAN. Unity Transport's own relay
   protocol (com.unity.transport, Runtime/Relay) is spoken, unencrypted, or inside DTLS
-  (pre-shared key, as Unity's relays) for a game that forces a secure relay.
+  (pre-shared key, as Unity's relays) for a game that forces a secure relay. Every
+  allocation has its own random key, made by the host's copy and given only to the
+  player it's for; the relay checks each Bind's HMAC with it.
+- Vivox voice chat (Unity's Vivox package) goes over the LAN: players in the same
+  channel hear each other, and in a proximity (positional) channel a player fades with
+  distance as the game set the channel up and sounds from their side (left or right of
+  where you face; in the middle if the game turns panning off). Mute, which channels
+  the microphone goes to, channel volume and blocking work. The game's device lists are
+  Windows' microphones and speakers (with Vivox's "Default System Device" and "Default
+  Communication Device"); voice starts on the system defaults, follows the game's
+  choice, and a device plugged in or out shows in the game's lists.
 - Trust stays inside the game: Unity's TLS reads the Windows ROOT store itself, so the
   ROOT store the game opens lists PeerParty's certificate too (crypt32's `CertOpenStore`
   hooked in the game only). Nothing is installed in Windows' certificate stores.
 - Cloud Save (player, public, protected and custom items, with write locks) and Remote
   Config are answered from disk (`%LOCALAPPDATA%\peerparty\ugs\<game>\`; put a
   `remote-config.json` there to give a game its settings), since the real ones would
-  refuse PeerParty's sign-in. QoS, Matchmaker and Vivox are left alone; WebSocket
+  refuse PeerParty's sign-in. QoS and Matchmaker are left alone; WebSocket
   relays (WebGL only) aren't carried. References are in docs/design.md, "Sources".
 - In a game's log look for `ugs: the game ships ...`, `tls: the game read the ROOT certificate
   store`, `ugs POST lobby.services.api.unity.com/v1/create`, `ugs relay: allocation`,
-  `join code`, `connected to host` (and `DTLS session with ... open` when the game
-  forces DTLS).
+  `join code`, `Bind HMAC checks out`, `connected to host` (and `DTLS session with
+  ... open` when the game forces DTLS); for voice, `vivox: PeerParty answers`, `vivox:
+  joined channel`, `vivox: ... is in channel` and, in a proximity channel, `vivox: ... is
+  N away ...: volume N%, pan P` (-1 left to +1 right); `voice: microphone '...'` and
+  `voice: speakers '...' open` name the devices in use.
 
 Offline (no internet at all, or the online services shut down):
 
@@ -495,8 +536,8 @@ Offline (no internet at all, or the online services shut down):
 - PlayFab: answered locally as above, also for games that only use PlayFab's web API
   once `playfabapi.com` stops resolving.
 - Photon: rooms are hosted by a copy on the LAN; Photon Cloud is never contacted.
-- Unity Gaming Services: sign-in, lobbies and relays are PeerParty's (QoS and other
-  Unity services are not).
+- Unity Gaming Services: sign-in, lobbies, relays and Vivox voice are PeerParty's (QoS
+  and other Unity services are not).
 - Finding each other: by UDP broadcast on the LAN, and copies on one PC also through a
   peer board (`%LOCALAPPDATA%\peerparty\peers`), which needs no network adapter at
   all.
@@ -642,7 +683,10 @@ PeerParty's SDK answers and, while the overlay shows, its controllers held still
   in your room or in public sessions: A / Cross joins them (asks them to invite you),
   X / Square invites them; Details for players in your lobby, and Block for public
   players; opened from the game's invite button, A invites; a different version of the
-  game is flagged), **Network** (this PC's Windows Firewall, which keeps out players at
+  game is flagged; a dedicated server is listed by the name it advertises, as a
+  server, with Join only, which hands a Steam game Steam's own "join this server"
+  request with its address: its LAN address when it is listed on Steam, else the
+  address its PlayFab lobby advertises, as for a crossplay server), **Network** (this PC's Windows Firewall, which keeps out players at
   home as much as online, with Fix; players on your network and those that can't be
   reached; the internet play switch; your room and public sessions; **Connection
   details**: the router, port forwarding, ping per player and the stand-in addresses)
@@ -707,3 +751,11 @@ Friends and invites (hook/src/steamlan.rs, eos/, invite.rs):
   public players are never invited this way: invite them one at a time from the
   overlay's Players page. A chime confirms it; an error chime means you aren't in a
   lobby yet.
+- A game that doesn't say where to join (no Steam rich presence `connect`, no lobby of an
+  SDK PeerParty hands over, as with Unity's Lobby) but has invites of its own shows
+  PeerParty how they look: invite someone once from the game's own friends list, and
+  that invite, with its lobby id as a placeholder, is kept for the game
+  (`%LOCALAPPDATA%\peerparty\invite-templates`). From then on the overlay's Invite and
+  Join send it with the lobby you're in. Until then the overlay asks you to invite once
+  from the game's friends list, instead of "Host or join a game first". The other details in it (player counts, password,
+  private) are the ones from that first invite.

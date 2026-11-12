@@ -339,7 +339,23 @@ has no game or SDK code in it.
   (with Wire events over a WebSocket), Relay, Cloud Save and Remote Config are answered by
   the same local HTTPS service. A relay allocation makes the host's copy the relay, which
   speaks Unity Transport's relay protocol, plain or inside DTLS with a pre-shared key.
-- QoS, Matchmaker and Vivox are left alone.
+- Each allocation has a random key that only the relay and its player know: a joiner's
+  copy asks the code's host for its allocation over the core's channel to that player.
+  A Bind must carry Unity Transport's HMAC with the key, and a copied Bind moves
+  nothing. DTLS asks for a cookie before keeping anything for an address, and drops
+  replayed records.
+- Vivox (`hook/src/vivox.rs`): a game whose Unity sign-in is PeerParty's hands Vivox a
+  token its servers refuse, so the Vivox core SDK's C API (vivoxsdk.dll, under Unity's
+  VivoxNative.dll) is answered instead, on the LAN voice rooms EOS and PlayFab Party use.
+  The real SDK is never initialized. Players appear with the account URIs Unity's
+  package builds, so the game's participant lists match its players; in positional
+  channels each speaker is turned down by distance with the channel's fade model and
+  placed left or right of where the listener faces (voice.rs mixes in stereo; the far
+  side goes down to a quarter, never silent). Device lists and choices are Windows'
+  own endpoints (voice/endpoints.rs), shared with EOS and PlayFab Party: one choice
+  each way per process, as the SDKs have, and a device that goes away falls back to
+  the communications default until it's back.
+- QoS and Matchmaker are left alone.
 
 ### Xbox Live (`hook/src/xboxlive/`, `xgameui.rs`)
 
@@ -549,8 +565,12 @@ its licence beside it (LEGAL.md).
   gitlab.com/luxon_project/Luxon, BSD-3-Clause), ported; the behaviour of Photon's own
   .NET client.
 - Unity Gaming Services: Unity's REST API references (services.docs.unity.com), Unity
-  Transport's package sources (its wire format), Centrifuge's protocol (MIT), RFC 6455,
-  6902, 6347, 5246, 4279 and 7627.
+  Transport's package sources (its wire format and the Bind HMAC), Centrifuge's protocol
+  (MIT), RFC 6455, 6902, 6347, 5246, 4279 and 7627.
+- Vivox: Unity's Vivox core reference (docs.unity.com/vivox-core: the request, response
+  and event structs), the order Unity's Vivox package (com.unity.services.vivox) expects
+  them in, and the field offsets VivoxNative.dll's own accessors use; OpenAL's distance
+  models for the fade.
 - Xbox (GDK): Microsoft's documentation for the calls; the interface ids the runtime is
   queried with and the slot numbers of its objects, with every hooked slot checked to
   point inside the loaded xgameruntime.dll before it is hooked.

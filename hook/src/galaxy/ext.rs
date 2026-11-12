@@ -127,10 +127,9 @@ fn root() -> Option<PathBuf> {
     Some(base.join("peerparty").join("galaxy").join(game).join(lan()?.me().hex()))
 }
 
-/// A name the game gave, kept to one path component.
+/// A name the game gave, kept to one ordinary file (`saves::file_name`).
 fn safe(name: &str) -> Option<String> {
-    let n = name.replace(['/', '\\', ':'], "_");
-    (!n.is_empty() && n != "." && n != "..").then_some(n)
+    crate::saves::file_name(name)
 }
 
 fn storage_path(name: &str) -> Option<PathBuf> {
@@ -163,7 +162,7 @@ fn write_file(path: Option<PathBuf>, data: &[u8]) -> bool {
     if let Some(d) = p.parent() {
         let _ = std::fs::create_dir_all(d);
     }
-    std::fs::write(p, data).is_ok()
+    crate::saves::write_whole(&p, data).is_ok()
 }
 
 // ---- state ----

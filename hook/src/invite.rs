@@ -14,6 +14,14 @@
 //!   button and/or View + Menu held together for a second, on any XInput controller. By
 //!   default the Guide button opens the overlay instead.
 //!
+//! A game that never publishes where to join (no Steam rich presence `connect`, no SDK
+//! lobby PeerParty can hand over) but sends invites of its own (its friends list, through
+//! Steam's InviteUserToGame) shows PeerParty what an invite looks like: when that invite
+//! names the lobby the game is in (a Unity lobby's id, say), it's kept for this game
+//! (`%LOCALAPPDATA%\peerparty\invite-templates`) with the lobby id as a placeholder, and
+//! from then on PeerParty's own invites and Join requests send it with the current
+//! lobby's id. Until the game has sent one, the overlay says so.
+//!
 //! Invites that arrive are accepted at once only when the player turned that on
 //! (`PEERPARTY_INVITES=auto`, or the setting; see settings.rs). Otherwise each front end
 //! tells the game one arrived, where its SDK has such an event, and the invite waits here
@@ -60,7 +68,73 @@ fn here() -> Option<Lobby> {
 /// Sends an invite with an explicit connect string (the game's own invite button).
 /// The lobby we're in rides along. Returns how many peers it reached.
 pub fn send(to: Option<PeerId>, connect: &str) -> usize {
+    learn(connect);
     deliver(to, connect, here())
+}
+
+// ---- invites learned from the game ----
+
+/// Where the lobby id goes in a learned invite.
+const LOBBY_MARK: &str = "{peerparty:lobby}";
+
+/// What the overlay says when the game is in a lobby but hasn't shown how its invites
+/// look yet.
+pub const LEARN_FIRST: &str = "Invite someone once from the game's friends list first. After that, Invite and Join work here";
+
+/// This game's learned invite (None: none yet), read once.
+static LEARNED: Mutex<Option<Option<String>>> = Mutex::new(None);
+
+fn learned_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from)?;
+    let name = crate::saves::file_name(&net::game_key())?;
+    Some(base.join("peerparty").join("invite-templates").join(format!("{name}.txt")))
+}
+
+fn learned() -> Option<String> {
+    let mut l = LEARNED.lock().unwrap();
+    l.get_or_insert_with(|| {
+        let t = std::fs::read_to_string(learned_path()?).ok()?;
+        let t = t.trim().to_string();
+        t.contains(LOBBY_MARK).then_some(t)
+    })
+    .clone()
+}
+
+/// The template of an invite that names `lobby_id`: the id swapped for the mark.
+fn template_of(connect: &str, lobby_id: &str) -> Option<String> {
+    let c = connect.trim();
+    if c.is_empty() || lobby_id.len() < 4 || c.starts_with(CODE_PREFIX) || c == JOIN_REQUEST || !c.contains(lobby_id) {
+        return None;
+    }
+    Some(c.replace(lobby_id, LOBBY_MARK))
+}
+
+/// A learned invite for the lobby `lobby_id`.
+fn fill(template: &str, lobby_id: &str) -> String {
+    template.replace(LOBBY_MARK, lobby_id)
+}
+
+/// Keeps the game's own invite as this game's template when it names the lobby we're in.
+fn learn(connect: &str) {
+    let Some(lobby) = current_lobby() else { return };
+    let Some(t) = template_of(connect, &lobby.id) else { return };
+    if learned().as_deref() == Some(t.as_str()) {
+        return;
+    }
+    let saved = learned_path().is_some_and(|p| {
+        p.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok()) && crate::saves::write_whole(&p, t.as_bytes()).is_ok()
+    });
+    *LEARNED.lock().unwrap() = Some(Some(t));
+    log!(
+        "invite: learned this game's invite from its own (the lobby id in it){}; peerparty's Invite and Join use it from now on",
+        if saved { ", kept for next time" } else { ", for this run only (couldn't save it)" }
+    );
+}
+
+/// The game's own invite, learned earlier, for the lobby we're in now.
+fn learned_connect() -> Option<String> {
+    let t = learned()?;
+    Some(fill(&t, &current_lobby()?.id))
 }
 
 /// Invites to a Steam lobby (the game's "invite to lobby"), with our `connect` presence
@@ -85,6 +159,9 @@ fn my_connect() -> String {
     }
     if let Some(g) = crate::galaxy::my_connect() {
         return g;
+    }
+    if let Some(c) = learned_connect() {
+        return c;
     }
     // A Photon room has no invite to give: the code to type goes instead.
     crate::photon::room_view().map(|r| format!("{CODE_PREFIX}{}", r.code)).unwrap_or_default()
@@ -151,10 +228,14 @@ pub fn join_requested(from: PeerId) {
     std::thread::spawn(move || {
         let connect = my_connect();
         let lobby = here();
+        if lobby.as_ref().or(current_lobby().as_ref()).is_some_and(|l| l.member(from).is_some()) {
+            log!("join: {from} is in our lobby already; nothing to send");
+            return;
+        }
         if connect.is_empty() && lobby.is_none() {
             let why = why_not_with(&net::fronts());
             log!("join: nothing to invite {from} to yet: {why}");
-            crate::ipc::note("A player asked to join you", &format!("There's nothing to invite them to. {why}"));
+            crate::ipc::note("A player asked to join you", &why);
             return;
         }
         deliver(Some(from), &connect, lobby);
@@ -191,15 +272,17 @@ pub fn why_not() -> Option<String> {
 /// PeerParty can't hand an invite to (Xbox's invites and PlayFab Party only, say) is
 /// told so, instead of being asked to host first.
 fn why_not_with(fronts: &[net::Front]) -> String {
-    why_not_for(fronts, &crate::modes::official_in_use(), crate::photon::local_room())
+    why_not_for(fronts, &crate::modes::official_in_use(), crate::photon::local_room(), current_lobby().is_some())
 }
 
 /// `why_not_with`, given the services left on their official servers this run: a game
 /// that hosts its rooms there (Photon's cloud, say) has nothing PeerParty can invite to,
 /// however many rooms it made, so it's told to use the game's own codes. A game hosting
 /// a Photon room on PeerParty's own servers (`photon_room`) is hosting: Photon has no
-/// invites, so it's told how the others join it instead of to host first.
-fn why_not_for(fronts: &[net::Front], official: &[&str], photon_room: Option<String>) -> String {
+/// invites, so it's told how the others join it instead of to host first. A game in a
+/// lobby PeerParty knows (`in_lobby`) but with no way to hand it over is told how
+/// PeerParty learns one (`LEARN_FIRST`).
+fn why_not_for(fronts: &[net::Front], official: &[&str], photon_room: Option<String>, in_lobby: bool) -> String {
     if !official.is_empty() {
         return format!(
             "This game's online play goes through {}'s own servers, which peerparty can't invite through: use the game's own invites or room codes instead",
@@ -212,6 +295,9 @@ fn why_not_for(fronts: &[net::Front], official: &[&str], photon_room: Option<Str
     if !fronts.is_empty() && !fronts.iter().any(|f| CARRIERS.contains(f)) {
         let names: Vec<&str> = fronts.iter().map(|f| f.label()).collect();
         return format!("Not supported for this game yet: peerparty can't hand it an invite through {}", names.join(" or "));
+    }
+    if in_lobby {
+        return LEARN_FIRST.into();
     }
     "Host or join a game first".into()
 }
@@ -249,6 +335,7 @@ pub fn to(target: Option<PeerId>) -> usize {
 /// room's friends and public players get an invite only when picked by name.
 fn deliver(to: Option<PeerId>, connect: &str, lobby: Option<Lobby>) -> usize {
     let Some(lan) = net::lan() else { return 0 };
+    let inside = if lobby.is_none() { current_lobby() } else { None };
     let targets: Vec<PeerId> = lan
         .peers()
         .into_iter()
@@ -257,7 +344,8 @@ fn deliver(to: Option<PeerId>, connect: &str, lobby: Option<Lobby>) -> usize {
             Some(t) => t == *p,
             None => !matches!(lan.peer_trust(*p), Some(peerparty_core::Trust::Room | peerparty_core::Trust::Public)),
         })
-        .filter(|p| lobby.as_ref().is_none_or(|l| l.member(*p).is_none()))
+        // Whoever is in the lobby we're in, through any SDK, is there already.
+        .filter(|p| lobby.as_ref().or(inside.as_ref()).is_none_or(|l| l.member(*p).is_none()))
         .filter(|p| !connect.starts_with(CODE_PREFIX) || room_lobby().is_none_or(|r| r.member(*p).is_none()))
         .collect();
     let mut n = 0;
@@ -735,24 +823,43 @@ mod tests {
         assert!(p.iter().all(|x| x.from != PeerId([1; 16])), "the oldest went first");
     }
 
+    /// The game's own invite names its lobby: kept with the id as a placeholder, and
+    /// filled with whichever lobby the game is in later.
+    #[test]
+    fn a_games_own_invite_is_learned_with_its_lobby_id_as_a_placeholder() {
+        let own = "gameId:ioKDkLB2F3qPEMW3GfcPqy|isPasswordRequired:False|isPrivate:False|isCrossPlatform:False|maxPlayers:4|currentPlayers:1";
+        let t = template_of(own, "ioKDkLB2F3qPEMW3GfcPqy").unwrap();
+        assert_eq!(t, "gameId:{peerparty:lobby}|isPasswordRequired:False|isPrivate:False|isCrossPlatform:False|maxPlayers:4|currentPlayers:1");
+        assert_eq!(fill(&t, "Zz9NewLobby"), own.replace("ioKDkLB2F3qPEMW3GfcPqy", "Zz9NewLobby"));
+        // Nothing to learn from an invite that doesn't name the lobby, from PeerParty's
+        // own kinds, or from an id too short to be one.
+        assert_eq!(template_of("+connect 10.0.0.2", "ioKDkLB2F3qPEMW3GfcPqy"), None);
+        assert_eq!(template_of(JOIN_REQUEST, "join"), None);
+        assert_eq!(template_of(&format!("{CODE_PREFIX}ABCD"), "ABCD"), None);
+        assert_eq!(template_of("gameId:1|x", "1"), None);
+    }
+
     #[test]
     fn says_why_there_is_nothing_to_invite_to() {
         use crate::net::Front;
         // PlayFab Party only, whose invites PeerParty can't carry.
-        let party = why_not_for(&[Front::Party], &[], None);
+        let party = why_not_for(&[Front::Party], &[], None, false);
         assert!(party.starts_with("Not supported for this game yet"), "{party}");
         assert!(party.contains("PlayFab Party"), "{party}");
         // A game with a lobby service just hasn't hosted yet, nor has one that hasn't
         // started any online service.
-        assert_eq!(why_not_for(&[Front::Party, Front::Eos], &[], None), "Host or join a game first");
-        assert_eq!(why_not_for(&[], &[], None), "Host or join a game first");
+        assert_eq!(why_not_for(&[Front::Party, Front::Eos], &[], None, false), "Host or join a game first");
+        assert_eq!(why_not_for(&[], &[], None, false), "Host or join a game first");
+        // In a lobby (a Unity lobby, say) PeerParty can't hand over until the game has
+        // shown it an invite of its own.
+        assert_eq!(why_not_for(&[Front::Steam, Front::Ugs], &[], None, true), LEARN_FIRST);
         // Rooms on Photon's own cloud (a Steam game whose multiplayer is Photon's):
         // no room the player makes is one PeerParty can invite to.
-        let photon = why_not_for(&[Front::Steam], &["Photon"], None);
+        let photon = why_not_for(&[Front::Steam], &["Photon"], None, false);
         assert!(photon.contains("Photon's own servers") && photon.contains("room codes"), "{photon}");
         // A room on PeerParty's own Photon servers: the game has hosted, and its players
         // join from its own menu (Photon has no invites), not "host first".
-        let room = why_not_for(&[Front::Steam], &[], Some("EUCSH".into()));
+        let room = why_not_for(&[Front::Steam], &[], Some("EUCSH".into()), false);
         assert_eq!(room, format!("{PHOTON_NO_INVITES} (room EUCSH)"));
     }
 }

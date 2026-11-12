@@ -57,7 +57,7 @@ itself still runs. PeerParty moves that part onto the players' own PCs:
 | **PlayFab** | Party (networks, endpoints, voice and text chat), Lobby & Matchmaking, sign-in through the C SDK, and the web API (sign-in, lobbies, statistics, user data, friends). |
 | **GOG Galaxy** | Sign-in, user data, friends, rich presence, invites, lobbies, P2P, chat, stats and achievements, storage and cloud saves (every SDK from 1.57 on). |
 | **Photon** | Realtime / PUN rooms served by one of the players' copies (name, master and game servers over UDP, TCP and WebSocket), Photon Voice, Chat, Bolt, and Fusion's Host, Server, Client and Shared modes. |
-| **Unity Gaming Services** | Authentication, Lobby (with Wire events), Relay (plain and DTLS), Cloud Save and Remote Config. |
+| **Unity Gaming Services** | Authentication, Lobby (with Wire events), Relay (plain and DTLS), Cloud Save and Remote Config; Vivox voice chat, positional (proximity) channels included. |
 | **Xbox app games** | Started as packages with PeerParty inside; PlayFab Party's Xbox Live helper and the Xbox Live friends and presence calls are answered by PeerParty. |
 
 Anything PeerParty doesn't carry behaves as if that service were offline or had nothing
@@ -176,7 +176,6 @@ included. Options for one run go in front of the game's path (or of `%command%`)
 | `--set key=value` | Changes one setting this run, e.g. `name=Alex`, `voice=off`, `internet=off`. |
 | `--multi-instance` | Lets a second copy of the game start on the same PC. |
 | `--copy-saves` | This copy starts from player 1's whole save; its own save, if any, is moved aside as a backup. Only when given. |
-| `--appid N` | A Steam game's app id, when PeerParty can't find it. |
 | `--log-dir DIR` | Where the logs go. |
 
 Commands on their own:

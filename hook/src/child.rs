@@ -264,7 +264,18 @@ fn never_followed(path: &str) -> Option<&'static str> {
 
 /// Whether a child started as `image` gets the hook, and if not, why.
 fn follow_verdict(image: &str) -> Result<(), &'static str> {
-    verdict(&norm_path(image), follow_all(), package_roots(), game_root().or(unreal_root()), SDK_SEEN.load(Ordering::Relaxed))
+    let path = norm_path(image);
+    if is_peerparty(&path, std::env::var("PEERPARTY_EXE").ok().map(|e| norm_path(&e)).as_deref()) {
+        return Err("PeerParty itself");
+    }
+    verdict(&path, follow_all(), package_roots(), game_root().or(unreal_root()), SDK_SEEN.load(Ordering::Relaxed))
+}
+
+/// PeerParty's own program (the launcher's `PEERPARTY_EXE`, or any `peerparty.exe`): its
+/// `--attach` helper, started from here for a child of the other bitness, mustn't be
+/// followed in turn. `path` and `exe` are `norm_path`'s.
+fn is_peerparty(path: &str, exe: Option<&str>) -> bool {
+    exe.is_some_and(|e| e == path) || path.rsplit('\\').next() == Some("peerparty.exe")
 }
 
 fn verdict(path: &str, all: bool, packages: &[String], root: Option<&str>, sdk_seen: bool) -> Result<(), &'static str> {
@@ -555,6 +566,19 @@ unsafe extern "system" fn create_hook(
     new_token: usize,
 ) -> i32 {
     let real = CREATE.get().unwrap();
+    // A process started while one is being followed (`attach_from_outside` starts
+    // `peerparty.exe --attach`) is just started.
+    thread_local!(static INSIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
+    if INSIDE.with(|i| i.replace(true)) {
+        return unsafe { real.call(token, app, cmd, pa, ta, inherit, flags, env, dir, si, pi, new_token) };
+    }
+    struct Leave;
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            INSIDE.with(|i| i.set(false));
+        }
+    }
+    let _leave = Leave;
     let image = full_image(&image_of(app, cmd), dir);
     if let Err(why) = follow_verdict(&image) {
         log!("child: {image} is left alone ({why})");
@@ -591,11 +615,20 @@ unsafe extern "system" fn create_hook(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_unreal_starter_dir, norm_dir, norm_path, verdict};
+    use super::{is_peerparty, is_unreal_starter_dir, norm_dir, norm_path, verdict};
     use std::fs;
 
     fn follows(image: &str, root: &str, sdk_seen: bool) -> bool {
         verdict(&norm_path(image), false, &[], norm_dir(root).as_deref(), sdk_seen).is_ok()
+    }
+
+    #[test]
+    fn never_follows_peerparty_itself() {
+        let exe = norm_path(r"C:\Tools\PeerParty\peerparty.exe");
+        assert!(is_peerparty(&exe, Some(&exe)));
+        assert!(is_peerparty(&norm_path(r"C:\Games\X\PeerParty.exe"), None));
+        assert!(is_peerparty(&norm_path(r"C:\Tools\pp-renamed.exe"), Some(&norm_path(r"c:\tools\PP-renamed.exe"))));
+        assert!(!is_peerparty(&norm_path(r"C:\Games\X\game.exe"), Some(&exe)));
     }
 
     #[test]

@@ -227,6 +227,7 @@ impl App {
     fn advanced_settings(&mut self, ui: &mut egui::Ui) {
         let mut setup = false;
         let mut reset = false;
+        let mut undo = false;
         let mut logs = false;
         widgets::card(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -274,10 +275,19 @@ impl App {
             });
             widgets::divider(ui);
             let changed = differs_from_recommended(&self.settings.prefs);
+            // What Reset replaced, while nothing has changed since: one click undoes it.
+            if changed {
+                self.reset_undo = None;
+            }
+            let can_undo = self.reset_undo.is_some();
             widgets::setting(ui, t!("settings.reset"), if changed { t!("settings.reset_sub_changed") } else { t!("settings.reset_sub") }, |ui| {
-                ui.add_enabled_ui(changed, |ui| {
-                    reset = widgets::button(ui, Some(Icon::Refresh), t!("settings.reset_go"), Kind::Danger).clicked();
-                });
+                if can_undo {
+                    undo = widgets::button(ui, Some(Icon::Refresh), t!("settings.reset_undo"), Kind::Secondary).clicked();
+                } else {
+                    ui.add_enabled_ui(changed, |ui| {
+                        reset = widgets::button(ui, Some(Icon::Refresh), t!("settings.reset_go"), Kind::Danger).clicked();
+                    });
+                }
             });
         });
         if logs {
@@ -289,8 +299,12 @@ impl App {
             self.welcome = Some(super::welcome::Welcome::again(&self.settings.prefs));
         }
         if reset {
+            self.reset_undo = Some(self.settings.prefs.clone());
             reset_to_recommended(&mut self.settings.prefs);
             self.say(t!("settings.reset_done"), true);
+        }
+        if undo && let Some(before) = self.reset_undo.take() {
+            undo_reset(&mut self.settings.prefs, &before);
         }
     }
 
@@ -408,17 +422,26 @@ fn differs_from_recommended(p: &Prefs) -> bool {
 
 /// The recommended answer to everything but who you are and who can join you.
 fn reset_to_recommended(p: &mut Prefs) {
-    let d = Prefs::default();
-    p.modes = d.modes;
-    p.hotkeys = d.hotkeys;
-    p.overlay = d.overlay;
-    p.overlay_scale = d.overlay_scale;
-    p.glyphs = d.glyphs;
-    p.draw = d.draw;
-    p.invite_buttons = d.invite_buttons;
-    p.steam_saves = d.steam_saves;
-    p.toasts = d.toasts;
-    p.effects = d.effects;
+    take_resettable(p, &Prefs::default());
+}
+
+/// Puts back what "Reset to recommended" changed, from the settings before it.
+fn undo_reset(p: &mut Prefs, before: &Prefs) {
+    take_resettable(p, before);
+}
+
+/// The settings "Reset to recommended" covers, taken from `from`.
+fn take_resettable(p: &mut Prefs, from: &Prefs) {
+    p.modes = from.modes.clone();
+    p.hotkeys = from.hotkeys.clone();
+    p.overlay = from.overlay;
+    p.overlay_scale = from.overlay_scale;
+    p.glyphs = from.glyphs.clone();
+    p.draw = from.draw.clone();
+    p.invite_buttons = from.invite_buttons.clone();
+    p.steam_saves = from.steam_saves;
+    p.toasts = from.toasts;
+    p.effects = from.effects;
     theme::set_effects(p.effects);
 }
 
@@ -436,5 +459,17 @@ mod tests {
         assert!(!differs_from_recommended(&p));
         assert_eq!((p.name.as_str(), p.room.as_str(), p.public, p.auto_accept, p.voice), ("Kim", "PP1-x", true, true, false));
         assert!(p.modes.is_empty() && p.overlay_scale == 1.0);
+    }
+
+    /// Undo puts back exactly what Reset changed, the controller buttons too.
+    #[test]
+    fn reset_can_be_undone() {
+        let mut p = Prefs { overlay_scale: 1.5, invite_buttons: "lb+rb+y".into(), ..Prefs::default() };
+        p.modes.insert("eos".into(), "official".into());
+        let before = p.clone();
+        reset_to_recommended(&mut p);
+        assert!(p != before);
+        undo_reset(&mut p, &before);
+        assert!(p == before, "undo didn't put everything back");
     }
 }

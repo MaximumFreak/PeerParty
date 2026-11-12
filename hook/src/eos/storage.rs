@@ -82,10 +82,9 @@ fn dir(store: Store) -> Option<PathBuf> {
     })
 }
 
-/// A file name the game gave, kept to one path component.
+/// A file name the game gave, kept to one ordinary file (`saves::file_name`).
 fn safe_name(name: &str) -> Option<String> {
-    let n = name.replace(['/', '\\'], "_");
-    (!n.is_empty() && n != "." && n != ".." && !n.contains(':')).then_some(n)
+    crate::saves::file_name(name)
 }
 
 fn path(store: Store, name: &str) -> Option<PathBuf> {
@@ -492,7 +491,7 @@ unsafe extern "system" fn player_write(_h: usize, o: *const TransferOptions, cd:
         if result == SUCCESS {
             let saved = path(Store::Player, &name).and_then(|p| {
                 std::fs::create_dir_all(p.parent()?).ok()?;
-                std::fs::write(&p, &contents).ok()
+                crate::saves::write_whole(&p, &contents).ok()
             });
             if saved.is_none() {
                 result = FAILED;

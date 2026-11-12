@@ -8,16 +8,20 @@
 //!
 //! Sound devices: when a game leaves microphone and speakers to the SDK (EOS's
 //! default; "manual audio" off), PeerParty does the SDK's part with Windows' waveIn /
-//! waveOut (winmm): the communications default microphone at 16 kHz mono in 20 ms
-//! frames, sent only while it carries voice (a level gate with a short hang-over), and
-//! the room's voices mixed to the communications default speakers. The microphone is opened only while a room wants to
-//! send, and closed when none does. `PEERPARTY_VOICE=0` turns the devices off (rooms,
-//! data and game-supplied audio still work).
+//! waveOut (winmm): the microphone at 16 kHz mono in 20 ms frames, sent only while it
+//! carries voice (a level gate with a short hang-over), and the room's voices mixed in
+//! stereo to the speakers, each at its own volume and place left to right (`set_pan`,
+//! for Vivox's positional channels). Which microphone and speakers: the game's choice
+//! through its SDK (endpoints.rs), else Windows' default communications devices; a
+//! change of choice, or of the default the choice follows, moves the open device. The
+//! microphone is opened only while a room wants to send, and closed when none does.
+//! `PEERPARTY_VOICE=0` turns the devices off (rooms, data and game-supplied audio still
+//! work).
 //!
 //! The microphone goes through Windows' Voice Capture DSP when it can (aec.rs): echo
 //! cancellation against whatever the speakers play, noise suppression and automatic
-//! gain, on the communications default devices. Without it (or with
-//! `PEERPARTY_VOICE_AEC=0`) the plain waveIn path below is used.
+//! gain, on the same devices. Without it (or with `PEERPARTY_VOICE_AEC=0`) the plain
+//! waveIn path below is used.
 //!
 //! A room can also narrow who it sends to and hears (`set_filters`, for Party's chat
 //! permissions), hand a speaker's audio to the game instead of the speakers
@@ -45,6 +49,10 @@ use peerparty_core::{Event, Lan, PeerId, SendResult};
 use crate::log;
 
 mod aec;
+mod com;
+mod endpoints;
+
+pub use endpoints::{Choice, Endpoint, Side, chosen, snapshot, start as watch_devices, version as devices_version};
 
 pub const SOCKET_PREFIX: &str = "rtc:";
 const CH_CTRL: u8 = 0;
@@ -94,6 +102,8 @@ struct Room {
     device_out: bool,
     volume_out: f32,
     peer_volume: HashMap<PeerId, f32>,
+    /// Where each speaker sits, -1 (left) to 1 (right).
+    peer_pan: HashMap<PeerId, f32>,
     heard: HashMap<PeerId, Instant>,
     /// Only these members get our audio (`None`: all of them).
     send_to: Option<HashSet<PeerId>>,
@@ -122,6 +132,7 @@ impl Room {
             device_out,
             volume_out: 1.0,
             peer_volume: HashMap::new(),
+            peer_pan: HashMap::new(),
             heard: HashMap::new(),
             send_to: None,
             hear: None,
@@ -318,6 +329,42 @@ pub fn set_volume(room: &str, peer: Option<PeerId>, volume: f32) -> bool {
     .is_some()
 }
 
+/// Where a participant's voice plays, from -1 (all left) through 0 (both sides alike)
+/// to 1 (all right).
+pub fn set_pan(room: &str, peer: PeerId, pan: f32) -> bool {
+    let pan = if pan.is_finite() { pan.clamp(-1.0, 1.0) } else { 0.0 };
+    with_room(room, |r| {
+        r.peer_pan.insert(peer, pan);
+    })
+    .is_some()
+}
+
+/// The game's choice of microphone (`output` false) or speakers, for every room.
+pub fn choose_device(output: bool, c: Choice) {
+    endpoints::choose(output, c);
+}
+
+/// Left and right gains for a place, -1 (left) to 1 (right): the near side at full
+/// volume, the far side down to a quarter (-12 dB) at the extreme, so a voice off to one
+/// side is still heard by both ears (a fully one-sided voice is tiring on headphones).
+/// The middle plays as a mono voice did.
+pub fn pan_gains(pan: f32) -> [f32; 2] {
+    let p = if pan.is_finite() { pan.clamp(-1.0, 1.0) } else { 0.0 };
+    let far = 1.0 - 0.75 * p.abs();
+    if p < 0.0 { [1.0, far] } else { [far, 1.0] }
+}
+
+/// A frame as 16 kHz stereo: its first two channels, or a mono frame on both sides.
+pub fn to_stereo(f: &Frame) -> Vec<[i16; 2]> {
+    let ch = f.channels.max(1) as usize;
+    if ch < 2 {
+        return to_device(f).into_iter().map(|s| [s, s]).collect();
+    }
+    let side = |i: usize| Frame { rate: f.rate, channels: 1, samples: f.samples.iter().skip(i).step_by(ch).copied().collect() };
+    let (l, r) = (resample(&side(0), DEVICE_RATE), resample(&side(1), DEVICE_RATE));
+    l.into_iter().zip(r).map(|(l, r)| [l, r]).collect()
+}
+
 fn encode_audio(f: &Frame) -> Vec<u8> {
     let mut out = Vec::with_capacity(6 + f.samples.len() * 2);
     out.push(AUDIO);
@@ -397,18 +444,9 @@ pub fn send_data_to(lan: &Lan, room: &str, peers: &[PeerId], data: &[u8]) -> boo
 }
 
 /// Plays audio the game mixed itself (Party's render stream) on the speakers, when a
-/// room has them open.
+/// room has them open; stereo stays stereo.
 pub fn play_local(f: &Frame, gain: f32) {
-    devices::play("", PeerId([0; 16]), f, gain);
-}
-
-/// Whether Windows has a microphone / speakers at all (counting devices opens nothing).
-pub fn input_present() -> bool {
-    devices::input_count() > 0
-}
-
-pub fn output_present() -> bool {
-    devices::output_count() > 0
+    devices::play("", PeerId([0; 16]), f, [gain, gain]);
 }
 
 /// Core events: room sockets are always accepted; players who leave the LAN leave rooms.
@@ -526,7 +564,8 @@ pub fn pump(lan: &Lan) {
                             }
                             if r.device_out && !r.no_play.contains(&p.peer) {
                                 let gain = r.volume_out * r.peer_volume.get(&p.peer).copied().unwrap_or(1.0);
-                                devices::play(room, p.peer, &f, gain);
+                                let [left, right] = pan_gains(r.peer_pan.get(&p.peer).copied().unwrap_or(0.0));
+                                devices::play(room, p.peer, &f, [gain * left, gain * right]);
                             }
                             r.events.push_back(RoomEvent::Audio(p.peer, f));
                         }
@@ -631,7 +670,7 @@ impl Gate {
 }
 
 mod devices {
-    //! waveIn / waveOut on the default devices, each on its own thread.
+    //! waveIn / waveOut on the chosen devices, each on its own thread.
     use super::*;
 
     #[repr(C)]
@@ -678,6 +717,51 @@ mod devices {
         fn waveOutGetNumDevs() -> u32;
     }
 
+    /// The waveIn / waveOut number of endpoint `id` (DRV_QUERYFUNCTIONINSTANCEID gives
+    /// each wave device's endpoint id).
+    pub(super) fn wave_index(output: bool, id: &str) -> Option<u32> {
+        const QUERY_ID: u32 = 0x0800 + 17;
+        const QUERY_ID_SIZE: u32 = 0x0800 + 18;
+        let message = |dev: u32, msg: u32, a: usize, b: usize| unsafe {
+            if output { waveOutMessage(dev as usize, msg, a, b) } else { waveInMessage(dev as usize, msg, a, b) }
+        };
+        let count = if output { output_count() } else { input_count() };
+        (0..count).find(|&dev| {
+            let mut size = 0u32;
+            if message(dev, QUERY_ID_SIZE, &mut size as *mut u32 as usize, 0) != 0 || !(2..=4096).contains(&size) {
+                return false;
+            }
+            let mut buf = vec![0u16; size as usize / 2];
+            if message(dev, QUERY_ID, buf.as_mut_ptr() as usize, size as usize) != 0 {
+                return false;
+            }
+            let n = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
+            String::from_utf16_lossy(&buf[..n]).eq_ignore_ascii_case(id)
+        })
+    }
+
+    /// The wave device to open for an endpoint (the communications default when Windows
+    /// can't say which one it is).
+    fn wave_device(output: bool, ep: Option<&Endpoint>) -> u32 {
+        ep.and_then(|e| wave_index(output, &e.id)).unwrap_or_else(|| communications(output))
+    }
+
+    fn label(ep: Option<&Endpoint>) -> String {
+        ep.map_or_else(|| "the communications default".to_string(), |e| format!("'{}'", e.name))
+    }
+
+    /// The endpoints the devices should be on now: [microphone, speakers].
+    fn targets() -> [Option<Endpoint>; 2] {
+        [endpoints::effective(false), endpoints::effective(true)]
+    }
+
+    /// How often an open device checks whether it should move.
+    const RECHECK: Duration = Duration::from_millis(250);
+
+    /// The speakers open now: Some(endpoint id, or None for the communications
+    /// default by number), None while closed.
+    pub(super) static SPEAKERS_OPEN: Mutex<Option<Option<String>>> = Mutex::new(None);
+
     /// The communications default device (Sound settings), where voice chat belongs and
     /// where the echo canceller listens; the default device if Windows won't say.
     fn communications(output: bool) -> u32 {
@@ -705,13 +789,14 @@ mod devices {
     const BUFFERS: usize = 4;
     const HDR: u32 = std::mem::size_of::<WaveHdr>() as u32;
 
-    fn format() -> WaveFormatEx {
+    /// 16 kHz 16-bit PCM: mono for the microphone, stereo for the speakers.
+    fn format(channels: u16) -> WaveFormatEx {
         WaveFormatEx {
             format_tag: 1, // WAVE_FORMAT_PCM
-            channels: 1,
+            channels,
             samples_per_sec: DEVICE_RATE,
-            avg_bytes_per_sec: DEVICE_RATE * 2,
-            block_align: 2,
+            avg_bytes_per_sec: DEVICE_RATE * 2 * channels as u32,
+            block_align: 2 * channels,
             bits_per_sample: 16,
             cb_size: 0,
         }
@@ -720,8 +805,8 @@ mod devices {
     static WANT_IN: AtomicBool = AtomicBool::new(false);
     static WANT_OUT: AtomicBool = AtomicBool::new(false);
     static STARTED: std::sync::Once = std::sync::Once::new();
-    /// Per (room, speaker) queues of 16 kHz mono samples waiting to be played.
-    static QUEUES: LazyLock<Mutex<HashMap<(String, PeerId), VecDeque<i16>>>> = LazyLock::new(Mutex::default);
+    /// Per (room, speaker) queues of 16 kHz stereo samples waiting to be played.
+    static QUEUES: LazyLock<Mutex<HashMap<(String, PeerId), VecDeque<[i16; 2]>>>> = LazyLock::new(Mutex::default);
     /// At most this much audio waits per speaker (the rest is late and dropped).
     const MAX_QUEUE: usize = DEVICE_RATE as usize * 3 / 10;
 
@@ -737,6 +822,7 @@ mod devices {
         WANT_IN.store(want_in, Ordering::Relaxed);
         WANT_OUT.store(want_out, Ordering::Relaxed);
         if want_in || want_out {
+            endpoints::start();
             STARTED.call_once(|| {
                 std::thread::spawn(capture_loop);
                 std::thread::spawn(playback_loop);
@@ -744,24 +830,29 @@ mod devices {
         }
     }
 
-    pub(super) fn play(room: &str, peer: PeerId, f: &Frame, gain: f32) {
-        let samples = to_device(f);
+    /// Queues a frame for the speakers at `gain` [left, right].
+    pub(super) fn play(room: &str, peer: PeerId, f: &Frame, gain: [f32; 2]) {
+        let samples = to_stereo(f);
+        let scale = |s: i16, g: f32| (s as f32 * g).clamp(-32768.0, 32767.0) as i16;
         let mut q = QUEUES.lock().unwrap();
         let queue = q.entry((room.to_string(), peer)).or_default();
-        queue.extend(samples.iter().map(|s| (*s as f32 * gain).clamp(-32768.0, 32767.0) as i16));
+        queue.extend(samples.iter().map(|[l, r]| [scale(*l, gain[0]), scale(*r, gain[1])]));
         while queue.len() > MAX_QUEUE {
             queue.pop_front();
         }
     }
 
-    /// One frame of everyone's voices, added together.
+    /// One frame of everyone's voices, added together (interleaved stereo).
     fn mix() -> Vec<i16> {
-        let mut out = vec![0i32; FRAME];
+        let mut out = vec![0i32; FRAME * 2];
         let mut q = QUEUES.lock().unwrap();
         for queue in q.values_mut() {
-            for o in out.iter_mut() {
+            for o in out.chunks_exact_mut(2) {
                 match queue.pop_front() {
-                    Some(s) => *o += s as i32,
+                    Some([l, r]) => {
+                        o[0] += l as i32;
+                        o[1] += r as i32;
+                    }
                     None => break,
                 }
             }
@@ -775,11 +866,12 @@ mod devices {
         _data: Vec<Vec<i16>>,
     }
 
-    fn buffers() -> Buffers {
-        let mut data: Vec<Vec<i16>> = (0..BUFFERS).map(|_| vec![0i16; FRAME]).collect();
+    /// Buffers of `samples` 16-bit samples each.
+    fn buffers(samples: usize) -> Buffers {
+        let mut data: Vec<Vec<i16>> = (0..BUFFERS).map(|_| vec![0i16; samples]).collect();
         let hdrs = Box::new(std::array::from_fn(|i| WaveHdr {
             data: data[i].as_mut_ptr() as *mut u8,
-            buffer_length: (FRAME * 2) as u32,
+            buffer_length: (samples * 2) as u32,
             bytes_recorded: 0,
             user: 0,
             flags: 0,
@@ -795,13 +887,29 @@ mod devices {
         std::env::var("PEERPARTY_VOICE_AEC").map_or(true, |v| v != "0")
     }
 
-    /// The microphone through the Voice Capture DSP, while a room wants it. False if the
-    /// DSP couldn't start (waveIn takes over).
-    fn capture_with_aec(gate: &mut Gate) -> bool {
-        let Some(mut cap) = aec::Capture::open() else { return false };
+    /// The microphone through the Voice Capture DSP, while a room wants it and the
+    /// devices stay `target`. False if the DSP couldn't start (waveIn takes over).
+    fn capture_with_aec(gate: &mut Gate, target: &[Option<Endpoint>; 2]) -> bool {
+        let Some(mic) = &target[0] else { return false };
+        let Some(mut cap) = aec::Capture::open(&mic.id, target[1].as_ref().map(|e| e.id.as_str())) else { return false };
+        log!(
+            "voice: microphone {} open, through Windows' echo cancellation and noise suppression (speakers {} as its reference)",
+            label(Some(mic)),
+            label(target[1].as_ref())
+        );
         let mut pending: Vec<i16> = Vec::with_capacity(FRAME * 4);
+        let mut checked = Instant::now();
         while WANT_IN.load(Ordering::Relaxed) {
+            if checked.elapsed() >= RECHECK {
+                checked = Instant::now();
+                if targets() != *target {
+                    break;
+                }
+            }
             if !cap.read(&mut pending) {
+                // A DSP that opens but can't read would otherwise be reopened at once,
+                // over and over.
+                std::thread::sleep(Duration::from_secs(1));
                 break;
             }
             let mut at = 0;
@@ -820,6 +928,13 @@ mod devices {
         true
     }
 
+    /// Waits while a room wants the device and the targets stay as they are.
+    fn wait_while_unchanged(want: &AtomicBool, target: &[Option<Endpoint>; 2]) {
+        while want.load(Ordering::Relaxed) && targets() == *target {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
     fn capture_loop() {
         let mut gate = Gate { hold: 0 };
         let mut aec = aec_wanted();
@@ -828,23 +943,28 @@ mod devices {
                 std::thread::sleep(Duration::from_millis(100));
                 continue;
             }
-            if aec {
-                if capture_with_aec(&mut gate) {
+            let target = targets();
+            if target[0].is_none() && input_count() == 0 {
+                log!("voice: Windows has no microphone; sending nothing until one appears");
+                wait_while_unchanged(&WANT_IN, &target);
+                continue;
+            }
+            // Without an endpoint (Windows wouldn't list them) waveIn's default is tried.
+            if aec && target[0].is_some() {
+                if capture_with_aec(&mut gate, &target) {
                     continue;
                 }
                 aec = false;
             }
             let mut h = 0usize;
-            let r = unsafe { waveInOpen(&mut h, communications(false), &format(), 0, 0, 0) };
+            let r = unsafe { waveInOpen(&mut h, wave_device(false, target[0].as_ref()), &format(1), 0, 0, 0) };
             if r != 0 {
                 log!("voice: no microphone (waveInOpen {r}); sending nothing");
-                while WANT_IN.load(Ordering::Relaxed) {
-                    std::thread::sleep(Duration::from_millis(500));
-                }
+                wait_while_unchanged(&WANT_IN, &target);
                 continue;
             }
-            log!("voice: microphone open (communications default, 16 kHz mono, no echo cancellation)");
-            let mut b = buffers();
+            log!("voice: microphone {} open (16 kHz mono, no echo cancellation)", label(target[0].as_ref()));
+            let mut b = buffers(FRAME);
             for hdr in b.hdrs.iter_mut() {
                 unsafe {
                     waveInPrepareHeader(h, hdr, HDR);
@@ -852,7 +972,14 @@ mod devices {
                 }
             }
             unsafe { waveInStart(h) };
+            let mut checked = Instant::now();
             while WANT_IN.load(Ordering::Relaxed) {
+                if checked.elapsed() >= RECHECK {
+                    checked = Instant::now();
+                    if targets()[0] != target[0] {
+                        break;
+                    }
+                }
                 for hdr in b.hdrs.iter_mut() {
                     if hdr.flags & WHDR_DONE != 0 {
                         let n = hdr.bytes_recorded as usize / 2;
@@ -883,26 +1010,34 @@ mod devices {
                 std::thread::sleep(Duration::from_millis(100));
                 continue;
             }
+            let target = targets();
             let mut h = 0usize;
-            let r = unsafe { waveOutOpen(&mut h, communications(true), &format(), 0, 0, 0) };
+            let r = unsafe { waveOutOpen(&mut h, wave_device(true, target[1].as_ref()), &format(2), 0, 0, 0) };
             if r != 0 {
                 log!("voice: no speakers (waveOutOpen {r}); voices aren't played");
-                while WANT_OUT.load(Ordering::Relaxed) {
-                    std::thread::sleep(Duration::from_millis(500));
-                }
+                wait_while_unchanged(&WANT_OUT, &target);
                 continue;
             }
-            let mut b = buffers();
+            log!("voice: speakers {} open (16 kHz stereo)", label(target[1].as_ref()));
+            *SPEAKERS_OPEN.lock().unwrap() = Some(target[1].as_ref().map(|e| e.id.clone()));
+            let mut b = buffers(FRAME * 2);
             for hdr in b.hdrs.iter_mut() {
                 unsafe { waveOutPrepareHeader(h, hdr, HDR) };
                 hdr.flags |= WHDR_DONE;
             }
+            let mut checked = Instant::now();
             while WANT_OUT.load(Ordering::Relaxed) {
+                if checked.elapsed() >= RECHECK {
+                    checked = Instant::now();
+                    if targets()[1] != target[1] {
+                        break;
+                    }
+                }
                 for hdr in b.hdrs.iter_mut() {
                     if hdr.flags & WHDR_DONE != 0 {
                         let frame = mix();
                         unsafe {
-                            std::ptr::copy_nonoverlapping(frame.as_ptr(), hdr.data as *mut i16, FRAME);
+                            std::ptr::copy_nonoverlapping(frame.as_ptr(), hdr.data as *mut i16, FRAME * 2);
                             hdr.flags &= !WHDR_DONE;
                             waveOutWrite(h, hdr, HDR);
                         }
@@ -917,6 +1052,7 @@ mod devices {
                 }
                 waveOutClose(h);
             }
+            *SPEAKERS_OPEN.lock().unwrap() = None;
         }
     }
 }
@@ -1088,6 +1224,70 @@ mod tests {
         let up = resample(&Frame { rate: 16_000, channels: 1, samples: vec![-700; 640] }, 24_000);
         assert_eq!(up.len(), 960);
         assert!(up.iter().all(|s| *s == -700));
+    }
+
+    #[test]
+    fn panning_keeps_the_near_side_full_and_the_far_side_audible() {
+        assert_eq!(pan_gains(0.0), [1.0, 1.0]);
+        assert_eq!(pan_gains(1.0), [0.25, 1.0]);
+        assert_eq!(pan_gains(-1.0), [1.0, 0.25]);
+        assert_eq!(pan_gains(5.0), [0.25, 1.0]);
+        assert_eq!(pan_gains(f32::NAN), [1.0, 1.0]);
+        let [l, r] = pan_gains(0.5);
+        assert!((l - 0.625).abs() < 1e-6 && r == 1.0);
+    }
+
+    #[test]
+    fn frames_play_in_stereo() {
+        // Mono goes to both sides; stereo keeps its sides (48 kHz to 16 kHz).
+        assert_eq!(to_stereo(&Frame { rate: 16_000, channels: 1, samples: vec![7, -7] }), vec![[7, 7], [-7, -7]]);
+        let st = to_stereo(&Frame { rate: 48_000, channels: 2, samples: [100, -100].repeat(480) });
+        assert_eq!(st.len(), 160);
+        assert!(st.iter().all(|s| *s == [100, -100]));
+    }
+
+    /// The speakers open on the chosen device and move when the choice does; silence
+    /// plays (nothing to check on a PC with fewer than two speakers, or with
+    /// `PEERPARTY_VOICE=0`).
+    #[test]
+    fn the_speakers_open_on_the_chosen_device_and_follow_the_choice() {
+        let s = snapshot();
+        if s.output.list.len() < 2 || !devices_allowed() {
+            eprintln!("fewer than two speakers, or devices off: skipped");
+            return;
+        }
+        let before = chosen(true);
+        let room = format!("speakers-test-{}", std::process::id());
+        S.lock().unwrap().rooms.insert(room.clone(), Room::new(false, true));
+        devices::update();
+        let open_on = |want: Option<Option<String>>| {
+            let until = Instant::now() + Duration::from_secs(10);
+            while *devices::SPEAKERS_OPEN.lock().unwrap() != want {
+                assert!(Instant::now() < until, "speakers didn't come to {want:?}");
+                play_local(&Frame { rate: DEVICE_RATE, channels: 2, samples: vec![0; FRAME * 2] }, 1.0);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        for e in s.output.list.iter().take(2) {
+            choose_device(true, Choice::Device(e.id.clone()));
+            open_on(Some(Some(e.id.clone())));
+        }
+        S.lock().unwrap().rooms.remove(&room);
+        devices::update();
+        open_on(None);
+        choose_device(true, before);
+    }
+
+    /// Every endpoint Windows lists has its waveIn / waveOut number, so a chosen device
+    /// opens (nothing to check on a PC without sound devices).
+    #[test]
+    fn endpoints_map_to_wave_devices() {
+        let s = snapshot();
+        for (output, side) in [(false, &s.input), (true, &s.output)] {
+            for e in &side.list {
+                assert!(devices::wave_index(output, &e.id).is_some(), "no wave device for {e:?}");
+            }
+        }
     }
 
     #[test]

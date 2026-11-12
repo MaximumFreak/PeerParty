@@ -16,7 +16,10 @@
 //!   PeerParty's microphone does (voice.rs). Arriving audio goes to the game's
 //!   `AudioBeforeRender` listeners and, unless manual audio output is on, to the
 //!   speakers. `AudioBeforeSend` never fires (the microphone isn't the game's here).
-//! - Devices: one "Default device" each way; settings calls succeed.
+//! - Devices: Windows' microphones and speakers, by endpoint id and name, the system
+//!   default marked as EOS's default (EOS plays on it until the game picks another).
+//!   The device settings move PeerParty's microphone and speakers (voice.rs; an empty
+//!   id is the default device); AudioDevicesChanged fires when Windows' list changes.
 //!
 //! Tested from two Python copies on the EOS SDK (tests/sdk/eos_rtc_test.py); not
 //! yet in a game.
@@ -112,11 +115,11 @@ pub(super) fn resolve(name: &str) -> Option<usize> {
         "EOS_RTC_AddNotifyDisconnected"
         | "EOS_RTC_AddNotifyRoomBeforeJoin"
         | "EOS_RTC_AddNotifyRoomStatisticsUpdated"
-        | "EOS_RTCAudio_AddNotifyAudioDevicesChanged"
         | "EOS_RTCAudio_AddNotifyAudioInputState"
         | "EOS_RTCAudio_AddNotifyAudioOutputState"
         | "EOS_RTCAudio_AddNotifyAudioBeforeSend" => notify_never as *const () as usize,
         "EOS_RTC_SetSetting" | "EOS_RTC_SetRoomSetting" => success as *const () as usize,
+        "EOS_RTCAudio_AddNotifyAudioDevicesChanged" => notify_devices_changed as *const () as usize,
         "EOS_RTCAudio_SendAudio" => send_audio as *const () as usize,
         "EOS_RTCAudio_UpdateSending" => update_sending as *const () as usize,
         "EOS_RTCAudio_UpdateReceiving" => update_receiving as *const () as usize,
@@ -128,26 +131,22 @@ pub(super) fn resolve(name: &str) -> Option<usize> {
         "EOS_RTCAudio_QueryInputDevicesInformation" | "EOS_RTCAudio_QueryOutputDevicesInformation" => {
             query_devices as *const () as usize
         }
-        "EOS_RTCAudio_GetInputDevicesCount"
-        | "EOS_RTCAudio_GetOutputDevicesCount"
-        | "EOS_RTCAudio_GetAudioInputDevicesCount"
-        | "EOS_RTCAudio_GetAudioOutputDevicesCount" => one as *const () as usize,
-        "EOS_RTCAudio_CopyInputDeviceInformationByIndex" | "EOS_RTCAudio_CopyOutputDeviceInformationByIndex" => {
-            copy_device as *const () as usize
-        }
+        "EOS_RTCAudio_GetInputDevicesCount" | "EOS_RTCAudio_GetAudioInputDevicesCount" => input_count as *const () as usize,
+        "EOS_RTCAudio_GetOutputDevicesCount" | "EOS_RTCAudio_GetAudioOutputDevicesCount" => output_count as *const () as usize,
+        "EOS_RTCAudio_CopyInputDeviceInformationByIndex" => copy_input as *const () as usize,
+        "EOS_RTCAudio_CopyOutputDeviceInformationByIndex" => copy_output as *const () as usize,
         "EOS_RTCAudio_InputDeviceInformation_Release" | "EOS_RTCAudio_OutputDeviceInformation_Release" => {
             release_device as *const () as usize
         }
-        "EOS_RTCAudio_GetAudioInputDeviceByIndex" | "EOS_RTCAudio_GetAudioOutputDeviceByIndex" => {
-            device_by_index as *const () as usize
+        "EOS_RTCAudio_GetAudioInputDeviceByIndex" => input_by_index as *const () as usize,
+        "EOS_RTCAudio_GetAudioOutputDeviceByIndex" => output_by_index as *const () as usize,
+        "EOS_RTCAudio_SetInputDeviceSettings" => input_settings as *const () as usize,
+        "EOS_RTCAudio_SetOutputDeviceSettings" => output_settings as *const () as usize,
+        "EOS_RTCAudio_SetAudioInputSettings" => old_input_settings as *const () as usize,
+        "EOS_RTCAudio_SetAudioOutputSettings" => old_output_settings as *const () as usize,
+        "EOS_RTCAudio_RegisterPlatformAudioUser" | "EOS_RTCAudio_UnregisterPlatformAudioUser" => {
+            success as *const () as usize
         }
-        "EOS_RTCAudio_SetInputDeviceSettings" | "EOS_RTCAudio_SetOutputDeviceSettings" => {
-            device_settings as *const () as usize
-        }
-        "EOS_RTCAudio_RegisterPlatformAudioUser"
-        | "EOS_RTCAudio_UnregisterPlatformAudioUser"
-        | "EOS_RTCAudio_SetAudioInputSettings"
-        | "EOS_RTCAudio_SetAudioOutputSettings" => success as *const () as usize,
         "EOS_RTCData_AddNotifyDataReceived" => notify_data as *const () as usize,
         "EOS_RTCData_AddNotifyParticipantUpdated" => notify_data_participant as *const () as usize,
         "EOS_RTCData_SendData" => send_data as *const () as usize,
@@ -169,6 +168,13 @@ pub(super) fn resolve(name: &str) -> Option<usize> {
 }
 
 unsafe extern "system" fn get_audio(_h: usize) -> usize {
+    // EOS plays on the system's default devices until the game picks others.
+    static FIRST: std::sync::Once = std::sync::Once::new();
+    FIRST.call_once(|| {
+        voice::choose_device(false, voice::Choice::System);
+        voice::choose_device(true, voice::Choice::System);
+        voice::watch_devices();
+    });
     AUDIO_HANDLE
 }
 
@@ -178,10 +184,6 @@ unsafe extern "system" fn get_data(_h: usize) -> usize {
 
 unsafe extern "system" fn success(_h: usize, _o: usize) -> i32 {
     SUCCESS
-}
-
-unsafe extern "system" fn one(_h: usize, _o: usize) -> u32 {
-    1
 }
 
 unsafe extern "system" fn notify_never(_h: usize, _o: usize, cd: usize, cb: usize) -> u64 {
@@ -525,46 +527,83 @@ struct IndexOptions {
     DeviceIndex: u32,
 }
 
-unsafe extern "system" fn copy_device(_h: usize, o: *const IndexOptions, out: *mut usize) -> i32 {
+/// Windows' devices one way, and which is EOS's default (the system default).
+fn device_list(output: bool) -> Vec<(voice::Endpoint, bool)> {
+    let snap = voice::snapshot();
+    let side = snap.side(output);
+    side.list.iter().map(|e| (e.clone(), side.system.as_deref() == Some(e.id.as_str()))).collect()
+}
+
+unsafe extern "system" fn input_count(_h: usize, _o: usize) -> u32 {
+    device_list(false).len() as u32
+}
+
+unsafe extern "system" fn output_count(_h: usize, _o: usize) -> u32 {
+    device_list(true).len() as u32
+}
+
+unsafe fn copy_device(o: *const IndexOptions, out: *mut usize, output: bool) -> i32 {
     if o.is_null() || out.is_null() {
         return INVALID_PARAMETERS;
     }
-    if unsafe { (*o).DeviceIndex } != 0 {
+    let Some((e, default)) = device_list(output).into_iter().nth(unsafe { (*o).DeviceIndex } as usize) else {
         return NOT_FOUND;
-    }
+    };
     let mut keep = Vec::new();
     let info = DeviceInfo {
         ApiVersion: 1,
-        bDefaultDevice: 1,
-        DeviceId: owned_str(&mut keep, "default"),
-        DeviceName: owned_str(&mut keep, "Default device (peerparty)"),
+        bDefaultDevice: default as i32,
+        DeviceId: owned_str(&mut keep, &e.id),
+        DeviceName: owned_str(&mut keep, &e.name),
     };
     unsafe { *out = hand_out(info, keep) };
     SUCCESS
+}
+
+unsafe extern "system" fn copy_input(_h: usize, o: *const IndexOptions, out: *mut usize) -> i32 {
+    unsafe { copy_device(o, out, false) }
+}
+
+unsafe extern "system" fn copy_output(_h: usize, o: *const IndexOptions, out: *mut usize) -> i32 {
+    unsafe { copy_device(o, out, true) }
 }
 
 unsafe extern "system" fn release_device(p: usize) {
     release(p);
 }
 
-struct StaticDevice(DeviceInfo);
-unsafe impl Send for StaticDevice {}
-unsafe impl Sync for StaticDevice {}
-
-static DEVICE: StaticDevice = StaticDevice(DeviceInfo {
-    ApiVersion: 1,
-    bDefaultDevice: 1,
-    DeviceId: c"default".as_ptr(),
-    DeviceName: c"Default device (peerparty)".as_ptr(),
-});
-
-unsafe extern "system" fn device_by_index(_h: usize, o: *const IndexOptions) -> usize {
-    if o.is_null() || unsafe { (*o).DeviceIndex } != 0 {
+/// The deprecated by-index calls hand out a pointer the SDK owns: each distinct
+/// device's info is made once and kept.
+fn device_by_index(o: *const IndexOptions, output: bool) -> usize {
+    struct Kept(DeviceInfo);
+    unsafe impl Send for Kept {}
+    static KEPT: LazyLock<Mutex<HashMap<(bool, String, String, bool), usize>>> = LazyLock::new(Mutex::default);
+    if o.is_null() {
         return 0;
     }
-    &DEVICE.0 as *const DeviceInfo as usize
+    let Some((e, default)) = device_list(output).into_iter().nth(unsafe { (*o).DeviceIndex } as usize) else { return 0 };
+    let mut kept = KEPT.lock().unwrap();
+    *kept.entry((output, e.id.clone(), e.name.clone(), default)).or_insert_with(|| {
+        let info = Box::leak(Box::new(Kept(DeviceInfo {
+            ApiVersion: 1,
+            bDefaultDevice: default as i32,
+            DeviceId: intern(&e.id),
+            DeviceName: intern(&e.name),
+        })));
+        &info.0 as *const DeviceInfo as usize
+    })
 }
 
+unsafe extern "system" fn input_by_index(_h: usize, o: *const IndexOptions) -> usize {
+    device_by_index(o, false)
+}
+
+unsafe extern "system" fn output_by_index(_h: usize, o: *const IndexOptions) -> usize {
+    device_by_index(o, true)
+}
+
+/// Device settings start `{ApiVersion, LocalUserId, RealDeviceId}` (the deprecated
+/// SetAudioInput/OutputSettings' DeviceId is in the same place).
 #[allow(non_snake_case)]
 #[repr(C)]
 struct DeviceSettingsOptions {
@@ -580,12 +619,59 @@ struct DeviceSettingsInfo {
     device: *const c_char,
 }
 
-unsafe extern "system" fn device_settings(_h: usize, o: *const DeviceSettingsOptions, cd: usize, cb: usize) {
-    let device = if o.is_null() { 0 } else { intern(&str_of(unsafe { (*o).RealDeviceId })) as usize };
+/// The game's device: an empty id is the default device.
+unsafe fn choose(o: *const DeviceSettingsOptions, output: bool) -> String {
+    let id = if o.is_null() { String::new() } else { str_of(unsafe { (*o).RealDeviceId }) };
+    voice::choose_device(output, if id.is_empty() { voice::Choice::System } else { voice::Choice::Device(id.clone()) });
+    id
+}
+
+unsafe fn device_settings(o: *const DeviceSettingsOptions, cd: usize, cb: usize, output: bool) {
+    let device = intern(&unsafe { choose(o, output) }) as usize;
     later(move || {
         let info = DeviceSettingsInfo { result: SUCCESS, client_data: cd, device: device as *const c_char };
         unsafe { call(cb, &info) };
     });
+}
+
+unsafe extern "system" fn input_settings(_h: usize, o: *const DeviceSettingsOptions, cd: usize, cb: usize) {
+    unsafe { device_settings(o, cd, cb, false) }
+}
+
+unsafe extern "system" fn output_settings(_h: usize, o: *const DeviceSettingsOptions, cd: usize, cb: usize) {
+    unsafe { device_settings(o, cd, cb, true) }
+}
+
+unsafe extern "system" fn old_input_settings(_h: usize, o: *const DeviceSettingsOptions) -> i32 {
+    unsafe { choose(o, false) };
+    SUCCESS
+}
+
+unsafe extern "system" fn old_output_settings(_h: usize, o: *const DeviceSettingsOptions) -> i32 {
+    unsafe { choose(o, true) };
+    SUCCESS
+}
+
+unsafe extern "system" fn notify_devices_changed(_h: usize, _o: usize, cd: usize, cb: usize) -> u64 {
+    add_listener(Kind::RtcAudioDevices, cb, cd, None)
+}
+
+/// Windows' devices changed since the last look: AudioDevicesChanged.
+fn devices_changed() {
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = voice::devices_version();
+    let before = SEEN.swap(now, Ordering::Relaxed);
+    if before == 0 || before == now {
+        return;
+    }
+    #[allow(non_snake_case)]
+    #[repr(C)]
+    struct Info {
+        ClientData: usize,
+    }
+    for (f, cd) in listeners(Kind::RtcAudioDevices, None) {
+        unsafe { call(f, &Info { ClientData: cd }) };
+    }
 }
 
 // ---- EOS_RTCData ----
@@ -896,6 +982,7 @@ pub fn on_event(lan: &Lan, ev: &Event) {
 /// Runs from EOS_Platform_Tick: room traffic becomes the game's notifications.
 pub fn pump(lan: &Lan) {
     sync_lobby_rooms();
+    devices_changed();
     voice::pump(lan);
     let me = local();
     for k in voice::rooms() {

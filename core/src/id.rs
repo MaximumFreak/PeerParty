@@ -12,11 +12,14 @@
 //! one a slot had is listed in `slot-N.previous` (newest first, one hex id a line), so
 //! saves a game keyed by the old id can be carried over to the new one (the hook's
 //! saves.rs). `slot-N.id` is only deleted once its id is listed.
+//!
+//! A dedicated server takes slots of its own (`server-N.*`, `claim_server`), so it
+//! never holds a player's slot: a server started before the game would otherwise be
+//! the PC's first copy, with the player's name and the PC's own ids, and push the
+//! player to a second slot.
 
-use std::collections::hash_map::RandomState;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::hash::BuildHasher;
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -35,15 +38,10 @@ impl PeerId {
         PeerId(h[..16].try_into().expect("16 of 32 bytes"))
     }
 
-    /// Random bytes in an id's shape (lobby ids and the like; a player's id is `of_key`).
-    /// RandomState is seeded from the OS generator, which is all this needs.
+    /// Random bytes in an id's shape (lobby ids and the like; a player's id is `of_key`),
+    /// from the OS's secure random source.
     pub fn random() -> Self {
-        let mut out = [0u8; 16];
-        for (i, chunk) in out.chunks_mut(8).enumerate() {
-            let v = RandomState::new().hash_one(i as u64 ^ std::process::id() as u64);
-            chunk.copy_from_slice(&v.to_le_bytes());
-        }
-        PeerId(out)
+        PeerId(crate::inet::crypto::random_array())
     }
 
     /// 32 lowercase hex digits, which is also the format of an EOS ProductUserId.
@@ -81,6 +79,8 @@ pub struct Identity {
     pub id: PeerId,
     pub name: String,
     pub slot: u32,
+    /// A dedicated server's identity (`claim_server`): its slots are apart from players'.
+    pub server: bool,
     /// What proves the id is ours.
     pub key: Arc<IdentityKey>,
     _lock: Option<File>,
@@ -96,9 +96,19 @@ impl Identity {
             .join("identity")
     }
 
-    /// Takes the first free slot in `dir`. Falls back to a throwaway id if the folder
-    /// can't be used, so a read-only profile still gets onto the LAN.
+    /// Takes the first free player slot in `dir`. Falls back to a throwaway id if the
+    /// folder can't be used, so a read-only profile still gets onto the LAN.
     pub fn claim(dir: &Path) -> Identity {
+        Self::claim_as(dir, false)
+    }
+
+    /// Takes the first free server slot in `dir` (a dedicated server's), named
+    /// "<player>'s server", or "<player>'s server (N)" after the first.
+    pub fn claim_server(dir: &Path) -> Identity {
+        Self::claim_as(dir, true)
+    }
+
+    fn claim_as(dir: &Path, server: bool) -> Identity {
         // The player's chosen name (the launcher's Settings), else the Windows user name.
         let user = std::env::var("PEERPARTY_NAME")
             .ok()
@@ -106,6 +116,7 @@ impl Identity {
             .filter(|n| !n.is_empty())
             .or_else(|| std::env::var("USERNAME").ok())
             .unwrap_or_else(|| "Player".into());
+        let (prefix, base) = if server { ("server", format!("{user}'s server")) } else { ("slot", user) };
         if fs::create_dir_all(dir).is_ok() {
             for slot in 0..32u32 {
                 let lock = OpenOptions::new()
@@ -113,28 +124,48 @@ impl Identity {
                     .write(true)
                     .truncate(false)
                     .share_mode(0)
-                    .open(dir.join(format!("slot-{slot}.lock")));
+                    .open(dir.join(format!("{prefix}-{slot}.lock")));
                 let Ok(lock) = lock else { continue };
-                let key = Arc::new(IdentityKey::load_or_create(&dir.join(format!("slot-{slot}.ed25519"))));
+                let key = Arc::new(IdentityKey::load_or_create(&dir.join(format!("{prefix}-{slot}.ed25519"))));
                 let id = PeerId::of_key(&key.public());
                 // The id used to be random bytes in a file of its own: listed among the
-                // slot's previous ids first, then the file goes.
-                retire_old_id(dir, slot, id);
-                let name = if slot == 0 {
-                    user
-                } else {
-                    format!("{user} ({})", slot + 1)
-                };
+                // slot's previous ids first, then the file goes (players' slots only:
+                // server slots came later).
+                if !server {
+                    retire_old_id(dir, slot, id);
+                }
+                let name = if slot == 0 { base } else { format!("{base} ({})", slot + 1) };
                 return Identity {
                     id,
                     name,
                     slot,
+                    server,
                     key,
                     _lock: Some(lock),
                 };
             }
         }
-        Identity::ephemeral(&user)
+        let mut me = Identity::ephemeral(&base);
+        me.server = server;
+        me
+    }
+
+    /// The ids of every identity slot on this PC (players' and servers'), from their
+    /// key files in `dir`: a peer with one of these is another copy on this PC.
+    pub fn ids_on_this_pc(dir: &Path) -> Vec<PeerId> {
+        let mut out = Vec::new();
+        for e in fs::read_dir(dir).into_iter().flatten().flatten() {
+            let name = e.file_name().to_string_lossy().to_ascii_lowercase();
+            let slot_file = (name.starts_with("slot-") || name.starts_with("server-")) && name.ends_with(".ed25519");
+            if !slot_file {
+                continue;
+            }
+            let key = fs::read_to_string(e.path()).ok().and_then(|t| IdentityKey::from_text(&t));
+            if let Some(key) = key {
+                out.push(PeerId::of_key(&key.public()));
+            }
+        }
+        out
     }
 
     /// The ids `slot` had before its current one, newest first (`slot-N.previous`).
@@ -165,6 +196,7 @@ impl Identity {
             id: PeerId::of_key(&key.public()),
             name: name.into(),
             slot: u32::MAX,
+            server: false,
             key,
             _lock: None,
         }
@@ -217,6 +249,34 @@ mod tests {
         assert_eq!(again.id, PeerId::of_key(&again.key.public()), "which is its key's");
         assert_ne!(PeerId::of_key(&[1; 32]), PeerId::of_key(&[2; 32]));
         drop((b, again));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A dedicated server's slots are apart from players': a server running first leaves
+    /// the player the first slot, its name and its id.
+    #[test]
+    fn a_server_never_takes_a_players_slot() {
+        let dir = std::env::temp_dir().join(format!("peerparty-id-server-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let server = Identity::claim_server(&dir);
+        let player = Identity::claim(&dir);
+        let second_server = Identity::claim_server(&dir);
+        assert_eq!((player.slot, player.server), (0, false));
+        assert!(!player.name.contains('('), "the player keeps the first slot's plain name");
+        assert_eq!((server.slot, server.server), (0, true));
+        assert_eq!(server.name, format!("{}'s server", player.name));
+        assert_eq!((second_server.slot, second_server.name.clone()), (1, format!("{}'s server (2)", player.name)));
+        assert_ne!(server.id, player.id);
+        assert!(dir.join("server-0.ed25519").exists() && dir.join("slot-0.ed25519").exists());
+        let mut here = Identity::ids_on_this_pc(&dir);
+        here.sort();
+        let mut want = vec![server.id, player.id, second_server.id];
+        want.sort();
+        assert_eq!(here, want, "every slot's id, players' and servers'");
+        let server_id = server.id;
+        drop(server);
+        assert_eq!(Identity::claim_server(&dir).id, server_id, "a server keeps its id across runs");
+        drop((player, second_server));
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -137,6 +137,8 @@ pub struct Import {
     pub name: String,
     /// The import address table entry the loader filled in.
     pub slot: *mut usize,
+    /// What the slot holds until the loader binds it (the import name table's entry).
+    pub unbound: usize,
 }
 
 /// Named imports of a loaded image. Ordinal imports and images without an import name
@@ -225,6 +227,7 @@ pub unsafe fn imports(base: *const u8) -> Vec<Import> {
                     dll: dll.clone(),
                     name: read_name(base.add((v as u32) as usize + 2)),
                     slot: base.add(ft as usize + i * entry) as *mut usize,
+                    unbound: v as usize,
                 });
             }
         }

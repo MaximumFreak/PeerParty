@@ -29,6 +29,8 @@ pub struct State {
     /// The players "Unblock all" let back in, until the window closes: one click, on
     /// people blocked one at a time for a reason, can be taken back.
     unblocked: Vec<(String, String)>,
+    /// "Unblock all" was pressed and waits for a yes.
+    confirm_unblock: bool,
     /// Public sessions were switched on and wait for a yes; the yes takes the focus once.
     confirm_public: bool,
     confirm_focus: bool,
@@ -87,6 +89,8 @@ fn public_switch(ui: &mut egui::Ui, p: &mut Prefs, st: &mut State) {
             }
             if yes.clicked() {
                 p.public = true;
+                // Public sessions are on the internet: turned on, they turn it on.
+                p.internet = true;
                 st.confirm_public = false;
             }
             if widgets::button(ui, None, t!("common.cancel"), Kind::Ghost).clicked() {
@@ -229,6 +233,9 @@ impl App {
                             first_focus(&r, focus);
                             if r.clicked() {
                                 p.room = RoomCode::generate().to_string();
+                                // A room is for the internet: one made while internet
+                                // play was paused would otherwise do nothing.
+                                p.internet = true;
                                 st.show_code = true;
                             }
                             if widgets::button(ui, Some(Icon::Link), t!("together.join"), Kind::Secondary).clicked() {
@@ -240,6 +247,7 @@ impl App {
                                 && widgets::button(ui, Some(Icon::Leave), &t!("together.rejoin", room = code.fingerprint()), Kind::Ghost).clicked()
                             {
                                 p.room = st.left.take().unwrap_or_default();
+                                p.internet = true;
                             }
                         });
                     }
@@ -270,6 +278,7 @@ impl App {
                         if let Some(d) = done {
                             if let Some(c) = d {
                                 p.room = c;
+                                p.internet = true;
                             }
                             st.join = None;
                         }
@@ -293,7 +302,7 @@ impl App {
             if p.public {
                 widgets::divider(ui);
                 let fallback = if p.name.trim().is_empty() { t!("together.public_name_hint").to_string() } else { p.name.clone() };
-                widgets::setting(ui, t!("together.public_name"), "", |ui| {
+                widgets::setting(ui, t!("together.public_name"), t!("together.public_name_sub"), |ui| {
                     widgets::text_field(ui, &mut p.public_name, &fallback, 200.0, 32);
                 });
                 widgets::divider(ui);
@@ -303,13 +312,26 @@ impl App {
                 widgets::divider(ui);
                 let n = self.together.blocked.unwrap_or(0);
                 widgets::setting(ui, &t!("together.blocked", n = n), t!("together.blocked_sub"), |ui| {
-                    if n > 0 && widgets::button(ui, None, t!("together.unblock_all"), Kind::Secondary).clicked() {
-                        unblock = true;
+                    if n > 0 && !self.together.confirm_unblock && widgets::button(ui, None, t!("together.unblock_all"), Kind::Secondary).clicked() {
+                        self.together.confirm_unblock = true;
                     }
                     if n == 0 && !self.together.unblocked.is_empty() && widgets::button(ui, None, t!("together.block_again"), Kind::Ghost).clicked() {
                         reblock = true;
                     }
                 });
+                // Each was blocked one at a time, for a reason: a yes first.
+                if self.together.confirm_unblock && n > 0 {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(t!("together.unblock_confirm")).color(TEXT));
+                        if widgets::button(ui, None, t!("together.unblock_all"), Kind::Danger).clicked() {
+                            unblock = true;
+                            self.together.confirm_unblock = false;
+                        }
+                        if widgets::button(ui, None, t!("common.cancel"), Kind::Ghost).clicked() {
+                            self.together.confirm_unblock = false;
+                        }
+                    });
+                }
             }
         });
         if unblock {

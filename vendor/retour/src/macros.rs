@@ -178,8 +178,13 @@ macro_rules! impl_hookable {
 
   (@impl_all ($($nm:ident : $ty:ident),*)) => {
     impl_hookable!(@impl_pair ($($nm : $ty),*) (                  fn($($ty),*) -> Ret));
+    // PeerParty patch: these are x86 conventions; rustc is phasing them out elsewhere
+    // (a warning now, an error later), and on x64 they are all "C" anyway.
+    #[cfg(target_arch = "x86")]
     impl_hookable!(@impl_pair ($($nm : $ty),*) (extern "cdecl"    fn($($ty),*) -> Ret));
+    #[cfg(target_arch = "x86")]
     impl_hookable!(@impl_pair ($($nm : $ty),*) (extern "stdcall"  fn($($ty),*) -> Ret));
+    #[cfg(target_arch = "x86")]
     impl_hookable!(@impl_pair ($($nm : $ty),*) (extern "fastcall" fn($($ty),*) -> Ret));
     // PeerParty patch: current rustc rejects "win64" outright on x86.
     #[cfg(target_arch = "x86_64")]

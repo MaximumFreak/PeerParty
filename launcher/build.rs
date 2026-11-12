@@ -13,6 +13,19 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// No console window for a program the build runs: started from a build with no
+/// console (an editor, a test runner), one would flash on screen. Its output is still
+/// read through pipes, and what it starts shares its hidden console.
+fn no_window(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    #[cfg(not(windows))]
+    let _ = cmd;
+}
+
 #[path = "src/icon_art.rs"]
 mod icon_art;
 
@@ -53,6 +66,7 @@ fn main() {
             continue;
         }
         let mut cmd = Command::new(&cargo);
+        no_window(&mut cmd);
         cmd.current_dir(&root)
             .args(["build", "-p", "peerparty_hook", "--target", triple])
             .arg("--target-dir")
@@ -131,7 +145,9 @@ fn build_number(root: &Path, version: &str) -> u32 {
         println!("cargo:rerun-if-changed={}", p.display());
     }
     let tag = format!("v{version}");
-    let out = Command::new("git")
+    let mut git = Command::new("git");
+    no_window(&mut git);
+    let out = git
         .current_dir(root)
         .args(["describe", "--tags", "--long", "--match", &tag])
         .output()

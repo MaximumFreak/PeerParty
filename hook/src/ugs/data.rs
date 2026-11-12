@@ -52,10 +52,17 @@ fn store_path(owner: &str, access: &str) -> Option<PathBuf> {
 }
 
 /// key -> {value, writeLock, created, modified}, in key order.
+/// A file there that isn't such an object is kept aside (`saves::set_aside_unreadable`)
+/// rather than overwritten by the next write.
 fn load(path: &Option<PathBuf>) -> Vec<(String, Json)> {
-    match path.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|t| Json::parse(&t)) {
+    let Some(p) = path else { return Vec::new() };
+    let Ok(text) = std::fs::read(p) else { return Vec::new() };
+    match std::str::from_utf8(&text).ok().and_then(Json::parse) {
         Some(Json::Obj(items)) => items,
-        _ => Vec::new(),
+        _ => {
+            crate::saves::set_aside_unreadable(p, "ugs cloud-save");
+            Vec::new()
+        }
     }
 }
 
@@ -64,7 +71,11 @@ fn save(path: &Option<PathBuf>, items: &[(String, Json)]) -> bool {
     if let Some(d) = p.parent() {
         let _ = std::fs::create_dir_all(d);
     }
-    std::fs::write(p, Json::Obj(items.to_vec()).to_string()).is_ok()
+    let ok = crate::saves::write_whole(p, Json::Obj(items.to_vec()).to_string().as_bytes()).is_ok();
+    if !ok {
+        log!("ugs cloud-save: couldn't write {}", p.display());
+    }
+    ok
 }
 
 fn query_param(path: &str, name: &str) -> Option<String> {
@@ -144,6 +155,11 @@ fn set(items: &mut Vec<(String, Json)>, key: &str, value: Json, lock: Option<&st
     Ok(fresh)
 }
 
+/// The store couldn't be written: the game hears its save didn't happen.
+fn not_saved() -> Reply {
+    (500, error_body(500, 0, "Internal Server Error", "peerparty couldn't write this save to disk"))
+}
+
 fn conflict(key: &str) -> Reply {
     (409, error_body(409, CONFLICT, "Conflict", &format!("the write lock for {key} doesn't match")))
 }
@@ -183,7 +199,9 @@ pub fn cloud_save(method: &str, path: &str, body: &Json) -> Reply {
             let key = body.get("key").as_str().unwrap_or_default().to_string();
             match set(&mut items, &key, body.get("value").clone(), body.get("writeLock").as_str()) {
                 Ok(lock) => {
-                    save(&path_buf, &items);
+                    if !save(&path_buf, &items) {
+                        return not_saved();
+                    }
                     (200, Json::obj(vec![("writeLock", Json::str(lock))]).to_string())
                 }
                 Err(k) => conflict(&k),
@@ -200,7 +218,9 @@ pub fn cloud_save(method: &str, path: &str, body: &Json) -> Reply {
                 }
             }
             items = next;
-            save(&path_buf, &items);
+            if !save(&path_buf, &items) {
+                return not_saved();
+            }
             (200, Json::obj(vec![("results", Json::Arr(results))]).to_string())
         }
         ("DELETE", ["items", key]) if writable => {
@@ -210,7 +230,9 @@ pub fn cloud_save(method: &str, path: &str, body: &Json) -> Reply {
                 Some(i) if lock.as_deref().is_some_and(|l| !l.is_empty() && Some(l) != items[i].1.get("writeLock").as_str()) => conflict(&key),
                 Some(i) => {
                     items.remove(i);
-                    save(&path_buf, &items);
+                    if !save(&path_buf, &items) {
+                        return not_saved();
+                    }
                     (204, String::new())
                 }
                 None => (404, error_body(404, NOT_FOUND, "Not Found", &format!("no item {key}"))),
@@ -218,7 +240,9 @@ pub fn cloud_save(method: &str, path: &str, body: &Json) -> Reply {
         }
         ("DELETE", ["items"]) if writable => {
             items.clear();
-            save(&path_buf, &items);
+            if !save(&path_buf, &items) {
+                return not_saved();
+            }
             (204, String::new())
         }
         _ => {

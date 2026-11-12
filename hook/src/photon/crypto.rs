@@ -26,28 +26,10 @@ const GENERATOR: u32 = 22;
 
 // ---------------------------------------------------------------- randomness
 
-/// Random bytes from the standard library's per-process random seed (RandomState
-/// draws on the OS generator), stretched with SHA-256 and a counter.
+/// Random bytes from the OS's secure random source.
 pub fn random_bytes(n: usize) -> Vec<u8> {
-    use std::collections::hash_map::RandomState;
-    use std::hash::BuildHasher;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let mut out = Vec::with_capacity(n);
-    while out.len() < n {
-        let c = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut seed = Vec::with_capacity(48);
-        for i in 0..4u64 {
-            seed.extend_from_slice(&RandomState::new().hash_one((c, i)).to_le_bytes());
-        }
-        let t = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        seed.extend_from_slice(&t.to_le_bytes());
-        out.extend_from_slice(&sha256(&seed));
-    }
-    out.truncate(n);
+    let mut out = vec![0u8; n];
+    peerparty_core::inet::crypto::random(&mut out);
     out
 }
 

@@ -24,6 +24,18 @@
 //! server's: their status changes go to the game server's dispatch, they are the game
 //! server's SteamID at its end, and a client's connection to it (by its SteamID, or by
 //! IP to a port it listens on) sees that SteamID too.
+//!
+//! A server is listed once the game asks for it (`SetAdvertiseServerActive(true)`, or
+//! the old `EnableHeartbeats`), or, for a game that never says, once it has a name: a
+//! game server that only exists for Steam's sign-in (a crossplay server reached through
+//! another service) isn't listed, so it doesn't show as a second, nameless entry.
+//!
+//! The host's presence carries the server's game port and name too, and whether it is
+//! listed, so the overlay lists a dedicated server by its name, and its Join hands the
+//! game Steam's own "join this server" request (`GameServerChangeRequested_t`) with the
+//! server's address: its LAN address when it is listed on Steam, else the address its
+//! PlayFab lobby advertises for that port (a crossplay server's, which a game looks up
+//! through PlayFab).
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_char;
@@ -42,6 +54,12 @@ use crate::steamobj::{call_real, vmethod};
 
 pub const NS: &str = "steam.server";
 const KEY_GS: &str = "peerparty:gs";
+/// The game port of the server in `KEY_GS`.
+const KEY_GS_PORT: &str = "peerparty:gsport";
+/// "1" while the server in `KEY_GS` is listed on the (LAN) Steam server browser.
+const KEY_GS_LISTED: &str = "peerparty:gslisted";
+
+const GAME_SERVER_CHANGE_REQUESTED: i32 = 332;
 
 const STEAM_SERVERS_CONNECTED: i32 = 101;
 const STEAM_SERVERS_DISCONNECTED: i32 = 103;
@@ -63,6 +81,13 @@ struct AuthResponse {
 struct ClientApprove {
     steam_id: u64,
     owner: u64,
+}
+
+/// Steam's GameServerChangeRequested_t.
+#[repr(C)]
+struct ChangeServer {
+    server: [u8; 64],
+    password: [u8; 64],
 }
 
 #[repr(C)]
@@ -141,7 +166,7 @@ struct Server {
     /// Steam id -> (name, score).
     players: BTreeMap<u64, (String, u32)>,
     logged_on: bool,
-    /// What the game asked for; unset means advertised once logged on.
+    /// What the game asked for; unset means listed once it has a name (`listed`).
     advertise: Option<bool>,
 }
 
@@ -277,6 +302,11 @@ pub fn is_server(id: u64) -> bool {
     matches!((id >> 52) & 0xf, 3 | 4) && host_of(id).is_some()
 }
 
+/// Whether the game is starting or running a game server (SteamGameServer_Init).
+pub fn server_started() -> bool {
+    SERVER_STARTED.load(Ordering::Relaxed)
+}
+
 /// The game server's dispatch pipe, once the game has started a game server.
 pub fn server_pipe() -> Option<i32> {
     let started = SERVER_STARTED.load(Ordering::Relaxed);
@@ -335,7 +365,8 @@ fn log_on(anonymous: bool) {
         st.dirty = true;
         server.id
     };
-    net::set_presence("steamgs", vec![(KEY_GS.into(), id.to_string())]);
+    let server = S.lock().unwrap().server.clone().unwrap_or_default();
+    publish(&server, listed(&server));
     log!("steam-lan game server logged on as {id} (LAN)");
     crate::steam::inject_server(STEAM_SERVERS_CONNECTED, vec![0]);
     crate::steam::inject_server(GS_POLICY_RESPONSE, bytes(&PolicyResponse { secure: 0 }));
@@ -356,10 +387,87 @@ fn log_off() {
     if let (Some(id), Some(lan)) = (advert, lan()) {
         let _ = lan.destroy(&id);
     }
+    *PUBLISHED.lock().unwrap() = None;
     net::set_presence("steamgs", Vec::new());
     log!("steam-lan game server logged off");
     // k_EResultOK: the game asked for it.
     crate::steam::inject_server(STEAM_SERVERS_DISCONNECTED, bytes(&Disconnected { result: 1 }));
+}
+
+/// Whether our server is listed: logged on, and the game asked for it, or never said
+/// either way and has named it (module docs).
+fn listed(s: &Server) -> bool {
+    s.logged_on && s.advertise.unwrap_or(!s.name.trim().is_empty())
+}
+
+/// What our presence last said about our server (id, port, name, listed).
+static PUBLISHED: Mutex<Option<(u64, u16, String, bool)>> = Mutex::new(None);
+
+/// Our server in our presence: its SteamID, game port, name and whether it's listed,
+/// when they change.
+fn publish(s: &Server, listed: bool) {
+    if !s.logged_on || s.id == 0 {
+        return;
+    }
+    let now = (s.id, s.game_port, s.name.clone(), listed);
+    {
+        let mut last = PUBLISHED.lock().unwrap();
+        if last.as_ref() == Some(&now) {
+            return;
+        }
+        *last = Some(now);
+    }
+    let mut kv = vec![(KEY_GS.into(), s.id.to_string())];
+    if s.game_port != 0 {
+        kv.push((KEY_GS_PORT.into(), s.game_port.to_string()));
+    }
+    if !s.name.is_empty() {
+        kv.push((net::SERVER_NAME_KEY.into(), s.name.clone()));
+    }
+    if listed {
+        kv.push((KEY_GS_LISTED.into(), "1".into()));
+    }
+    net::set_presence("steamgs", kv);
+}
+
+/// The overlay's Join on a player who hosts a game server: the game is handed Steam's
+/// "join this server" request with the server's address, as Steam's friends list
+/// would. False when the game doesn't use Steam or the peer hosts no server.
+pub fn join_server(peer: PeerId) -> bool {
+    if !net::fronts().contains(&net::Front::Steam) {
+        return false;
+    }
+    let Some(lan) = lan() else { return false };
+    let presence = lan.presence(peer);
+    let get = |key: &str| presence.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
+    let (Some(_), Some(port)) = (get(KEY_GS), get(KEY_GS_PORT).and_then(|p| p.parse::<u16>().ok())) else {
+        return false;
+    };
+    let address = if get(KEY_GS_LISTED).as_deref() == Some("1") {
+        match lan.game_address(peer) {
+            Some(std::net::IpAddr::V4(v4)) => format!("{v4}:{port}"),
+            _ => return false,
+        }
+    } else {
+        // Not listed on Steam: reached through another service, at the address its
+        // lobby there advertises.
+        match crate::playfab::api::lobby_address(peer, port) {
+            Some(a) => a,
+            None => {
+                log!("steam-lan join: {peer}'s game server isn't listed on Steam and advertises no address elsewhere");
+                return false;
+            }
+        }
+    };
+    log!("steam-lan join: the game is asked to join {peer}'s game server at {address}");
+    crate::steam::inject(GAME_SERVER_CHANGE_REQUESTED, change_server(&address));
+    true
+}
+
+fn change_server(address: &str) -> Vec<u8> {
+    let mut c = ChangeServer { server: [0; 64], password: [0; 64] };
+    copy(&mut c.server, address);
+    bytes(&c)
 }
 
 fn add_player(user: u64) {
@@ -422,7 +530,7 @@ pub fn tick() {
     let (want, server, advert) = {
         let mut st = S.lock().unwrap();
         let Some(server) = st.server.clone() else { return };
-        let want = server.logged_on && server.advertise != Some(false);
+        let want = listed(&server);
         let due = st.last_advert.is_none_or(|t| t.elapsed() >= ADVERT_EVERY);
         if want && st.advert.is_some() && !(st.dirty && due) {
             return;
@@ -434,6 +542,7 @@ pub fn tick() {
         st.last_advert = Some(std::time::Instant::now());
         (want, server, st.advert.clone())
     };
+    publish(&server, want);
     match (want, advert) {
         (true, None) => {
             let mut l = Lobby::new(NS);
@@ -1425,6 +1534,30 @@ mod tests {
         l.id = "steamgs:1".into();
         l.attrs = kv.iter().map(|(k, v)| attr(k, v)).collect();
         l
+    }
+
+    #[test]
+    fn a_server_is_listed_when_asked_or_once_named() {
+        let mut s = Server { logged_on: true, ..Server::default() };
+        assert!(!listed(&s), "a nameless server the game never listed (a crossplay server's Steam side)");
+        s.name = "My World".into();
+        assert!(listed(&s), "a game that never says, once its server has a name");
+        s.advertise = Some(false);
+        assert!(!listed(&s));
+        s.name.clear();
+        s.advertise = Some(true);
+        assert!(listed(&s), "asked for, name or not");
+        s.logged_on = false;
+        assert!(!listed(&s));
+    }
+
+    #[test]
+    fn a_join_request_carries_the_servers_address() {
+        let b = change_server("192.168.1.20:2456");
+        assert_eq!(b.len(), 128);
+        assert_eq!(&b[..17], b"192.168.1.20:2456");
+        assert_eq!(b[17], 0);
+        assert!(b[64..].iter().all(|c| *c == 0), "no password: the game asks for one");
     }
 
     #[test]

@@ -131,20 +131,35 @@ fn says_nothing(ip: Ipv4Addr) -> bool {
     (o[0] == 198 && o[1] & 0xFE == 18) || ip.is_loopback() || o[0] == 0 || o[0] >= 224
 }
 
-/// Full-width digits and the full-width dot and colon ("１９２．１６８．０．１"), which
-/// read as an address to a person or a game that converts them.
-fn is_wide(c: char) -> bool {
-    matches!(c, '\u{FF10}'..='\u{FF19}' | '\u{FF0E}' | '\u{FF1A}')
+/// The first digit (zero) of each run of ten decimal digits Unicode has besides ASCII's
+/// (category Nd): full-width, Arabic-Indic, Devanagari, Thai, the mathematical bold and
+/// monospace sets and the rest. Each run is 0 to 9 in order.
+const DIGIT_ZEROS: [u32; 43] = [
+    0x0660, 0x06F0, 0x07C0, 0x0966, 0x09E6, 0x0A66, 0x0AE6, 0x0B66, 0x0BE6, 0x0C66, 0x0CE6, 0x0D66, 0x0DE6, 0x0E50, 0x0ED0, 0x0F20,
+    0x1040, 0x1090, 0x17E0, 0x1810, 0x1946, 0x19D0, 0x1A80, 0x1A90, 0x1B50, 0x1BB0, 0x1C40, 0x1C50, 0xA620, 0xA8D0, 0xA900, 0xA9D0,
+    0xA9F0, 0xAA50, 0xABF0, 0xFF10, 0x104A0, 0x11066, 0x1D7CE, 0x1D7D8, 0x1D7E2, 0x1D7EC, 0x1D7F6,
+];
+
+/// The value of a decimal digit from any script but ASCII's.
+fn other_digit(c: char) -> Option<u8> {
+    let c = c as u32;
+    DIGIT_ZEROS.iter().find(|z| (**z..**z + 10).contains(&c)).map(|z| (c - z) as u8)
 }
 
-/// `s` with full-width digits, dots and colons as ASCII.
+/// Digits from other scripts ("١٩٢", full-width "１９２") and the full-width or ideographic
+/// dot and full-width colon ("１９２．１６８．０．１"), which read as an address to a
+/// person or a game that converts them.
+fn is_wide(c: char) -> bool {
+    matches!(c, '\u{FF0E}' | '\u{FF1A}' | '\u{3002}' | '\u{FF61}') || other_digit(c).is_some()
+}
+
+/// `s` with such digits, dots and colons as ASCII.
 fn narrow(s: &str) -> String {
     s.chars()
         .map(|c| match c {
-            '\u{FF10}'..='\u{FF19}' => char::from(b'0' + (c as u32 - 0xFF10) as u8),
-            '\u{FF0E}' => '.',
+            '\u{FF0E}' | '\u{3002}' | '\u{FF61}' => '.',
             '\u{FF1A}' => ':',
-            c => c,
+            c => other_digit(c).map_or(c, |d| char::from(b'0' + d)),
         })
         .collect()
 }
@@ -461,6 +476,11 @@ mod tests {
             ("x", "id169.254.10.1", Some("id198.18.4.9")),
             ("x", "\u{FF12}\u{FF10}\u{FF13}\u{FF0E}\u{FF10}\u{FF0E}\u{FF11}\u{FF11}\u{FF13}\u{FF0E}\u{FF15}", Some("198.18.4.9")),
             ("x", "at \u{FF11}\u{FF19}\u{FF12}.\u{FF11}\u{FF16}\u{FF18}.1.20\u{FF1A}\u{FF17}\u{FF17}\u{FF17}\u{FF17}", Some("at 198.18.4.9:7777")),
+            // Other scripts' digits: Arabic-Indic, Devanagari with the ideographic dot,
+            // mathematical bold.
+            ("x", "\u{661}\u{669}\u{662}.\u{661}\u{666}\u{668}.\u{661}.\u{662}\u{660}", Some("198.18.4.9")),
+            ("x", "\u{967}\u{96F}\u{968}\u{3002}\u{967}\u{96C}\u{96E}\u{3002}\u{967}\u{3002}\u{968}\u{966}", Some("198.18.4.9")),
+            ("x", "\u{1D7CF}\u{1D7CE}.\u{1D7CE}.\u{1D7CE}.\u{1D7D5}:\u{1D7D5}\u{1D7D5}", Some("198.18.4.9:77")),
             // Still kept: a version stuck to a word, full-width digits that aren't an address.
             ("desc", "v10.0.0.1", None),
             ("desc", "v1.0.7.2", None),

@@ -13,6 +13,8 @@ pub enum Sdk {
     Eos,
     /// GOG Galaxy (Galaxy64.dll / Galaxy.dll): decorated C++ exports in galaxy::api.
     Galaxy,
+    /// Vivox's core SDK (vivoxsdk.dll), under Unity's Vivox package.
+    Vivox,
 }
 
 pub fn label(sdk: Sdk) -> &'static str {
@@ -25,6 +27,7 @@ pub fn label(sdk: Sdk) -> &'static str {
         Sdk::PlayFabCore => "playfab-core",
         Sdk::Eos => "eos",
         Sdk::Galaxy => "gog-galaxy",
+        Sdk::Vivox => "vivox",
     }
 }
 
@@ -38,6 +41,7 @@ pub fn identify<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<Sdk> {
     let mut core = false;
     let mut eos = false;
     let mut galaxy = false;
+    let mut vivox = false;
     for name in names {
         if name.starts_with("?ProcessData@api@galaxy@@") {
             galaxy = true;
@@ -53,6 +57,7 @@ pub fn identify<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<Sdk> {
             "PFMultiplayerInitialize" => multiplayer = true,
             "PFServiceConfigCreateHandle" | "PFInitialize" => core = true,
             "EOS_Platform_Create" => eos = true,
+            "vx_initialize3" => vivox = true,
             _ => {}
         }
     }
@@ -81,6 +86,9 @@ pub fn identify<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<Sdk> {
     }
     if galaxy {
         return Some(Sdk::Galaxy);
+    }
+    if vivox {
+        return Some(Sdk::Vivox);
     }
     None
 }

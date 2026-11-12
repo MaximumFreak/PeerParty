@@ -16,7 +16,9 @@
   load a real SDK DLL with ctypes and talk to each other through PeerParty, as two copies
   of a game would. EOS RTC voice, EOS lobby voice and EOS custom invites; PlayFab Party
   chat and PlayFabCore sign-in; PlayFab's web API (lobbies, statistics, user data,
-  friends; no DLL needed); Unity Gaming Services (no DLL needed); GOG Galaxy (stats,
+  friends; no DLL needed); Unity Gaming Services (no DLL needed); Vivox (a game's
+  VivoxNative.dll driven as Unity's package does: login, a positional channel, each
+  other's participants, positions, Windows' devices listed and one chosen, leaving); GOG Galaxy (stats,
   storage, cloud saves, telemetry, tokens, chat); Steam licence checks, which must reach
   Steam itself and read "can't verify" for a LAN player (needs the Steam client running,
   and shows the account as playing the app used).
@@ -48,6 +50,7 @@ folder holding several):
 | `PPTEST_GALAXY_DLL` | A 64-bit `Galaxy64.dll` (SDK 1.144 or newer; the cargo test wants 1.152.11) |
 | `PPTEST_GALAXY_1152_6_DLL` | A 64-bit `Galaxy64.dll`, SDK 1.152.6 (cargo test only) |
 | `PPTEST_PHOTON_DIR` | A folder with `Photon3Unity3D.dll`, `PhotonRealtime.dll` and, if the game has it, `PhotonChat.dll` |
+| `PPTEST_VIVOX_DIR` | A folder with a Unity game's 64-bit `VivoxNative.dll` and `vivoxsdk.dll` (its `Plugins\x86_64`) |
 | `PPTEST_STEAM_DLL`, `PPTEST_STEAM_APPID` | A `steam_api64.dll` or 32-bit `steam_api.dll` (any SDK with the flat API), and the app id of a game the signed-in Steam account owns |
 | `PPTEST_SDK_DLLS`, `PPTEST_SDK_DLLS_X86` | `;`-separated SDK DLLs the cargo test maps and hooks without running (64-bit, 32-bit) |
 
@@ -79,11 +82,11 @@ cpython-3.12-windows-x86-none` gets one).
 ## In games
 
 PeerParty has been played with two copies on one PC on Steam, EOS, PlayFab Party, GOG
-Galaxy and Photon Fusion games, and started as a package for Microsoft Store games. Many
-parts are covered by the automated tests above but haven't been played in a game yet,
-among them: drawing the overlay inside a game's frames, voice through the default
-microphone and speakers, Unity Gaming Services in a real Unity game, and play between two
-PCs over the internet.
+Galaxy, Photon Fusion and Unity Gaming Services (Lobby and Relay) games, and started as a
+package for Microsoft Store games. Many parts are covered by the automated tests above
+but haven't been played in a game yet, among them: drawing the overlay inside a game's
+frames, voice through the default microphone and speakers (Vivox included), and play
+between two PCs over the internet.
 
 When you try a game, the log in `%TEMP%\peerparty\logs\` says what each layer did. Lines
 worth looking for:
@@ -95,7 +98,8 @@ worth looking for:
 | PlayFab | `party-lan`, `pfmp-lan`, `playfab POST ...` |
 | GOG Galaxy | `galaxy signed in on the LAN`, `galaxy lobby` |
 | Photon | `photon ns.photonengine.io -> ...`, `signed in as`, `joined room ... as actor N` |
-| Unity Gaming Services | `ugs: the game ships ...`, `ugs relay: allocation`, `connected to host` |
+| Unity Gaming Services | `ugs: the game ships ...`, `ugs relay: allocation`, `Bind HMAC checks out`, `connected to host` |
+| Vivox | `vivox: PeerParty answers`, `vivox: joined channel`, `vivox: ... is in channel`, `vivox: ... volume N%` |
 | Overlay | `overlay: opened by ...`, `present: drawing the overlay inside the game's ... frames` |
 | Internet play | `inet connected to NAME`, `... now runs through the tunnel` |
 
