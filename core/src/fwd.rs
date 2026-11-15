@@ -68,6 +68,8 @@ const MAX_TCP_PER_PEER: usize = 32;
 const OPEN_WAIT: Duration = Duration::from_secs(10);
 /// How long a port found in the socket tables counts as still open.
 const OWNER_CACHE: Duration = Duration::from_secs(5);
+/// How long the list of peers behind stand-in addresses is used before it's read again.
+const PEERS_FRESH: Duration = Duration::from_secs(2);
 /// A port that isn't in the tables we read is looked for again (the game may have just
 /// opened it) only once they're this old: a peer naming one port after another can't
 /// make us read the system's socket tables for each. Short, because until then a socket
@@ -150,6 +152,9 @@ pub struct Forwarder {
     /// Public players are kept off ports the game bound to loopback only (see the
     /// module docs). Off in `loopback_only()` mode, where every socket is on loopback.
     loopback_private: AtomicBool,
+    /// Some UDP alias is on a LAN address (a game socket bound to one gets its peers'
+    /// datagrams from there): senders that aren't loopback are looked up too.
+    lan_aliases: AtomicBool,
     log: fn(&str),
 }
 
@@ -189,8 +194,15 @@ impl Forwarder {
             next: AtomicU64::new(1),
             refused: AtomicU64::new(0),
             loopback_private: AtomicBool::new(!crate::loopback_only()),
+            lan_aliases: AtomicBool::new(false),
             log,
         })
+    }
+
+    /// Whether a datagram's sender can be one of our aliases: a loopback one always
+    /// can, another one only once an alias sits on a LAN address.
+    pub fn may_be_alias(&self, from: Ipv4Addr) -> bool {
+        from.is_loopback() || self.lan_aliases.load(Ordering::Relaxed)
     }
 
     /// Whether public players are kept off ports the game bound to loopback only. On
@@ -220,11 +232,14 @@ impl Forwarder {
         }
         let mut st = self.st.lock().unwrap();
         let find = |st: &St| st.peers.iter().find(|(a, _)| *a == ip).map(|(_, p)| *p);
-        if let Some(p) = find(&st) {
+        // A hit is kept for PEERS_FRESH (a peer that left, or one more trusted at the
+        // same stand-in, shows within that); a miss looks again after 200 ms at most.
+        let age = st.peers_at.map(|t| t.elapsed());
+        if let Some(p) = find(&st).filter(|_| age.is_some_and(|a| a < PEERS_FRESH)) {
             return Some(p);
         }
-        if st.peers_at.is_some_and(|t| t.elapsed() < Duration::from_millis(200)) {
-            return None;
+        if age.is_some_and(|a| a < Duration::from_millis(200)) {
+            return find(&st);
         }
         // Best first: `find` takes the first peer at an address (see the module docs).
         st.peers = self.lan.peers_by_standing().into_iter().map(|id| (stand_in(&id.0), id)).collect();
@@ -534,6 +549,9 @@ impl Forwarder {
         }
         let sock = UdpSocket::bind((ip, 0)).ok()?;
         let SocketAddr::V4(addr) = sock.local_addr().ok()? else { return None };
+        if !ip.is_loopback() {
+            self.lan_aliases.store(true, Ordering::Relaxed);
+        }
         sock.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
         let a = Arc::new(Alias {
             sock,

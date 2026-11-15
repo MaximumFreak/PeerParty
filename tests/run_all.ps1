@@ -1,6 +1,8 @@
 # Every automated peerparty test in one go:
 #   1. cargo test (unit and loopback tests: hook, core, launcher). The launcher's nested
-#      hook build is x64 only: these tests never inject a 32-bit DLL.
+#      hook build is x64 only: these tests never inject a 32-bit DLL. The hook's and the
+#      core's unit tests then run again as 32-bit code (--target i686-pc-windows-msvc):
+#      32-bit games run that build, with its own layouts and pointer sizes.
 #   2. a testexe build (release optimizations, no link-time optimization, incremental).
 #      The tests below run that peerparty.exe. The shipping exe stays a release build.
 #      -SkipBuild reuses the last testexe build. A 32-bit test DLL builds the x86 hook
@@ -10,7 +12,7 @@
 #      same Photon DLLs and the same test sources skips `dotnet build`.
 #   4. the two-copy SDK tests (tests/sdk/run_pair.ps1): EOS RTC, EOS lobby voice, EOS custom
 #      invites, PlayFab Party chat, PlayFabCore sign-in, PlayFab's web API, Unity Gaming
-#      Services, Vivox voice (Unity's VivoxNative.dll), GOG Galaxy, Steam licence checks (with the Steam client running), and
+#      Services, Vivox voice (Unity's VivoxNative.dll), GOG Galaxy, Steam licence checks (with the Steam client running), a starter handing over to the game, and
 #      typed-IP games on async sockets (two copies in a room)
 #
 # SDK pairs and Photon run four at a time. Each pair gets its own PEERPARTY_GAME, so they
@@ -337,8 +339,10 @@ try {
     if (Want 'cargo') {
         # Launcher unit tests never inject, so the nested hook build skips x86.
         $env:PEERPARTY_HOOKS = 'x64'
-        cargo test --workspace 2>&1 | Tee-Object -Variable out | Select-String '^test result|FAILED|panicked' | ForEach-Object Line
+        cargo test --workspace --no-fail-fast 2>&1 | Tee-Object -Variable out | Select-String '^test result|FAILED|panicked' | ForEach-Object Line
         if ($LASTEXITCODE -eq 0) { Note 'cargo test' 'pass' } else { Note 'cargo test' 'FAIL' 'see output above' }
+        cargo test -p peerparty_core -p peerparty_hook --lib --target i686-pc-windows-msvc 2>&1 | Select-String '^test result|FAILED|panicked' | ForEach-Object Line
+        if ($LASTEXITCODE -eq 0) { Note 'cargo test (32-bit)' 'pass' } else { Note 'cargo test (32-bit)' 'FAIL' 'see output above' }
     }
 
     # Which SDK DLLs this run will load, before the exe build, so a 32-bit one can
@@ -384,6 +388,11 @@ try {
         # (steamown.rs, saves.rs), once per callback dispatch.
         @{ Name = 'steam_own_id'; Py = 'steam_own_id_test.py'; Var = 'PPTEST_STEAM_OWN_DLL'; Files = @('steam_api64.dll'); File = $true; Env = @('SteamAppId=480', 'PEERPARTY_MODE_STEAMID=lan'); Steam = $true; Roles = @('A'); Probe = $true; ProbeOf = 'steam_own' },
         @{ Name = 'steam_own_id_classic'; Dlls = 'steam_own_id'; Py = 'steam_own_id_test.py'; Var = 'PPTEST_STEAM_OWN_DLL'; Files = @('steam_api64.dll'); File = $true; Env = @('SteamAppId=480', 'PEERPARTY_MODE_STEAMID=lan', 'PPTEST_DISPATCH=classic'); Steam = $true; Roles = @('A'); Probe = $true; ProbeOf = 'steam_own' },
+        # A starter that starts the game, with a room code set: the game, not the starter,
+        # is this PC's first player. Only loads the DLL: no Steam client needed.
+        @{ Name = 'starter'; Dlls = 'steam_own_id'; Py = 'starter_test.py'; Var = 'PPTEST_STARTER_DLL'; Files = @('steam_api64.dll'); File = $true; Env = @('PEERPARTY_ROOM=starter-test-room', 'PEERPARTY_INET_DHT=0', 'PEERPARTY_INET_STUN=0', 'PEERPARTY_INET_PORTMAP=0'); Roles = @('A') },
+        # The same with a menu first (5 s): the starter starts its LAN, then gives it up.
+        @{ Name = 'starter_menu'; Dlls = 'steam_own_id'; Py = 'starter_test.py'; Var = 'PPTEST_STARTER_DLL'; Files = @('steam_api64.dll'); File = $true; Env = @('PEERPARTY_ROOM=starter-test-room', 'PEERPARTY_INET_DHT=0', 'PEERPARTY_INET_STUN=0', 'PEERPARTY_INET_PORTMAP=0', 'PPTEST_STARTER_MENU=5'); Roles = @('A') },
         @{ Name = 'ipfwd'; Py = 'ipfwd_test.py'; Var = $null; Files = @(); File = $false; Env = $inet; NeedsRoom = $true; RoleEnv = @("A:PEERPARTY_INET_PORT=$p1", "B:PEERPARTY_INET_PORT=$($p1 + 1)", "B:PEERPARTY_INET_PEERS=127.0.0.1:$p1") }
     )
     foreach ($p in $pairs) {

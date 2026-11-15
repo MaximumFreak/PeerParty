@@ -200,7 +200,7 @@ check("player name", st == 200 and "#" in nm.get("name", ""), nm)
 
 if ROLE == "A":
     st, lob = call(LOBBY, "POST", "/v1/create", {
-        "name": "peerparty ugs test", "maxPlayers": 4, "isPrivate": False,
+        "name": "peerparty ugs test", "maxPlayers": 4, "isPrivate": False, "password": "letmein123",
         "data": {"mode": {"value": "coop", "visibility": "public", "index": "S1"},
                  "secret": {"value": "host-only", "visibility": "private"}},
         "player": {"id": PID, "data": {"ready": {"value": "yes", "visibility": "member"}}}})
@@ -232,6 +232,12 @@ if ROLE == "A":
     rhost = endpoint(alloc)
     u.sendto(bind_msg(base64.b64decode(alloc["connectionData"]), base64.b64decode(alloc["key"])), rhost)
     check("host bound to the relay", udp_wait(u, 1) is not None, rhost)
+    # A private lobby: no query lists it (not even the LAN search under it), its code
+    # still finds it.
+    st, priv = call(LOBBY, "POST", "/v1/create", {"name": "peerparty private", "maxPlayers": 2, "isPrivate": True,
+                                                  "player": {"id": PID}})
+    check("private lobby create 201", st == 201 and priv.get("isPrivate") is True, (st, priv))
+    put_file("pcode", priv.get("lobbyCode", ""))
     put_file("code", CODE)
 
     def patches(ps):
@@ -253,6 +259,8 @@ if ROLE == "A":
     check("lobby back to one player", st == 200 and len(g["players"]) == 1, (st, g and len(g.get("players", []))))
     st, _ = call(LOBBY, "DELETE", f"/v1/{LID}")
     check("delete 204", st == 204, st)
+    st, _ = call(LOBBY, "DELETE", f"/v1/{priv['id']}")
+    check("private lobby delete 204", st == 204, st)
     put_file("a-done", "1")
     finish()
 else:
@@ -272,9 +280,22 @@ else:
     if found:
         check("listing has no lobby code", "lobbyCode" not in found[0], found[0].get("lobbyCode"))
         check("query hides private data", "secret" not in found[0].get("data", {}) and "relay" not in found[0].get("data", {}), found[0].get("data"))
+        check("listing says there's a password", found[0].get("hasPassword") is True, found[0].get("hasPassword"))
+    check("query doesn't list the private lobby", not any(l.get("name") == "peerparty private" for l in q.get("results", [])))
+    pcode = wait_file("pcode", 10)
+    st, pl = call(LOBBY, "POST", "/v1/joinbycode", {"lobbyCode": pcode, "player": {"id": PID}})
+    check("its code joins the private lobby", st == 200 and pl.get("name") == "peerparty private", (st, pl))
+    if st == 200:
+        st, _ = call(LOBBY, "DELETE", f"/v1/{pl['id']}/players/{PID}")
+        check("and leaves it", st == 204, st)
     st, bad = call(LOBBY, "POST", "/v1/joinbycode", {"lobbyCode": "ZZZZZZ"})
     check("bad code is 404", st == 404 and isinstance(bad, dict), (st, bad))
-    st, lob = call(LOBBY, "POST", "/v1/joinbycode", {"lobbyCode": code, "player": {"id": PID}})
+    st, bad = call(LOBBY, "POST", "/v1/joinbycode", {"lobbyCode": code, "player": {"id": PID}})
+    check("no password is 403 IncorrectPassword", st == 403 and bad.get("code") == 16009, (st, bad))
+    # The host's copy checks the password (the joiner's has no hash to check it with).
+    st, bad = call(LOBBY, "POST", "/v1/joinbycode", {"lobbyCode": code, "password": "wrongpass1", "player": {"id": PID}})
+    check("a wrong password is refused by the host (403)", st == 403 and bad.get("code") == 16009, (st, bad))
+    st, lob = call(LOBBY, "POST", "/v1/joinbycode", {"lobbyCode": code, "password": "letmein123", "player": {"id": PID}})
     check("join by code 200", st == 200 and len(lob["players"]) == 2, (st, lob and len(lob.get("players", []))))
     LID = lob["id"]
     rcode = lob.get("data", {}).get("relay", {}).get("value")

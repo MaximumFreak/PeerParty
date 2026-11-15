@@ -234,6 +234,8 @@ pub fn skip(layer: &str) -> bool {
 pub fn on_exit() {
     if let Some(Some(l)) = LAN.get() {
         l.release_port_maps();
+        // A run started while this one finishes exiting gets this player's slot.
+        l.release_slot();
     }
 }
 

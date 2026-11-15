@@ -149,11 +149,11 @@ fn draw(dc: usize) {
             c.size = (f.w, f.h);
             c.seq = None;
         }
-        if c.seq != Some(f.seq) && !f.writing() {
-            (g.tex_sub_image)(TEXTURE_2D, 0, 0, 0, f.w as i32, f.h as i32, BGRA, UNSIGNED_BYTE, f.px as *const u8);
-            if frame().is_some_and(|now| now.seq == f.seq) {
-                c.seq = Some(f.seq);
-            }
+        if c.seq != Some(f.seq)
+            && let Some(px) = f.stable()
+        {
+            (g.tex_sub_image)(TEXTURE_2D, 0, 0, 0, f.w as i32, f.h as i32, BGRA, UNSIGNED_BYTE, px.as_ptr() as *const u8);
+            c.seq = Some(f.seq);
         }
         if c.seq.is_some() {
             (g.viewport)(0, 0, w as i32, h as i32);

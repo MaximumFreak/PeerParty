@@ -71,6 +71,7 @@ fn save(path: &Option<PathBuf>, items: &[(String, Json)]) -> bool {
     if let Some(d) = p.parent() {
         let _ = std::fs::create_dir_all(d);
     }
+    crate::ipc::local_store("Unity Cloud Save", p);
     let ok = crate::saves::write_whole(p, Json::Obj(items.to_vec()).to_string().as_bytes()).is_ok();
     if !ok {
         log!("ugs cloud-save: couldn't write {}", p.display());

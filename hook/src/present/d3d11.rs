@@ -22,7 +22,41 @@ V vs(uint id : SV_VertexID) {
 Texture2D t : register(t0);
 SamplerState s : register(s0);
 float4 ps(V i) : SV_Target { return t.Sample(s, i.uv); }
+// For targets that hold linear light: the frame's sRGB colour is decoded first (an
+// sRGB target encodes it again as it writes, and blends in linear light), and scaled
+// to SDR white for an scRGB (float) one, where 1.0 is only 80 nits.
+float4 linear_of(float4 c, float gain) {
+    if (c.a <= 0) return c;
+    float3 e = saturate(c.rgb / c.a);
+    float3 l = e <= 0.04045 ? e / 12.92 : pow((e + 0.055) / 1.055, 2.4);
+    return float4(l * c.a * gain, c.a);
+}
+float4 ps_srgb(V i) : SV_Target { return linear_of(t.Sample(s, i.uv), 1.0); }
+float4 ps_scrgb(V i) : SV_Target { return linear_of(t.Sample(s, i.uv), SDR_WHITE); }
 "#;
+
+/// What scRGB 1.0 (80 nits) is multiplied by for the overlay's white: 200 nits, about
+/// where Windows puts SDR content on an HDR display by default.
+const SDR_WHITE: &str = "2.5";
+
+/// How a render target's format takes the frame's (sRGB-encoded) pixels.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Target {
+    /// As they are (UNORM formats, which hold sRGB-encoded values).
+    Plain,
+    /// An `_SRGB` format: the hardware encodes what is written.
+    Srgb,
+    /// R16G16B16A16_FLOAT: scRGB, linear light (HDR swap chains).
+    ScRgb,
+}
+
+fn target_of(format: u32) -> Target {
+    match format {
+        29 | 91 | 93 => Target::Srgb, // R8G8B8A8 / B8G8R8A8 / B8G8R8X8 _UNORM_SRGB
+        10 => Target::ScRgb,          // R16G16B16A16_FLOAT
+        _ => Target::Plain,
+    }
+}
 
 const FORMAT_B8G8R8A8_UNORM: u32 = 87;
 
@@ -72,6 +106,9 @@ pub struct Renderer {
     ctx: usize,
     vs: usize,
     ps: usize,
+    /// The pixel shaders for linear targets (`Target::Srgb`, `Target::ScRgb`).
+    ps_srgb: usize,
+    ps_scrgb: usize,
     sampler: usize,
     blend: usize,
     raster: usize,
@@ -90,12 +127,20 @@ impl Renderer {
         vcall!(device, 1, fn() -> u32);
         let mut ctx = 0usize;
         vcall!(device, 40, fn(*mut usize) -> (), &mut ctx);
-        let mut r = Renderer { device, ctx, vs: 0, ps: 0, sampler: 0, blend: 0, raster: 0, depth: 0, tex: 0, srv: 0, size: (0, 0), seq: None };
-        let vs = compile(HLSL, c"vs", c"vs_4_0")?;
-        let ps = compile(HLSL, c"ps", c"ps_4_0")?;
+        let mut r = Renderer {
+            device, ctx, vs: 0, ps: 0, ps_srgb: 0, ps_scrgb: 0, sampler: 0, blend: 0, raster: 0, depth: 0, tex: 0, srv: 0, size: (0, 0), seq: None,
+        };
+        let hlsl = format!("#define SDR_WHITE {SDR_WHITE}\n{HLSL}");
+        let vs = compile(&hlsl, c"vs", c"vs_4_0")?;
+        let ps = compile(&hlsl, c"ps", c"ps_4_0")?;
+        let ps_srgb = compile(&hlsl, c"ps_srgb", c"ps_4_0")?;
+        let ps_scrgb = compile(&hlsl, c"ps_scrgb", c"ps_4_0")?;
         let ok = |hr: i32| hr >= 0;
+        let pixel = |code: &[u8], out: &mut usize| ok(vcall!(device, 15, fn(*const u8, usize, usize, *mut usize) -> i32, code.as_ptr(), code.len(), 0, out));
         if !ok(vcall!(device, 12, fn(*const u8, usize, usize, *mut usize) -> i32, vs.as_ptr(), vs.len(), 0, &mut r.vs))
-            || !ok(vcall!(device, 15, fn(*const u8, usize, usize, *mut usize) -> i32, ps.as_ptr(), ps.len(), 0, &mut r.ps))
+            || !pixel(&ps, &mut r.ps)
+            || !pixel(&ps_srgb, &mut r.ps_srgb)
+            || !pixel(&ps_scrgb, &mut r.ps_scrgb)
         {
             return None;
         }
@@ -213,6 +258,14 @@ impl Renderer {
             return;
         }
         let c = self.ctx;
+        // ID3D11RenderTargetView::GetDesc: the view's format says how to write to it.
+        let mut view = RtvDesc { format: 0, dimension: 0, mip_slice: 0, pad: [0; 2] };
+        vcall!(rtv, 8, fn(*mut RtvDesc) -> (), &mut view);
+        let shader = match target_of(view.format) {
+            Target::Plain => self.ps,
+            Target::Srgb => self.ps_srgb,
+            Target::ScRgb => self.ps_scrgb,
+        };
         // Save.
         let mut rtvs = [0usize; 8];
         let mut dsv = 0usize;
@@ -251,7 +304,7 @@ impl Renderer {
         vcall!(c, 17, fn(usize) -> (), 0);
         vcall!(c, 24, fn(u32) -> (), 4); // TRIANGLELIST
         vcall!(c, 11, fn(usize, *const usize, u32) -> (), self.vs, std::ptr::null(), 0);
-        vcall!(c, 9, fn(usize, *const usize, u32) -> (), self.ps, std::ptr::null(), 0);
+        vcall!(c, 9, fn(usize, *const usize, u32) -> (), shader, std::ptr::null(), 0);
         vcall!(c, 23, fn(usize, *const usize, u32) -> (), 0, std::ptr::null(), 0);
         vcall!(c, 60, fn(usize, *const usize, u32) -> (), 0, std::ptr::null(), 0);
         vcall!(c, 64, fn(usize, *const usize, u32) -> (), 0, std::ptr::null(), 0);
@@ -286,7 +339,7 @@ impl Renderer {
 
 impl Drop for Renderer {
     fn drop(&mut self) {
-        for o in [self.srv, self.tex, self.sampler, self.depth, self.raster, self.blend, self.ps, self.vs, self.ctx, self.device] {
+        for o in [self.srv, self.tex, self.sampler, self.depth, self.raster, self.blend, self.ps_scrgb, self.ps_srgb, self.ps, self.vs, self.ctx, self.device] {
             release(o);
         }
     }
@@ -347,7 +400,7 @@ mod tests {
                 px[y * w as usize + x] = 0x8080_0000;
             }
         }
-        let f = Frame { seq: 2, w, h, px: px.as_ptr() };
+        let f = Frame { seq: 2, w, h, px: px.as_ptr(), base: 0 };
         // The frame isn't in shared memory, so copy_to's re-check would read address 0:
         // upload it by hand instead.
         assert!(r.ensure_texture(w, h));
@@ -365,6 +418,50 @@ mod tests {
         assert_eq!(left & 0x00ff_ffff, 0x0000_00ff, "left {left:#x}");
         let (rr, bb) = ((right >> 16) & 0xff, right & 0xff);
         assert!((rr as i32 - 128).abs() <= 2 && (bb as i32 - 127).abs() <= 2, "right {right:#x}");
+        release(rtv);
+        drop(r);
+        release(target);
+        release(ctx);
+        release(device);
+    }
+
+    /// An sRGB back buffer encodes what is written: the overlay's grey must land as the
+    /// same grey (encoded once), not brightened by a second encoding.
+    #[test]
+    fn an_srgb_target_gets_the_frame_encoded_once() {
+        let m = super::super::com::load("d3d11.dll");
+        type Create = unsafe extern "system" fn(usize, u32, usize, u32, *const u32, u32, u32, *mut usize, *mut u32, *mut usize) -> i32;
+        let create: Create = unsafe { std::mem::transmute(super::super::com::proc(m, c"D3D11CreateDevice").unwrap()) };
+        let (mut device, mut ctx, mut fl) = (0usize, 0usize, 0u32);
+        let hr = unsafe { create(0, 5, 0, 0x20, std::ptr::null(), 0, 7, &mut device, &mut fl, &mut ctx) };
+        assert!(hr >= 0, "D3D11CreateDevice {hr:#x}");
+        let (w, h) = (16u32, 16u32);
+        let desc = Texture2dDesc {
+            width: w, height: h, mip_levels: 1, array_size: 1, format: 91, sample_count: 1, sample_quality: 0,
+            usage: 0, bind_flags: 0x20, cpu_access: 0, misc: 0,
+        };
+        let mut target = 0usize;
+        assert!(vcall!(device, 5, fn(*const Texture2dDesc, usize, *mut usize) -> i32, &desc, 0, &mut target) >= 0);
+        let mut r = Renderer::new(device).expect("renderer");
+        let rtv = r.rtv_for(target);
+        assert_ne!(rtv, 0);
+        vcall!(ctx, 50, fn(usize, *const f32) -> (), rtv, [0.0f32, 0.0, 0.0, 1.0].as_ptr());
+        let px = vec![0xff80_8080u32; (w * h) as usize];
+        let f = Frame { seq: 2, w, h, px: px.as_ptr(), base: 0 };
+        assert!(r.ensure_texture(w, h));
+        let mut mp = Mapped { data: std::ptr::null_mut(), row_pitch: 0, depth_pitch: 0 };
+        assert!(vcall!(ctx, 14, fn(usize, u32, u32, u32, *mut Mapped) -> i32, r.tex, 0, 4, 0, &mut mp) >= 0);
+        for y in 0..h as usize {
+            unsafe { std::ptr::copy_nonoverlapping(px.as_ptr().add(y * w as usize) as *const u8, mp.data.add(y * mp.row_pitch as usize), w as usize * 4) };
+        }
+        vcall!(ctx, 15, fn(usize, u32) -> (), r.tex, 0);
+        r.seq = Some(2);
+        r.draw(rtv, w, h, &f);
+        let out = read_pixels(device, ctx, target, w, h);
+        let g = out[(h as usize / 2) * w as usize + 4] & 0xff;
+        assert!((g as i32 - 0x80).abs() <= 2, "grey {:#x}", out[(h as usize / 2) * w as usize + 4]);
+        assert_eq!(target_of(10), Target::ScRgb);
+        assert_eq!(target_of(87), Target::Plain);
         release(rtv);
         drop(r);
         release(target);

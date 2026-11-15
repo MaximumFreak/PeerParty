@@ -150,6 +150,8 @@ pub mod prop {
     pub const EMPTY_ROOM_TTL: u8 = 245;
     pub const MAX_PLAYERS_INT: u8 = 243;
     pub const ACTOR_USER_ID: u8 = 253;
+    /// Actor property: the player's name (NickName).
+    pub const ACTOR_NAME: u8 = 255;
     /// Actor property: inactive (left with a PlayerTTL, may rejoin).
     pub const ACTOR_INACTIVE: u8 = 254;
 }
@@ -304,6 +306,9 @@ struct Actor {
     groups: [u64; 4],
     user_id: String,
     ip: IpAddr,
+    /// The PeerParty player it joined as (`Config::player`), if known: only that
+    /// player may take it back.
+    player: Option<Player>,
     /// Inactive until then (its client left with a PlayerTTL); `conn` is 0 meanwhile.
     inactive_until: Option<i64>,
 }
@@ -533,11 +538,15 @@ impl Game {
     }
 
     /// The inactive actor `user` can take back.
-    fn validate_rejoin(&self, user: &str) -> Result<i32, (i16, &'static str)> {
+    /// A user id is whatever the game sends, so it alone doesn't give the actor back:
+    /// the rejoin must come from the PeerParty player the actor joined as, when that is
+    /// known (another player is told the user id isn't there, as Photon would).
+    fn validate_rejoin(&self, user: &str, player: Option<Player>) -> Result<i32, (i16, &'static str)> {
         if !self.created {
             return Err((err::GAME_DOES_NOT_EXIST, "Game does not exist"));
         }
         match self.actors.iter().find(|a| !user.is_empty() && a.user_id == user) {
+            Some(a) if a.player.is_some() && a.player != player => Err((err::REJOINER_NOT_FOUND, "UserId not found")),
             Some(a) if a.inactive_until.is_some() => Ok(a.nr),
             Some(_) => Err((err::FOUND_ACTIVE_JOINER, "Found active UserId")),
             None => Err((err::REJOINER_NOT_FOUND, "UserId not found")),
@@ -590,8 +599,14 @@ pub struct Config {
     /// The host part of server addresses handed to a client at `ip`.
     /// The address of this PC to give a client at this address (its other end).
     pub advertise: Box<dyn Fn(std::net::SocketAddr) -> String + Send>,
+    /// The PeerParty player behind a client address (this PC's, a LAN player's, an
+    /// internet player's through the forwarder), if known.
+    pub player: Box<dyn Fn(std::net::SocketAddr) -> Option<Player> + Send>,
     pub log: Box<dyn Fn(&str) + Send>,
 }
+
+/// A PeerParty player's id (`PeerId`'s bytes).
+pub type Player = [u8; 16];
 
 /// `PEERPARTY_PHOTON_TRACE=1`: game server operations, events and Fusion packets go to
 /// the log (for finding why a game leaves a room).
@@ -1183,8 +1198,9 @@ impl Server {
                 }
             }
         }
-        if chat {
-            self.chat.signed_in(id, &app.0, &user_id);
+        if chat && !self.chat.signed_in(id, &app.0, &user_id, (self.cfg.player)(addr)) {
+            self.log(&format!("photon: chat front end {addr} asked to sign in as '{user_id}', another player's chat id"));
+            return self.refuse(id, code, err::INVALID_AUTHENTICATION, "That user id is another player's", encrypted, now);
         }
         self.log(&format!(
             "photon: {} {addr} signed in as '{user_id}' (app '{}' version '{}'){}",
@@ -1345,9 +1361,9 @@ impl Server {
     /// the game server with a token that carries the invitation.
     fn on_matchmaking(&mut self, id: u64, req: &Request, now: i64) {
         let code = req.code;
-        let (app, user, ip) = {
+        let (app, user, ip, player) = {
             let c = &self.conns[&id];
-            (c.app.clone().unwrap_or_default(), c.user_id.clone(), c.addr.ip())
+            (c.app.clone().unwrap_or_default(), c.user_id.clone(), c.addr.ip(), (self.cfg.player)(c.addr))
         };
         let mode = param(&req.params, key::JOIN_MODE).and_then(Value::as_u8).unwrap_or(0);
         let lk = self.lobby_key(id, &req.params);
@@ -1371,7 +1387,7 @@ impl Server {
                 let Some(name) = requested else { return fail(self, err::INVALID_PARAMETERS, "Missing game id") };
                 match self.games.get(&(app.clone(), name.clone())) {
                     Some(g) if g.created && mode == JOIN_MODE_REJOIN => {
-                        if let Err((ret, why)) = g.validate_rejoin(&user) {
+                        if let Err((ret, why)) = g.validate_rejoin(&user, player) {
                             return fail(self, ret, why);
                         }
                     }
@@ -1569,15 +1585,19 @@ impl Server {
         let Some(mut gk) = invited else {
             return self.gs_fail(id, code, err::SERVER_FORBIDDEN, "Not invited to any game server");
         };
+        // A room other than the one the master sent this client to: only one that is
+        // already made, which the join checks below then apply to. One only reserved
+        // is its creator's to make (taken, its options and master would be another's).
         if let Some(n) = param(&req.params, key::GAME_ID).and_then(Value::as_str) {
             if n != gk.1 {
                 let other = (gk.0.clone(), n.to_owned());
-                if !self.games.contains_key(&other) {
+                if !self.games.get(&other).is_some_and(|g| g.created) {
                     return self.gs_fail(id, code, err::GAME_DOES_NOT_EXIST, "Game does not exist");
                 }
                 gk = other;
             }
         }
+        let player = (self.cfg.player)(addr);
         let mode = param(&req.params, key::JOIN_MODE).and_then(Value::as_u8).unwrap_or(0);
         let Some(g) = self.games.get_mut(&gk) else {
             return self.gs_fail(id, code, err::GAME_DOES_NOT_EXIST, "Game does not exist");
@@ -1589,7 +1609,7 @@ impl Server {
         let rejoin = g.created && mode == JOIN_MODE_REJOIN;
         let mut joined_props = param(&req.params, key::PLAYER_PROPERTIES).and_then(Value::as_table).cloned().unwrap_or_default();
         let nr = if rejoin {
-            let nr = match g.validate_rejoin(&user) {
+            let nr = match g.validate_rejoin(&user, player) {
                 Ok(nr) => nr,
                 Err((ret, why)) => return self.gs_fail(id, code, ret, why),
             };
@@ -1629,7 +1649,7 @@ impl Server {
             if g.flags & flag::PUBLISH_USER_ID != 0 {
                 table_set(&mut joined_props, Value::Byte(prop::ACTOR_USER_ID), Value::Str(user.clone()));
             }
-            g.actors.push(Actor { conn: id, nr, props: joined_props, groups: [1, 0, 0, 0], user_id: user.clone(), ip, inactive_until: None });
+            g.actors.push(Actor { conn: id, nr, props: joined_props, groups: [1, 0, 0, 0], user_id: user.clone(), ip, player, inactive_until: None });
             nr
         };
         let props = g.actor(nr).map(|a| a.props.clone()).unwrap_or_default();
@@ -1670,7 +1690,7 @@ impl Server {
         c.game = Some(gk.clone());
         c.actor = nr;
         c.left = false;
-        if addr.ip().is_loopback() {
+        if super::from_this_pc(addr) {
             super::joined_locally(&gk.1, nr);
         }
         self.publish_room(&gk);
@@ -1812,6 +1832,12 @@ impl Server {
             }
             if !update_fits(&update) {
                 return self.gs_fail(id, code, err::INVALID_PARAMETERS, "Too many properties");
+            }
+            // An actor's user id and inactive mark are the server's; its name is its own.
+            // Other actors' game properties stay open to everyone, as in Photon.
+            let owned = |k: &Value| matches!(k, Value::Byte(prop::ACTOR_USER_ID | prop::ACTOR_INACTIVE)) || (target != me && matches!(k, Value::Byte(prop::ACTOR_NAME)));
+            if update.iter().any(|(k, _)| owned(k)) {
+                return self.gs_fail(id, code, err::INVALID_PARAMETERS, "That property can't be set");
             }
             let before = a.props.clone();
             for (k, v) in &update {
@@ -2052,22 +2078,22 @@ impl Server {
             .map(|a| a.conn)
             .collect();
         let msg = Msg::Event(e.clone());
-        let mut encoded: HashMap<Proto, Vec<u8>> = HashMap::new();
+        // None: the event can't be put in that protocol (an older one lacks a type it
+        // holds); its clients miss it, the others still get it.
+        let mut encoded: HashMap<Proto, Option<Vec<u8>>> = HashMap::new();
         for id in conns {
             let Some(c) = self.conns.get_mut(&id) else { continue };
             let Some(p) = c.proto else { continue };
-            if !encoded.contains_key(&p) {
-                match p.encode(&msg, None) {
-                    Ok(b) => {
-                        encoded.insert(p, b);
-                    }
-                    Err(err) => {
-                        (self.cfg.log)(&format!("photon: couldn't encode event {}: {err}", e.code));
-                        return;
-                    }
+            let bytes = encoded.entry(p).or_insert_with(|| match p.encode(&msg, None) {
+                Ok(b) => Some(b),
+                Err(err) => {
+                    (self.cfg.log)(&format!("photon: couldn't encode event {} for {p:?} clients: {err}", e.code));
+                    None
                 }
+            });
+            if let Some(b) = bytes {
+                c.enet.send(channel, b, reliable, false);
             }
-            c.enet.send(channel, &encoded[&p], reliable, false);
         }
     }
 }
@@ -2125,4 +2151,36 @@ fn uuid_like() -> String {
     let b = random_bytes(16);
     let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
     format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn actor(nr: i32, user: &str, player: Option<Player>, inactive: bool) -> Actor {
+        Actor {
+            conn: 0,
+            nr,
+            props: Table::default(),
+            groups: [1, 0, 0, 0],
+            user_id: user.into(),
+            ip: IpAddr::from([127, 0, 0, 1]),
+            player,
+            inactive_until: inactive.then_some(60_000),
+        }
+    }
+
+    #[test]
+    fn only_the_player_an_actor_was_takes_it_back() {
+        let mut g = Game::new(((String::new(), String::new()), String::new(), 0), 0);
+        g.created = true;
+        let (alice, mallory) = ([1u8; 16], [2u8; 16]);
+        g.actors.push(actor(1, "alice", Some(alice), true));
+        g.actors.push(actor(2, "nobody-knew", None, true));
+        assert_eq!(g.validate_rejoin("alice", Some(alice)), Ok(1));
+        assert_eq!(g.validate_rejoin("alice", Some(mallory)).unwrap_err().0, err::REJOINER_NOT_FOUND, "another player with her user id");
+        assert_eq!(g.validate_rejoin("alice", None).unwrap_err().0, err::REJOINER_NOT_FOUND, "a client no player is known for");
+        // An actor that joined with no player known goes by its user id, as before.
+        assert_eq!(g.validate_rejoin("nobody-knew", Some(mallory)), Ok(2));
+    }
 }

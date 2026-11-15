@@ -13,7 +13,8 @@ use super::abi::{CompletionId, CompletionTwoIds};
 use super::ids;
 use super::{Kind, add_listener, call, later, listeners, remove_listener};
 
-const NOT_CONFIGURED: i32 = 31;
+/// EOS_NotConfigured (31 is EOS_Invalid_Sandbox).
+const NOT_CONFIGURED: i32 = 14;
 
 /// Whether PeerParty's overlay is showing, as the game sees it.
 static VISIBLE: AtomicBool = AtomicBool::new(false);

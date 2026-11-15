@@ -97,6 +97,10 @@ static PAIRS: Mutex<Vec<Pair>> = Mutex::new(Vec::new());
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Roots already handled this run (the side the game uses now).
 static DONE: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
+/// Held while a save is looked at and copied: a second thread touching the same save
+/// meanwhile (a loader thread opening the file the main thread's touch is copying)
+/// waits for the copy to finish rather than opening it half written.
+static COPYING: Mutex<()> = Mutex::new(());
 
 thread_local! {
     /// Set while PeerParty itself is copying, so its own file calls pass straight through.
@@ -399,6 +403,9 @@ fn sources_of(path: &str, pairs: &[Pair]) -> Vec<(String, String, bool, bool)> {
     out
 }
 
+/// Copies what is newer under `from` to `to`. A link or junction inside the save is
+/// left out: following one would copy what `size_of_tree` didn't count (it doesn't
+/// follow them), and one pointing back up would never end. `from` itself is followed.
 fn copy_newer(from: &Path, to: &Path) -> std::io::Result<usize> {
     let meta = std::fs::metadata(from)?;
     if meta.is_dir() {
@@ -406,6 +413,10 @@ fn copy_newer(from: &Path, to: &Path) -> std::io::Result<usize> {
         let mut n = 0;
         for entry in std::fs::read_dir(from)? {
             let entry = entry?;
+            if entry.file_type()?.is_symlink() {
+                log!("saves: {} is a link; not copied", entry.path().display());
+                continue;
+            }
             n += copy_newer(&entry.path(), &to.join(entry.file_name()))?;
         }
         return Ok(n);
@@ -476,6 +487,8 @@ fn backup_name(save: &Path, n: usize) -> PathBuf {
 fn remove_any(p: &Path) -> std::io::Result<()> {
     match std::fs::symlink_metadata(p) {
         Ok(m) if m.is_dir() => std::fs::remove_dir_all(p),
+        // A link to a folder (a junction too) goes as a folder; what it points to stays.
+        Ok(m) if m.is_symlink() && std::fs::metadata(p).is_ok_and(|t| t.is_dir()) => std::fs::remove_dir(p),
         Ok(_) => std::fs::remove_file(p),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
@@ -552,6 +565,7 @@ fn seen(path: &str) {
         }
         return;
     };
+    let _copying = COPYING.lock().unwrap_or_else(|e| e.into_inner());
     if !DONE.lock().unwrap().insert(root.to_ascii_lowercase()) {
         return;
     }
@@ -971,6 +985,31 @@ mod tests {
         std::fs::write(lan.join("a.sav"), "lan").unwrap();
         assert_eq!(copy_newer(&main, &lan).unwrap(), 0);
         assert_eq!(std::fs::read_to_string(lan.join("a.sav")).unwrap(), "lan");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_junction_inside_a_save_is_not_followed() {
+        use std::os::windows::process::CommandExt;
+        let base = std::env::temp_dir().join(format!("peerparty-junction-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (main, lan) = (base.join("111"), base.join("222"));
+        std::fs::create_dir_all(&main).unwrap();
+        std::fs::write(main.join("a.sav"), "main").unwrap();
+        // A junction back up to the save itself: followed, the copy would never end.
+        let made = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(main.join("loop"))
+            .arg(&main)
+            .creation_flags(0x0800_0000)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "mklink /J: {made:?}");
+        assert!(size_of_tree(&main, MAX_COPY) < 100);
+        assert_eq!(copy_newer(&main, &lan).unwrap(), 1);
+        assert!(!lan.join("loop").exists());
+        remove_any(&main.join("loop")).unwrap();
+        assert!(main.join("a.sav").exists(), "removing the junction leaves what it pointed to");
         let _ = std::fs::remove_dir_all(&base);
     }
 

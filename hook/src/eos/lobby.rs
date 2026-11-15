@@ -50,8 +50,13 @@ struct Handles {
     mods: HashMap<usize, Box<ModObj>>,
     /// Lan search id -> (search handle, callback, client data).
     finds: HashMap<u64, (usize, usize, usize)>,
-    /// Lobby id -> (callback, client data) for a join in flight.
-    joins: HashMap<String, (usize, usize)>,
+    /// Lobby id -> (callback, client data) of each JoinLobby / JoinLobbyById waiting on
+    /// the join in flight (a game may ask twice; every call is answered).
+    joins: HashMap<String, Vec<(usize, usize)>>,
+    /// Lobby id -> its notifications (updates, member changes) held back while its join
+    /// is in flight or its answer waits out JOIN_LATENCY: a game hears of the lobby
+    /// only once its join has been answered, as from Epic.
+    held: HashMap<String, Vec<Event>>,
     /// Invites received: (invite id, lobby, sender), oldest first.
     invites: Vec<(String, Lobby, peerparty_core::PeerId)>,
     /// UI event id -> lobby, for `JoinLobbyAccepted` auto-accepts.
@@ -237,7 +242,7 @@ fn join_result(r: JoinResult) -> i32 {
         JoinResult::Ok => SUCCESS,
         JoinResult::Full => LOBBY_TOO_MANY_PLAYERS,
         JoinResult::NotFound => NOT_FOUND,
-        JoinResult::NotAllowed => LOBBY_NOT_ALLOWED,
+        JoinResult::NotAllowed | JoinResult::WrongSecret => LOBBY_NOT_ALLOWED,
         JoinResult::TimedOut => TIMED_OUT,
     }
 }
@@ -290,11 +295,22 @@ unsafe extern "system" fn create_lobby(
     }
     spec.join_by_id = v >= abi::CREATELOBBY_JOIN_BY_ID && o.bEnableJoinById != 0;
     // bEnableRTCRoom and LocalRTCOptions follow bDisableHostMigration (eos_lobby_types.h).
-    if v >= abi::CREATELOBBY_DISABLE_MIGRATION && o.bEnableRTCRoom != 0 {
+    let rtc = v >= abi::CREATELOBBY_DISABLE_MIGRATION && o.bEnableRTCRoom != 0;
+    if rtc {
         super::rtc::lobby_voice(o.LocalRTCOptions);
+    }
+    // What LobbyDetails_CopyInfo says back, on every member's PC: kept with the lobby.
+    let rejoin = v >= abi::CREATELOBBY_JOIN_BY_ID && o.bRejoinAfterKickRequiresInvite != 0;
+    for (key, on) in [(FLAG_PRESENCE, o.bPresenceEnabled != 0), (FLAG_RTC, rtc), (FLAG_REJOIN, rejoin)] {
+        if on {
+            peerparty_core::set_attr(&mut spec.attrs, Attr { key: key.into(), value: peerparty_core::Value::Bool(true), public: true });
+        }
     }
     match lan.create_lobby(spec) {
         Ok(l) => {
+            if rtc {
+                super::rtc::lobby_voice_for(&l.id, o.LocalRTCOptions);
+            }
             trace("EOS_Lobby_CreateLobby", || {
                 format!(
                     "v={v} id={} bucket={} max={}",
@@ -318,7 +334,40 @@ unsafe extern "system" fn destroy_lobby(
         .flatten()
         .unwrap_or_default();
     let r = lan().map_or(Err(LobbyError::NotFound), |l| l.destroy(&id));
+    drop_join(&id);
     complete(cb, cd, r.map_or_else(lobby_error, |_| SUCCESS), &id);
+}
+
+/// A join in flight that the game gave up on (it left, or destroyed, the lobby first):
+/// the LAN won't answer it, so its calls are answered here, and nothing is held for it.
+fn drop_join(id: &str) {
+    let waiting = {
+        let mut h = H.lock().unwrap();
+        h.held.remove(id);
+        h.joins.remove(id).unwrap_or_default()
+    };
+    for (cb, cd) in waiting {
+        complete(cb, cd, NOT_FOUND, id);
+    }
+}
+
+/// Starts a join (`start`), or adds the call to the one already in flight for `id`.
+fn begin_join(id: String, cb: usize, cd: usize, start: impl FnOnce() -> Result<(), LobbyError>) {
+    {
+        let mut h = H.lock().unwrap();
+        if let Some(waiting) = h.joins.get_mut(&id) {
+            waiting.push((cb, cd));
+            return;
+        }
+    }
+    match start() {
+        Ok(()) => {
+            let mut h = H.lock().unwrap();
+            h.joins.insert(id.clone(), vec![(cb, cd)]);
+            h.held.insert(id, Vec::new());
+        }
+        Err(e) => complete(cb, cd, lobby_error(e), &id),
+    }
 }
 
 unsafe extern "system" fn leave_lobby(
@@ -333,6 +382,7 @@ unsafe extern "system" fn leave_lobby(
         .unwrap_or_default();
     let r = lan().map_or(Err(LobbyError::NotFound), |l| l.leave(&id));
     trace("EOS_Lobby_LeaveLobby", || format!("{id} -> {r:?}"));
+    drop_join(&id);
     complete(cb, cd, r.map_or_else(lobby_error, |_| SUCCESS), &id);
 }
 
@@ -357,12 +407,8 @@ unsafe extern "system" fn join_lobby(
     trace("EOS_Lobby_JoinLobby", || {
         format!("{} owner={}", target.id, target.owner)
     });
-    match lan.join(&target) {
-        Ok(()) => {
-            H.lock().unwrap().joins.insert(target.id, (cb, cd));
-        }
-        Err(e) => complete(cb, cd, lobby_error(e), &target.id),
-    }
+    let id = target.id.clone();
+    begin_join(id, cb, cd, || lan.join(&target));
 }
 
 unsafe extern "system" fn join_lobby_by_id(
@@ -377,12 +423,7 @@ unsafe extern "system" fn join_lobby_by_id(
     let (Some(lan), Some(id)) = (lan(), id) else {
         return complete(cb, cd, INVALID_PARAMETERS, "");
     };
-    match lan.join_by_id(NS, &id) {
-        Ok(()) => {
-            H.lock().unwrap().joins.insert(id, (cb, cd));
-        }
-        Err(e) => complete(cb, cd, lobby_error(e), &id),
-    }
+    begin_join(id.clone(), cb, cd, || lan.join_by_id(NS, &id));
 }
 
 unsafe fn member_action(
@@ -488,9 +529,27 @@ fn not_ours(ev: &Event) -> bool {
 }
 
 pub fn on_event(_lan: &Lan, ev: &Event) {
-    if not_ours(ev) {
+    if not_ours(ev) || hold(ev) {
         return;
     }
+    notify(ev);
+}
+
+/// Keeps a notification for a lobby whose join hasn't been answered yet (`held`).
+fn hold(ev: &Event) -> bool {
+    let (Event::LobbyUpdated { lobby } | Event::MemberUpdated { lobby, .. } | Event::MemberStatus { lobby, .. }) = ev else {
+        return false;
+    };
+    match H.lock().unwrap().held.get_mut(lobby) {
+        Some(q) => {
+            q.push(ev.clone());
+            true
+        }
+        None => false,
+    }
+}
+
+fn notify(ev: &Event) {
     match ev {
         Event::SearchDone { search, results } => {
             let done = {
@@ -514,20 +573,30 @@ pub fn on_event(_lan: &Lan, ev: &Event) {
             unsafe { call(done.0, &info) };
         }
         Event::JoinDone { lobby, result } => {
-            let Some((cb, cd)) = H.lock().unwrap().joins.remove(lobby) else {
+            let Some(waiting) = H.lock().unwrap().joins.remove(lobby) else {
                 return;
             };
             trace("EOS_Lobby_JoinLobby(done)", || {
-                format!("{lobby} {result:?}")
+                format!("{lobby} {result:?} ({} call(s))", waiting.len())
             });
             let (code, id) = (join_result(*result), intern(lobby) as usize);
+            let (lobby, joined) = (lobby.clone(), *result == JoinResult::Ok);
             later_after(JOIN_LATENCY, move || {
-                let info = abi::CompletionId {
-                    ResultCode: code,
-                    ClientData: cd,
-                    Id: id,
-                };
-                unsafe { call(cb, &info) };
+                for (cb, cd) in waiting {
+                    let info = abi::CompletionId {
+                        ResultCode: code,
+                        ClientData: cd,
+                        Id: id,
+                    };
+                    unsafe { call(cb, &info) };
+                }
+                // Then what happened in the lobby meanwhile, in order.
+                let held = H.lock().unwrap().held.remove(&lobby).unwrap_or_default();
+                if joined {
+                    for ev in &held {
+                        notify(ev);
+                    }
+                }
             });
         }
         Event::LobbyUpdated { lobby } => {
@@ -897,6 +966,9 @@ unsafe extern "system" fn mod_add_attribute(h: usize, o: *const abi::AddAttribut
         a.value,
         if a.public { "public" } else { "private" }
     );
+    if ours(&a) {
+        return INVALID_PARAMETERS;
+    }
     with_mod(h, |m| {
         peerparty_core::set_attr(&mut m.edited.attrs, a);
         m.lobby_changed = true;
@@ -908,6 +980,9 @@ unsafe extern "system" fn mod_remove_attribute(h: usize, o: *const abi::KeyOptio
     let Some(k) = (!o.is_null()).then(|| unsafe { text((*o).Key) }).flatten() else {
         return INVALID_PARAMETERS;
     };
+    if k.starts_with(char::from(1)) {
+        return INVALID_PARAMETERS;
+    }
     with_mod(h, |m| {
         peerparty_core::remove_attr(&mut m.edited.attrs, &k);
         m.lobby_changed = true;
@@ -1248,6 +1323,32 @@ unsafe extern "system" fn details_owner(h: usize, _o: usize) -> usize {
     with_details(h, 0, |l| ids::puid(l.owner))
 }
 
+/// Lobby settings only CopyInfo reports, kept as attributes the game never sees (a key
+/// starting with a control character no game sets): the presence flag, the voice room,
+/// and whether a kicked member needs an invite to come back.
+const FLAG_PRESENCE: &str = "\u{1}eos:presence";
+const FLAG_RTC: &str = "\u{1}eos:rtc";
+const FLAG_REJOIN: &str = "\u{1}eos:rejoin";
+
+/// Whether a lobby has a voice room (its creator asked for one).
+pub(crate) fn has_rtc_room(l: &Lobby) -> bool {
+    l.attr(FLAG_RTC).is_some()
+}
+
+/// Whether an attribute is one of those, not the game's.
+fn ours(a: &Attr) -> bool {
+    a.key.starts_with('\u{1}')
+}
+
+/// The game's own attributes of a lobby.
+fn game_attrs(l: &Lobby) -> Vec<&Attr> {
+    l.attrs.iter().filter(|a| !ours(a)).collect()
+}
+
+fn flag(l: &Lobby, key: &str) -> i32 {
+    l.attr(key).is_some() as i32
+}
+
 unsafe extern "system" fn details_copy_info(h: usize, _o: usize, out: *mut usize) -> i32 {
     if out.is_null() {
         return INVALID_PARAMETERS;
@@ -1267,10 +1368,10 @@ unsafe extern "system" fn details_copy_info(h: usize, _o: usize, out: *mut usize
         bAllowInvites: l.allow_invites as i32,
         BucketId: owned_str(&mut keep, &l.bucket),
         bAllowHostMigration: l.host_migration as i32,
-        bRTCRoomEnabled: super::rtc::lobby_rooms_on() as i32,
+        bRTCRoomEnabled: flag(&l, FLAG_RTC),
         bAllowJoinById: l.join_by_id as i32,
-        bRejoinAfterKickRequiresInvite: 0,
-        bPresenceEnabled: 0,
+        bRejoinAfterKickRequiresInvite: flag(&l, FLAG_REJOIN),
+        bPresenceEnabled: flag(&l, FLAG_PRESENCE),
         AllowedPlatformIds: 0,
         AllowedPlatformIdsCount: 0,
     };
@@ -1279,7 +1380,7 @@ unsafe extern "system" fn details_copy_info(h: usize, _o: usize, out: *mut usize
 }
 
 unsafe extern "system" fn details_attr_count(h: usize, _o: usize) -> u32 {
-    with_details(h, 0, |l| l.attrs.len() as u32)
+    with_details(h, 0, |l| game_attrs(l).len() as u32)
 }
 
 unsafe extern "system" fn details_attr_by_index(
@@ -1292,7 +1393,7 @@ unsafe extern "system" fn details_attr_by_index(
     }
     unsafe { *out = 0 };
     let i = unsafe { (*o).Value } as usize;
-    match with_details(h, None, |l| l.attrs.get(i).cloned()) {
+    match with_details(h, None, |l| game_attrs(l).get(i).map(|a| (*a).clone())) {
         Some(a) => {
             unsafe { *out = hand_out_attr(&a) };
             SUCCESS
@@ -1311,14 +1412,14 @@ unsafe extern "system" fn details_attr_by_key(
     }
     unsafe { *out = 0 };
     let k = unsafe { text((*o).Value as *const c_char) }.unwrap_or_default();
-    match with_details(h, None, |l| l.attr(&k).cloned()) {
+    match with_details(h, None, |l| l.attr(&k).filter(|a| !ours(a)).cloned()) {
         Some(a) => {
             unsafe { *out = hand_out_attr(&a) };
             SUCCESS
         }
         None => {
             let have = with_details(h, String::new(), |l| {
-                l.attrs.iter().map(|a| a.key.as_str()).collect::<Vec<_>>().join(",")
+                game_attrs(l).iter().map(|a| a.key.as_str()).collect::<Vec<_>>().join(",")
             });
             crate::log!("eos-lan LobbyDetails attribute {k} not found (has: {have})");
             NOT_FOUND
@@ -1414,4 +1515,40 @@ unsafe extern "system" fn details_member_info(
 
 unsafe extern "system" fn details_release(h: usize) {
     H.lock().unwrap().details.remove(&h);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A second JoinLobby for a lobby already being joined waits on the same join (it
+    /// used to replace the first call's callback, which then never came), and the
+    /// lobby's notifications are held until the join is answered.
+    #[test]
+    fn joins_in_flight_hold_their_lobbys_notifications() {
+        let id = "test-join-in-flight".to_string();
+        let mut started = 0;
+        begin_join(id.clone(), 1, 10, || {
+            started += 1;
+            Ok(())
+        });
+        begin_join(id.clone(), 2, 20, || {
+            started += 1;
+            Ok(())
+        });
+        assert_eq!(started, 1, "one join for both calls");
+        assert_eq!(H.lock().unwrap().joins[&id], vec![(1, 10), (2, 20)]);
+        let ev = Event::MemberStatus { lobby: id.clone(), member: peerparty_core::PeerId([4; 16]), status: MemberStatus::Joined };
+        assert!(hold(&ev));
+        assert!(!hold(&Event::LobbyUpdated { lobby: "another".into() }));
+        assert_eq!(H.lock().unwrap().held[&id], vec![ev]);
+        // Given up on (left before the answer): nothing stays held or waiting.
+        {
+            let mut h = H.lock().unwrap();
+            h.joins.get_mut(&id).unwrap().clear();
+        }
+        drop_join(&id);
+        assert!(!H.lock().unwrap().joins.contains_key(&id) && !H.lock().unwrap().held.contains_key(&id));
+        assert!(!hold(&Event::LobbyUpdated { lobby: id }));
+    }
 }

@@ -1,6 +1,10 @@
 //! Windows.Gaming.Input: `Gamepad.GetCurrentReading` reads at rest (buttons up, sticks
 //! and triggers at zero, the timestamp kept), and `RawGameController.GetCurrentReading`
-//! reads no buttons, hats centred and the axes as they were when the overlay opened.
+//! reads no buttons, hats centred and each axis at its rest: where it sits most of the
+//! time while the overlay is closed (`Rest`), learnt from the game's own reads. Until
+//! there's enough of that, an axis near the middle reads centred and any other as it
+//! was when the overlay opened (a raw axis can be a stick, centred at 0.5, or a trigger,
+//! resting at an end).
 //!
 //! A Gamepad object exists only for a connected pad, so the method is found through one:
 //! PeerParty asks the Gamepad (and RawGameController) statics for the pads, takes the
@@ -27,6 +31,51 @@ static TRIED_GAMEPAD: AtomicBool = AtomicBool::new(false);
 static TRIED_RAW: AtomicBool = AtomicBool::new(false);
 /// Raw controllers' axes when the overlay opened, per controller.
 static AXES: Mutex<Vec<(usize, Vec<f64>)>> = Mutex::new(Vec::new());
+/// Where each raw controller's axes sit while the overlay is closed.
+static REST: Mutex<Vec<(usize, Vec<Rest>)>> = Mutex::new(Vec::new());
+
+/// How often an axis was seen in each twentieth of its range (0..=1).
+#[derive(Clone, Copy, Default)]
+struct Rest {
+    bins: [u16; 21],
+}
+
+impl Rest {
+    fn bin(v: f64) -> usize {
+        (v.clamp(0.0, 1.0) * 20.0).round() as usize
+    }
+
+    fn saw(&mut self, v: f64) {
+        let b = &mut self.bins[Self::bin(v)];
+        if *b == u16::MAX {
+            // Keep the shape, not the counts.
+            for x in &mut self.bins {
+                *x /= 2;
+            }
+        }
+        self.bins[Self::bin(v)] += 1;
+    }
+
+    /// The axis' rest, once it has been seen often enough to say.
+    fn rest(&self) -> Option<f64> {
+        let total: u32 = self.bins.iter().map(|&b| u32::from(b)).sum();
+        if total < 120 {
+            return None;
+        }
+        let (i, _) = self.bins.iter().enumerate().max_by_key(|(_, b)| **b)?;
+        Some(i as f64 / 20.0)
+    }
+}
+
+/// What a held-back raw axis reads: its rest, else centred if near the middle when the
+/// overlay opened, else as it was then.
+fn held_axis(rest: Option<f64>, at_open: f64) -> f64 {
+    match rest {
+        Some(r) => r,
+        None if (at_open - 0.5).abs() < 0.15 => 0.5,
+        None => at_open,
+    }
+}
 
 const IID_GAMEPAD_STATICS: [u8; 16] = super::guid(0x8BBCE529, 0xD49C, 0x39E9, [0x95, 0x60, 0xE4, 0x7D, 0xDE, 0x96, 0xB7, 0xC8]);
 const IID_RAW_STATICS: [u8; 16] = super::guid(0xEB8D0792, 0xE95A, 0x4B19, [0xAF, 0xC7, 0x0A, 0x59, 0xF8, 0xBF, 0x75, 0x9E]);
@@ -199,7 +248,24 @@ unsafe extern "system" fn raw_reading(
 ) -> i32 {
     let Some(h) = RAW.get() else { return -1 };
     let hr = unsafe { h.call(this, n_buttons, buttons, n_switches, switches, n_axes, axes, timestamp) };
-    if hr < 0 || !pads_held_back() {
+    if hr < 0 {
+        return hr;
+    }
+    if !pads_held_back() {
+        // Learn where the axes rest (never waiting on the lock: this is the game's read).
+        if !axes.is_null() && n_axes > 0 && n_axes <= 64
+            && let Ok(mut rest) = REST.try_lock()
+        {
+            let now = unsafe { std::slice::from_raw_parts(axes, n_axes as usize) };
+            if !rest.iter().any(|(c, _)| *c == this) && rest.len() < 16 {
+                rest.push((this, vec![Rest::default(); now.len()]));
+            }
+            if let Some((_, r)) = rest.iter_mut().find(|(c, r)| *c == this && r.len() == now.len()) {
+                for (r, v) in r.iter_mut().zip(now) {
+                    r.saw(*v);
+                }
+            }
+        }
         return hr;
     }
     if !buttons.is_null() {
@@ -212,11 +278,49 @@ unsafe extern "system" fn raw_reading(
     if !axes.is_null() && n_axes > 0 {
         let now = unsafe { std::slice::from_raw_parts_mut(axes, n_axes as usize) };
         let mut held = AXES.lock().unwrap();
-        match held.iter().find(|(c, _)| *c == this) {
-            Some((_, a)) if a.len() == now.len() => now.copy_from_slice(a),
-            Some(_) => {}
-            None => held.push((this, now.to_vec())),
+        let at_open = match held.iter().find(|(c, _)| *c == this) {
+            Some((_, a)) if a.len() == now.len() => a.clone(),
+            Some(_) => return hr,
+            None => {
+                held.push((this, now.to_vec()));
+                now.to_vec()
+            }
+        };
+        drop(held);
+        let rest = REST.lock().unwrap();
+        let learnt = rest.iter().find(|(c, r)| *c == this && r.len() == now.len()).map(|(_, r)| r.clone());
+        drop(rest);
+        for (i, v) in now.iter_mut().enumerate() {
+            *v = held_axis(learnt.as_ref().and_then(|r| r[i].rest()), at_open[i]);
         }
     }
     hr
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A held-back raw axis reads where it rests: learnt from reads, else centred near
+    /// the middle, else as at opening.
+    #[test]
+    fn a_raw_axis_held_back_reads_its_rest() {
+        let mut stick = Rest::default();
+        let mut trigger = Rest::default();
+        for i in 0..200 {
+            stick.saw(if i % 10 == 0 { 0.9 } else { 0.5 });
+            trigger.saw(0.0);
+        }
+        assert_eq!(stick.rest(), Some(0.5));
+        assert_eq!(trigger.rest(), Some(0.0));
+        assert_eq!(Rest::default().rest(), None, "not seen enough");
+        assert_eq!(held_axis(Some(0.5), 0.0), 0.5, "a stick held hard left at opening");
+        assert_eq!(held_axis(None, 0.58), 0.5);
+        assert_eq!(held_axis(None, 1.0), 1.0);
+        let mut busy = Rest::default();
+        for _ in 0..70_000 {
+            busy.saw(0.25);
+        }
+        assert_eq!(busy.rest(), Some(0.25), "counts halve rather than overflow");
+    }
 }

@@ -4,7 +4,9 @@ PPTEST_PARTY_DLL = that copy and PEERPARTY_VOICE=0 (no sound devices are opened)
 `peerparty --multi-instance`. The DLL is loaded with ctypes, so every Party lookup
 goes through PeerParty's swapped GetProcAddress, as a game's would.
 
-A hosts a network, B joins it; both authenticate and make an endpoint. Before any chat
+A hosts a network, B joins it; both authenticate and make an endpoint. A makes and
+revokes an invitation; B can't revoke the one it joined with (A's, revocable by its
+creator only). Before any chat
 control exists nothing chat-related happens (the old behaviour). Then each makes a chat
 control (audio input and output set to none, and once to the system default to see it
 report "not found" with devices off), connects it, sees the other's chat control
@@ -88,6 +90,7 @@ def parse(ptr):
     d = {}
     if t == 3: d = dict(result=u(4), network=q(384))
     elif t == 4: d = dict(result=u(4), network=q(16))
+    elif t == 7: d = dict(network=q(8), user=q(16), reason=u(24))
     elif t == 12: d = dict(network=q(8), endpoint=q(16))
     elif t in (14, 15): d = dict(device=q(8))
     elif t in (16,): d = dict(device=q(8), network=q(16))
@@ -105,6 +108,8 @@ def parse(ptr):
     elif t == 47: d = dict(reason=u(4), network=q(16), chat=q(24))
     elif t in (48, 49): d = dict(result=u(4), network=q(16), chat=q(24))
     elif t in (58, 59, 60): d = dict(result=u(4), chat=q(16), config=q(24))
+    elif t in (51, 52): d = dict(result=u(4), network=q(16), user=q(24), invitation=q(40))
+    elif t in (53, 54): d = dict(network=q(8), invitation=q(16))
     return t, d
 
 START = fn("PartyStartProcessingStateChanges", P, C.POINTER(U32), C.POINTER(P))
@@ -151,6 +156,10 @@ if ROLE == "A":
     r = fn("PartyCreateNewNetwork", P, P, C.POINTER(NetConfig), U32, P, P, P, P, C.c_char_p)(
         H, USER, C.byref(cfg), 0, None, None, None, C.byref(desc), applied)
     check("PartyCreateNewNetwork", r == 0, r)
+    INVITATION = applied.value
+    check("the network's first invitation is applied", INVITATION, INVITATION)
+    with open(os.path.join(DIR, "invitation.txt"), "wb") as fh:
+        fh.write(INVITATION)
     text = C.create_string_buffer(449)
     fn("PartySerializeNetworkDescriptor", P, C.c_char_p)(C.byref(desc), text)
     with open(os.path.join(DIR, "network.txt"), "w") as fh:
@@ -160,11 +169,18 @@ else:
     wait(lambda: os.path.exists(path) and os.path.getsize(path) > 0, 30, "the network descriptor")
     r = fn("PartyDeserializeNetworkDescriptor", C.c_char_p, P)(open(path).read().strip().encode(), C.byref(desc))
     check("PartyDeserializeNetworkDescriptor", r == 0, r)
+    INVITATION = open(os.path.join(DIR, "invitation.txt"), "rb").read()
 r = fn("PartyConnectToNetwork", P, P, P, C.POINTER(P))(H, C.byref(desc), None, C.byref(net))
 check("PartyConnectToNetwork", r == 0, r)
 NET = net.value
 check("network connects", wait(lambda: find(3, network=NET, result=0), 30, "ConnectToNetworkCompleted"))
-fn("PartyNetworkAuthenticateLocalUser", P, P, C.c_char_p, P)(NET, USER, b"", None)
+AUTH = fn("PartyNetworkAuthenticateLocalUser", P, P, C.c_char_p, P)
+if ROLE == "B":
+    # The owner's copy checks the invitation: a made-up one is refused there.
+    AUTH(NET, USER, b"not-the-networks-invitation", None)
+    check("a wrong invitation is refused (UserNotAuthorized)", wait(lambda: find(4, network=NET, result=6), 10, "AuthenticateLocalUserCompleted"))
+    check("and the user is removed", wait(lambda: find(7, network=NET, user=USER), 5, "LocalUserRemoved"))
+AUTH(NET, USER, INVITATION, None)
 check("user authenticates", wait(lambda: find(4, network=NET, result=0), 10, "AuthenticateLocalUserCompleted"))
 ep = P()
 r = fn("PartyNetworkCreateEndpoint", P, P, U32, P, P, P, C.POINTER(P))(NET, USER, 0, None, None, None, C.byref(ep))
@@ -183,6 +199,37 @@ pump()
 check("no chat state changes without chat", not any(30 <= t <= 60 for t in types()), types())
 flag("endpoint")
 wait_flag("endpoint")
+
+# ---- invitations: only the creator revokes one made revocable by its creator ----
+class InvitationConfig(C.Structure):
+    _fields_ = [("identifier", C.c_char_p), ("revocability", U32), ("entityCount", U32), ("entityIds", P)]
+GET_INV = fn("PartyNetworkGetInvitations", P, C.POINTER(U32), C.POINTER(P))
+REVOKE = fn("PartyNetworkRevokeInvitation", P, P, P, P)
+def invitations():
+    n, arr = U32(), P()
+    GET_INV(NET, C.byref(n), C.byref(arr))
+    return [rd(arr.value, 8 * i, "<Q") for i in range(n.value)]
+EVENTS.clear()
+if ROLE == "A":
+    before = invitations()
+    spare = P()
+    icfg = InvitationConfig(b"spare", 1, 0, None)
+    r = fn("PartyNetworkCreateInvitation", P, P, C.POINTER(InvitationConfig), P, C.POINTER(P))(NET, USER, C.byref(icfg), P(51), C.byref(spare))
+    check("PartyNetworkCreateInvitation", r == 0 and spare.value and spare.value in invitations(), r)
+    wait_flag("tried")
+    check("PartyNetworkRevokeInvitation (ours)", REVOKE(NET, USER, spare.value, P(52)) == 0)
+    done = wait(lambda: find(52, invitation=spare.value), 5, "RevokeInvitationCompleted")
+    check("revoked", done and done["result"] == 0, done)
+    check("and destroyed", find(54, invitation=spare.value, network=NET))
+    check("GetInvitations no longer lists it", invitations() == before, (invitations(), before))
+else:
+    joined = invitations()
+    check("the invitation B joined with is listed", len(joined) == 1, joined)
+    REVOKE(NET, USER, joined[0], P(52))
+    done = wait(lambda: find(52, invitation=joined[0]), 5, "RevokeInvitationCompleted")
+    check("B can't revoke A's invitation (only its creator may)", done and done["result"] == 6, done)
+    check("which stays", invitations() == joined and not find(54))
+    flag("tried")
 
 # ---- chat control ----
 dev = P()
@@ -355,7 +402,8 @@ else:
                 peak = max(peak, max(abs(x) for x in pcm))
                 RETURN(stream.value, b.buffer)
         time.sleep(0.02)
-    check("A's voice comes out of the voice stream", got >= 10 and sizes == {1920} and 8000 < peak < 11000, (got, sizes, peak))
+    # A's 0.3 sine (peak 9830) through Opus, which is lossy and may overshoot a little.
+    check("A's voice comes out of the voice stream", got >= 10 and sizes == {1920} and 7000 < peak < 16000, (got, sizes, peak))
     check("A shows as talking", talking)
     b = DataBuffer()
     wait_flag("voice-sent")

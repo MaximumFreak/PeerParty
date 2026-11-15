@@ -8,13 +8,15 @@
 //! and the 27000-27002 "alternative" ports). The first copy that needs Photon looks
 //! for a peer that already hosts (LAN presence `photon=host`, lowest peer id wins);
 //! if there is none after a short wait, it hosts. Every other copy's lookups resolve
-//! to that peer's LAN address, so all copies meet in the same rooms.
+//! to that peer, so all copies meet in the same rooms.
 //!
-//! Over the internet (a public session or an internet room, with the typed-IP forwarder
-//! on) a host that isn't on the LAN is reached at its stand-in (198.18.x): the forwarder
-//! carries Photon's UDP, TCP and WebSocket traffic through the encrypted tunnel, and the
-//! host gives such clients its own stand-in as the master and game server address. A LAN
-//! host still wins over an internet one.
+//! Another PC's servers are reached at its stand-in (198.18.x): the typed-IP forwarder
+//! carries Photon's UDP, TCP and WebSocket traffic over the PeerParty connection to it,
+//! and the host gives such clients its own stand-in as the master and game server
+//! address. So the host needs no inbound firewall permission for Photon's ports (its
+//! network may be set to Public): only the PeerParty connection must exist, which either
+//! side may have opened. Without the forwarder (`PEERPARTY_SKIP=ipfwd`) a LAN host is
+//! given at its LAN address. A LAN host wins over an internet one.
 //!
 //! Ported from Luxon Server (github.com/niansa/LuxonServer, commit 147e5e5) and its
 //! Luxon library (gitlab.com/luxon_project/Luxon, commit 809c9ce), both BSD-3-Clause
@@ -111,6 +113,12 @@ pub fn local_room() -> Option<String> {
     LOCAL_ROOM.lock().unwrap().as_ref().map(|(r, _)| r.clone())
 }
 
+/// Whether a client is this PC's own game: from loopback, and not another PC's
+/// traffic the forwarder delivers from there.
+pub(crate) fn from_this_pc(addr: SocketAddr) -> bool {
+    addr.ip().is_loopback() && crate::ipfwd::forwarded_peer(addr).is_none()
+}
+
 /// A client from this PC (loopback) joined `room` as actor `nr` (server.rs).
 pub(crate) fn joined_locally(room: &str, nr: i32) {
     *LOCAL_ROOM.lock().unwrap() = Some((room.to_string(), nr));
@@ -151,11 +159,12 @@ pub struct RoomView {
 /// The player behind a client address on our servers: this PC (loopback), an internet
 /// player (through the forwarder), or a LAN peer by its address.
 fn peer_at(lan: &peerparty_core::Lan, addr: SocketAddr) -> Option<PeerId> {
-    if addr.ip().is_loopback() {
-        return Some(lan.me());
-    }
+    // First: the forwarder's deliveries come from loopback too.
     if let Some(p) = crate::ipfwd::forwarded_peer(addr) {
         return Some(p);
+    }
+    if addr.ip().is_loopback() {
+        return Some(lan.me());
     }
     lan.peers().into_iter().map(|(p, _)| p).find(|p| lan.peer_has_ip(*p, addr.ip()))
 }
@@ -263,13 +272,29 @@ struct Candidate {
     direct: Option<IpAddr>,
     /// The address games are given for it otherwise (its stand-in, for an internet peer).
     shown: Option<IpAddr>,
+    /// A public player (a stranger from public sessions), or one whose path isn't known.
+    public: bool,
 }
 
+/// The host chosen: who, where games reach it, its name, and whether it's a public
+/// player.
+type Chosen = (PeerId, IpAddr, String, bool);
+
 /// The host to use: a LAN host if there is one, else (only while the typed-IP forwarder
-/// runs, which is what makes a stand-in lead somewhere) an internet host at its stand-in;
-/// the lowest peer id within each.
-fn pick_host(hosts: Vec<Candidate>, forwarding: bool) -> Option<(PeerId, IpAddr, String)> {
-    let lan = hosts.iter().filter_map(|c| c.direct.map(|ip| (c.id, ip, c.name.clone()))).min_by_key(|h| h.0);
+/// runs, which is what makes a stand-in lead somewhere) an internet host at its stand-in,
+/// a room player's before a public player's: a stranger never becomes the server for
+/// friends who have one of their own. The lowest peer id within each, which everyone
+/// who sees them alike agrees on. While the forwarder runs a LAN host is reached at its
+/// stand-in too, over the PeerParty connection: its firewall may refuse a connection to
+/// its Photon ports from another PC (a network set to Public), never that one.
+fn pick_host(hosts: Vec<Candidate>, forwarding: bool) -> Option<Chosen> {
+    let lan = hosts
+        .iter()
+        .filter_map(|c| {
+            let ip = if forwarding { IpAddr::V4(peerparty_core::fwd::Forwarder::address_of(c.id)) } else { c.direct? };
+            c.direct.map(|_| (c.id, ip, c.name.clone(), false))
+        })
+        .min_by_key(|h| h.0);
     lan.or_else(|| {
         if !forwarding {
             return None;
@@ -278,23 +303,25 @@ fn pick_host(hosts: Vec<Candidate>, forwarding: bool) -> Option<(PeerId, IpAddr,
             .iter()
             .filter(|c| c.direct.is_none())
             .filter_map(|c| match c.shown {
-                Some(IpAddr::V4(v4)) if peerparty_core::fwd::is_stand_in(v4) => Some((c.id, IpAddr::V4(v4), c.name.clone())),
+                Some(IpAddr::V4(v4)) if peerparty_core::fwd::is_stand_in(v4) => Some((c.id, IpAddr::V4(v4), c.name.clone(), c.public)),
                 _ => None,
             })
-            .min_by_key(|h| h.0)
+            .min_by_key(|h| (h.3, h.0))
     })
 }
 
 /// A peer that hosts Photon, as `pick_host` chooses among those that say so.
-fn peer_host() -> Option<(PeerId, IpAddr, String)> {
+fn peer_host() -> Option<Chosen> {
     let lan = crate::net::lan()?;
     let hosts = lan
         .peers()
         .into_iter()
         .filter(|(id, _)| lan.presence(*id).iter().any(|(k, v)| k == PRESENCE && v == "host"))
         .map(|(id, name)| {
-            let direct = if lan.peer_trust(id) == Some(peerparty_core::Trust::Lan) { lan.peer_direct_ip(id) } else { None };
-            Candidate { id, name, direct, shown: lan.peer_ip(id) }
+            let trust = lan.peer_trust(id);
+            let direct = if trust == Some(peerparty_core::Trust::Lan) { lan.peer_direct_ip(id) } else { None };
+            let public = !matches!(trust, Some(peerparty_core::Trust::Lan | peerparty_core::Trust::Room));
+            Candidate { id, name, direct, shown: lan.peer_ip(id), public }
         })
         .collect();
     pick_host(hosts, crate::ipfwd::active())
@@ -312,10 +339,11 @@ fn target() -> Option<(IpAddr, String)> {
             }
         }
     }
-    if let Some((id, ip, name)) = peer_host() {
+    if let Some((id, ip, name, public)) = peer_host() {
         // A peer with a lower id hosts too (both started at once): its rooms win for
-        // new connections. Ours keeps serving whoever is already connected.
-        let lower = lan.is_some_and(|l| id < l.me());
+        // new connections. Ours keeps serving whoever is already connected. Never a
+        // public player's: a stranger doesn't take over the server friends play on.
+        let lower = !public && lan.is_some_and(|l| id < l.me());
         if st.host.is_none() || lower {
             return Some((ip, format!("Photon servers on {name}")));
         }
@@ -329,6 +357,8 @@ fn target() -> Option<(IpAddr, String)> {
     let opts = host::Options::standard(
         IpAddr::V4(peerparty_core::bind_ip()),
         Box::new(advertise),
+        Box::new(|addr| crate::net::lan().and_then(|lan| peer_at(lan, addr)).map(|p| p.0)),
+        Arc::new(|addr: SocketAddr| addr.ip().is_loopback() || crate::net::lan().and_then(|lan| peer_at(lan, addr)).is_some()),
         Arc::new(|s: &str| log!("{s}")),
     );
     match host::Host::start(opts) {
@@ -412,15 +442,23 @@ mod glue_tests {
         let mut ids = [PeerId::random(), PeerId::random(), PeerId::random()];
         ids.sort();
         let at = |id| IpAddr::V4(peerparty_core::fwd::Forwarder::address_of(id));
-        let lan_host = Candidate { id: ids[2], name: "lan".into(), direct: Some("192.168.1.9".parse().unwrap()), shown: Some("192.168.1.9".parse().unwrap()) };
-        let far = |id, name: &str| Candidate { id, name: name.into(), direct: None, shown: Some(at(id)) };
+        let lan_host = Candidate { id: ids[2], name: "lan".into(), direct: Some("192.168.1.9".parse().unwrap()), shown: Some("192.168.1.9".parse().unwrap()), public: false };
+        let far = |id, name: &str| Candidate { id, name: name.into(), direct: None, shown: Some(at(id)), public: false };
         let hosts = vec![far(ids[0], "far0"), far(ids[1], "far1"), lan_host.clone()];
         assert_eq!(pick_host(hosts.clone(), true).map(|h| h.2), Some("lan".into()));
+        // Reached over the PeerParty connection while the forwarder runs, else directly.
+        assert_eq!(pick_host(hosts.clone(), true).map(|h| h.1), Some(at(ids[2])));
+        assert_eq!(pick_host(hosts.clone(), false).map(|h| h.1), Some("192.168.1.9".parse().unwrap()));
         let only_far = vec![far(ids[1], "far1"), far(ids[0], "far0")];
-        assert_eq!(pick_host(only_far.clone(), true), Some((ids[0], at(ids[0]), "far0".into())));
+        assert_eq!(pick_host(only_far.clone(), true), Some((ids[0], at(ids[0]), "far0".into(), false)));
         assert_eq!(pick_host(only_far, false), None);
         // A peer whose address isn't a stand-in (nothing forwards to it) is never picked.
-        let odd = Candidate { id: ids[0], name: "odd".into(), direct: None, shown: Some("203.0.113.5".parse().unwrap()) };
+        let odd = Candidate { id: ids[0], name: "odd".into(), direct: None, shown: Some("203.0.113.5".parse().unwrap()), public: false };
         assert_eq!(pick_host(vec![odd], true), None);
+        // A public player with the lowest id doesn't beat a room player who hosts; alone,
+        // it's the host (and said to be public, so ours isn't given up for it).
+        let stranger = Candidate { public: true, ..far(ids[0], "stranger") };
+        assert_eq!(pick_host(vec![stranger.clone(), far(ids[1], "friend")], true).map(|h| h.2), Some("friend".into()));
+        assert_eq!(pick_host(vec![stranger], true), Some((ids[0], at(ids[0]), "stranger".into(), true)));
     }
 }

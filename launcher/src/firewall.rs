@@ -303,9 +303,7 @@ pub fn fix_script(disable: &[&str], remove: &[&str], exe: &str, profiles: u32) -
     let list = |ids: &[&str]| ids.iter().map(|i| ps_literal_name(i)).collect::<Vec<_>>().join(",");
     // Windows' own NetSecurity module, by its path: a module of that name in the user's
     // Documents would otherwise be found first, by a prompt running as administrator.
-    let mut s = String::from(
-        r"$ErrorActionPreference='Stop'; $m = Join-Path $PSHOME 'Modules\NetSecurity\NetSecurity.psd1'; if (Test-Path -LiteralPath $m) { Import-Module $m } else { Import-Module NetSecurity }; ",
-    );
+    let mut s = String::from(IMPORT);
     if !disable.is_empty() {
         s.push_str(&format!("Disable-NetFirewallRule -Name {}; ", list(disable)));
     }
@@ -314,14 +312,41 @@ pub fn fix_script(disable: &[&str], remove: &[&str], exe: &str, profiles: u32) -
     }
     let names: Vec<&str> = [(DOMAIN, "Domain"), (PRIVATE, "Private"), (PUBLIC, "Public")].into_iter().filter(|(b, _)| profiles & b != 0).map(|(_, n)| n).collect();
     let file = Path::new(exe).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| exe.to_string());
-    s.push_str(&format!(
-        "New-NetFirewallRule -DisplayName {} -Description {} -Group 'peerparty' -Direction Inbound -Action Allow -Program {} -Profile {} | Out-Null",
-        q(&format!("{OURS}{file}")),
-        q("Lets other players connect to this game. Added by peerparty when you asked it to fix the firewall."),
-        q(exe),
-        names.join(",")
-    ));
+    // TCP and UDP only, what games and PeerParty use (not every protocol there is).
+    for proto in ["TCP", "UDP"] {
+        s.push_str(&format!(
+            "New-NetFirewallRule -DisplayName {} -Description {} -Group 'peerparty' -Direction Inbound -Action Allow -Program {} -Protocol {proto} -Profile {} | Out-Null; ",
+            q(&format!("{OURS}{file}")),
+            q("Lets other players connect to this game. Added by peerparty when you asked it to fix the firewall; peerparty --remove-firewall takes it away."),
+            q(exe),
+            names.join(",")
+        ));
+    }
+    s.truncate(s.trim_end_matches([';', ' ']).len());
     s
+}
+
+/// PowerShell's lines to load Windows' own NetSecurity module, by its path: a module of
+/// that name in the user's Documents would otherwise be found first, by a prompt running
+/// as administrator.
+const IMPORT: &str = r"$ErrorActionPreference='Stop'; $m = Join-Path $PSHOME 'Modules\NetSecurity\NetSecurity.psd1'; if (Test-Path -LiteralPath $m) { Import-Module $m } else { Import-Module NetSecurity }; ";
+
+/// `peerparty --remove-firewall`, run elevated: every rule PeerParty added (its group),
+/// for every game. Block rules it turned off stay off (they were the game's own prompt
+/// answers, and turning them back on would lock the players out again). How many went.
+pub fn remove_all() -> Result<String, String> {
+    let script = format!("{IMPORT}$r = @(Get-NetFirewallRule -Group 'peerparty' -ErrorAction SilentlyContinue); if ($r.Count) {{ $r | Remove-NetFirewallRule }}; $r.Count");
+    let out = std::process::Command::new(powershell())
+        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &script])
+        .creation_flags_no_window()
+        .output()
+        .map_err(|e| format!("PowerShell: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(err.lines().find(|l| !l.trim().is_empty()).unwrap_or("PowerShell").trim().to_string());
+    }
+    let n = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Ok(format!("removed {n} firewall rule(s) peerparty had added"))
 }
 
 /// What `--fix-firewall` changes for an exe: the Block rules to turn off (local ones on
@@ -804,7 +829,9 @@ mod tests {
         let s = fix_script(&["TCP Query User{X}c:\\it's\\game.exe"], &["old"], r"C:\it's\game.exe", PRIVATE | DOMAIN);
         assert!(s.contains(r"Disable-NetFirewallRule -Name 'TCP Query User{X}c:\it''s\game.exe';"), "{s}");
         assert!(s.contains("Remove-NetFirewallRule -Name 'old';"), "{s}");
-        assert!(s.contains(r"-Program 'C:\it''s\game.exe' -Profile Domain,Private"), "{s}");
+        assert!(s.contains(r"-Program 'C:\it''s\game.exe' -Protocol TCP -Profile Domain,Private"), "{s}");
+        assert!(s.contains(r"-Program 'C:\it''s\game.exe' -Protocol UDP -Profile Domain,Private | Out-Null"), "{s}");
+        assert!(!s.ends_with(';'), "{s}");
         assert!(s.contains("-DisplayName 'peerparty: game.exe'"), "{s}");
         let s = fix_script(&[], &[], r"C:\g.exe", ALL);
         assert!(!s.contains("Disable-") && !s.contains("Remove-") && s.contains("-Profile Domain,Private,Public"), "{s}");

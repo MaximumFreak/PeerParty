@@ -114,14 +114,23 @@ enum Filter {
     Num(String, i64, i32),
 }
 
+/// A lobby list request's filters. Steam applies those added before RequestLobbyList
+/// to that request, and starts the next one empty.
 #[derive(Default)]
-struct State {
+struct Wanted {
     filters: Vec<Filter>,
+    /// Near-value filters, the first added sorting first.
     near: Vec<(String, i64)>,
     slots: Option<u32>,
     max_results: Option<usize>,
-    /// The lobby list search in flight: (core search, our call).
-    search: Option<(u64, u64)>,
+}
+
+#[derive(Default)]
+struct State {
+    /// Filters for the next RequestLobbyList.
+    next: Wanted,
+    /// The lobby list search in flight: (core search, our call, its filters).
+    search: Option<(u64, u64, Wanted)>,
     results: Vec<u64>,
     /// Lobbies seen in searches and invites.
     known: HashMap<u64, Lobby>,
@@ -204,7 +213,8 @@ fn visible(attrs: &[Attr]) -> Vec<&Attr> {
 
 fn permission(kind: i64, joinable: bool) -> Permission {
     match (kind, joinable) {
-        (_, false) | (0, _) => Permission::InviteOnly,
+        // 4, PrivateUnique, is as private as 0.
+        (_, false) | (0, _) | (4, _) => Permission::InviteOnly,
         (1, _) => Permission::Presence,
         _ => Permission::Public,
     }
@@ -290,31 +300,37 @@ fn passes(l: &Lobby, f: &Filter) -> bool {
     }
 }
 
-fn finish_search(results: &[Lobby]) -> (u64, u32) {
-    let mut st = S.lock().unwrap();
-    let Some((_, call)) = st.search.take() else {
-        return (0, 0);
-    };
+/// The lobbies a request's filters pass, nearest first, at most its count.
+fn filtered(results: &[Lobby], w: &Wanted) -> Vec<Lobby> {
     let mut hits: Vec<Lobby> = results
         .iter()
-        .filter(|l| st.filters.iter().all(|f| passes(l, f)))
-        .filter(|l| st.slots.is_none_or(|n| l.open_slots() >= n))
+        .filter(|l| w.filters.iter().all(|f| passes(l, f)))
+        .filter(|l| w.slots.is_none_or(|n| l.open_slots() >= n))
         .cloned()
         .collect();
-    for (k, target) in &st.near {
-        hits.sort_by_key(|l| lobby_int(l, k).map_or(i64::MAX, |v| (v - target).abs()));
+    // One stable sort on every near filter's distance in order (a lobby without the
+    // key last), so the first filter added decides first.
+    if !w.near.is_empty() {
+        hits.sort_by_cached_key(|l| {
+            w.near.iter().map(|(k, target)| lobby_int(l, k).map_or(u64::MAX, |v| v.abs_diff(*target))).collect::<Vec<u64>>()
+        });
     }
-    hits.truncate(st.max_results.unwrap_or(50));
+    hits.truncate(w.max_results.unwrap_or(50));
+    hits
+}
+
+fn finish_search(results: &[Lobby]) -> (u64, u32) {
+    let mut st = S.lock().unwrap();
+    let Some((_, call, wanted)) = st.search.take() else {
+        return (0, 0);
+    };
+    let hits = filtered(results, &wanted);
     st.results = hits.iter().filter_map(|l| steam_lobby(&l.id)).collect();
     for l in hits {
         if let Some(id) = steam_lobby(&l.id) {
             st.known.insert(id, l);
         }
     }
-    st.filters.clear();
-    st.near.clear();
-    st.slots = None;
-    st.max_results = None;
     (call, st.results.len() as u32)
 }
 
@@ -366,7 +382,9 @@ vmethod! {
         let mut q = Query::new(NS);
         q.max_results = 500;
         let search = lan.search(q);
-        S.lock().unwrap().search = Some((search, call));
+        let mut st = S.lock().unwrap();
+        let wanted = std::mem::take(&mut st.next);
+        st.search = Some((search, call, wanted));
         log!("steam-lan RequestLobbyList call={call:#x}");
         call
     }
@@ -374,31 +392,31 @@ vmethod! {
 
 vmethod! {
     fn add_string_filter(_this: usize, key: *const c_char, value: *const c_char, cmp: i32) {
-        S.lock().unwrap().filters.push(Filter::Str(s(key), s(value), cmp));
+        S.lock().unwrap().next.filters.push(Filter::Str(s(key), s(value), cmp));
     }
 }
 
 vmethod! {
     fn add_numerical_filter(_this: usize, key: *const c_char, value: i32, cmp: i32) {
-        S.lock().unwrap().filters.push(Filter::Num(s(key), value as i64, cmp));
+        S.lock().unwrap().next.filters.push(Filter::Num(s(key), value as i64, cmp));
     }
 }
 
 vmethod! {
     fn add_near_filter(_this: usize, key: *const c_char, value: i32) {
-        S.lock().unwrap().near.push((s(key), value as i64));
+        S.lock().unwrap().next.near.push((s(key), value as i64));
     }
 }
 
 vmethod! {
     fn add_slots_filter(_this: usize, n: i32) {
-        S.lock().unwrap().slots = Some(n.max(0) as u32);
+        S.lock().unwrap().next.slots = Some(n.max(0) as u32);
     }
 }
 
 vmethod! {
     fn add_count_filter(_this: usize, n: i32) {
-        S.lock().unwrap().max_results = Some(n.max(0) as usize);
+        S.lock().unwrap().next.max_results = Some(n.max(0) as usize);
     }
 }
 
@@ -840,7 +858,7 @@ pub fn on_event(ev: &Event) {
             lan.accept(*peer, socket);
         }
         Event::SearchDone { search, results } => {
-            let mine = S.lock().unwrap().search.is_some_and(|(s, _)| s == *search);
+            let mine = S.lock().unwrap().search.as_ref().is_some_and(|(s, _, _)| s == search);
             if mine {
                 let (call, count) = finish_search(results);
                 log!("steam-lan RequestLobbyList found {count}");
@@ -959,6 +977,30 @@ mod tests {
         assert!(!passes(&l, &Filter::Str("mode".into(), "pvp".into(), 0)));
         assert!(!passes(&l, &Filter::Str("missing".into(), "x".into(), 0)));
         assert!(passes(&l, &Filter::Str("missing".into(), "x".into(), 3)));
+    }
+
+    #[test]
+    fn the_first_near_filter_sorts_first_and_huge_values_dont_overflow() {
+        let lobby = |id: &str, level: &str, region: &str| {
+            let mut l = Lobby::new(NS);
+            l.id = id.into();
+            l.attrs.push(Attr { key: "level".into(), value: Value::Str(level.into()), public: true });
+            l.attrs.push(Attr { key: "region".into(), value: Value::Str(region.into()), public: true });
+            l
+        };
+        let all = [lobby("a", "10", "1"), lobby("b", "5", "9"), lobby("c", "5", "2"), lobby("d", "-9223372036854775808", "2")];
+        let w = Wanted { near: vec![("level".into(), 5), ("region".into(), 1)], ..Default::default() };
+        let ids: Vec<String> = filtered(&all, &w).into_iter().map(|l| l.id).collect();
+        assert_eq!(ids, ["c", "b", "a", "d"]);
+        let w = Wanted { max_results: Some(1), filters: vec![Filter::Num("region".into(), 2, 0)], ..Default::default() };
+        let ids: Vec<String> = filtered(&all, &w).into_iter().map(|l| l.id).collect();
+        assert_eq!(ids, ["c"]);
+    }
+
+    #[test]
+    fn private_unique_lobbies_are_invite_only() {
+        assert_eq!(permission(4, true), Permission::InviteOnly);
+        assert_eq!(permission(3, true), Permission::Public);
     }
 
     #[test]

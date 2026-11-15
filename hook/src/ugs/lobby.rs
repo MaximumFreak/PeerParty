@@ -3,9 +3,11 @@
 //! A UGS lobby is a LAN lobby in namespace `ugs.lobby`, owned by its host's copy, as
 //! pfmp.rs maps PlayFab's lobbies. Its id is the UGS id; its join code is the LAN
 //! lobby's bucket (searchable). Lobby attributes:
-//! `ugs` (public JSON: name, isPrivate, isLocked, created, and a hash of the password
-//! so a joiner checks it before joining) and `d:<key>` per data entry (public when its
-//! visibility is public). Member attributes: `p` (public JSON: joined, lastUpdated,
+//! `ugs` (public JSON: name, isPrivate, isLocked, hasPassword, created), `pw` (members
+//! only: a hash of the password) and `d:<key>` per data entry (public when its
+//! visibility is public). A private lobby is unlisted: the LAN finds it only by its
+//! id or its code. Joins are checked by the host's copy (`join_check`): a locked
+//! lobby or a wrong password is refused there, whatever the joiner's copy did. Member attributes: `p` (public JSON: joined, lastUpdated,
 //! profile), `c` (members only: connectionInfo, allocationId) and `pd:<key>` per player
 //! data entry. Visibility is applied when a copy renders the lobby for its own player:
 //! member data to members, private lobby data to the host, private player data to that
@@ -107,11 +109,40 @@ fn set(obj: &mut Json, key: &str, value: Json) {
     }
 }
 
+/// The members-only attribute with the password's hash (none: no password). It isn't
+/// in the public `ugs` meta, which every searcher gets: from there anyone could try
+/// passwords offline.
+const PASSWORD_KEY: &str = "pw";
+
 fn password_hash(lobby: &str, password: &str) -> String {
     crate::photon::crypto::sha256(format!("peerparty-ugs:{lobby}:{password}").as_bytes())
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+fn password_attr(lobby: &str, password: &str) -> Attr {
+    Attr { key: PASSWORD_KEY.into(), value: Value::Str(password_hash(lobby, password)), public: false }
+}
+
+/// The host's say on a join of one of its lobbies (`Lan::set_join_check`), with the
+/// password the joiner was given as its secret: a locked lobby lets nobody in, one
+/// with a password only those who give it.
+fn join_check(l: &Lobby, _joiner: PeerId, secret: &str) -> Option<JoinResult> {
+    if flag(&meta(l), "isLocked") {
+        return Some(JoinResult::NotAllowed);
+    }
+    let pwh = find_attr(&l.attrs, PASSWORD_KEY).map(|a| a.value.text()).unwrap_or_default();
+    if !pwh.is_empty() && password_hash(&l.id, secret) != pwh {
+        return Some(JoinResult::WrongSecret);
+    }
+    None
+}
+
+/// The host's checks are on in this copy: it may host a lobby (made here, or handed on
+/// to it when its host leaves).
+fn check_joins(lan: &peerparty_core::Lan) {
+    lan.set_join_check(NS, join_check);
 }
 
 /// A data entry as stored: value as text, visibility, index (lobby data only).
@@ -129,6 +160,48 @@ fn data_entry(v: &Json, lobby_data: bool) -> Json {
         }
     }
     Json::obj(e)
+}
+
+/// What the service refuses in a request's `data` (the SDK's DataObject and
+/// PlayerDataObject): a visibility other than public, member or private; for lobby
+/// data, an index other than S1-S5 / N1-N5, an indexed value of 128 bytes or more, or a
+/// numeric index on a value that isn't a number. A null entry removes its key.
+fn bad_data(data: &Json, lobby_data: bool) -> Option<String> {
+    for (k, v) in pairs(data) {
+        if k.is_empty() {
+            return Some("a data key is empty".into());
+        }
+        if v.is_null() {
+            continue;
+        }
+        let Json::Obj(_) = v else { return Some(format!("data '{k}' isn't an object")) };
+        let vis = v.get("visibility").as_str().unwrap_or("public").to_ascii_lowercase();
+        if !["public", "member", "private"].contains(&vis.as_str()) {
+            return Some(format!("data '{k}' has visibility '{vis}'"));
+        }
+        let Some(index) = v.get("index").as_str().filter(|_| lobby_data) else { continue };
+        let index = index.to_ascii_uppercase();
+        let b = index.as_bytes();
+        if !(b.len() == 2 && matches!(b[0], b'S' | b'N') && (b'1'..=b'5').contains(&b[1])) {
+            return Some(format!("data '{k}' has index '{index}'"));
+        }
+        let value = match v.get("value") {
+            Json::Null => continue,
+            Json::Str(s) => s.clone(),
+            other => other.to_string(),
+        };
+        if value.len() >= 128 {
+            return Some(format!("data '{k}' is indexed and 128 bytes or longer"));
+        }
+        if b[0] == b'N' && value.trim().parse::<f64>().is_err() {
+            return Some(format!("data '{k}' is under a numeric index but isn't a number"));
+        }
+    }
+    None
+}
+
+fn bad_request(why: String) -> Reply {
+    err(400, VALIDATION, "Validation Error", &why)
 }
 
 fn visible(vis: &str, member: bool, owner: bool) -> bool {
@@ -156,7 +229,7 @@ fn player_attrs(player: &Json, joined: &str) -> Vec<Attr> {
         out.push(attr_json("c", &Json::obj(c), false));
     }
     for (k, v) in pairs(player.get("data")) {
-        if !v.is_null() && !v.get("value").is_null() {
+        if !v.is_null() {
             let e = data_entry(v, false);
             let public = e.get("visibility").as_str() == Some("public");
             out.push(attr_json(&format!("pd:{k}"), &e, public));
@@ -227,7 +300,7 @@ pub fn render(l: &Lobby, viewer: PeerId) -> Json {
         ("availableSlots", Json::Num(l.open_slots() as f64)),
         ("isPrivate", Json::Bool(flag(&m, "isPrivate"))),
         ("isLocked", Json::Bool(flag(&m, "isLocked"))),
-        ("hasPassword", Json::Bool(!text(&m, "pwh").is_empty())),
+        ("hasPassword", Json::Bool(flag(&m, "hasPassword"))),
         ("players", Json::Arr(players)),
         ("data", Json::Obj(data)),
         ("hostId", Json::str(player_id(l.owner))),
@@ -527,6 +600,16 @@ fn sort(views: &mut [Json], order: &[Json]) {
     });
 }
 
+/// A private lobby is left out of every LAN search but one for its id or code (so a
+/// modified copy can't list it either); anyone with those may join it, as in UGS.
+fn permission(meta: &Json) -> peerparty_core::Permission {
+    if flag(meta, "isPrivate") {
+        peerparty_core::Permission::Unlisted
+    } else {
+        peerparty_core::Permission::Public
+    }
+}
+
 /// Lobbies a query or quick join may return: public and unlocked.
 fn listed(l: &Lobby) -> bool {
     let m = meta(l);
@@ -569,6 +652,9 @@ fn create(body: &Json, id: Option<&str>) -> Reply {
     if password.is_some_and(|p| p.len() < 8 || p.len() > 64) {
         return err(400, VALIDATION, "Validation Error", "a password is 8 to 64 characters");
     }
+    if let Some(why) = bad_data(body.get("data"), true).or_else(|| bad_data(body.get("player").get("data"), false)) {
+        return bad_request(why);
+    }
     let now = now_iso();
     let mut l = Lobby::new(NS);
     l.id = id.map(str::to_string).unwrap_or_else(|| random_text(22, ID_ALPHABET));
@@ -580,18 +666,24 @@ fn create(body: &Json, id: Option<&str>) -> Reply {
         ("name", Json::str(name.clone())),
         ("isPrivate", Json::Bool(flag(body, "isPrivate"))),
         ("isLocked", Json::Bool(flag(body, "isLocked"))),
+        ("hasPassword", Json::Bool(password.is_some())),
         ("created", Json::str(now.clone())),
-        ("pwh", Json::str(password.map(|p| password_hash(&l.id, p)).unwrap_or_default())),
     ]);
+    l.permission = permission(&meta);
     l.attrs.push(attr_json("ugs", &meta, true));
+    if let Some(p) = password {
+        l.attrs.push(password_attr(&l.id, p));
+    }
+    // A null value is kept (the SDK leaves it out); only a null entry is nothing.
     for (k, v) in pairs(body.get("data")) {
-        if !v.is_null() && !v.get("value").is_null() {
+        if !v.is_null() {
             let e = data_entry(v, true);
             let public = e.get("visibility").as_str() == Some("public");
             l.attrs.push(attr_json(&format!("d:{k}"), &e, public));
         }
     }
     l.members = vec![Member { id: lan.me(), attrs: player_attrs(body.get("player"), &now) }];
+    check_joins(lan);
     match lan.create_lobby(l) {
         Ok(l) => {
             log!("ugs created lobby {} '{name}' code {} for {}", l.id, l.bucket, l.max_members);
@@ -613,6 +705,7 @@ fn join_found(target: Lobby, body: &Json) -> Reply {
             None => not_found(),
         };
     }
+    // What the public meta says, to answer at once; the host checks again (`join_check`).
     let m = meta(&target);
     if flag(&m, "isLocked") {
         return err(409, LOCKED, "Lobby Locked", "the lobby is locked");
@@ -620,12 +713,16 @@ fn join_found(target: Lobby, body: &Json) -> Reply {
     if target.open_slots() == 0 {
         return err(409, FULL, "Lobby Full", "the lobby is full");
     }
-    let pwh = text(&m, "pwh");
-    if !pwh.is_empty() && password_hash(&id, body.get("password").as_str().unwrap_or_default()) != pwh {
-        return err(403, BAD_PASSWORD, "Incorrect Password", "the password is wrong");
+    let password = body.get("password").as_str().unwrap_or_default();
+    if flag(&m, "hasPassword") && password.is_empty() {
+        return err(403, BAD_PASSWORD, "Incorrect Password", "the lobby needs a password");
     }
+    if let Some(why) = bad_data(body.get("player").get("data"), false) {
+        return bad_request(why);
+    }
+    check_joins(lan);
     super::clear_join(&id);
-    match lan.join(&target) {
+    match lan.join_with(&target, password) {
         Ok(()) | Err(LobbyError::AlreadyIn) => {}
         Err(_) => return not_found(),
     }
@@ -633,6 +730,7 @@ fn join_found(target: Lobby, body: &Json) -> Reply {
         JoinResult::Ok => {}
         JoinResult::Full => return err(409, FULL, "Lobby Full", "the lobby is full"),
         JoinResult::NotAllowed => return err(409, LOCKED, "Lobby Locked", "the host refused"),
+        JoinResult::WrongSecret => return err(403, BAD_PASSWORD, "Incorrect Password", "the password is wrong"),
         JoinResult::NotFound => return not_found(),
         JoinResult::TimedOut => {
             let _ = lan.leave(&id);
@@ -653,7 +751,7 @@ fn quick_join(body: &Json) -> Reply {
     let filters = body.get("filter").as_arr();
     let mut candidates: Vec<(Json, Lobby)> = all_lobbies()
         .into_iter()
-        .filter(|l| listed(l) && l.open_slots() > 0 && text(&meta(l), "pwh").is_empty() && l.member(lan.me()).is_none())
+        .filter(|l| listed(l) && l.open_slots() > 0 && !flag(&meta(l), "hasPassword") && l.member(lan.me()).is_none())
         .map(|l| (with_version(render(&l, lan.me()), 1, &now_iso()), l))
         .filter(|(v, _)| filters.iter().all(|f| passes(v, f)))
         .collect();
@@ -691,19 +789,36 @@ fn update(id: &str, body: &Json) -> Reply {
             set(&mut m, k, Json::Bool(*b));
         }
     }
+    l.permission = permission(&m);
     if let Some(p) = body.get("password").as_str() {
-        set(&mut m, "pwh", Json::str(if p.is_empty() { String::new() } else { password_hash(id, p) }));
+        if !p.is_empty() && (p.len() < 8 || p.len() > 64) {
+            return err(400, VALIDATION, "Validation Error", "a password is 8 to 64 characters");
+        }
+        set(&mut m, "hasPassword", Json::Bool(!p.is_empty()));
+        if p.is_empty() {
+            remove_attr(&mut l.attrs, PASSWORD_KEY);
+        } else {
+            set_attr(&mut l.attrs, password_attr(id, p));
+        }
     }
     if let Some(n) = body.get("maxPlayers").as_f64() {
         if !(1.0..=100.0).contains(&n) {
             return err(400, VALIDATION, "Validation Error", "maxPlayers must be 1 to 100");
         }
+        // UpdateRequest: "Must be greater than or equal to the current number of players".
+        if (n as usize) < l.members.len() {
+            return bad_request(format!("maxPlayers can't be below the {} players in the lobby", l.members.len()));
+        }
         l.max_members = n as u32;
     }
+    if let Some(why) = bad_data(body.get("data"), true) {
+        return bad_request(why);
+    }
     set_attr(&mut l.attrs, attr_json("ugs", &m, true));
+    // A null entry removes its key; a null value (left out by the SDK) is kept as null.
     for (k, v) in pairs(body.get("data")) {
         let key = format!("d:{k}");
-        if v.is_null() || v.get("value").is_null() {
+        if v.is_null() {
             remove_attr(&mut l.attrs, &key);
         } else {
             let e = data_entry(v, true);
@@ -736,11 +851,14 @@ fn update_player(id: &str, player: &str, body: &Json) -> Reply {
         return err(403, FORBIDDEN, "Forbidden", "players change only their own data");
     }
     let Some(me) = l.member(lan.me()) else { return not_found() };
+    if let Some(why) = bad_data(body.get("data"), false) {
+        return bad_request(why);
+    }
     let mut setv = Vec::new();
     let mut remove = Vec::new();
     for (k, v) in pairs(body.get("data")) {
         let key = format!("pd:{k}");
-        if v.is_null() || v.get("value").is_null() {
+        if v.is_null() {
             remove.push(key);
         } else {
             let e = data_entry(v, false);
@@ -928,6 +1046,29 @@ pub fn handle(method: &str, path: &str, body: &Json) -> Reply {
 mod tests {
     use super::*;
 
+    #[test]
+    fn data_the_service_would_refuse_is_refused() {
+        let d = |s: &str| Json::parse(s).unwrap();
+        assert_eq!(bad_data(&d(r#"{"map":{"value":"forest","visibility":"public","index":"S1"},"gone":null,"blank":{"visibility":"member"}}"#), true), None);
+        assert_eq!(bad_data(&d(r#"{"level":{"value":"12.5","visibility":"public","index":"n2"}}"#), true), None);
+        for bad in [
+            r#"{"x":{"value":"a","visibility":"everyone"}}"#,
+            r#"{"x":{"value":"a","visibility":"public","index":"S6"}}"#,
+            r#"{"x":{"value":"a","visibility":"public","index":"X1"}}"#,
+            r#"{"x":{"value":"twelve","visibility":"public","index":"N1"}}"#,
+            r#"{"x":5}"#,
+            r#"{"":{"value":"a","visibility":"public"}}"#,
+        ] {
+            assert!(bad_data(&d(bad), true).is_some(), "{bad}");
+        }
+        let long = format!(r#"{{"x":{{"value":"{}","visibility":"public","index":"S1"}}}}"#, "a".repeat(128));
+        assert!(bad_data(&d(&long), true).is_some(), "an indexed value of 128 bytes");
+        let long = format!(r#"{{"x":{{"value":"{}","visibility":"public"}}}}"#, "a".repeat(128));
+        assert_eq!(bad_data(&d(&long), true), None, "not indexed: any length");
+        // Player data has no index: one sent is ignored.
+        assert_eq!(bad_data(&d(r#"{"x":{"value":"a","visibility":"private","index":"Q9"}}"#), false), None);
+    }
+
     fn peer(b: u8) -> PeerId {
         PeerId([b; 16])
     }
@@ -950,7 +1091,7 @@ mod tests {
         l.bucket = "ABC123".into();
         l.owner = peer(1);
         l.max_members = 4;
-        let meta = Json::obj(vec![("name", Json::str("Room")), ("isPrivate", Json::Bool(false)), ("isLocked", Json::Bool(false)), ("created", Json::str("2026-10-31T00:00:00.000Z")), ("pwh", Json::str(""))]);
+        let meta = Json::obj(vec![("name", Json::str("Room")), ("isPrivate", Json::Bool(false)), ("isLocked", Json::Bool(false)), ("created", Json::str("2026-10-31T00:00:00.000Z")), ("hasPassword", Json::Bool(false))]);
         l.attrs.push(attr_json("ugs", &meta, true));
         for (k, v, vis, idx) in [("map", "forest", "public", Some("S1")), ("secret", "x", "private", None), ("team", "red", "member", None), ("level", "7", "public", Some("N1"))] {
             let mut e = vec![("value", Json::str(v)), ("visibility", Json::str(vis))];
@@ -1146,5 +1287,21 @@ mod tests {
     fn password_hashes_depend_on_the_lobby() {
         assert_ne!(password_hash("a", "password1"), password_hash("b", "password1"));
         assert_eq!(password_hash("a", "password1").len(), 64);
+    }
+
+    #[test]
+    fn the_host_checks_lock_and_password_and_searchers_see_neither() {
+        let mut l = lobby();
+        assert_eq!(join_check(&l, peer(9), ""), None);
+        l.attrs.push(password_attr(&l.id, "password1"));
+        assert_eq!(join_check(&l, peer(9), "password1"), None);
+        assert_eq!(join_check(&l, peer(9), "password2"), Some(JoinResult::WrongSecret));
+        assert_eq!(join_check(&l, peer(9), ""), Some(JoinResult::WrongSecret));
+        // The hash is for members only: a search result doesn't carry it.
+        assert!(find_attr(&l.public_view().attrs, PASSWORD_KEY).is_none());
+        let mut m = meta(&l);
+        set(&mut m, "isLocked", Json::Bool(true));
+        set_attr(&mut l.attrs, attr_json("ugs", &m, true));
+        assert_eq!(join_check(&l, peer(9), "password1"), Some(JoinResult::NotAllowed));
     }
 }

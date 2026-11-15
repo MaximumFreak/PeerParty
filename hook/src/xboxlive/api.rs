@@ -264,10 +264,11 @@ fn presence_batch(dir: &Directory, body: &Json) -> Json {
     )
 }
 
-/// One permission check's answer. There is no Xbox Live to ask, so everything is
-/// allowed, but for one thing PeerParty knows: speech and text (the `CommunicateUsing*`
-/// permissions) with a public player, while the player has voice and chat with
-/// strangers off. A game that carries its own chat asks here whether it may.
+/// One permission check's answer as far as PeerParty knows: everything is allowed but
+/// speech and text (the `CommunicateUsing*` permissions) with a public player while the
+/// player has voice and chat with strangers off. A game that carries its own chat asks
+/// here whether it may. What the real service says about the same request (block
+/// lists, account limits; real.rs) is merged in by `merge_privacy`.
 fn allowed(dir: &Directory, target: u64, permission: &str, with_reasons: bool) -> Json {
     let quiet = permission.to_ascii_lowercase().starts_with("communicateusing") && dir.peers.iter().any(|p| p.xuid == target && p.quiet);
     let mut out = vec![("isAllowed", Json::Bool(!quiet))];
@@ -291,6 +292,53 @@ fn permissions(dir: &Directory, body: &Json) -> Json {
         })
         .collect();
     Json::obj(vec![("responses", Json::Arr(responses))])
+}
+
+/// PeerParty's answer to a privacy request (`route`) merged with the real service's
+/// answer to the same request (real.rs): the stricter wins. The avoid and mute lists are
+/// joined; a permission is allowed only if both allow it, with the reasons of whichever
+/// refuses. None: not a request whose answers merge (the caller keeps its own).
+pub fn merge_privacy(method: &str, path_and_query: &str, ours: &str, real: &str) -> Option<String> {
+    let (o, r) = (Json::parse(ours)?, Json::parse(real)?);
+    let path = path_and_query.split('?').next().unwrap_or_default();
+    let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
+    let merged = match segs.as_slice() {
+        ["users", _, "people", "avoid" | "mute"] => {
+            let mut users: Vec<Json> = o.get("users").as_arr().to_vec();
+            for u in r.get("users").as_arr() {
+                let x = xuids(&Json::Arr(vec![u.get("xuid").clone()]));
+                if !x.is_empty() && !users.iter().any(|v| xuids(&Json::Arr(vec![v.get("xuid").clone()])) == x) {
+                    users.push(u.clone());
+                }
+            }
+            Json::obj(vec![("users", Json::Arr(users))])
+        }
+        ["users", _, "permission", "validate"] if method.eq_ignore_ascii_case("GET") => stricter(&o, &r),
+        ["users", _, "permission", "validate"] => {
+            let real = r.get("responses").as_arr();
+            let ours = o.get("responses").as_arr();
+            let responses = ours
+                .iter()
+                .enumerate()
+                .map(|(i, mine)| {
+                    // Each user as asked: by who it is, else where it stands.
+                    let theirs = real.iter().find(|x| x.get("user") == mine.get("user")).or_else(|| real.get(i).filter(|_| real.len() == ours.len()));
+                    let Some(theirs) = theirs else { return mine.clone() };
+                    let tp = theirs.get("permissions").as_arr();
+                    let permissions = mine.get("permissions").as_arr().iter().enumerate().map(|(j, p)| tp.get(j).map_or_else(|| p.clone(), |t| stricter(p, t))).collect();
+                    Json::obj(vec![("user", mine.get("user").clone()), ("permissions", Json::Arr(permissions))])
+                })
+                .collect();
+            Json::obj(vec![("responses", Json::Arr(responses))])
+        }
+        _ => return None,
+    };
+    Some(merged.to_string())
+}
+
+/// Of two answers to one permission check, the one that refuses (else ours).
+fn stricter(ours: &Json, real: &Json) -> Json {
+    if real.get("isAllowed") == &Json::Bool(false) && ours.get("isAllowed") != &Json::Bool(false) { real.clone() } else { ours.clone() }
 }
 
 #[cfg(test)]
@@ -453,6 +501,39 @@ mod tests {
             .map(|r| r.get("permissions").as_arr().iter().map(|p| p.get("isAllowed") == &Json::Bool(true)).collect())
             .collect();
         assert_eq!(answers, [[true, false], [true, true]]);
+    }
+
+    /// The real service's word on the same request: its block list joins ours, and a
+    /// permission it refuses (a child account, a block) is refused, with its reasons.
+    #[test]
+    fn the_real_services_refusals_win() {
+        let mut d = dir();
+        d.peers[1].quiet = true;
+        let me = "/users/xuid(2533274800000001)";
+        let ours = |method: &str, path: &str, body: &str| route("privacy", method, path, &Json::parse(body).unwrap_or(Json::Null), &d).1;
+        let path = format!("{me}/people/mute");
+        let merged = merge_privacy("GET", &path, &ours("GET", &path, ""), r#"{"users":[{"xuid":"2533274800000007"},{"xuid":2533274800000003}]}"#).unwrap();
+        let ids = xuids(&Json::Arr(Json::parse(&merged).unwrap().get("users").as_arr().iter().map(|u| u.get("xuid").clone()).collect()));
+        assert_eq!(ids, [2533274800000003, 2533274800000007], "joined, each once");
+
+        let path = format!("{me}/permission/validate?setting=CommunicateUsingVoice&target=xuid(2533274800000002)");
+        let refused = r#"{"isAllowed":false,"reasons":[{"reason":"PrivilegeRestrictsTarget","restrictedPrivilege":"Communications"}]}"#;
+        let j = Json::parse(&merge_privacy("GET", &path, &ours("GET", &path, ""), refused).unwrap()).unwrap();
+        assert_eq!(j.get("isAllowed"), &Json::Bool(false));
+        assert_eq!(j.get("reasons").as_arr()[0].get("reason").as_str(), Some("PrivilegeRestrictsTarget"));
+        // Allowed there, but not here: ours stands.
+        let path = format!("{me}/permission/validate?setting=CommunicateUsingVoice&target=xuid(2533274800000003)");
+        let j = Json::parse(&merge_privacy("GET", &path, &ours("GET", &path, ""), r#"{"isAllowed":true}"#).unwrap()).unwrap();
+        assert_eq!(j.get("isAllowed"), &Json::Bool(false));
+
+        let path = format!("{me}/permission/validate");
+        let body = r#"{"users":[{"xuid":"2533274800000002"},{"xuid":"2533274800000003"}],"permissions":["PlayMultiplayer","CommunicateUsingVoice"]}"#;
+        let real = r#"{"responses":[{"user":{"xuid":"2533274800000002"},"permissions":[{"isAllowed":false,"reasons":[{"reason":"BlockListRestrictsTarget"}]},{"isAllowed":false,"reasons":[{"reason":"BlockListRestrictsTarget"}]}]},{"user":{"xuid":"2533274800000003"},"permissions":[{"isAllowed":true},{"isAllowed":true}]}]}"#;
+        let j = Json::parse(&merge_privacy("POST", &path, &ours("POST", &path, body), real).unwrap()).unwrap();
+        let answers: Vec<Vec<bool>> =
+            j.get("responses").as_arr().iter().map(|r| r.get("permissions").as_arr().iter().map(|p| p.get("isAllowed") == &Json::Bool(true)).collect()).collect();
+        assert_eq!(answers, [[false, false], [true, false]]);
+        assert_eq!(merge_privacy("GET", "/users/xuid(1)/people", "{}", "{}"), None);
     }
 
     #[test]

@@ -20,7 +20,8 @@ calls only**:
    game loaded, unchanged, or fails as offline where the SDK would need the store's
    servers (EOS Ecom, and PlayFab's purchase, receipt, currency, grant, trade and
    inventory-change calls, and its Admin API); PlayFab's web API answers the rest of what
-   it doesn't implement with an empty success.
+   it doesn't implement with an empty success, shaped as that call's result (its lists
+   and maps empty rather than missing).
    In the answers that do go to the store's SDK, the one thing PeerParty
    touches is a player's own SteamID:
    where the game is shown a SteamID of its own for this PC, results that carry the real
@@ -76,7 +77,11 @@ game.exe
   parent is the game). A followed child connects to the overlay's pipe only once it
   turns out to be the game (a game SDK loads, a window of 640x360 or more, or its
   parent ends): it signals `Local\peerparty-follow-<pid>`, which the parent made, and
-  the parent lets the pipe go. The launcher puts the game in a job object (breakaway
+  the parent lets the pipe go. A starter never starts the LAN for itself: with internet
+  play set up (a room code, public sessions), a process without a game SDK waits until a
+  program it started has said whether it is the game (3 s with none pending, 30 s at
+  most) and starts none once the pipe has gone to it, so the game, not the starter, is
+  this PC's first player (its name, its saves). The launcher puts the game in a job object (breakaway
   allowed, nothing killed on close) and waits for the last of its programs inside the
   folder, reporting that one's exit code.
 - **.bat / .cmd wrappers** (`launcher/src/wrapper.rs`): read, not run; the one program
@@ -86,7 +91,9 @@ game.exe
   to restart through Epic's launcher.
 - peerparty.exe stays running beside the game: it hands back the game's exit code and
   hosts the overlay.
-- A game in which EasyAntiCheat or BattlEye loads is stopped as soon as that module
+- A game whose program is an anti-cheat starter, or has an anti-cheat module beside
+  it, isn't started (the launcher looks first: launcher/src/anticheat.rs). A game in
+  which EasyAntiCheat or BattlEye loads anyway is stopped as soon as that module
   loads, and, with the EOS layer on, one that starts an EOS Anti-Cheat session is stopped
   then.
 
@@ -101,7 +108,11 @@ game.exe
   manual lookups), and the game modules' static imports of it are rewritten. By default
   the `GetProcAddress` slots of the game's own modules' import tables are pointed at
   PeerParty, so Windows' own code is never patched (`PEERPARTY_SWAP=inline` hooks
-  kernelbase instead).
+  kernelbase instead). A slot that another module already redirected keeps that
+  redirect behind PeerParty's: mod loaders built on Unity Doorstop (BepInEx,
+  MelonLoader) point UnityPlayer.dll's slot at themselves from their `DllMain`, before
+  the hook loads, to catch the runtime's start-up lookups, and still get every lookup
+  PeerParty doesn't answer, so the game's mods load.
 - **Inline detours** (the vendored `retour` crate) for the few entry points that have to
   run PeerParty's code around the SDK's own: platform creation and ticks, callback
   dispatch, host lookups.
@@ -117,10 +128,12 @@ game.exe
   interface headers (`tools/steam_vtables.py`, `tools/galaxy_vtables.py`) and carry
   method names and slot order only, no header text; a version without a known layout is
   handed out unwrapped.
-- **Host lookups** (`hook/src/dns.rs`): `getaddrinfo`, `GetAddrInfoW/ExW` and
-  `DnsQuery` are hooked in the game. Hosts PeerParty stands in for resolve to a loopback
-  address of the game's own process (127.80.x.y) or to the LAN copy that hosts a
-  service; everything else resolves normally.
+- **Host lookups** (`hook/src/dns.rs`): `getaddrinfo`, `GetAddrInfoW/ExA/ExW`,
+  `gethostbyname`, `DnsQuery_A/W` and `DnsQueryEx` are hooked in the game. Hosts
+  PeerParty stands in for resolve to a loopback address of the game's own process
+  (127.80.x.y, the next free one if another process has it) or to the LAN copy that
+  hosts a service; a DnsQuery gets an A record dnsapi itself made (no AAAA). Everything
+  else resolves normally.
 
 ## The LAN core (`core/`)
 
@@ -136,7 +149,9 @@ has no game or SDK code in it.
 | Voice rooms | — | RTC rooms | Party chat | — | — |
 
 - **Identity.** Each copy takes an identity slot in `%LOCALAPPDATA%\peerparty\identity`,
-  so two copies on one PC are two players. A slot is an Ed25519 key, and the player's id
+  so two copies of one game on one PC are two players (slots are held per game: the
+  player is the same player in two different games at once, and the overlay tells a
+  copy on a later slot that it is another player). A slot is an Ed25519 key, and the player's id
   is 128 bits of its hash (`core/src/id.rs`): every way of connecting (the mesh's hello
   on the LAN and inside a tunnel, a room's and a public session's handshake) has the key
   sign for the connection, so an id can't be used by anyone but its player. The first copy of a Steam game is shown a
@@ -152,9 +167,53 @@ has no game or SDK code in it.
   targets (`PEERPARTY_PEERS`) cover VPNs and networks broadcast doesn't cross.
 - **Mesh.** One TCP connection per peer for reliable data, with keepalive and a capped
   send queue, plus a UDP socket for unreliable data once the peer answers a UDP probe.
+- **Dropped connections** (`core/src/link.rs`): a peer whose connection drops keeps its
+  place for 10 s: it stays in its lobbies and channels, and what is sent to it is kept.
+  Each reliable message of a peer's session carries its number, and each side keeps
+  what the other hasn't acknowledged (up to 4 MiB). The receiver goes by the numbers: a
+  message it already has is dropped, and messages lost on one connection while another
+  carried later ones (a duplicate connection retired when both sides dialed at once,
+  then cut) are asked for again, so nothing arrives twice or goes missing. When the peer
+  is back, on any path, both sides exchange where they stand and make the same call:
+  pick up where they left, each sending again what the other missed, so the game sees
+  nothing; or, after a restart or a gap longer than what was kept, a leave and a fresh
+  join. What came before that call waits and is delivered first, and anything another
+  of the peer's connections brings meanwhile queues behind it. Not back in time, it
+  leaves. A copy that quits, switches internet play off or
+  blocks a player says goodbye and leaves at once. Before this, a break between a lobby
+  member and the owner split the lobby: the member promoted a new owner, the owner
+  dropped the member.
+- **Connections through another player** (`core/src/lan/relay.rs`): when only the link
+  between two players breaks (a member and its lobby's owner) while both still reach a
+  third in a lobby with them, their meshes connect again through that player. The two
+  ends trade X25519 halves, each signed with its player's key, and seal every chunk with
+  ChaCha20-Poly1305 under the key they agree on, numbered each way: the player carrying
+  it sees only sizes, and can neither read the connection nor pass as either end. The
+  hellos and proofs run end to end, and the session picks up where it left. Either end
+  may start it (the higher id waits 1.5 s; when both start, the lower id's offer wins),
+  and an offer names the connection its sender lost, so an end that hadn't noticed the
+  break drops that connection then, and a replayed offer changes nothing. It ranks below
+  every direct path, so the direct link takes over once it mends. When nobody can carry
+  it, a member that lost the owner asks the members it still reaches, which pass the
+  question on to the owner; if the owner answers, only that member's link broke and it
+  is out of the lobby (the owner has dropped it), else the election goes ahead 3 s later
+  than it used to.
 - **Lobbies** (`core/src/lobby.rs`, `core/src/lan.rs`): owned by their creator's copy,
-  changes sent as snapshots, the owner handed over when it leaves. Searches run on every
-  peer and complete when each has answered or after a timeout.
+  changes sent as snapshots, the owner handed over when it leaves. A join can carry a
+  secret (a lobby's password) that the owner's front end checks, so what only the owner
+  may decide isn't left to the joiner's copy. Searches run on every
+  peer and complete when each has answered or after a timeout. Ownership is signed: the
+  creator makes a key pair for the lobby, every snapshot, search result and join answer
+  carries the owner's claim signed with it, and only members get the secret half, so
+  whoever owns the lobby next can sign. A copy that has a lobby's key (from a search
+  result, an invite, being in it) takes word of that lobby only under that key, so
+  nobody outside it can answer for it or take it over. A join by bare id, with no key
+  in hand yet, asks every player and every player answers (the owner signed, the rest
+  "not mine"). It is settled once all have answered, or 3 s after the first signed
+  answer: LAN and room players' answers count over public players', and if the answers
+  that count name different lobby keys the join is refused, and every player that let
+  us in is told we aren't coming. So a LAN player can stop a bare-id join, but not
+  redirect it.
 - **Presence and invites:** each copy publishes key/value presence. An invite is a
   connect string and an optional lobby; it waits for the player in the overlay unless
   auto-accept is on, or the overlay is off (nothing could answer it there; a public
@@ -175,7 +234,11 @@ has no game or SDK code in it.
   each flat `SteamAPI_ISteam*` function calls the stand-in's own method, as Valve's flat
   functions do (in 32-bit games through a trampoline from the flat function's cdecl to
   the method's thiscall); the few that return a SteamID get small adapters, since the C++
-  method returns it through a hidden pointer and the flat function as a number.
+  method returns it through a hidden pointer and the flat function as a number, and so
+  do ISteamNetworkingUtils's inline helpers (`SetGlobalCallback_*`,
+  `SetGlobalConfigValue*`), which are one `SetConfigValue` call on the stand-in. A
+  steam_api from before the flat API (it exports only the accessors) is reached through
+  the real objects' own methods.
 - Carried: ISteamMatchmaking (lobbies with every comparison Steam's filters have, data,
   member data, chat, owner changes), ISteamNetworking (legacy P2P), ISteamNetworkingSockets,
   ISteamNetworkingMessages and the relay / ping parts of ISteamNetworkingUtils, ISteamFriends
@@ -186,7 +249,9 @@ has no game or SDK code in it.
   ignored).
 - Callbacks and call results reach the game through its own dispatch: registered
   `CCallbackBase` / `CCallResult` objects after `SteamAPI_RunCallbacks`, or the
-  ManualDispatch queue. PeerParty's `SteamAPICall_t` handles come from a reserved range.
+  ManualDispatch queue. PeerParty's `SteamAPICall_t` handles come from a reserved range;
+  a game that polls them (ISteamUtils's `IsAPICallCompleted` / `GetAPICallResult`) gets
+  them from ISteamUtils's stand-in.
 - Not carried: anything that needs Valve's relay network (Valve-hosted dedicated
   servers, FakeIP).
 - **A SteamID of its own for each PC** (`steamlan.rs` `my_steam_id`, `steamown.rs`,
@@ -211,10 +276,11 @@ has no game or SDK code in it.
     do `ISteamApps::GetAppOwner` and a downloaded leaderboard entry's user. Classic
     dispatch calls the game's `CCallbackBase` objects directly, so each registered one
     gets a copy of its class's vtable whose two `Run` slots swap first (the RTTI pointer
-    and every other slot kept). Not covered: a native game calling `ISteamUserStats`,
-    `ISteamApps` or `ISteamUGC` through their C++ interfaces with its own SteamID (no
-    vtable layouts for them; a game's own stats come from `RequestCurrentStats`, which
-    takes no id). `PEERPARTY_SKIP=steamown` turns the mapping off.
+    and every other slot kept). A native game calling `ISteamUserStats`, `ISteamApps` or
+    `ISteamUGC` through their C++ interfaces gets the same: those are stand-ins whose
+    methods map the id and call the real object's (GetUserStat's two overloads, one slot
+    each, are told apart as `GetUserStat~3@0` and `@1`). `PEERPARTY_SKIP=steamown` turns
+    the mapping off.
   - **Saves** (`saves.rs`). Saves a game keys by SteamID are new ones under the new id.
     The first time the game touches a path holding the new SteamID, account id or hex
     SteamID as a path component or delimited file name token, the same path under
@@ -298,23 +364,37 @@ has no game or SDK code in it.
   library never starts. A network is a LAN lobby, endpoints are its members, messages
   ride LAN channels, and state changes are handed out through
   `PartyStartProcessingStateChanges` in the documented order. Chat controls, text chat
-  and voice chat ride the network's voice room, with Party's permission rules.
-  `PartyXboxLive.dll` (GDK builds) is answered on the LAN too.
+  and voice chat ride the network's voice room, with Party's permission rules. Who
+  gets in is the network owner's copy's call: a user authenticates with one of the
+  network's invitations (with their entity lists), checked there, and a member it
+  hasn't let in is shown to nobody and dropped after a minute. An invitation's creator
+  may revoke it (`PartyNetworkRevokeInvitation`), anyone in may revoke one made
+  revocable by anyone, and every copy tells its game when an invitation it holds is
+  gone (revoked, or its creator left).
+  `PartyXboxLive.dll` (GDK builds) is answered on the LAN too; its chat permissions
+  follow what the real Xbox Live privacy service said (below).
 - **Lobby & Matchmaking:** every `PF*` export of `PlayFabMultiplayerWin.dll` is
   PeerParty's. Lobbies are LAN lobbies with PlayFab's filter and sort strings evaluated
   locally; matchmaking tickets pair the mutually oldest compatible tickets.
 - **Web API:** lookups of `<title>.playfabapi.com` resolve to the game process's own
   loopback address, where PeerParty answers HTTPS with PlayFab's JSON shapes: sign-in,
   entity tokens, profiles, statistics and user data kept on disk, lobbies, matchmaking,
-  and empty title data, CloudScript and catalog answers. PlayFab's C SDK (PlayFabCore)
-  uses the same service through its own HTTP stack.
+  and empty title data, CloudScript and catalog answers. A call with no stand-in answers
+  with its result as a title with nothing set up has it: the lists and maps a game reads
+  from it come back empty, not missing (a table of PlayFab's calls, else for a `Get`,
+  `List`, `Find` or `Search` call the plural nouns in its name), since a game that loops
+  over a missing list can crash. PlayFab's C SDK (PlayFabCore) uses the same service
+  through its own HTTP stack.
 
 ### GOG Galaxy (`hook/src/galaxy.rs`, `galaxy/`)
 
 - `galaxy::api::User()`, `Friends()`, `Matchmaking()`, `Networking()` and the listener
   registrar hand out stand-ins; `ProcessData()` runs PeerParty's listener calls after
   the real one. The DLL's file version picks the vtable layout (every SDK from 1.57 on),
-  checked against the DLL's own vtables through MSVC RTTI.
+  checked against the DLL's own vtables through MSVC RTTI. An older SDK's shape of a
+  method (before per-call listeners, a user argument or a savegame type) is answered as
+  the newest one, its results going to the global listeners; a listener whose callback
+  had fewer arguments then is called with that many.
 - Carried: sign-in, user data, friends, persona names, rich presence, invites, lobbies,
   P2P, chat, stats and achievements on disk, storage and cloud saves on disk, tokens.
   IApps (DLC) stays with Galaxy. Game servers aren't carried.
@@ -324,6 +404,10 @@ has no game or SDK code in it.
 - Photon Cloud's hosts resolve to one copy on the LAN, which runs Photon's name, master
   and game servers inside its game process (UDP, TCP and WebSocket). The first copy to
   look Photon up hosts unless a LAN peer already does.
+- The other copies reach those servers at the host's stand-in address, through the
+  typed-IP forwarder over their PeerParty connection, so the host's firewall never has
+  to let them in (a network set to Public still works). A game's connected UDP socket
+  is connected to the forwarder's local socket for that peer and port.
 - The protocol layer (ENet, GpBinary 1.6 and 1.8, the key exchange and payload
   encryption, the server handlers) is ported from Luxon and Luxon Server (BSD-3-Clause,
   `hook/src/photon/LICENSE-Luxon`). On top: Photon Chat, SQL lobby filters, inactive
@@ -337,7 +421,11 @@ has no game or SDK code in it.
 
 - For games that ship Unity's Lobby, Relay or Multiplayer SDK: Authentication, Lobby
   (with Wire events over a WebSocket), Relay, Cloud Save and Remote Config are answered by
-  the same local HTTPS service. A relay allocation makes the host's copy the relay, which
+  the same local HTTPS service. A locked lobby and a lobby's password are checked by the
+  host's copy; the password's hash is kept for members only. A private lobby is
+  unlisted: the host's copy answers only a search for its id or its exact code, so no
+  query (a modified copy's either) lists it, and anyone with the code still joins. A relay allocation makes
+  the host's copy the relay, which
   speaks Unity Transport's relay protocol, plain or inside DTLS with a pre-shared key.
 - Each allocation has a random key that only the relay and its player know: a joiner's
   copy asks the code's host for its allocation over the core's channel to that player.
@@ -363,6 +451,12 @@ has no game or SDK code in it.
   from the LAN, so a game's friends screen lists LAN players, and the Xbox invite screens
   open PeerParty's overlay. Everything else on Xbox Live (achievements, multiplayer
   session directory, title storage) resolves normally.
+- Privacy requests also go on, unchanged and as the game signed them, to the real
+  privacy service (`real.rs`, its own TLS client that checks the real certificate), and
+  the stricter answer wins: the player's real block and mute lists and the account's
+  limits (a child account's settings) apply to LAN players too, and to PlayFab Party
+  chat through `PartyXboxLive.dll`. Offline or signed out, the LAN's answers stand
+  alone. `PEERPARTY_XBL_REAL=0` turns it off.
 
 ## Trust for the local HTTPS service
 
@@ -512,7 +606,8 @@ hand, attaching `peerparty.exe` (that exact name) is enough.
   skipped: their rules belong to the package.
 - The fix runs `peerparty --fix-firewall` elevated (`runas`): PowerShell's NetSecurity
   disables the game's local Block rules on the chosen profiles, replaces PeerParty's own
-  earlier rule, and adds `peerparty: game.exe` (group `peerparty`). Block rules are
+  earlier rules, and adds `peerparty: game.exe` for TCP and for UDP (group `peerparty`;
+  `--remove-firewall` deletes the group). Block rules are
   turned off, not deleted. Declined or failed (an administrator account can't see a
   mapped drive peerparty.exe runs from): the "Allowed apps" control panel opens, or
   `wf.msc`. The overlay rechecks every 20 s and right after a fix.

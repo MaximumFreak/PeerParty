@@ -105,8 +105,10 @@ struct CallCompleted {
     id: i32,
     size: u32,
 }
-/// The injected callback the game is holding, until its FreeLastCallback.
-static OUTSTANDING: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+/// The injected callback the game is holding on each pipe, until that pipe's
+/// FreeLastCallback (a game dispatching the client's and the server's pipes in turn can
+/// hold one of the SDK's on one while ours is out on the other).
+static OUTSTANDING: LazyLock<Mutex<HashMap<i32, Vec<u8>>>> = LazyLock::new(Mutex::default);
 /// The game dispatches manually (it called SteamAPI_ManualDispatch_RunFrame).
 static MANUAL: AtomicBool = AtomicBool::new(false);
 /// Callback id -> CCallbackBase objects the game registered (classic dispatch), each
@@ -444,7 +446,7 @@ fn try_typed<T>(
 
 unsafe extern "C" fn detour_free_last(pipe: i32) {
     // Our injected callback isn't the SDK's to free.
-    if OUTSTANDING.lock().unwrap().take().is_some() {
+    if OUTSTANDING.lock().unwrap().remove(&pipe).is_some() {
         return;
     }
     if let Some(hook) = FREE_LAST.get() {
@@ -550,16 +552,21 @@ fn deliver_registered(server: bool) {
             }
             continue;
         }
-        // A client callback reaches every listener (as it always has); a server one only
-        // the game server's.
+        // As steam_api has it: a client callback reaches the client's listeners, a
+        // server one the game server's.
         let objs: Vec<usize> = REGISTERED
             .lock()
             .unwrap()
             .get(&p.id)
-            .map(|v| v.iter().filter(|(_, gs)| !server || *gs).map(|(o, _)| *o).collect())
+            .map(|v| v.iter().filter(|(_, gs)| *gs == server).map(|(o, _)| *o).collect())
             .unwrap_or_default();
         for obj in &objs {
-            unsafe { run_callback(*obj, &mut p.data) };
+            // One listener's callback can unregister (and delete) another: only one
+            // still registered is called.
+            let still = REGISTERED.lock().unwrap().get(&p.id).is_some_and(|v| v.iter().any(|(o, gs)| o == obj && *gs == server));
+            if still {
+                unsafe { run_callback(*obj, &mut p.data) };
+            }
         }
         log::throttled(&format!("steam-lan delivered {}", p.id), 8, |n| {
             log!(
@@ -688,7 +695,7 @@ unsafe extern "C" fn detour_next(pipe: i32, msg: *mut CallbackMsg) -> bool {
     // GetAPICallResult.
     if !msg.is_null() {
         let mut out = OUTSTANDING.lock().unwrap();
-        if out.is_none() {
+        if !out.contains_key(&pipe) {
             // The game server's pipe gets its callbacks; every other pipe the rest.
             let server = crate::steamgs::server_pipe() == Some(pipe);
             let next = {
@@ -722,7 +729,7 @@ unsafe extern "C" fn detour_next(pipe: i32, msg: *mut CallbackMsg) -> bool {
                 log::throttled(&format!("steam-lan manual {id}"), 8, |n| {
                     log!("steam-lan delivered callback {id} ({} bytes, n={n})", data.len())
                 });
-                *out = Some(data);
+                out.insert(pipe, data);
                 return true;
             }
         }
@@ -769,30 +776,7 @@ unsafe extern "C" fn detour_manual_result(
     failed: *mut bool,
 ) -> bool {
     if ours(call) {
-        // Kept when asked for the wrong callback, as Steam does: the game can still ask
-        // again with the right one.
-        let mut completed = COMPLETED.lock().unwrap();
-        let Some((id, _)) = completed.get(&call) else {
-            return false;
-        };
-        if *id != expected {
-            if !failed.is_null() {
-                unsafe { *failed = true };
-            }
-            return false;
-        }
-        let Some((id, data)) = completed.remove(&call) else { return false };
-        drop(completed);
-        let n = data.len().min(cub.max(0) as usize);
-        unsafe {
-            if !buf.is_null() {
-                std::ptr::copy_nonoverlapping(data.as_ptr(), buf as *mut u8, n);
-            }
-            if !failed.is_null() {
-                *failed = false;
-            }
-        }
-        return id == expected;
+        return unsafe { take_result(call, buf, cub, expected, failed) };
     }
     unsafe {
         log_api_result(
@@ -805,6 +789,117 @@ unsafe extern "C" fn detour_manual_result(
             expected,
             failed,
         )
+    }
+}
+
+/// Hands the game PeerParty's completed call `call` (`GetAPICallResult`). Kept when asked
+/// for the wrong callback, as Steam does: the game can still ask again with the right one.
+unsafe fn take_result(call: u64, buf: *mut core::ffi::c_void, cub: i32, expected: i32, failed: *mut bool) -> bool {
+    let mut completed = COMPLETED.lock().unwrap();
+    let Some((id, _)) = completed.get(&call) else {
+        return false;
+    };
+    if *id != expected {
+        if !failed.is_null() {
+            unsafe { *failed = true };
+        }
+        return false;
+    }
+    let Some((id, data)) = completed.remove(&call) else { return false };
+    drop(completed);
+    let n = data.len().min(cub.max(0) as usize);
+    unsafe {
+        if !buf.is_null() {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), buf as *mut u8, n);
+        }
+        if !failed.is_null() {
+            *failed = false;
+        }
+    }
+    id == expected
+}
+
+/// Whether PeerParty's call `call` has completed, for a game that polls ISteamUtils
+/// instead of waiting for a callback. A result still queued for the game's dispatch is
+/// moved to the completed calls: the game fetches it with `GetAPICallResult`, and its
+/// dispatch no longer looks for a CCallResult to hand it to.
+fn polled(call: u64) -> bool {
+    if COMPLETED.lock().unwrap().contains_key(&call) {
+        return true;
+    }
+    let found = {
+        let mut q = INJECT.lock().unwrap();
+        q.iter().position(|p| p.call == call).and_then(|i| q.remove(i))
+    };
+    match found {
+        Some(p) => {
+            RESULT_OBJS.lock().unwrap().remove(&call);
+            COMPLETED.lock().unwrap().insert(call, (p.id, p.data));
+            true
+        }
+        None => false,
+    }
+}
+
+// ---- ISteamUtils: PeerParty's calls for a game that polls them ----
+
+/// `ESteamAPICallFailure`: none.
+const CALL_FAILURE_NONE: i32 = -1;
+
+/// ISteamUtils's methods PeerParty answers for its own calls (steamobj.rs stand-ins);
+/// everything else, and every call of Steam's, stays with Steam.
+pub fn utils() -> Vec<(&'static str, usize)> {
+    vec![
+        ("IsAPICallCompleted", utils_completed as *const () as usize),
+        ("GetAPICallFailureReason", utils_failure as *const () as usize),
+        ("GetAPICallResult", utils_result as *const () as usize),
+    ]
+}
+
+crate::steamobj::vmethod! {
+    fn utils_completed(this: usize, call: u64, failed: *mut bool) -> bool {
+        if !ours(call) {
+            return crate::steamobj::call_real!(this, "IsAPICallCompleted", fn(u64, *mut bool) -> bool, false, call, failed);
+        }
+        if !failed.is_null() {
+            unsafe { *failed = false };
+        }
+        polled(call)
+    }
+}
+
+crate::steamobj::vmethod! {
+    fn utils_failure(this: usize, call: u64) -> i32 {
+        if !ours(call) {
+            return crate::steamobj::call_real!(this, "GetAPICallFailureReason", fn(u64) -> i32, CALL_FAILURE_NONE, call);
+        }
+        CALL_FAILURE_NONE
+    }
+}
+
+crate::steamobj::vmethod! {
+    fn utils_result(this: usize, call: u64, buf: *mut core::ffi::c_void, cub: i32, expected: i32, failed: *mut bool) -> bool {
+        if !ours(call) {
+            let ok = crate::steamobj::call_real!(
+                this,
+                "GetAPICallResult",
+                fn(u64, *mut core::ffi::c_void, i32, i32, *mut bool) -> bool,
+                false,
+                call,
+                buf,
+                cub,
+                expected,
+                failed
+            );
+            if ok && (failed.is_null() || !unsafe { *failed }) {
+                unsafe { crate::steamown::rewrite_raw(buf as *mut u8, cub.max(0) as usize) };
+            }
+            return ok;
+        }
+        if !polled(call) {
+            return false;
+        }
+        unsafe { take_result(call, buf, cub, expected, failed) }
     }
 }
 
@@ -832,4 +927,28 @@ unsafe fn log_api_result(
         log!("callback {label} n={n} id={expected} call={call:#x} ok={ok} failed={fail}");
     });
     ok
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_polled_call_is_handed_over_once() {
+        let call = new_call();
+        complete(call, 1234, vec![1, 2, 3, 4]);
+        assert!(polled(call));
+        // Moved out of the dispatch queue: no CCallResult gets it as well.
+        assert!(!INJECT.lock().unwrap().iter().any(|p| p.call == call));
+        let mut buf = [0u8; 8];
+        let mut failed = true;
+        // Asked for the wrong callback: failed, and still there.
+        assert!(!unsafe { take_result(call, buf.as_mut_ptr().cast(), 8, 999, &mut failed) });
+        assert!(failed);
+        assert!(unsafe { take_result(call, buf.as_mut_ptr().cast(), 8, 1234, &mut failed) });
+        assert!(!failed);
+        assert_eq!(&buf[..4], &[1, 2, 3, 4]);
+        // Taken: no longer complete.
+        assert!(!polled(call));
+    }
 }

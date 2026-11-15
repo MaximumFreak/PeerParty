@@ -26,7 +26,8 @@ fingerprint. The Windows user name is never used. People at home and friends in 
 always see **Your name**.
 
 Blocking: in the overlay, open a public player's Details (Friends page) and choose
-**Block this player**. From a prompt: `peerparty --blocked` lists blocked fingerprints,
+**Block this player** (press it twice; Players offers **Undo** for 30 s, which also
+lets the player straight back in). From a prompt: `peerparty --blocked` lists blocked fingerprints,
 `--block FINGERPRINT` adds one, `--unblock FINGERPRINT` (or `all`) removes. Settings shows
 how many are blocked and has Unblock all.
 
@@ -82,9 +83,11 @@ limiter, names), `core/src/inet/redact.rs` (address hiding), the public paths in
      and asking to join gets "not allowed". Two things open them: you invite the player
      (it stands for 15 minutes, and ends if you kick them), or they are in a lobby with
      you already. The same goes for voice rooms: saying "I joined" isn't enough.
-   - A join by lobby id asks every player, and only the lobby's owner should answer. A
-     public player's answer waits a second and counts only if no LAN or room player
-     answered meanwhile, so a stranger can't answer for a friend's lobby.
+   - A join by lobby id asks every player, and only the lobby's owner signs its answer.
+     The join waits for every player's answer, or 3 s after the first signed one; a
+     public player's answer counts only if no LAN or room player answered for the lobby,
+     so a stranger can't answer for a friend's lobby, and answers that disagree on the
+     lobby's key refuse the join.
    - At most 256 channels each, with names up to 256 bytes.
    - The overlay shows "public player" and offers Block.
 6. **Against floods and junk.** At most 16 public sessions, 4 per player key and 32 per

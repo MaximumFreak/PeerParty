@@ -8,8 +8,13 @@
 //!   use), and its Xbox user id goes out in LAN presence (`peerparty:xuid`).
 //! - `GetEntityIdsFromXboxLiveUserIds` maps an Xbox user id to the LAN player whose
 //!   presence carries it.
-//! - Privacy and permissions say everything is allowed (no Xbox Live to ask), and no
-//!   token is ever requested from the game.
+//! - Chat permissions are what the real Xbox Live privacy service said about the game's
+//!   own privacy requests (xboxlive/real.rs): a blocked player gets no chat, a muted one
+//!   isn't heard, refused voice or text is off, each with its reason (privilege for the
+//!   account's own limits, a child account's; privacy for the rest). Without such an
+//!   answer everything is allowed. When what's known changes, each local and remote
+//!   chat user pair gets a REQUIRED_CHAT_PERMISSION_INFO_CHANGED. No token is ever
+//!   requested from the game.
 //!
 //! Layouts: PartyXboxLive_c.h (PlayFab's Unreal plugin, Platforms/GDK/Include). State
 //! changes are boxed and handed out by `PartyXblStartProcessingStateChanges`, freed at
@@ -66,6 +71,13 @@ fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
 }
 
 pub fn attach(base: usize, module_name: &str, exports: &[Export]) -> HashSet<usize> {
+    // The generic answers (one body for any number of arguments) are only right where
+    // the caller cleans the stack (x64); in a 32-bit game's stdcall they would unbalance
+    // it. Until those have exact signatures, a 32-bit game keeps its own SDK.
+    if cfg!(target_arch = "x86") {
+        log!("party-xbl: off in 32-bit games (its stand-ins are x64-only for now): {module_name} runs as it is");
+        return HashSet::new();
+    }
     crate::swap::register(base, module_name, resolve);
     let n = exports.iter().filter(|e| e.name.starts_with("PartyXbl")).count();
     log!("party-xbl on for {module_name}: {n} PartyXbl functions are PeerParty's (Xbox users sign in to the LAN)");
@@ -162,10 +174,39 @@ unsafe extern "system" fn get_affinity(_thread: u32, mask: *mut u64) -> PartyErr
     OK
 }
 
+/// PARTY_XBL_REQUIRED_CHAT_PERMISSION_INFO_CHANGED_STATE_CHANGE.
+#[repr(C)]
+struct PermissionChanged {
+    kind: u32,
+    local: usize,
+    target: usize,
+}
+
+/// The real service's word as last told to the game (`xboxlive::real::generation`).
+static TOLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Each local and remote chat user pair hears that its permissions may have changed.
+fn permissions_changed() {
+    let g = crate::xboxlive::real::generation();
+    if TOLD.swap(g, std::sync::atomic::Ordering::Relaxed) == g {
+        return;
+    }
+    let pairs: Vec<(usize, usize)> = with(|s| {
+        let live = |u: &ChatUser| s.handles.contains(&user_ptr(u));
+        let locals: Vec<usize> = s.users.iter().filter(|u| u.local && live(u)).map(|u| user_ptr(u)).collect();
+        let remotes: Vec<usize> = s.users.iter().filter(|u| !u.local && live(u)).map(|u| user_ptr(u)).collect();
+        locals.iter().flat_map(|l| remotes.iter().map(move |r| (*l, *r))).collect()
+    });
+    for (local, target) in pairs {
+        push(PermissionChanged { kind: 2, local, target });
+    }
+}
+
 unsafe extern "system" fn start(_h: usize, count: *mut u32, changes: *mut *const *const u32) -> PartyError {
     if count.is_null() || changes.is_null() {
         return BAD;
     }
+    permissions_changed();
     with(|s| {
         let batch: Vec<Change> = s.queue.drain(..).collect();
         s.out_ptrs = batch.iter().map(|c| c.ptr).collect();
@@ -408,14 +449,17 @@ unsafe extern "system" fn accessibility(user: usize, out: *mut u8) -> PartyError
     OK
 }
 
-/// Everything allowed: send and receive audio, receive text; no restriction.
-unsafe extern "system" fn permission(user: usize, _target: usize, out: *mut u32) -> PartyError {
+/// PARTY_XBL_CHAT_PERMISSION_INFO: what the real service allows with the target (see
+/// the module comment), everything when it hasn't said.
+unsafe extern "system" fn permission(user: usize, target: usize, out: *mut u32) -> PartyError {
     if out.is_null() || !find(user) {
         return BAD;
     }
+    let xuid = with(|s| s.users.iter().find(|u| user_ptr(u) == target).map(|u| u.xuid));
+    let (mask, reason) = xuid.map_or((crate::xboxlive::real::ALL_CHAT, 0), crate::xboxlive::real::chat_permission);
     unsafe {
-        *out = 0x1f;
-        *out.add(1) = 0;
+        *out = mask;
+        *out.add(1) = reason;
     }
     OK
 }
@@ -440,7 +484,8 @@ unsafe extern "system" fn error_message(error: u32, out: *mut *const c_char) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::mem::{offset_of, size_of};
+    #[cfg(target_pointer_width = "64")]
+    use std::mem::offset_of;
 
     #[test]
     #[cfg(target_pointer_width = "64")]

@@ -247,3 +247,207 @@ fn http_init_with_token_parses() {
     assert_eq!(h.init.version, [4, 1, 8, 4]);
     assert!(h.init.ipv6);
 }
+
+// ---- randomized robustness (A-04) ----
+//
+// Every Photon decoder that reads bytes a client sends gets valid input mutated (bit
+// flips, truncation, insertions, lying lengths) and pure noise. None may panic or
+// abort (a failed allocation, an overflow, a slice out of range); whatever decodes must
+// encode again. The core's own wire decoders have the same in core/src/fuzz_tests.rs,
+// Fusion Shared's server in shared.rs's tests.
+
+pub(super) struct Rng(pub u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    pub fn below(&mut self, n: usize) -> usize {
+        (self.next() % n.max(1) as u64) as usize
+    }
+
+    fn bytes(&mut self, n: usize) -> Vec<u8> {
+        (0..n).map(|_| self.next() as u8).collect()
+    }
+
+    /// A mutated copy of `v`, or (one time in eight) noise.
+    pub fn mutate(&mut self, v: &[u8]) -> Vec<u8> {
+        if self.below(8) == 0 {
+            let n = self.below(512);
+            return self.bytes(n);
+        }
+        let mut m = v.to_vec();
+        for _ in 0..1 + self.below(4) {
+            match self.below(5) {
+                0 if !m.is_empty() => {
+                    let i = self.below(m.len());
+                    m[i] ^= 1 << self.below(8);
+                }
+                1 if !m.is_empty() => {
+                    let n = self.below(m.len());
+                    m.truncate(n);
+                }
+                2 => {
+                    let i = self.below(m.len() + 1);
+                    let n = 1 + self.below(8);
+                    let extra = self.bytes(n);
+                    m.splice(i..i, extra);
+                }
+                3 if m.len() >= 4 => {
+                    // A count or length that lies.
+                    let i = self.below(m.len() - 3);
+                    let b = [0xff, 0x7f, 0x80, 0x00][self.below(4)];
+                    m[i..i + 4].copy_from_slice(&[b; 4]);
+                }
+                _ if !m.is_empty() => {
+                    let i = self.below(m.len());
+                    m[i] = self.next() as u8;
+                }
+                _ => {}
+            }
+        }
+        m
+    }
+}
+
+/// Rounds per decoder: 4000, or PPTEST_FUZZ_ROUNDS for a longer run.
+pub(super) fn rounds() -> usize {
+    std::env::var("PPTEST_FUZZ_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(4000)
+}
+
+#[test]
+fn fuzz_messages_and_hellos() {
+    let aes = Aes256::new(&[7u8; 32]);
+    let msgs = vec![
+        Msg::Request(Request { code: 230, params: vec![(220, s("1.0")), (224, s("app")), (1, every_shape())] }),
+        Msg::Response(Response { code: 226, ret: -2, debug: Some("no".into()), params: vec![(249, every_shape())] }),
+        Msg::Event(EventMsg { code: 253, params: vec![(251, every_shape())] }),
+        Msg::InternalRequest(Request { code: 0, params: vec![(1, Value::Bytes(vec![1; 96]))] }),
+        Msg::Disconnect(Response { code: 0, ret: 32767, debug: Some("bye".into()), params: vec![] }),
+        Msg::Init(Init { proto_major: 1, proto_minor: 8, sdk: 15, version: [4, 1, 8, 4], ipv6: false, app_id: "NameServer".into() }),
+    ];
+    let mut rng = Rng(0x5eed_0001);
+    for p in [Proto::V16, Proto::V18] {
+        let seeds: Vec<Vec<u8>> = msgs
+            .iter()
+            .flat_map(|m| [p.encode(m, None).ok(), p.encode(m, Some(&aes)).ok()])
+            .flatten()
+            .chain([enc(p, &every_shape())])
+            .collect();
+        for i in 0..rounds() {
+            let b = rng.mutate(&seeds[i % seeds.len()]);
+            for key in [None, Some(&aes)] {
+                if let Ok((m, _)) = p.decode(&b, key) {
+                    // What decodes encodes again (the plain way: some messages never seal).
+                    p.encode(&m, None).expect("a decoded message encodes");
+                }
+            }
+            let _ = parse_hello(&b);
+            if let Ok(v) = p.read_value(&mut Rd::new(&b)) {
+                let mut w = Vec::new();
+                p.write_value(&mut w, &v).expect("a decoded value encodes");
+            }
+        }
+    }
+}
+
+#[test]
+fn fuzz_enet_datagrams() {
+    use super::enet::{self, Peer};
+    let mut rng = Rng(0x5eed_0002);
+    let mut client = Peer::connect(0x1234_5678, 2, 0);
+    let mut seeds = client.flush(0);
+    client.send(0, &[9; 40], true, false);
+    client.send(1, &[8; 3000], true, false);
+    client.send(0, &[7; 10], false, true);
+    seeds.extend(client.flush(1));
+    let mut server: Option<Peer> = None;
+    for i in 0..rounds() {
+        let b = rng.mutate(&seeds[i % seeds.len()]);
+        let now = i as i64;
+        let Ok((hdr, cmds)) = enet::parse(&b) else { continue };
+        let _ = enet::build(&hdr, &cmds);
+        if server.is_none() || i % 97 == 0 {
+            server = Peer::accept(&hdr, &cmds, 0, now);
+        }
+        if let Some(s) = server.as_mut() {
+            s.handle(&hdr, cmds, now);
+            while s.dispatch().is_some() {}
+            let _ = s.flush(now);
+        }
+    }
+}
+
+#[test]
+fn fuzz_fusion_messages_and_plugin() {
+    use super::fusion::*;
+    let v = Version { protocol: 6, fusion: (2, 0, 6) };
+    let seeds: Vec<Vec<u8>> = [
+        Body::Join { kind: 1, game_mode: CLIENT_SERVER, peer_mode: PEER_SERVER, requests: 6, unique_id: Some(vec![1; 8]) },
+        Body::Join { kind: 1, game_mode: SHARED, peer_mode: PEER_CLIENT, requests: 0, unique_id: None },
+        Body::NetworkConfig { kind: 1, config: Some("{\"Simulation\":{\"TickRate\":60,\"PlayerCount\":4}}".into()) },
+        Body::ReflexiveInfo { actor: 2, public: [1, 2, 3], private: [4, 5, 6], nat: 2, unique_id: Some(vec![2; 8]) },
+        Body::Disconnect { reason: 5 },
+        Body::Start { remote_server: 1, requests: 4 },
+        Body::Snapshot { tick: 50, network_id: 3, kind: 1, size: 64, crc: 1, data: Some(vec![1; 64]) },
+        Body::HostMigration { peer_mode: 1 },
+    ]
+    .into_iter()
+    .map(|b| encode(&Message::new(v, b)))
+    .collect();
+    let mut rng = Rng(0x5eed_0003);
+    let mut plugin = Plugin::default();
+    let mut log = Vec::new();
+    for i in 0..rounds() {
+        let b = rng.mutate(&seeds[i % seeds.len()]);
+        for m in decode(&b) {
+            let _ = encode(&m);
+        }
+        let actor = 1 + (i % 4) as i32;
+        let _ = plugin.handle(actor, &b, || [actor as u8; 8], &mut log);
+        let _ = plugin.relay(actor, &b, i as i64, 4, 1, &mut log);
+        if i % 50 == 0 {
+            let _ = plugin.tick(i as i64, &mut log);
+        }
+        if i % 400 == 399 {
+            plugin.left(actor);
+        }
+        log.clear();
+    }
+}
+
+#[test]
+fn fuzz_sql_filters_and_websocket_frames() {
+    use super::{sql::Filter, ws};
+    let mut rng = Rng(0x5eed_0004);
+    let filters = [
+        "C0 = 1 AND C1 LIKE 'a%'",
+        "(C0 > 2 OR NOT C2 <> 'x') AND C3 IN (1, 2, 3)",
+        "C0 BETWEEN -5 AND +5 OR C1 IS NULL",
+        "C5 >= 1.5e3 AND C6 <= 'z' ORDER BY C0 DESC",
+    ];
+    let prop = |k: &str| -> Option<Value> {
+        match k {
+            "C0" => Some(Value::Int(1)),
+            "C1" => Some(s("abc")),
+            "C5" => Some(Value::Double(f64::NAN)),
+            _ => None,
+        }
+    };
+    for i in 0..rounds() {
+        let t = rng.mutate(filters[i % filters.len()].as_bytes());
+        if let Ok(f) = Filter::parse(&String::from_utf8_lossy(&t)) {
+            let _ = f.matches(&prop);
+        }
+    }
+    let frames = [ws::frame(2, &[1; 10]), ws::frame(2, &[2; 300]), ws::frame(2, &[3; 70_000]), ws::frame(8, &[])];
+    for i in 0..rounds() / 4 {
+        let b = rng.mutate(&frames[i % frames.len()]);
+        let mut c = std::io::Cursor::new(b);
+        while ws::read_frame(&mut c).is_ok() {}
+    }
+}

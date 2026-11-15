@@ -510,7 +510,8 @@ pub fn on_event(_lan: &Lan, ev: &Event) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::mem::{offset_of, size_of};
+    #[cfg(target_pointer_width = "64")]
+    use std::mem::offset_of;
 
     #[test]
     fn messages_round_trip_and_stay_ours() {

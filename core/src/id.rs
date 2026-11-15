@@ -13,16 +13,35 @@
 //! saves a game keyed by the old id can be carried over to the new one (the hook's
 //! saves.rs). `slot-N.id` is only deleted once its id is listed.
 //!
+//! Slots are held per game (`claim_for`: the lock and owner files carry a tag of the
+//! game's key): the player is the same player in two different games running at once
+//! (their keys are the slot's), and a second copy of the same game takes the next slot.
+//!
 //! A dedicated server takes slots of its own (`server-N.*`, `claim_server`), so it
 //! never holds a player's slot: a server started before the game would otherwise be
 //! the PC's first copy, with the player's name and the PC's own ids, and push the
 //! player to a second slot.
+//!
+//! A game started again straight after quitting can find its slot still held by the
+//! run that is quitting (a game can take seconds to close after its window has gone).
+//! The next slot would make it a different player: another id, a LAN SteamID, other
+//! saves. So a slot's holder says who it is (`slot-N.owner`: its process id and
+//! program), and a slot held by an earlier run of the same program that has no window
+//! left is waited for (EXITING_WAIT). The hook also lets the slot go as soon as the
+//! game starts exiting (`Lan::release_slot`).
+//!
+//! A starter that waited long enough to take itself for the game (a menu before the
+//! game starts, with internet play set up) holds the first slot when the game it
+//! starts comes up. It lets the slot go once the game says it is the game, and the game
+//! waits for a slot its starter holds (`take_slot_from`), so the game is still this
+//! PC's first player.
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
@@ -99,16 +118,28 @@ impl Identity {
     /// Takes the first free player slot in `dir`. Falls back to a throwaway id if the
     /// folder can't be used, so a read-only profile still gets onto the LAN.
     pub fn claim(dir: &Path) -> Identity {
-        Self::claim_as(dir, false)
+        Self::claim_as(dir, false, None)
+    }
+
+    /// Takes the first player slot in `dir` that no other copy of `game` holds: copies
+    /// of other games don't count (the player is the same one in each).
+    pub fn claim_for(dir: &Path, game: &str) -> Identity {
+        Self::claim_as(dir, false, Some(game))
     }
 
     /// Takes the first free server slot in `dir` (a dedicated server's), named
     /// "<player>'s server", or "<player>'s server (N)" after the first.
     pub fn claim_server(dir: &Path) -> Identity {
-        Self::claim_as(dir, true)
+        Self::claim_as(dir, true, None)
     }
 
-    fn claim_as(dir: &Path, server: bool) -> Identity {
+    /// As `claim_server`, held per game.
+    pub fn claim_server_for(dir: &Path, game: &str) -> Identity {
+        Self::claim_as(dir, true, Some(game))
+    }
+
+    fn claim_as(dir: &Path, server: bool, game: Option<&str>) -> Identity {
+        let tag = game.map(|g| format!(".{}", game_tag(g))).unwrap_or_default();
         // The player's chosen name (the launcher's Settings), else the Windows user name.
         let user = std::env::var("PEERPARTY_NAME")
             .ok()
@@ -119,13 +150,19 @@ impl Identity {
         let (prefix, base) = if server { ("server", format!("{user}'s server")) } else { ("slot", user) };
         if fs::create_dir_all(dir).is_ok() {
             for slot in 0..32u32 {
-                let lock = OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(false)
-                    .share_mode(0)
-                    .open(dir.join(format!("{prefix}-{slot}.lock")));
+                let path = dir.join(format!("{prefix}-{slot}{tag}.lock"));
+                let owner = dir.join(format!("{prefix}-{slot}{tag}.owner"));
+                let mut lock = open_lock(&path);
+                // Held by an earlier run of this program on its way out: wait for it,
+                // for as long as it stays without a window (players' slots). Held by
+                // this game's starter: wait for it to let the slot go.
+                let until = Instant::now() + EXITING_WAIT;
+                while lock.is_err() && !server && Instant::now() < until && (leaving(&owner) || held_by_starter(&owner)) {
+                    std::thread::sleep(Duration::from_millis(100));
+                    lock = open_lock(&path);
+                }
                 let Ok(lock) = lock else { continue };
+                let _ = fs::write(&owner, format!("{}\r\n{}\r\n", std::process::id(), own_exe().unwrap_or_default()));
                 let key = Arc::new(IdentityKey::load_or_create(&dir.join(format!("{prefix}-{slot}.ed25519"))));
                 let id = PeerId::of_key(&key.public());
                 // The id used to be random bytes in a file of its own: listed among the
@@ -203,6 +240,107 @@ impl Identity {
     }
 }
 
+/// How long a new copy waits for its slot's holder to finish quitting (see the top).
+const EXITING_WAIT: Duration = Duration::from_secs(8);
+
+/// The process (the game's starter) whose slot this one takes over: 0 for none.
+static STARTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// This process is the game that `pid` (its starter) started: a slot `pid` holds is
+/// waited for, as a quitting run's is, since the starter lets it go once this process
+/// says it is the game.
+pub fn take_slot_from(pid: u32) {
+    STARTER.store(pid, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether a held slot's owner (from its owner file) is the running starter set by
+/// `take_slot_from`.
+fn held_by_starter(owner: &Path) -> bool {
+    let starter = STARTER.load(std::sync::atomic::Ordering::Relaxed);
+    if starter == 0 || starter == std::process::id() {
+        return false;
+    }
+    let Ok(text) = fs::read_to_string(owner) else { return false };
+    let Some(pid) = text.lines().next().and_then(|p| p.trim().parse::<u32>().ok()) else { return false };
+    let Some(exe) = text.lines().nth(1) else { return false };
+    // The owner file names a process id; that id may since belong to another program.
+    pid == starter && process_exe(pid).is_some_and(|e| e.eq_ignore_ascii_case(exe.trim()))
+}
+
+/// A short, file-name-safe tag for a game's key (its slot locks are per game).
+pub fn game_tag(game: &str) -> String {
+    Sha256::digest(game.as_bytes())[..6].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn open_lock(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new().create(true).write(true).truncate(false).share_mode(0).open(path)
+}
+
+/// This process's program, as `QueryFullProcessImageNameW` gives it.
+fn own_exe() -> Option<String> {
+    std::env::current_exe().ok().map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Whether a held slot's owner (from its owner file) is an earlier run of this program
+/// that is quitting: still running, the same program as us, and with no visible window.
+fn leaving(owner: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(owner) else { return false };
+    let mut lines = text.lines();
+    let (Some(pid), Some(exe)) = (lines.next().and_then(|p| p.trim().parse::<u32>().ok()), lines.next()) else {
+        return false;
+    };
+    let Some(ours) = own_exe() else { return false };
+    if pid == std::process::id() || !exe.trim().eq_ignore_ascii_case(&ours) {
+        return false;
+    }
+    let Some(theirs) = process_exe(pid) else { return false };
+    // The owner file names a process id; that id may since belong to another program.
+    theirs.eq_ignore_ascii_case(&ours) && !has_visible_window(pid)
+}
+
+/// The program a running process was started from; None when it has ended.
+fn process_exe(pid: u32) -> Option<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW,
+        WaitForSingleObject,
+    };
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE, 0, pid);
+        if h.is_null() {
+            return None;
+        }
+        let alive = WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len) != 0;
+        CloseHandle(h);
+        (alive && ok).then(|| String::from_utf16_lossy(&buf[..len as usize]))
+    }
+}
+
+fn has_visible_window(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId, IsWindowVisible};
+    struct Find {
+        pid: u32,
+        found: bool,
+    }
+    unsafe extern "system" fn each(hwnd: HWND, l: LPARAM) -> BOOL {
+        let f = unsafe { &mut *(l as *mut Find) };
+        let mut pid = 0;
+        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        if pid == f.pid && unsafe { IsWindowVisible(hwnd) } != 0 {
+            f.found = true;
+            return 0;
+        }
+        1
+    }
+    let mut f = Find { pid, found: false };
+    unsafe { EnumWindows(Some(each), &mut f as *mut Find as LPARAM) };
+    f.found
+}
+
 /// `slot-N.id`, from before ids were their key's: its id goes on the slot's previous
 /// list, and only once it's there is the file deleted. A file that doesn't read as an id
 /// is left alone.
@@ -219,6 +357,24 @@ fn retire_old_id(dir: &Path, slot: u32, now: PeerId) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Slots are held per game: the player is the same in two games at once, and a
+    /// second copy of one game is another player.
+    #[test]
+    fn slots_are_held_per_game() {
+        let dir = std::env::temp_dir().join(format!("peerparty-id-game-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let a = Identity::claim_for(&dir, "steam:480");
+        let other_game = Identity::claim_for(&dir, "eos:abc");
+        assert_eq!((a.slot, other_game.slot), (0, 0));
+        assert_eq!(a.id, other_game.id, "one player in both games");
+        let second = Identity::claim_for(&dir, "steam:480");
+        assert_eq!(second.slot, 1);
+        assert_ne!(second.id, a.id);
+        assert_ne!(game_tag("steam:480"), game_tag("eos:abc"));
+        drop((a, other_game, second));
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn hex_round_trips_and_rejects_junk() {
@@ -249,6 +405,106 @@ mod tests {
         assert_eq!(again.id, PeerId::of_key(&again.key.public()), "which is its key's");
         assert_ne!(PeerId::of_key(&[1; 32]), PeerId::of_key(&[2; 32]));
         drop((b, again));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A slot's holder says who it is; a holder that is this very process, or no longer
+    /// runs, or is another program, or still has its window, isn't waited for.
+    #[test]
+    fn a_slot_is_waited_for_only_while_an_earlier_run_quits() {
+        let dir = std::env::temp_dir().join(format!("peerparty-id-owner-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let me = Identity::claim(&dir);
+        let owner = dir.join("slot-0.owner");
+        let text = fs::read_to_string(&owner).unwrap();
+        assert_eq!(text.lines().next(), Some(std::process::id().to_string().as_str()));
+        assert!(!leaving(&owner), "this process isn't an earlier run");
+        // Another process of another program (this PC's System process can't be opened;
+        // explorer or anything else runs under its own program).
+        fs::write(&owner, format!("4\r\n{}\r\n", own_exe().unwrap())).unwrap();
+        assert!(!leaving(&owner), "not the same program");
+        fs::write(&owner, format!("{}\r\nC:\\elsewhere\\game.exe\r\n", u32::MAX - 3)).unwrap();
+        assert!(!leaving(&owner), "no such process");
+        fs::write(&owner, "junk").unwrap();
+        assert!(!leaving(&owner));
+        let t = Instant::now();
+        let second = Identity::claim(&dir);
+        assert_eq!(second.slot, 1);
+        assert!(t.elapsed() < Duration::from_secs(2), "a running copy isn't waited for");
+        drop((me, second));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A slot held by the starter this game took it over from is waited for; one held
+    /// by any other process, or a pid now another program's, isn't.
+    #[test]
+    fn a_slot_held_by_the_games_starter_is_waited_for() {
+        use std::os::windows::process::CommandExt;
+        let dir = std::env::temp_dir().join(format!("peerparty-id-starter-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut other = std::process::Command::new("cmd")
+            .args(["/c", "ping -n 4 127.0.0.1 >nul"])
+            .stdout(std::process::Stdio::null())
+            .creation_flags(0x0800_0000)
+            .spawn()
+            .unwrap();
+        let pid = other.id();
+        let exe = process_exe(pid).unwrap();
+        let owner = dir.join("slot-0.owner");
+        fs::write(&owner, format!("{pid}\r\n{exe}\r\n")).unwrap();
+        assert!(!held_by_starter(&owner), "no starter named yet");
+        take_slot_from(pid);
+        assert!(held_by_starter(&owner));
+        assert!(!leaving(&owner), "another program, so only as the starter");
+        fs::write(&owner, format!("{pid}\r\nC:\\elsewhere\\game.exe\r\n")).unwrap();
+        assert!(!held_by_starter(&owner), "the pid is another program's now");
+        take_slot_from(0);
+        let _ = other.kill();
+        let _ = other.wait();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Run by the next test in a process of its own: holds slot 0 a moment, windowless,
+    /// as a game that is quitting does.
+    #[test]
+    #[ignore]
+    fn slot_holder() {
+        let Some(dir) = std::env::var_os("PPTEST_HOLD_SLOT") else { return };
+        let me = Identity::claim(Path::new(&dir));
+        assert_eq!(me.slot, 0);
+        std::thread::sleep(Duration::from_millis(1500));
+        drop(me);
+    }
+
+    /// An earlier run of the same program still holding the slot while it quits is
+    /// waited for: the new run is the same player, not the next slot's.
+    #[test]
+    fn a_quitting_earlier_run_is_waited_for() {
+        use std::os::windows::process::CommandExt;
+        let dir = std::env::temp_dir().join(format!("peerparty-id-quitting-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "id::tests::slot_holder", "--test-threads", "1"])
+            .env("PPTEST_HOLD_SLOT", &dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(0x0800_0000)
+            .spawn()
+            .unwrap();
+        let owner = dir.join("slot-0.owner");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !fs::read_to_string(&owner).is_ok_and(|t| t.starts_with(&child.id().to_string())) {
+            assert!(Instant::now() < deadline, "the holder never took the slot");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let t = Instant::now();
+        let me = Identity::claim(&dir);
+        assert_eq!(me.slot, 0, "waited for the quitting run");
+        assert!(t.elapsed() >= Duration::from_millis(500), "{:?}", t.elapsed());
+        assert!(child.wait().unwrap().success());
+        drop(me);
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -3,13 +3,14 @@
 //! Live. Only with `PEERPARTY_XBL_TRACE=1`: a game failed to load its first map with
 //! these hooks (and winhttp.rs's) always on, so they stay off unless asked for.
 //!
-//! `curl_easy_setopt` and `curl_easy_cleanup` are hooked: each request to an
-//! `*.xboxlive.com` host is logged once it's done, with its full URL and its request
-//! and response bodies (up to 4 KB each). libHttpClient streams the bodies through the
-//! read and write callbacks it sets (CURLOPT_READFUNCTION / WRITEFUNCTION, with itself
-//! as the data pointer; libHttpClient Source/HTTP/Curl/CurlEasyRequest.cpp), so those
-//! are wrapped. A path may name the player making it (mod.rs `own_xuid_in`). Headers
-//! (the Xbox token) are never logged.
+//! `curl_easy_setopt`, `curl_easy_reset` and `curl_easy_cleanup` are hooked: each
+//! request to an `*.xboxlive.com` host is logged once it's done, with its full URL and
+//! its request and response bodies (up to 4 KB each). libHttpClient streams the bodies
+//! through the read and write callbacks it sets (CURLOPT_READFUNCTION / WRITEFUNCTION,
+//! with itself as the data pointer; libHttpClient Source/HTTP/Curl/CurlEasyRequest.cpp),
+//! so those are wrapped: once a handle has both a callback and its data pointer, curl is
+//! given our wrapper and a slot of ours that names the game's pair. A path may name the
+//! player making it (mod.rs `own_xuid_in`). Headers (the Xbox token) are never logged.
 //!
 //! Nothing a request does is changed.
 
@@ -35,32 +36,57 @@ const OPT_READFUNCTION: u32 = 20012;
 
 const BODY_MAX: usize = 4096;
 
-/// `curl_easy_setopt(handle, option, ...)`: one pointer-sized argument after the
-/// option, passed as a fixed one (the same registers and stack slot on x64 and x86).
-type SetOpt = unsafe extern "C" fn(usize, u32, usize) -> u32;
+/// `curl_easy_setopt(handle, option, ...)`: one argument after the option. It is taken
+/// and passed on as two pointer-sized ones: a `curl_off_t` option (30000 and up) passes
+/// 64 bits, two stack slots on x86, and the second must reach curl too. On x64 the
+/// spare one is a register curl doesn't read.
+type SetOpt = unsafe extern "C" fn(usize, u32, usize, usize) -> u32;
 type Cleanup = unsafe extern "C" fn(usize);
 /// `size_t (*)(char *buffer, size_t size, size_t nitems, void *userdata)`.
 type DataFn = unsafe extern "C" fn(*mut u8, usize, usize, usize) -> usize;
 
 static SETOPT: OnceLock<GenericDetour<SetOpt>> = OnceLock::new();
 static CLEANUP: OnceLock<GenericDetour<Cleanup>> = OnceLock::new();
+static RESET: OnceLock<GenericDetour<Cleanup>> = OnceLock::new();
 
 #[derive(Default)]
 struct Call {
     url: String,
     method: &'static str,
-    read_fn: usize,
-    write_fn: usize,
     sent: Vec<u8>,
     got: Vec<u8>,
+}
+
+/// One direction (read or write) of a handle's body callback: what the game set.
+#[derive(Default, Clone, Copy)]
+struct Side {
+    func: usize,
+    data: usize,
+    data_set: bool,
+}
+
+impl Side {
+    /// The game's callback is wrapped only once both it and its data pointer are known:
+    /// the wrapper is passed a slot of ours as its data, and curl's own default callback
+    /// (no function set) must never be handed that slot.
+    fn wrapped(&self) -> bool {
+        self.func != 0 && self.data_set
+    }
+}
+
+/// What the wrappers get as their data pointer: one per handle address, never freed,
+/// so a handle copied by `curl_easy_duphandle` (which copies our slot along) still
+/// finds the callback the game set.
+struct Slot {
+    handle: usize,
+    read: Mutex<Side>,
+    write: Mutex<Side>,
 }
 
 #[derive(Default)]
 struct Calls {
     by_handle: HashMap<usize, Call>,
-    /// The callbacks' data pointer -> its handle.
-    read_owner: HashMap<usize, usize>,
-    write_owner: HashMap<usize, usize>,
+    slots: HashMap<usize, &'static Slot>,
 }
 
 static CALLS: LazyLock<Mutex<Calls>> = LazyLock::new(Mutex::default);
@@ -85,6 +111,10 @@ pub fn attach(exports: &[Export]) -> usize {
     if let Some(e) = exports.iter().find(|e| e.name == "curl_easy_cleanup") {
         let target: Cleanup = unsafe { std::mem::transmute(e.addr) };
         n += usize::from(arm(&CLEANUP, target, cleanup as Cleanup, "curl_easy_cleanup"));
+    }
+    if let Some(e) = exports.iter().find(|e| e.name == "curl_easy_reset") {
+        let target: Cleanup = unsafe { std::mem::transmute(e.addr) };
+        n += usize::from(arm(&RESET, target, reset as Cleanup, "curl_easy_reset"));
     }
     n
 }
@@ -122,9 +152,48 @@ fn is_xbox(url: &str) -> bool {
     host.ends_with(".xboxlive.com")
 }
 
-unsafe extern "C" fn setopt(h: usize, option: u32, value: usize) -> u32 {
+fn new_slot(h: usize) -> &'static Slot {
+    Box::leak(Box::new(Slot { handle: h, read: Mutex::new(Side::default()), write: Mutex::new(Side::default()) }))
+}
+
+/// A body option set on a handle (`func`: its callback, else its data pointer): what
+/// curl is given instead, and the other option of the pair to set too when this one
+/// starts or ends the wrapping.
+fn body_option(slot: &'static Slot, write: bool, func: bool, value: usize) -> (usize, Option<(u32, usize)>) {
+    let (side, wrapper, func_opt, data_opt) = if write {
+        (&slot.write, write_wrap as DataFn as usize, OPT_WRITEFUNCTION, OPT_WRITEDATA)
+    } else {
+        (&slot.read, read_wrap as DataFn as usize, OPT_READFUNCTION, OPT_READDATA)
+    };
+    let mut s = side.lock().unwrap();
+    let was = s.wrapped();
+    if func {
+        s.func = value;
+    } else {
+        s.data = value;
+        s.data_set = true;
+    }
+    let now = s.wrapped();
+    let ours = slot as *const Slot as usize;
+    let value = match (now, func) {
+        (true, true) => wrapper,
+        (true, false) => ours,
+        (false, _) => value,
+    };
+    let other = match (was, now, func) {
+        (false, true, true) => Some((data_opt, ours)),
+        (false, true, false) => Some((func_opt, wrapper)),
+        // The callback set back to curl's own: the game's data pointer goes back too.
+        (true, false, true) => Some((data_opt, s.data)),
+        _ => None,
+    };
+    (value, other)
+}
+
+unsafe extern "C" fn setopt(h: usize, option: u32, value: usize, high: usize) -> u32 {
     let Some(hook) = SETOPT.get() else { return 43 };
     let mut value = value;
+    let mut also = None;
     {
         let mut calls = CALLS.lock().unwrap();
         let c = &mut *calls;
@@ -151,33 +220,31 @@ unsafe extern "C" fn setopt(h: usize, option: u32, value: usize) -> u32 {
             OPT_POST if value != 0 => c.by_handle.entry(h).or_default().method = "POST",
             OPT_UPLOAD if value != 0 => c.by_handle.entry(h).or_default().method = "PUT",
             OPT_NOBODY if value != 0 => c.by_handle.entry(h).or_default().method = "HEAD",
-            OPT_READFUNCTION if bodies() && value != 0 => {
-                c.by_handle.entry(h).or_default().read_fn = value;
-                value = read_wrap as DataFn as usize;
-            }
-            OPT_WRITEFUNCTION if bodies() && value != 0 => {
-                c.by_handle.entry(h).or_default().write_fn = value;
-                value = write_wrap as DataFn as usize;
-            }
-            OPT_READDATA if bodies() => {
-                c.read_owner.insert(value, h);
-            }
-            OPT_WRITEDATA if bodies() => {
-                c.write_owner.insert(value, h);
+            OPT_READFUNCTION | OPT_WRITEFUNCTION | OPT_READDATA | OPT_WRITEDATA => {
+                let slot: &'static Slot = c.slots.entry(h).or_insert_with(|| new_slot(h));
+                let write = matches!(option, OPT_WRITEFUNCTION | OPT_WRITEDATA);
+                let func = matches!(option, OPT_READFUNCTION | OPT_WRITEFUNCTION);
+                (value, also) = body_option(slot, write, func, value);
             }
             _ => {}
         }
     }
-    unsafe { hook.call(h, option, value) }
+    if let Some((opt, v)) = also {
+        unsafe { hook.call(h, opt, v, 0) };
+    }
+    unsafe { hook.call(h, option, value, high) }
 }
 
-/// The original callback for a data pointer, and its handle.
-fn original(data: usize, write: bool) -> Option<(usize, DataFn)> {
-    let calls = CALLS.lock().unwrap();
-    let h = *if write { calls.write_owner.get(&data) } else { calls.read_owner.get(&data) }?;
-    let call = calls.by_handle.get(&h)?;
-    let f = if write { call.write_fn } else { call.read_fn };
-    (f != 0).then(|| (h, unsafe { std::mem::transmute::<usize, DataFn>(f) }))
+/// The handle, and the game's callback and data, behind a wrapper's data pointer:
+/// always one of our slots (the wrapper is only ever set together with one), which are
+/// never freed.
+fn original(data: usize, write: bool) -> Option<(usize, DataFn, usize)> {
+    if data == 0 {
+        return None;
+    }
+    let slot = unsafe { &*(data as *const Slot) };
+    let s = *if write { &slot.write } else { &slot.read }.lock().unwrap();
+    (s.func != 0).then(|| (slot.handle, unsafe { std::mem::transmute::<usize, DataFn>(s.func) }, s.data))
 }
 
 fn keep(h: usize, bytes: &[u8], write: bool) {
@@ -189,10 +256,12 @@ fn keep(h: usize, bytes: &[u8], write: bool) {
     }
 }
 
+/// CURL_READFUNC_ABORT.
+const READ_ABORT: usize = 0x1000_0000;
+
 unsafe extern "C" fn read_wrap(buf: *mut u8, size: usize, n: usize, data: usize) -> usize {
-    // No original means a handle this module didn't see set up; nothing to read then.
-    let Some((h, f)) = original(data, false) else { return 0 };
-    let got = unsafe { f(buf, size, n, data) };
+    let Some((h, f, game_data)) = original(data, false) else { return READ_ABORT };
+    let got = unsafe { f(buf, size, n, game_data) };
     // CURL_READFUNC_ABORT / PAUSE are large sentinels, not lengths.
     if got <= size.saturating_mul(n) && !buf.is_null() {
         keep(h, unsafe { std::slice::from_raw_parts(buf, got) }, false);
@@ -201,12 +270,27 @@ unsafe extern "C" fn read_wrap(buf: *mut u8, size: usize, n: usize, data: usize)
 }
 
 unsafe extern "C" fn write_wrap(buf: *mut u8, size: usize, n: usize, data: usize) -> usize {
-    let Some((h, f)) = original(data, true) else { return 0 };
+    let Some((h, f, game_data)) = original(data, true) else { return 0 };
     let len = size.saturating_mul(n);
     if !buf.is_null() {
         keep(h, unsafe { std::slice::from_raw_parts(buf, len) }, true);
     }
-    unsafe { f(buf, size, n, data) }
+    unsafe { f(buf, size, n, game_data) }
+}
+
+/// `curl_easy_reset`: every option back to curl's default, so nothing is wrapped.
+unsafe extern "C" fn reset(h: usize) {
+    {
+        let mut calls = CALLS.lock().unwrap();
+        if let Some(slot) = calls.slots.get(&h) {
+            *slot.read.lock().unwrap() = Side::default();
+            *slot.write.lock().unwrap() = Side::default();
+        }
+        calls.by_handle.remove(&h);
+    }
+    if let Some(hook) = RESET.get() {
+        unsafe { hook.call(h) }
+    }
 }
 
 fn text(bytes: &[u8]) -> String {
@@ -216,9 +300,8 @@ fn text(bytes: &[u8]) -> String {
 
 unsafe extern "C" fn cleanup(h: usize) {
     let call = {
+        // The handle's slot stays as it is: a copy made of this handle may still use it.
         let mut calls = CALLS.lock().unwrap();
-        calls.read_owner.retain(|_, owner| *owner != h);
-        calls.write_owner.retain(|_, owner| *owner != h);
         calls.by_handle.remove(&h)
     };
     if let Some(call) = call.filter(|c| is_xbox(&c.url)) {
@@ -251,5 +334,26 @@ mod tests {
         assert!(is_xbox("https://sessiondirectory.xboxlive.com/handles/query"));
         assert!(!is_xbox("https://telemetry.example.net/x"));
         assert!(!is_xbox("https://xboxlive.com.example.org/"));
+    }
+
+    #[test]
+    fn a_callback_is_wrapped_once_its_data_is_known_in_either_order() {
+        let ours = |s: &'static Slot| s as *const Slot as usize;
+        let wrapper = write_wrap as DataFn as usize;
+        // Callback first: passed on as it is until the data comes, then both swap.
+        let s = new_slot(1);
+        assert_eq!(body_option(s, true, true, 0x1111), (0x1111, None));
+        assert_eq!(body_option(s, true, false, 0x2222), (ours(s), Some((OPT_WRITEFUNCTION, wrapper))));
+        assert_eq!(original(ours(s), true).map(|(h, f, d)| (h, f as usize, d)), Some((1, 0x1111, 0x2222)));
+        // Data first.
+        let s = new_slot(2);
+        assert_eq!(body_option(s, true, false, 0x2222), (0x2222, None));
+        assert_eq!(body_option(s, true, true, 0x1111), (wrapper, Some((OPT_WRITEDATA, ours(s)))));
+        // Back to curl's own callback: the game's data pointer goes back too.
+        assert_eq!(body_option(s, true, true, 0), (0, Some((OPT_WRITEDATA, 0x2222))));
+        // Data alone never becomes the slot (curl's default callback would write to it).
+        let s = new_slot(3);
+        assert_eq!(body_option(s, false, false, 0x3333), (0x3333, None));
+        assert!(original(ours(s), false).is_none());
     }
 }

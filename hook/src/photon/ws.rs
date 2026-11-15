@@ -21,7 +21,7 @@ use super::value::{Msg, Response, Value};
 use std::io::{self, Read, Write};
 
 const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-const MAX_MESSAGE: usize = 1 << 20;
+const MAX_MESSAGE: usize = super::enet::MAX_MESSAGE;
 
 /// Text frames aren't sent (only binary ones); kept to document the opcode.
 #[allow(dead_code)]
@@ -62,6 +62,13 @@ fn query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
         let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
         (k == name).then_some(v)
     })
+}
+
+/// A query value that goes into the init line as it is: a name, number or version
+/// (letters, digits, `.`, `-`, `_`), else None (the default is used), so nothing a
+/// client puts there adds to or breaks that line.
+fn plain_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
+    query_param(query, name).filter(|v| !v.is_empty() && v.len() <= 64 && v.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_')))
 }
 
 /// Reads the client's upgrade request and answers it (101). Err when it isn't one.
@@ -106,9 +113,9 @@ pub fn accept(s: &mut (impl Read + Write)) -> io::Result<Handshake> {
     let init = if query_param(query, "xInit").is_some() {
         None
     } else {
-        let app = query_param(query, "app").unwrap_or("LoadBalancing");
-        let version = query_param(query, "libversion").unwrap_or("4.1.0.0");
-        let sid = query_param(query, "sid").unwrap_or("0");
+        let app = plain_param(query, "app").unwrap_or("LoadBalancing");
+        let version = plain_param(query, "libversion").unwrap_or("4.1.0.0");
+        let sid = plain_param(query, "sid").unwrap_or("0");
         let ipv6 = if query_param(query, "IPv6").is_some() { "&IPv6" } else { "" };
         Some(format!("POST /?init&app={app}&clientversion={version}&protocol={}&sid={sid}{ipv6} HTTP/1.1\r\n\r\n", proto.name()).into_bytes())
     };

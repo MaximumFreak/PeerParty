@@ -17,6 +17,11 @@ pub enum Class {
     Pass,
     /// `(handle, options, client_data, callback)`: completes with EOS_NoConnection.
     Async,
+    /// The same, with a pointer-sized field (a user id) between the callback info's
+    /// ResultCode and ClientData (Mods, ProgressionSnapshot_DeleteSnapshot).
+    AsyncAfterPtr,
+    /// The same, with a 32-bit field there (ProgressionSnapshot_SubmitSnapshot).
+    AsyncAfterU32,
     /// Returns a notification id that never fires.
     AddNotify,
     /// Returns EOS_NotFound and nulls the out handle at this argument index.
@@ -31,28 +36,37 @@ pub enum Class {
 /// Notification ids are shared with the implemented interfaces, so ids never collide.
 pub static NEXT_NOTIFY: AtomicU64 = AtomicU64::new(1);
 
-#[repr(C)]
-struct FailedInfo {
-    result: i32,
-    client_data: usize,
-    /// Room for whatever else the callback info has; all zero / null.
-    rest: [usize; 32],
+/// A failed callback info: ResultCode first, ClientData in pointer-sized slot `at`,
+/// and room for whatever else the info has, all zero / null.
+fn failed_info(client_data: usize, at: usize) -> [usize; 34] {
+    let mut info = [0usize; 34];
+    info[0] = result::NO_CONNECTION as u32 as usize;
+    info[at] = client_data;
+    info
+}
+
+/// The pointer-sized slot ClientData is in, by class: after ResultCode it is slot 1;
+/// after ResultCode and a pointer, slot 2; after ResultCode and a uint32_t, slot 1 on
+/// x64 (both share the first eight bytes) and slot 2 on x86.
+fn client_data_slot(class: u8) -> usize {
+    match class {
+        ASYNC_AFTER_PTR => 2,
+        ASYNC_AFTER_U32 if cfg!(target_pointer_width = "64") => 1,
+        ASYNC_AFTER_U32 => 2,
+        _ => 1,
+    }
 }
 
 unsafe fn run(class: u8, a: &[usize]) -> usize {
     match class {
-        ASYNC => {
+        ASYNC | ASYNC_AFTER_PTR | ASYNC_AFTER_U32 => {
             let (client_data, callback) = (a[2], a[3]);
+            let at = client_data_slot(class);
             if callback != 0 {
                 super::later(move || {
-                    let info = FailedInfo {
-                        result: result::NO_CONNECTION,
-                        client_data,
-                        rest: [0; 32],
-                    };
-                    let f: unsafe extern "system" fn(*const FailedInfo) =
-                        unsafe { std::mem::transmute(callback) };
-                    unsafe { f(&info) };
+                    let info = failed_info(client_data, at);
+                    let f: unsafe extern "system" fn(*const usize) = unsafe { std::mem::transmute(callback) };
+                    unsafe { f(info.as_ptr()) };
                 });
             }
             0
@@ -75,13 +89,18 @@ const ADD_NOTIFY: u8 = 1;
 const RESULT: u8 = 2;
 const ZERO: u8 = 3;
 const VOID: u8 = 4;
+const ASYNC_AFTER_PTR: u8 = 5;
+const ASYNC_AFTER_U32: u8 = 6;
 const COPY: u8 = 10;
 
 macro_rules! handlers {
     ($($name:ident($($a:ident),*);)*) => {
         $(
-            unsafe extern "system" fn $name<const C: u8>($($a: usize),*) -> usize {
-                unsafe { run(C, &[$($a),*]) }
+            // A 64-bit return: EOS_NotificationId is a uint64_t, which x86 returns in
+            // edx:eax (edx is zero here); on x64 it's rax either way. Callers of the
+            // narrower results ignore edx.
+            unsafe extern "system" fn $name<const C: u8>($($a: usize),*) -> u64 {
+                unsafe { run(C, &[$($a),*]) as u64 }
             }
         )*
     };
@@ -125,6 +144,9 @@ pub fn handler(class: Class, slots: u8) -> Option<usize> {
         Class::Pass => None,
         Class::Async if slots >= 4 => pick::<ASYNC>(slots),
         Class::Async => None,
+        Class::AsyncAfterPtr if slots >= 4 => pick::<ASYNC_AFTER_PTR>(slots),
+        Class::AsyncAfterU32 if slots >= 4 => pick::<ASYNC_AFTER_U32>(slots),
+        Class::AsyncAfterPtr | Class::AsyncAfterU32 => None,
         Class::AddNotify => pick::<ADD_NOTIFY>(slots),
         Class::Result => pick::<RESULT>(slots),
         Class::Zero => pick::<ZERO>(slots),
@@ -159,14 +181,11 @@ unsafe extern "system" fn called(id: usize) {
     }
 }
 
-fn block() -> Option<usize> {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc};
-    static BASE: OnceLock<usize> = OnceLock::new();
-    // Written while earlier thunks in the block may be running, so it stays writable.
-    let base = *BASE.get_or_init(|| unsafe {
-        VirtualAlloc(std::ptr::null(), THUNKS * THUNK, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as usize
-    });
-    (base != 0).then_some(base)
+/// The thunks' memory: (where they're written, where they run). Written while earlier
+/// thunks in it may be running, so through a view of its own (crate::hook::wx_block).
+fn block() -> Option<(usize, usize)> {
+    static BASE: OnceLock<Option<(usize, usize)>> = OnceLock::new();
+    *BASE.get_or_init(|| crate::hook::wx_block(THUNKS * THUNK))
 }
 
 fn thunk_code(id: usize, handler: usize) -> Vec<u8> {
@@ -206,7 +225,7 @@ pub fn noted(name: &str, handler: usize) -> usize {
     if name.ends_with("_Release") || name.contains("_RemoveNotify") {
         return handler;
     }
-    let Some(base) = block() else { return handler };
+    let Some((write, base)) = block() else { return handler };
     let mut names = NAMES.lock().unwrap();
     if let Some(i) = names.iter().position(|n| *n == name) {
         return base + i * THUNK;
@@ -217,10 +236,9 @@ pub fn noted(name: &str, handler: usize) -> usize {
     }
     let code = thunk_code(id, handler);
     debug_assert!(code.len() <= THUNK);
-    let at = base + id * THUNK;
-    unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), at as *mut u8, code.len()) };
+    unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), (write + id * THUNK) as *mut u8, code.len()) };
     names.push(Box::leak(name.to_string().into_boxed_str()));
-    at
+    base + id * THUNK
 }
 
 #[cfg(test)]
@@ -261,5 +279,43 @@ mod tests {
         let (a, b) = unsafe { (notify(0, 0, 0, 0), notify(0, 0, 0, 0)) };
         assert!(a != 0 && b != a);
         assert!(handler(Class::Pass, 1).is_none());
+        // EOS_NotificationId is 64-bit: the whole value comes back.
+        let notify64: unsafe extern "system" fn(usize, usize, usize, usize) -> u64 =
+            unsafe { std::mem::transmute(handler(Class::AddNotify, 4).unwrap()) };
+        let c = unsafe { notify64(0, 0, 0, 0) };
+        assert!(c > b as u64 && c >> 32 == 0);
+    }
+
+    #[test]
+    fn failed_callback_infos_put_client_data_where_each_struct_has_it() {
+        // { EOS_EResult ResultCode; EOS_EpicAccountId LocalUserId; void* ClientData; ... }
+        #[repr(C)]
+        struct AfterPtr {
+            result: i32,
+            user: usize,
+            client_data: usize,
+        }
+        // { EOS_EResult ResultCode; uint32_t SnapshotId; void* ClientData; }
+        #[repr(C)]
+        struct AfterU32 {
+            result: i32,
+            snapshot: u32,
+            client_data: usize,
+        }
+        #[repr(C)]
+        struct Plain {
+            result: i32,
+            client_data: usize,
+        }
+        let read = |class: u8| failed_info(0xC0DE, client_data_slot(class));
+        let i = read(ASYNC_AFTER_PTR);
+        let s = unsafe { &*(i.as_ptr() as *const AfterPtr) };
+        assert_eq!((s.result, s.user, s.client_data), (result::NO_CONNECTION, 0, 0xC0DE));
+        let i = read(ASYNC_AFTER_U32);
+        let s = unsafe { &*(i.as_ptr() as *const AfterU32) };
+        assert_eq!((s.result, s.snapshot, s.client_data), (result::NO_CONNECTION, 0, 0xC0DE));
+        let i = read(ASYNC);
+        let s = unsafe { &*(i.as_ptr() as *const Plain) };
+        assert_eq!((s.result, s.client_data), (result::NO_CONNECTION, 0xC0DE));
     }
 }

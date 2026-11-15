@@ -1909,7 +1909,7 @@ dependencies = [
 
 [[package]]
 name = "peerparty"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "eframe",
  "egui_extras",
@@ -1925,7 +1925,7 @@ dependencies = [
 
 [[package]]
 name = "peerparty_core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chacha20poly1305",
  "ed25519-dalek",
@@ -1941,10 +1941,11 @@ dependencies = [
 
 [[package]]
 name = "peerparty_hook"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "peerparty_core",
  "retour",
+ "rusty-opus",
  "windows-sys 0.59.0",
 ]
 
@@ -2365,6 +2366,12 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "rusty-opus"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8acfb69e58b5082d511451aae511dd1b1d0fe693e54ddb29535b480ac48bf8b9"
 
 [[package]]
 name = "same-file"

@@ -1,6 +1,13 @@
 //! Games where a player types the host's IP address: their socket calls to a peer's
 //! stand-in address (198.18.x.y, shown in the overlay's Internet page) are redirected
 //! through the forwarder (peerparty_core::fwd), so they work with internet players.
+//! PeerParty's own servers on another PC (Photon's) are reached the same way, LAN or
+//! not, so their host's firewall never has to let a player in: the forwarder runs in
+//! every game once the LAN is up (it starts the LAN itself only for internet play).
+//!
+//! A connected UDP socket (`connect` on a datagram socket, as Photon's client does) is
+//! connected to the forwarder's local socket for that peer and port, so its plain
+//! `send` and `recv` work unhooked: the replies come from the address it connected to.
 //!
 //! Hooked: connect, WSAConnect, ConnectEx (handed out by WSAIoctl), sendto, WSASendTo,
 //! recvfrom and WSARecvFrom. An overlapped WSARecvFrom that completes later has its
@@ -89,13 +96,199 @@ struct OverlappedEntry {
     bytes: u32,
 }
 
-/// An overlapped WSARecvFrom still in flight: where the game wants the sender written
-/// (and that buffer's size), and its completion routine if it gave one.
+/// An overlapped WSARecvFrom still in flight: its socket, where the game wants the
+/// sender written (and that buffer's size), and its completion routine if it gave one.
+///
+/// A receive the game collects some way that isn't hooked leaves its entry behind, and
+/// the OVERLAPPED may then carry another operation: an entry goes when the same
+/// OVERLAPPED starts a send or a ConnectEx, a completion that names a socket must be
+/// on this one, and the sender buffer must still be there to be read (L-93).
 #[derive(Clone, Copy)]
 struct Pending {
+    socket: usize,
     from: usize,
     cap: i32,
     routine: Option<Completion>,
+    /// The OVERLAPPED's hEvent when it had one: a game that waits on that event and then
+    /// reads the result itself is seen through its wait (`completed_by_events`).
+    event: usize,
+}
+
+/// OVERLAPPED's hEvent, after Internal, InternalHigh and the 8-byte offset.
+const OV_EVENT: usize = 2 * size_of::<usize>() + 8;
+/// STATUS_PENDING in OVERLAPPED.Internal: not finished yet.
+const STATUS_PENDING: usize = 0x103;
+
+/// The event an OVERLAPPED names (0 for none or one we can't read).
+unsafe fn ov_event(ov: *mut u8) -> usize {
+    if ov.is_null() || !crate::read::readable(ov as usize, OV_EVENT + size_of::<usize>()) {
+        return 0;
+    }
+    // The low bit only says "no completion port packet" for that call.
+    unsafe { std::ptr::read_unaligned(ov.add(OV_EVENT).cast::<usize>()) & !1 }
+}
+
+/// A wait on `handles` returned with them signalled: receives noted with one of them as
+/// their event that have finished (OVERLAPPED.Internal no longer STATUS_PENDING) get
+/// their sender fixed, before the game reads it.
+fn completed_by_events(handles: &[usize]) {
+    if handles.is_empty() || !ANY_PENDING.load(Ordering::Relaxed) {
+        return;
+    }
+    let done: Vec<(usize, bool)> = {
+        let m = PENDING.lock().unwrap();
+        m.iter()
+            .filter(|(_, p)| p.event != 0 && handles.contains(&p.event))
+            .filter_map(|(ov, _)| {
+                crate::read::readable(*ov, size_of::<usize>()).then(|| unsafe { std::ptr::read_volatile(*ov as *const usize) }).filter(|st| *st != STATUS_PENDING).map(|st| (*ov, st == 0))
+            })
+            .collect()
+    };
+    for (ov, ok) in done {
+        completed(ov, ok);
+    }
+}
+
+type WaitOne = unsafe extern "system" fn(usize, u32) -> u32;
+type WaitOneEx = unsafe extern "system" fn(usize, u32, i32) -> u32;
+type WaitMany = unsafe extern "system" fn(u32, *const usize, i32, u32) -> u32;
+type WaitManyEx = unsafe extern "system" fn(u32, *const usize, i32, u32, i32) -> u32;
+type WsaWaitEvents = unsafe extern "system" fn(u32, *const usize, i32, u32, i32) -> u32;
+type WsaRecvMsg = unsafe extern "system" fn(usize, *mut u8, *mut u32, *mut u8, *mut u8) -> i32;
+type WsaSendMsg = unsafe extern "system" fn(usize, *const u8, u32, *mut u32, *mut u8, *mut u8) -> i32;
+
+static WAIT_ONE: OnceLock<GenericDetour<WaitOne>> = OnceLock::new();
+static WAIT_ONE_EX: OnceLock<GenericDetour<WaitOneEx>> = OnceLock::new();
+static WAIT_MANY: OnceLock<GenericDetour<WaitMany>> = OnceLock::new();
+static WAIT_MANY_EX: OnceLock<GenericDetour<WaitManyEx>> = OnceLock::new();
+static WSA_WAIT: OnceLock<GenericDetour<WsaWaitEvents>> = OnceLock::new();
+static REAL_RECVMSG: OnceLock<usize> = OnceLock::new();
+static REAL_SENDMSG: OnceLock<usize> = OnceLock::new();
+
+/// WSAID_WSARECVMSG {f689d7c8-6f1f-436b-8a53-e54fe351c322} and WSAID_WSASENDMSG
+/// {a441e712-754f-43ca-84a7-0dee44cf606d}, as laid out in memory.
+const WSAID_WSARECVMSG: [u8; 16] = [0xc8, 0xd7, 0x89, 0xf6, 0x1f, 0x6f, 0x6b, 0x43, 0x8a, 0x53, 0xe5, 0x4f, 0xe3, 0x51, 0xc3, 0x22];
+const WSAID_WSASENDMSG: [u8; 16] = [0x12, 0xe7, 0x41, 0xa4, 0x4f, 0x75, 0xca, 0x43, 0x84, 0xa7, 0x0d, 0xee, 0x44, 0xcf, 0x60, 0x6d];
+
+/// The handles a wait that returned `r` found signalled: all of them for a wait-all, the
+/// one it names otherwise (WAIT_OBJECT_0 + i).
+fn signalled(r: u32, n: u32, handles: *const usize, all: bool) -> Vec<usize> {
+    if handles.is_null() || r >= n || n > 64 {
+        return Vec::new();
+    }
+    let hs = unsafe { std::slice::from_raw_parts(handles, n as usize) };
+    if all { hs.to_vec() } else { vec![hs[r as usize]] }
+}
+
+/// After a wait: fixes what finished, keeping the thread's last error.
+fn after_wait(handles: Vec<usize>) {
+    if handles.is_empty() || !ANY_PENDING.load(Ordering::Relaxed) {
+        return;
+    }
+    let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+    completed_by_events(&handles);
+    unsafe { windows_sys::Win32::Foundation::SetLastError(err) };
+}
+
+unsafe extern "system" fn detour_wait_one(h: usize, ms: u32) -> u32 {
+    let r = unsafe { WAIT_ONE.get().unwrap().call(h, ms) };
+    if r == 0 {
+        after_wait(vec![h]);
+    }
+    r
+}
+
+unsafe extern "system" fn detour_wait_one_ex(h: usize, ms: u32, alertable: i32) -> u32 {
+    let r = unsafe { WAIT_ONE_EX.get().unwrap().call(h, ms, alertable) };
+    if r == 0 {
+        after_wait(vec![h]);
+    }
+    r
+}
+
+unsafe extern "system" fn detour_wait_many(n: u32, handles: *const usize, all: i32, ms: u32) -> u32 {
+    let r = unsafe { WAIT_MANY.get().unwrap().call(n, handles, all, ms) };
+    if ANY_PENDING.load(Ordering::Relaxed) {
+        after_wait(signalled(r, n, handles, all != 0));
+    }
+    r
+}
+
+unsafe extern "system" fn detour_wait_many_ex(n: u32, handles: *const usize, all: i32, ms: u32, alertable: i32) -> u32 {
+    let r = unsafe { WAIT_MANY_EX.get().unwrap().call(n, handles, all, ms, alertable) };
+    if ANY_PENDING.load(Ordering::Relaxed) {
+        after_wait(signalled(r, n, handles, all != 0));
+    }
+    r
+}
+
+unsafe extern "system" fn detour_wsa_wait(n: u32, events: *const usize, all: i32, ms: u32, alertable: i32) -> u32 {
+    let r = unsafe { WSA_WAIT.get().unwrap().call(n, events, all, ms, alertable) };
+    if ANY_PENDING.load(Ordering::Relaxed) {
+        after_wait(signalled(r, n, events, all != 0));
+    }
+    r
+}
+
+/// WSAMSG's name and namelen (the first two fields).
+unsafe fn msg_name(msg: *const u8) -> (*mut u8, *mut i32) {
+    if msg.is_null() {
+        return (std::ptr::null_mut(), std::ptr::null_mut());
+    }
+    unsafe { (std::ptr::read_unaligned(msg.cast::<*mut u8>()), msg.add(size_of::<usize>()) as *mut i32) }
+}
+
+/// WSARecvMsg (an extension function from WSAIoctl): its sender is fixed as
+/// WSARecvFrom's is, now or when it completes.
+unsafe extern "system" fn detour_recvmsg(s: usize, msg: *mut u8, got: *mut u32, ov: *mut u8, done: *mut u8) -> i32 {
+    let real = unsafe { std::mem::transmute::<usize, WsaRecvMsg>(*REAL_RECVMSG.get().unwrap()) };
+    let (from, fromlen) = unsafe { msg_name(msg) };
+    let track = !ov.is_null() && !from.is_null() && FWD.get().is_some();
+    let mut routine = done;
+    if track {
+        let cap = unsafe { *fromlen };
+        let orig = (!done.is_null()).then(|| unsafe { std::mem::transmute::<*mut u8, Completion>(done) });
+        note_pending(ov as usize, Pending { socket: s, from: from as usize, cap, routine: orig, event: unsafe { ov_event(ov) } });
+        if let Some(f) = orig {
+            ROUTINES.lock().unwrap().insert(ov as usize, f);
+            routine = completion_shim as *const () as *mut u8;
+        }
+    }
+    let r = unsafe { real(s, msg, got, ov, routine) };
+    let err = unsafe { windows_sys::Win32::Networking::WinSock::WSAGetLastError() };
+    if r == 0 && !from.is_null() {
+        unsafe { fix_from(from, fromlen) };
+    }
+    let failed = r != 0 && err != WSA_IO_PENDING;
+    if track && (failed || (r == 0 && routine == done)) {
+        take_pending(ov as usize);
+    }
+    if track && failed && routine != done {
+        ROUTINES.lock().unwrap().remove(&(ov as usize));
+    }
+    if r != 0 {
+        unsafe { windows_sys::Win32::Networking::WinSock::WSASetLastError(err) };
+    }
+    r
+}
+
+/// WSASendMsg: a datagram to a stand-in goes where sendto's would.
+unsafe extern "system" fn detour_sendmsg(s: usize, msg: *const u8, flags: u32, sent: *mut u32, ov: *mut u8, done: *mut u8) -> i32 {
+    let real = unsafe { std::mem::transmute::<usize, WsaSendMsg>(*REAL_SENDMSG.get().unwrap()) };
+    overlapped_reused(ov as usize);
+    let (to, len) = unsafe { msg_name(msg) };
+    let len = if len.is_null() { 0 } else { unsafe { *len } };
+    let Some(buf) = (unsafe { udp_target(s, to, len) }) else {
+        return unsafe { real(s, msg, flags, sent, ov, done) };
+    };
+    // A copy of the WSAMSG naming the forwarder's address instead (the game's stays as
+    // it was).
+    // sizeof(WSAMSG): name, namelen, lpBuffers, dwBufferCount, Control (WSABUF), dwFlags.
+    const WSAMSG_SIZE: usize = if cfg!(target_pointer_width = "64") { 56 } else { 28 };
+    let mut copy = [0u8; WSAMSG_SIZE];
+    unsafe { std::ptr::copy_nonoverlapping(msg, copy.as_mut_ptr(), WSAMSG_SIZE) };
+    unsafe { std::ptr::write_unaligned(copy.as_mut_ptr().cast::<*const u8>(), buf.as_ptr()) };
+    unsafe { real(s, copy.as_ptr(), flags, sent, ov, done) }
 }
 
 /// Receives in flight, by their OVERLAPPED. ANY_PENDING spares the completion hooks a
@@ -147,7 +340,7 @@ pub(crate) fn internet_configured() -> bool {
 /// ws2_32.dll loaded: hooks its socket calls and starts the engine and the forwarder on
 /// a thread of their own (never from inside a hooked call).
 pub fn attach_winsock(exports: &[Export]) -> usize {
-    if !crate::net::enabled() || crate::net::skip("ipfwd") || !internet_configured() {
+    if !crate::net::enabled() || crate::net::skip("ipfwd") {
         return 0;
     }
     let mut n = 0;
@@ -182,7 +375,23 @@ pub fn attach_winsock(exports: &[Export]) -> usize {
         if let Some(a) = proc_addr(kb, c"CreateThreadpoolIo") {
             n += usize::from(arm(&CREATE_TP_IO, unsafe { std::mem::transmute::<usize, CreateTpIo>(a) }, detour_create_tp_io, "CreateThreadpoolIo"));
         }
+        // Waits on an OVERLAPPED's event, after which a game reads the result itself.
+        if let Some(a) = proc_addr(kb, c"WaitForSingleObject") {
+            n += usize::from(arm(&WAIT_ONE, unsafe { std::mem::transmute::<usize, WaitOne>(a) }, detour_wait_one, "WaitForSingleObject"));
+        }
+        if let Some(a) = proc_addr(kb, c"WaitForSingleObjectEx") {
+            n += usize::from(arm(&WAIT_ONE_EX, unsafe { std::mem::transmute::<usize, WaitOneEx>(a) }, detour_wait_one_ex, "WaitForSingleObjectEx"));
+        }
+        if let Some(a) = proc_addr(kb, c"WaitForMultipleObjects") {
+            n += usize::from(arm(&WAIT_MANY, unsafe { std::mem::transmute::<usize, WaitMany>(a) }, detour_wait_many, "WaitForMultipleObjects"));
+        }
+        if let Some(a) = proc_addr(kb, c"WaitForMultipleObjectsEx") {
+            n += usize::from(arm(&WAIT_MANY_EX, unsafe { std::mem::transmute::<usize, WaitManyEx>(a) }, detour_wait_many_ex, "WaitForMultipleObjectsEx"));
+        }
     }
+    n += hook_one(exports, "WSAWaitForMultipleEvents", |a| {
+        arm(&WSA_WAIT, unsafe { std::mem::transmute::<*const (), WsaWaitEvents>(a) }, detour_wsa_wait, "WSAWaitForMultipleEvents")
+    });
     // kernel32's own code, on ntdll's thread pool.
     if let Some(k32) = module("kernel32.dll") {
         if let Some(a) = proc_addr(k32, c"BindIoCompletionCallback") {
@@ -200,16 +409,62 @@ pub fn attach_winsock(exports: &[Export]) -> usize {
     // second detour on the same functions.
     n += crate::padblock::hook_overlapped_results();
     if n > 0 {
+        STARTING.store(true, Ordering::Relaxed);
         let _ = std::thread::Builder::new().name("peerparty-ipfwd-start".into()).spawn(|| {
-            let Some(lan) = crate::net::lan() else { return };
+            // Internet play needs the LAN now (a typed-IP game has nothing else to start
+            // it), once this process is the game rather than its starter; otherwise it
+            // waits for whatever starts it (a game SDK), so a dedicated server still
+            // says it's one first.
+            let lan = if internet_configured() {
+                lan_once_the_game()
+            } else {
+                loop {
+                    if let Some(l) = crate::net::lan_if_started() {
+                        break Some(l);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            };
+            let Some(lan) = lan else {
+                STARTING.store(false, Ordering::Relaxed);
+                return;
+            };
             let f = Forwarder::new(lan.clone(), Some(crate::net::pump), core_log);
             f.ensure_pump();
             if FWD.set(f).is_ok() {
-                log!("ipfwd: on; games that ask for an IP reach internet players at their 198.18.x.y address (overlay: Internet)");
+                log!("ipfwd: on; games that ask for an IP reach internet players at their 198.18.x.y address (overlay: Internet), and other PCs' Photon servers are reached over PeerParty");
             }
         });
     }
     n
+}
+
+/// How long a process with no game SDK waits before it takes itself for the game, with
+/// no program it started still to say whether it is; and at most, one still to say.
+const STARTER_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+const STARTER_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The LAN for internet play, started here once this process is the game: a game SDK
+/// loaded, or STARTER_WAIT passed with no program it started pending. A starter that
+/// hands the game to a program it started never starts one: it would take this PC's
+/// first player slot (its name, its saves), and the game would be the second player,
+/// "Name (2)". Whatever starts it first meanwhile (a game SDK) is used.
+fn lan_once_the_game() -> Option<&'static peerparty_core::Lan> {
+    let since = std::time::Instant::now();
+    loop {
+        if let Some(l) = crate::net::lan_if_started() {
+            return Some(l);
+        }
+        if crate::ipc::handed_over() {
+            log!("ipfwd: a program this one started is the game; no LAN in this one");
+            return None;
+        }
+        let waited = since.elapsed();
+        if crate::child::sdk_seen() || (waited >= STARTER_WAIT && !crate::child::starter_pending()) || waited >= STARTER_WAIT_MAX {
+            return crate::net::lan();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 fn core_log(line: &str) {
@@ -348,23 +603,48 @@ unsafe fn local_port(s: usize, v6: bool) -> Option<u16> {
 
 /// Where a datagram to `to` really goes (`None`: unchanged).
 unsafe fn udp_target(s: usize, to: *const u8, len: i32) -> Option<[u8; 28]> {
-    let f = FWD.get()?;
     let (dest, v6) = unsafe { parse(to, len) }?;
     if !fwd::is_stand_in(*dest.ip()) {
         return None;
     }
+    let f = forwarder_soon()?;
     let local = unsafe { local_port(s, v6) }?;
     let via = f.udp_dest(dest, local)?;
     Some(unsafe { rewritten(to, len, via, v6) })
 }
 
+/// The forwarder, for traffic to a stand-in address. It starts on a thread of its own
+/// once the hooks are in (never inside a hooked call), so a game quick enough to reach a
+/// stand-in first waits for it a moment (up to FWD_WAIT) instead of sending into
+/// nowhere. Only traffic to a stand-in waits, and only once the hooks are armed.
+fn forwarder_soon() -> Option<&'static Arc<Forwarder>> {
+    const FWD_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+    if let Some(f) = FWD.get() {
+        return Some(f);
+    }
+    if !STARTING.load(Ordering::Relaxed) {
+        return None;
+    }
+    let until = std::time::Instant::now() + FWD_WAIT;
+    while std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        if let Some(f) = FWD.get() {
+            return Some(f);
+        }
+    }
+    None
+}
+
+/// The forwarder's start is under way (its thread is running).
+static STARTING: AtomicBool = AtomicBool::new(false);
+
 /// Where a connection to `to` really goes (`None`: unchanged).
 unsafe fn tcp_target(to: *const u8, len: i32) -> Option<[u8; 28]> {
-    let f = FWD.get()?;
     let (dest, v6) = unsafe { parse(to, len) }?;
     if !fwd::is_stand_in(*dest.ip()) {
         return None;
     }
+    let f = forwarder_soon()?;
     let via = f.tcp_dest(dest)?;
     log!("ipfwd: a connection to {dest} goes over peerparty");
     Some(unsafe { rewritten(to, len, via, v6) })
@@ -377,17 +657,40 @@ unsafe fn fix_from(from: *mut u8, fromlen: *mut i32) {
         return;
     }
     let len = unsafe { *fromlen };
+    // A game socket bound to a LAN address gets its peers' datagrams from aliases on
+    // that address, not loopback: those are rewritten too.
     if let Some((src, v6)) = unsafe { parse(from, len) }
-        && src.ip().is_loopback()
+        && f.may_be_alias(*src.ip())
         && let Some(peer) = f.udp_from(src)
     {
         unsafe { put(from, peer, v6) };
     }
 }
 
+/// Whether `s` is a datagram (UDP) socket.
+unsafe fn is_datagram(s: usize) -> bool {
+    use windows_sys::Win32::Networking::WinSock::{SO_TYPE, SOCK_DGRAM, SOL_SOCKET, getsockopt};
+    let mut t = 0i32;
+    let mut n = size_of::<i32>() as i32;
+    unsafe { getsockopt(s, SOL_SOCKET, SO_TYPE, (&mut t as *mut i32).cast(), &mut n) == 0 && t == SOCK_DGRAM as i32 }
+}
+
+/// Where a `connect` to `to` really goes: a UDP socket to the forwarder's local socket
+/// for that peer and port, a TCP one to its stream listener (`None`: unchanged).
+unsafe fn connect_target(s: usize, to: *const u8, len: i32) -> Option<[u8; 28]> {
+    if unsafe { is_datagram(s) } {
+        let via = unsafe { udp_target(s, to, len) };
+        if via.is_some() {
+            crate::log::throttled("ipfwd udp connect", 4, |n| log!("ipfwd: a UDP socket connected to a stand-in goes over peerparty (n={n})"));
+        }
+        return via;
+    }
+    unsafe { tcp_target(to, len) }
+}
+
 unsafe extern "system" fn detour_connect(s: usize, name: *const u8, len: i32) -> i32 {
     let real = CONNECT.get().unwrap();
-    match unsafe { tcp_target(name, len) } {
+    match unsafe { connect_target(s, name, len) } {
         Some(buf) => unsafe { real.call(s, buf.as_ptr(), len) },
         None => unsafe { real.call(s, name, len) },
     }
@@ -403,7 +706,7 @@ unsafe extern "system" fn detour_wsaconnect(
     gqos: *mut u8,
 ) -> i32 {
     let real = WSACONNECT.get().unwrap();
-    match unsafe { tcp_target(name, len) } {
+    match unsafe { connect_target(s, name, len) } {
         Some(buf) => unsafe { real.call(s, buf.as_ptr(), len, caller, callee, sqos, gqos) },
         None => unsafe { real.call(s, name, len, caller, callee, sqos, gqos) },
     }
@@ -429,6 +732,7 @@ unsafe extern "system" fn detour_wsasendto(
     done: *mut u8,
 ) -> i32 {
     let real = WSASENDTO.get().unwrap();
+    overlapped_reused(ov as usize);
     match unsafe { udp_target(s, to, len) } {
         Some(buf) => unsafe { real.call(s, bufs, count, sent, flags, buf.as_ptr(), len, ov, done) },
         None => unsafe { real.call(s, bufs, count, sent, flags, to, len, ov, done) },
@@ -464,8 +768,9 @@ unsafe extern "system" fn detour_wsarecvfrom(
     if track {
         let cap = unsafe { *fromlen };
         let orig = (!done.is_null()).then(|| unsafe { std::mem::transmute::<*mut u8, Completion>(done) });
-        note_pending(ov as usize, Pending { from: from as usize, cap, routine: orig });
-        if orig.is_some() {
+        note_pending(ov as usize, Pending { socket: s, from: from as usize, cap, routine: orig, event: unsafe { ov_event(ov) } });
+        if let Some(f) = orig {
+            ROUTINES.lock().unwrap().insert(ov as usize, f);
             routine = completion_shim as *const () as *mut u8;
         }
     }
@@ -482,11 +787,22 @@ unsafe extern "system" fn detour_wsarecvfrom(
     if track && (failed || (r == 0 && routine == done)) {
         take_pending(ov as usize);
     }
+    // Failed at once: no routine runs for it.
+    if track && failed && routine != done {
+        ROUTINES.lock().unwrap().remove(&(ov as usize));
+    }
     if r != 0 {
         unsafe { windows_sys::Win32::Networking::WinSock::WSASetLastError(err) };
     }
     r
 }
+
+/// The game's completion routines for receives our shim stands in for, by OVERLAPPED.
+/// Apart from PENDING: a receive can be collected first some other way (the game asks
+/// WSAGetOverlappedResult while its routine is still to run), and the routine must
+/// still be found when ours runs. Only the shim (or a receive that failed at once)
+/// takes one out.
+static ROUTINES: LazyLock<Mutex<HashMap<usize, Completion>>> = LazyLock::new(Mutex::default);
 
 fn note_pending(ov: usize, p: Pending) {
     let mut m = PENDING.lock().unwrap();
@@ -511,16 +827,41 @@ fn take_pending(ov: usize) -> Option<Pending> {
     p
 }
 
+/// An OVERLAPPED starts another operation: a receive noted for it was collected some
+/// way we didn't see, and is forgotten (one with a routine of ours ran it already).
+fn overlapped_reused(ov: usize) {
+    if ov != 0 && ANY_PENDING.load(Ordering::Relaxed) {
+        let mut m = PENDING.lock().unwrap();
+        if m.get(&ov).is_some_and(|p| p.routine.is_none()) {
+            m.remove(&ov);
+        }
+        if m.is_empty() {
+            ANY_PENDING.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
 /// An overlapped receive finished (`ok`: successfully): its sender is fixed.
 fn completed(ov: usize, ok: bool) -> Option<Pending> {
     let p = take_pending(ov)?;
-    if ok {
-        // fix_from checks the buffer still holds one of the forwarder's loopback
-        // aliases, so one the game has reused since is left alone.
+    // fix_from checks the buffer still holds one of the forwarder's loopback aliases,
+    // so one the game has reused since is left alone; one no longer there isn't read.
+    if ok && p.cap > 0 && crate::read::readable(p.from, p.cap as usize) {
         let mut len = p.cap;
         unsafe { fix_from(p.from as *mut u8, &mut len) };
     }
     Some(p)
+}
+
+/// A completion on socket `s`: only a receive noted on that socket is taken.
+fn completed_on(s: usize, ov: usize, ok: bool) -> Option<Pending> {
+    if ov == 0 || !ANY_PENDING.load(Ordering::Relaxed) {
+        return None;
+    }
+    if PENDING.lock().unwrap().get(&ov).is_some_and(|p| p.socket != s) {
+        return None;
+    }
+    completed(ov, ok)
 }
 
 /// GetOverlappedResult(Ex) returned `ok` (padblock's detours call this): a receive
@@ -602,8 +943,10 @@ unsafe extern "system" fn bind_shim(err: u32, bytes: u32, ov: *mut u8) {
 }
 
 unsafe extern "system" fn completion_shim(err: u32, bytes: u32, ov: *mut u8, flags: u32) {
-    let p = completed(ov as usize, err == 0);
-    if let Some(f) = p.and_then(|p| p.routine) {
+    // The sender, unless another way of collecting it fixed it already.
+    completed(ov as usize, err == 0);
+    let f = ROUTINES.lock().unwrap().remove(&(ov as usize));
+    if let Some(f) = f {
         unsafe { f(err, bytes, ov, flags) };
     }
 }
@@ -646,12 +989,12 @@ unsafe extern "system" fn detour_wsagetresult(s: usize, ov: *mut u8, bytes: *mut
     let r = unsafe { WSAGETRESULT.get().unwrap().call(s, ov, bytes, wait, flags) };
     if ANY_PENDING.load(Ordering::Relaxed) {
         if r != 0 {
-            completed(ov as usize, true);
+            completed_on(s, ov as usize, true);
         } else {
             let err = unsafe { windows_sys::Win32::Networking::WinSock::WSAGetLastError() };
             // Still running: keep waiting. Anything else: it failed.
             if err != WSA_IO_INCOMPLETE {
-                completed(ov as usize, false);
+                completed_on(s, ov as usize, false);
             }
             unsafe { windows_sys::Win32::Networking::WinSock::WSASetLastError(err) };
         }
@@ -688,6 +1031,21 @@ unsafe extern "system" fn detour_wsaioctl(
             unsafe { std::ptr::write_unaligned(outbuf.cast::<usize>(), detour_connectex as *const () as usize) };
         }
     }
+    // WSARecvMsg and WSASendMsg the same way.
+    if r == 0 && code == SIO_GET_EXTENSION_FUNCTION_POINTER && !inbuf.is_null() && inlen >= 16 && !outbuf.is_null() && outlen as usize >= size_of::<usize>() {
+        let id = unsafe { std::slice::from_raw_parts(inbuf, 16) };
+        let (slot, ours) = if id == WSAID_WSARECVMSG {
+            (&REAL_RECVMSG, detour_recvmsg as *const () as usize)
+        } else if id == WSAID_WSASENDMSG {
+            (&REAL_SENDMSG, detour_sendmsg as *const () as usize)
+        } else {
+            return r;
+        };
+        let real = unsafe { std::ptr::read_unaligned(outbuf.cast::<usize>()) };
+        if real != 0 && real != ours && *slot.get_or_init(|| real) == real {
+            unsafe { std::ptr::write_unaligned(outbuf.cast::<usize>(), ours) };
+        }
+    }
     r
 }
 
@@ -701,6 +1059,7 @@ unsafe extern "system" fn detour_connectex(
     ov: *mut u8,
 ) -> i32 {
     let real = unsafe { std::mem::transmute::<usize, ConnectEx>(*REAL_CONNECTEX.get().unwrap()) };
+    overlapped_reused(ov as usize);
     match unsafe { tcp_target(name, len) } {
         Some(buf) => unsafe { real(s, buf.as_ptr(), len, send, send_len, sent, ov) },
         None => unsafe { real(s, name, len, send, send_len, sent, ov) },
@@ -713,10 +1072,14 @@ mod tests {
 
     unsafe extern "system" fn routine(_: u32, _: u32, _: *mut u8, _: u32) {}
 
+    /// The tests that use PENDING run one at a time (one of them clears it).
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn overlapped_receives_are_tracked_until_collected() {
-        let plain = Pending { from: 0x1000, cap: 16, routine: None };
-        let with_routine = Pending { from: 0x2000, cap: 16, routine: Some(routine) };
+        let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let plain = Pending { socket: 5, from: 0x1000, cap: 16, routine: None, event: 0 };
+        let with_routine = Pending { socket: 5, from: 0x2000, cap: 16, routine: Some(routine), event: 0 };
         note_pending(1, plain);
         note_pending(2, with_routine);
         assert!(ANY_PENDING.load(Ordering::Relaxed));
@@ -733,6 +1096,48 @@ mod tests {
         assert!(take_pending(9).is_some());
         assert!(take_pending(100 + MAX_PENDING - 1).is_some());
         PENDING.lock().unwrap().clear();
+
+        // Left behind (collected unseen), then the OVERLAPPED reused: forgotten, unless
+        // a routine of ours still has to run.
+        note_pending(3, plain);
+        note_pending(4, with_routine);
+        overlapped_reused(3);
+        overlapped_reused(4);
+        assert!(take_pending(3).is_none());
+        assert!(take_pending(4).is_some());
+        // A completion naming another socket isn't this receive's.
+        note_pending(6, plain);
+        assert!(completed_on(7, 6, true).is_none());
+        assert!(completed_on(5, 6, false).is_some());
+        // A sender buffer no longer there isn't read (address 0x1000 is never mapped).
+        note_pending(8, plain);
+        assert!(completed(8, true).is_some());
+        PENDING.lock().unwrap().clear();
+    }
+
+    /// A receive the game collects by waiting on its OVERLAPPED's event is taken once the
+    /// wait says that event is set and the OVERLAPPED says it finished.
+    #[test]
+    fn a_receive_waited_for_by_its_event_is_collected() {
+        let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ov = vec![0usize; 8];
+        ov[0] = STATUS_PENDING;
+        ov[OV_EVENT / size_of::<usize>()] = 0x1234;
+        let at = ov.as_mut_ptr() as usize;
+        assert_eq!(unsafe { ov_event(at as *mut u8) }, 0x1234);
+        let from = [0u8; 16];
+        note_pending(at, Pending { socket: 5, from: from.as_ptr() as usize, cap: 16, routine: None, event: 0x1234 });
+        completed_by_events(&[0x1234]);
+        assert!(PENDING.lock().unwrap().contains_key(&at), "still running");
+        ov[0] = 0;
+        completed_by_events(&[0x9999]);
+        assert!(PENDING.lock().unwrap().contains_key(&at), "another event");
+        completed_by_events(&[0x1234]);
+        assert!(!PENDING.lock().unwrap().contains_key(&at), "finished and waited for");
+        let hs = [7usize, 8, 9];
+        assert_eq!(signalled(1, 3, hs.as_ptr(), false), vec![8]);
+        assert_eq!(signalled(0, 3, hs.as_ptr(), true), vec![7, 8, 9]);
+        assert!(signalled(258, 3, hs.as_ptr(), false).is_empty(), "WAIT_TIMEOUT");
     }
 
     #[test]

@@ -16,6 +16,9 @@
 //! goes to Xbox Live.
 //!
 //! - api.rs: the answers, from a directory of who is on the LAN.
+//! - real.rs: privacy requests also go on, as the game signed them, to the real privacy
+//!   service: its block and mute lists and the account's limits (a child account's
+//!   settings) are merged into the LAN's answers, and kept for Party chat.
 //! - curl.rs, winhttp.rs: with `PEERPARTY_XBL_TRACE=1`, a trace of every Xbox Live
 //!   call the game makes (URLs and bodies), through XCurl or WinHTTP.
 //!
@@ -33,6 +36,7 @@
 
 pub mod api;
 pub mod curl;
+pub mod real;
 pub mod winhttp;
 
 use std::sync::OnceLock;
@@ -252,7 +256,15 @@ pub fn handle(req: &Request) -> (u16, String) {
         learn(x);
     }
     let body = Json::parse(&String::from_utf8_lossy(&req.body)).unwrap_or(Json::Null);
-    let (status, out) = api::route(service, &req.method, &req.path, &body, &directory());
+    let (status, mut out) = api::route(service, &req.method, &req.path, &body, &directory());
+    if service == "privacy" && status == 200 {
+        if let Some((200, real_answer)) = real::ask(req) {
+            real::learn(&req.method, &req.path, &body, &real_answer);
+            if let Some(merged) = api::merge_privacy(&req.method, &req.path, &out, &real_answer) {
+                out = merged;
+            }
+        }
+    }
     let shape = shape(&req.path);
     crate::log::throttled(&format!("xboxlive {} {host}{shape} {status}", req.method), 3, |n| {
         log!("xboxlive {} {host}{shape} -> {status} n={n}", req.method);

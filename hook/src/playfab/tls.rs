@@ -7,7 +7,11 @@
 //!   key lives in the user's key container `peerparty-playfab` (SChannel needs a
 //!   persisted key; it's reused on later runs).
 //! - An SChannel server stream (`AcceptSecurityContext` / `EncryptMessage` /
-//!   `DecryptMessage`) over a loopback TCP connection.
+//!   `DecryptMessage`) over a loopback TCP connection, and a client one
+//!   (`TlsStream::connect`, `InitializeSecurityContextW`) for the few requests PeerParty
+//!   passes on to a real service (xboxlive/real.rs). The client checks the server's
+//!   chain and name with Windows' SSL policy and never accepts PeerParty's own
+//!   certificate (a redirected lookup must not make it talk to itself).
 //! - Trust: crypt32's `CertGetCertificateChain` is hooked, and only for that exact
 //!   certificate it builds the chain with an engine whose sole root is the certificate
 //!   itself. Every other chain, and every other process, is untouched; nothing goes into
@@ -25,8 +29,9 @@ use std::sync::OnceLock;
 use retour::GenericDetour;
 use windows_sys::Win32::Security::Authentication::Identity::{
     AcceptSecurityContext, AcquireCredentialsHandleW, DecryptMessage, DeleteSecurityContext,
-    EncryptMessage, FreeContextBuffer, QueryContextAttributesW, SCHANNEL_CRED, SecBuffer,
-    SecBufferDesc, SecPkgContext_StreamSizes, UNISP_NAME_W,
+    EncryptMessage, FreeContextBuffer, FreeCredentialsHandle, InitializeSecurityContextW,
+    QueryContextAttributesW, SCHANNEL_CRED, SecBuffer, SecBufferDesc, SecPkgContext_StreamSizes,
+    UNISP_NAME_W,
 };
 use windows_sys::Win32::Security::Credentials::SecHandle;
 use windows_sys::Win32::Security::Cryptography::{
@@ -35,7 +40,9 @@ use windows_sys::Win32::Security::Cryptography::{
     CRYPT_INTEGER_BLOB, CRYPT_KEY_PROV_INFO, CertAddCertificateContextToStore,
     CertCreateCertificateChainEngine, CertCreateSelfSignCertificate, CertOpenStore,
     CertStrToNameW, CryptAcquireContextW, CryptEncodeObjectEx, CryptGenKey, CryptGetUserKey,
-    MS_ENH_RSA_AES_PROV_W, X509_ALTERNATE_NAME,
+    MS_ENH_RSA_AES_PROV_W, X509_ALTERNATE_NAME, CERT_CHAIN_PARA, CERT_CHAIN_POLICY_PARA,
+    CERT_CHAIN_POLICY_STATUS, CertFreeCertificateChain, CertFreeCertificateContext,
+    CertGetCertificateChain, CertVerifyCertificateChainPolicy,
 };
 
 use crate::hook::with_lock;
@@ -57,6 +64,16 @@ const CERT_STORE_ADD_ALWAYS: u32 = 4;
 const SECPKG_CRED_INBOUND: u32 = 1;
 const SP_PROT_TLS1_2_SERVER: u32 = 0x400;
 const SECPKG_ATTR_STREAM_SIZES: u32 = 4;
+const SECPKG_ATTR_REMOTE_CERT_CONTEXT: u32 = 0x53;
+const SECPKG_CRED_OUTBOUND: u32 = 2;
+const SCH_CRED_NO_DEFAULT_CREDS: u32 = 0x10;
+const SCH_USE_STRONG_CRYPTO: u32 = 0x0040_0000;
+const ISC_FLAGS: u32 = 0x4 // replay detect
+    | 0x8 // sequence detect
+    | 0x10 // confidentiality
+    | 0x100 // allocate memory
+    | 0x4000 // extended error
+    | 0x8000; // stream
 
 const SECBUFFER_EMPTY: u32 = 0;
 const SECBUFFER_DATA: u32 = 1;
@@ -76,6 +93,11 @@ const SEC_E_OK: i32 = 0;
 const SEC_I_CONTINUE_NEEDED: i32 = 0x0009_0312;
 const SEC_I_CONTEXT_EXPIRED: i32 = 0x0009_0317;
 const SEC_E_INCOMPLETE_MESSAGE: i32 = 0x8009_0318_u32 as i32;
+/// DecryptMessage: a handshake message came (TLS 1.3's key updates and tickets, a TLS
+/// 1.2 renegotiation): it goes back through AcceptSecurityContext.
+const SEC_I_RENEGOTIATE: i32 = 0x0009_0321;
+/// The most handshake bytes held while waiting for a message to be whole.
+const MAX_HANDSHAKE: usize = 64 * 1024;
 
 struct Cert {
     #[cfg_attr(not(test), allow(dead_code))]
@@ -610,6 +632,8 @@ pub struct TlsStream {
     /// Decrypted bytes not yet read.
     plain: Vec<u8>,
     eof: bool,
+    /// A client stream's credentials and the server name it checks.
+    client: Option<(SecHandle, Vec<u16>)>,
 }
 
 fn buf(kind: u32, data: *mut u8, len: usize) -> SecBuffer {
@@ -641,72 +665,16 @@ fn read_more(sock: &mut TcpStream, into: &mut Vec<u8>) -> io::Result<()> {
 impl TlsStream {
     /// Runs the server side of the handshake.
     pub fn accept(mut sock: TcpStream) -> io::Result<TlsStream> {
-        let cert = cert().ok_or_else(|| io::Error::other("no certificate"))?;
         let mut ctx = SecHandle {
             dwLower: 0,
             dwUpper: 0,
         };
-        let mut have_ctx = false;
         let mut incoming = Vec::new();
-        loop {
-            if incoming.is_empty() {
-                read_more(&mut sock, &mut incoming)?;
+        if let Err(e) = handshake(&mut sock, &mut ctx, false, &mut incoming) {
+            if ctx.dwLower != 0 || ctx.dwUpper != 0 {
+                unsafe { DeleteSecurityContext(&ctx) };
             }
-            let mut in_bufs = [
-                buf(SECBUFFER_TOKEN, incoming.as_mut_ptr(), incoming.len()),
-                buf(SECBUFFER_EMPTY, ptr::null_mut(), 0),
-            ];
-            let in_desc = desc(&mut in_bufs);
-            let mut out_bufs = [buf(SECBUFFER_TOKEN, ptr::null_mut(), 0)];
-            let mut out_desc = desc(&mut out_bufs);
-            let mut attrs = 0u32;
-            let rc = unsafe {
-                AcceptSecurityContext(
-                    &cert.credentials,
-                    if have_ctx { &ctx } else { ptr::null() },
-                    &in_desc,
-                    ASC_FLAGS,
-                    0,
-                    &mut ctx,
-                    &mut out_desc,
-                    &mut attrs,
-                    ptr::null_mut(),
-                )
-            };
-            have_ctx = true;
-            let out = out_bufs[0];
-            if out.cbBuffer > 0 && !out.pvBuffer.is_null() {
-                let token =
-                    unsafe { std::slice::from_raw_parts(out.pvBuffer as *const u8, out.cbBuffer as usize) };
-                let sent = sock.write_all(token);
-                unsafe { FreeContextBuffer(out.pvBuffer) };
-                sent?;
-            }
-            match rc {
-                SEC_E_INCOMPLETE_MESSAGE => {
-                    read_more(&mut sock, &mut incoming)?;
-                    continue;
-                }
-                SEC_I_CONTINUE_NEEDED | SEC_E_OK => {
-                    if in_bufs[1].BufferType == SECBUFFER_EXTRA && in_bufs[1].cbBuffer > 0 {
-                        let keep = in_bufs[1].cbBuffer as usize;
-                        incoming.drain(..incoming.len() - keep);
-                    } else {
-                        incoming.clear();
-                    }
-                    if rc == SEC_E_OK {
-                        break;
-                    }
-                }
-                other => {
-                    if have_ctx {
-                        unsafe { DeleteSecurityContext(&ctx) };
-                    }
-                    return Err(io::Error::other(format!(
-                        "AcceptSecurityContext {other:#x}"
-                    )));
-                }
-            }
+            return Err(e);
         }
         let mut sizes: SecPkgContext_StreamSizes = unsafe { std::mem::zeroed() };
         let rc = unsafe {
@@ -723,8 +691,218 @@ impl TlsStream {
             incoming,
             plain: Vec::new(),
             eof: false,
+            client: None,
         })
     }
+
+    /// Runs the client side of a handshake with `host` (its name goes out as SNI and is
+    /// what the server's certificate must name).
+    pub fn connect(mut sock: TcpStream, host: &str) -> io::Result<TlsStream> {
+        let mut sc: SCHANNEL_CRED = unsafe { std::mem::zeroed() };
+        sc.dwVersion = 4;
+        // No client certificate offered; the server's checked by Schannel and below.
+        sc.dwFlags = SCH_CRED_NO_DEFAULT_CREDS | SCH_USE_STRONG_CRYPTO;
+        let mut creds = SecHandle { dwLower: 0, dwUpper: 0 };
+        let rc = unsafe {
+            AcquireCredentialsHandleW(ptr::null(), UNISP_NAME_W, SECPKG_CRED_OUTBOUND, ptr::null(), &sc as *const _ as *const _, None, ptr::null(), &mut creds, ptr::null_mut())
+        };
+        if rc != SEC_E_OK {
+            return Err(io::Error::other(format!("AcquireCredentialsHandle (client) {rc:#x}")));
+        }
+        let target = wide(host);
+        let mut ctx = SecHandle { dwLower: 0, dwUpper: 0 };
+        let mut incoming = Vec::new();
+        let done = client_handshake(&mut sock, &creds, &target, &mut ctx, false, &mut incoming).and_then(|()| check_server(&ctx, host));
+        let sizes = done.and_then(|()| {
+            let mut sizes: SecPkgContext_StreamSizes = unsafe { std::mem::zeroed() };
+            let rc = unsafe { QueryContextAttributesW(&ctx, SECPKG_ATTR_STREAM_SIZES, &mut sizes as *mut _ as *mut _) };
+            if rc == SEC_E_OK { Ok(sizes) } else { Err(io::Error::other(format!("QueryContextAttributes {rc:#x}"))) }
+        });
+        match sizes {
+            Ok(sizes) => Ok(TlsStream { sock, ctx, sizes, incoming, plain: Vec::new(), eof: false, client: Some((creds, target)) }),
+            Err(e) => {
+                if ctx.dwLower != 0 || ctx.dwUpper != 0 {
+                    unsafe { DeleteSecurityContext(&ctx) };
+                }
+                unsafe { FreeCredentialsHandle(&creds) };
+                Err(e)
+            }
+        }
+    }
+}
+
+/// The client side of a handshake on `ctx`: the first (`have_ctx` false), or one the
+/// server starts later (TLS 1.3's tickets and key updates come as SEC_I_RENEGOTIATE).
+fn client_handshake(sock: &mut TcpStream, creds: &SecHandle, target: &[u16], ctx: &mut SecHandle, mut have_ctx: bool, incoming: &mut Vec<u8>) -> io::Result<()> {
+    loop {
+        if have_ctx && incoming.is_empty() {
+            read_more(sock, incoming)?;
+        }
+        if incoming.len() > MAX_HANDSHAKE {
+            return Err(io::Error::other("handshake too long"));
+        }
+        let mut in_bufs = [buf(SECBUFFER_TOKEN, incoming.as_mut_ptr(), incoming.len()), buf(SECBUFFER_EMPTY, ptr::null_mut(), 0)];
+        let in_desc = desc(&mut in_bufs);
+        let mut out_bufs = [buf(SECBUFFER_TOKEN, ptr::null_mut(), 0)];
+        let mut out_desc = desc(&mut out_bufs);
+        let mut attrs = 0u32;
+        let rc = unsafe {
+            InitializeSecurityContextW(
+                creds,
+                if have_ctx { &*ctx } else { ptr::null() },
+                target.as_ptr(),
+                ISC_FLAGS,
+                0,
+                0,
+                if have_ctx { &in_desc } else { ptr::null() },
+                0,
+                &mut *ctx,
+                &mut out_desc,
+                &mut attrs,
+                ptr::null_mut(),
+            )
+        };
+        have_ctx = true;
+        let out = out_bufs[0];
+        if out.cbBuffer > 0 && !out.pvBuffer.is_null() {
+            let token = unsafe { std::slice::from_raw_parts(out.pvBuffer as *const u8, out.cbBuffer as usize) };
+            let sent = sock.write_all(token);
+            unsafe { FreeContextBuffer(out.pvBuffer) };
+            sent?;
+        }
+        match rc {
+            SEC_E_INCOMPLETE_MESSAGE => read_more(sock, incoming)?,
+            SEC_I_CONTINUE_NEEDED | SEC_E_OK => {
+                if in_bufs[1].BufferType == SECBUFFER_EXTRA && in_bufs[1].cbBuffer > 0 {
+                    let keep = in_bufs[1].cbBuffer as usize;
+                    incoming.drain(..incoming.len() - keep);
+                } else {
+                    incoming.clear();
+                }
+                if rc == SEC_E_OK {
+                    return Ok(());
+                }
+            }
+            other => return Err(io::Error::other(format!("InitializeSecurityContext {other:#x}"))),
+        }
+    }
+}
+
+/// The server's certificate chains to a trusted root and names `host` (Windows' SSL
+/// policy, as .NET checks it), and isn't PeerParty's own.
+fn check_server(ctx: &SecHandle, host: &str) -> io::Result<()> {
+    let mut cert: *const CERT_CONTEXT = ptr::null();
+    let rc = unsafe { QueryContextAttributesW(ctx, SECPKG_ATTR_REMOTE_CERT_CONTEXT, &mut cert as *mut _ as *mut _) };
+    if rc != SEC_E_OK || cert.is_null() {
+        return Err(io::Error::other(format!("no server certificate ({rc:#x})")));
+    }
+    let verdict = if is_peerparty(cert) { Err(io::Error::other("the server is PeerParty's own")) } else { ssl_policy(cert, host) };
+    unsafe { CertFreeCertificateContext(cert) };
+    verdict
+}
+
+#[repr(C)]
+struct SslPolicy {
+    size: u32,
+    auth_type: u32,
+    checks: u32,
+    server_name: *const u16,
+}
+
+/// Windows' SSL policy verdict on `cert` for `host`: chain built with the default
+/// engine, then checked (0 = trusted).
+fn ssl_policy(cert: *const CERT_CONTEXT, host: &str) -> io::Result<()> {
+    let mut para: CERT_CHAIN_PARA = unsafe { std::mem::zeroed() };
+    para.cbSize = std::mem::size_of::<CERT_CHAIN_PARA>() as u32;
+    let mut chain = ptr::null_mut();
+    let built = unsafe { CertGetCertificateChain(0, cert, ptr::null(), ptr::null_mut(), &para, 0, ptr::null(), &mut chain) };
+    if built == 0 {
+        return Err(io::Error::other(os_error("CertGetCertificateChain")));
+    }
+    let name = wide(host);
+    let mut ssl = SslPolicy { size: std::mem::size_of::<SslPolicy>() as u32, auth_type: 2, checks: 0, server_name: name.as_ptr() };
+    let policy = CERT_CHAIN_POLICY_PARA { cbSize: std::mem::size_of::<CERT_CHAIN_POLICY_PARA>() as u32, dwFlags: 0, pvExtraPolicyPara: &mut ssl as *mut _ as *mut _ };
+    let mut status: CERT_CHAIN_POLICY_STATUS = unsafe { std::mem::zeroed() };
+    status.cbSize = std::mem::size_of::<CERT_CHAIN_POLICY_STATUS>() as u32;
+    let ok = unsafe { CertVerifyCertificateChainPolicy(4 as _, chain, &policy, &mut status) };
+    unsafe { CertFreeCertificateChain(chain) };
+    match (ok, status.dwError) {
+        (0, _) => Err(io::Error::other(os_error("CertVerifyCertificateChainPolicy"))),
+        (_, 0) => Ok(()),
+        (_, e) => Err(io::Error::other(format!("the server's certificate isn't trusted for {host} ({e:#x})"))),
+    }
+}
+
+/// The server side of a handshake on `ctx`: the first one (`have_ctx` false), or one
+/// the client starts later (`SEC_I_RENEGOTIATE`). `incoming` holds what was read and
+/// not used; what is left over after the handshake stays there.
+fn handshake(sock: &mut TcpStream, ctx: &mut SecHandle, mut have_ctx: bool, incoming: &mut Vec<u8>) -> io::Result<()> {
+    let cert = cert().ok_or_else(|| io::Error::other("no certificate"))?;
+    {
+        loop {
+            if incoming.is_empty() {
+                read_more(sock, incoming)?;
+            }
+            if incoming.len() > MAX_HANDSHAKE {
+                return Err(io::Error::other("handshake too long"));
+            }
+            let mut in_bufs = [
+                buf(SECBUFFER_TOKEN, incoming.as_mut_ptr(), incoming.len()),
+                buf(SECBUFFER_EMPTY, ptr::null_mut(), 0),
+            ];
+            let in_desc = desc(&mut in_bufs);
+            let mut out_bufs = [buf(SECBUFFER_TOKEN, ptr::null_mut(), 0)];
+            let mut out_desc = desc(&mut out_bufs);
+            let mut attrs = 0u32;
+            let rc = unsafe {
+                AcceptSecurityContext(
+                    &cert.credentials,
+                    if have_ctx { &*ctx } else { ptr::null() },
+                    &in_desc,
+                    ASC_FLAGS,
+                    0,
+                    &mut *ctx,
+                    &mut out_desc,
+                    &mut attrs,
+                    ptr::null_mut(),
+                )
+            };
+            have_ctx = true;
+            let out = out_bufs[0];
+            if out.cbBuffer > 0 && !out.pvBuffer.is_null() {
+                let token =
+                    unsafe { std::slice::from_raw_parts(out.pvBuffer as *const u8, out.cbBuffer as usize) };
+                let sent = sock.write_all(token);
+                unsafe { FreeContextBuffer(out.pvBuffer) };
+                sent?;
+            }
+            match rc {
+                SEC_E_INCOMPLETE_MESSAGE => {
+                    read_more(sock, incoming)?;
+                    continue;
+                }
+                SEC_I_CONTINUE_NEEDED | SEC_E_OK => {
+                    if in_bufs[1].BufferType == SECBUFFER_EXTRA && in_bufs[1].cbBuffer > 0 {
+                        let keep = in_bufs[1].cbBuffer as usize;
+                        incoming.drain(..incoming.len() - keep);
+                    } else {
+                        incoming.clear();
+                    }
+                    if rc == SEC_E_OK {
+                        return Ok(());
+                    }
+                }
+                other => {
+                    return Err(io::Error::other(format!(
+                        "AcceptSecurityContext {other:#x}"
+                    )));
+                }
+            }
+        }
+    }
+}
+
+impl TlsStream {
 
     /// A read timeout on the socket underneath: a read that times out fails with
     /// WouldBlock / TimedOut and loses nothing (Wire polls its outbox between reads).
@@ -776,6 +954,23 @@ impl TlsStream {
                     Err(e) => return Err(e),
                 },
                 SEC_I_CONTEXT_EXPIRED => self.eof = true,
+                SEC_I_RENEGOTIATE => {
+                    // The record's handshake message goes to AcceptSecurityContext (as
+                    // the extra buffer); any data that came with it is kept.
+                    let mut extra = Vec::new();
+                    for b in &bufs {
+                        if b.BufferType == SECBUFFER_DATA && b.cbBuffer > 0 {
+                            self.plain.extend_from_slice(unsafe { std::slice::from_raw_parts(b.pvBuffer as *const u8, b.cbBuffer as usize) });
+                        } else if b.BufferType == SECBUFFER_EXTRA && b.cbBuffer > 0 {
+                            extra = unsafe { std::slice::from_raw_parts(b.pvBuffer as *const u8, b.cbBuffer as usize) }.to_vec();
+                        }
+                    }
+                    self.incoming = extra;
+                    match &self.client {
+                        Some((creds, target)) => client_handshake(&mut self.sock, creds, target, &mut self.ctx, true, &mut self.incoming)?,
+                        None => handshake(&mut self.sock, &mut self.ctx, true, &mut self.incoming)?,
+                    }
+                }
                 other => return Err(io::Error::other(format!("DecryptMessage {other:#x}"))),
             }
         }
@@ -829,6 +1024,9 @@ impl Write for TlsStream {
 impl Drop for TlsStream {
     fn drop(&mut self) {
         unsafe { DeleteSecurityContext(&self.ctx) };
+        if let Some((creds, _)) = &self.client {
+            unsafe { FreeCredentialsHandle(creds) };
+        }
     }
 }
 
@@ -912,6 +1110,20 @@ mod tests {
         assert_eq!(verdict("privacy.xboxlive.com"), 0);
         assert_eq!(verdict("achievements.xboxlive.com"), 0x800B_010F, "CERT_E_CN_NO_MATCH");
         assert_eq!(verdict("www.example.com"), 0x800B_010F, "CERT_E_CN_NO_MATCH");
+
+        // The client side refuses our server's certificate even now that the chain hook
+        // trusts it here: Schannel's own check doesn't go through the hook (an untrusted
+        // root), and past it ours refuses PeerParty's certificate. A redirected lookup
+        // must not have PeerParty talk to itself (xboxlive/real.rs).
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            let _ = TlsStream::accept(s);
+        });
+        let e = TlsStream::connect(TcpStream::connect(("127.0.0.1", port)).unwrap(), "privacy.xboxlive.com").err().expect("refused");
+        assert!(e.to_string().contains("PeerParty's own") || e.to_string().contains("0x80090325"), "{e}");
+        let _ = server.join();
 
         // Unity's TLS reads the ROOT store and checks the chain itself: once armed, the
         // ROOT store this process opens lists our certificate; other stores don't, and

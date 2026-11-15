@@ -6,8 +6,10 @@
 //! Also gives the exe its resources: the icon (drawn from `src/icon_art.rs`, the window's
 //! too), a manifest (run as the user, never elevated; the Windows versions it knows),
 //! and a version resource naming it PeerParty. The version is the package version plus
-//! a build number, the commits since git's `v<version>` tag (`git describe`), so a
-//! peerparty.exe names its commit: 0.1.0.5 is five commits after v0.1.0.
+//! a build number, the commits since git's `v<version>` tag (`git describe`): 0.1.0.5
+//! is five commits after v0.1.0. Two builds can share that number (another branch, or
+//! changes not committed yet), so the version strings also carry the commit and say
+//! when the working tree had changes (`v0.1.0-5-gabc1234-dirty`).
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -44,12 +46,11 @@ fn main() {
         .unwrap()
         .to_path_buf();
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
-    // The outer target directory is the ancestor cargo marked with CACHEDIR.TAG.
-    let nested = out
-        .ancestors()
-        .find(|p| p.join("CACHEDIR.TAG").is_file())
-        .map(|t| t.join("hook"))
-        .unwrap_or_else(|| out.join("hook"));
+    // The outer target directory, from OUT_DIR's layout (CACHEDIR.TAG can't say: cargo
+    // marks only some of its folders with it). Without the config's `..` hops: cl.exe
+    // and link.exe, which the hook's build runs, can't open a file whose path as written
+    // passes MAX_PATH, and those hops did once the nested build sat deeper.
+    let nested = target_dir_of(&out).map(|t| normalized(&t).join("hook")).unwrap_or_else(|| normalized(&out).join("hook"));
     let profile = env::var("PROFILE").unwrap();
     let cargo = env::var("CARGO").unwrap();
     // PROFILE is `debug` for dev and test, and `release` for every profile that
@@ -108,6 +109,10 @@ fn main() {
             println!("cargo:rustc-link-arg-bins=/DELAYLOAD:{dll}.dll");
         }
         println!("cargo:rustc-link-arg-bins=delayimp.lib");
+        // The flags reach the launcher's unit-test exe too, which imports none of some of
+        // them: "/DELAYLOAD ignored" (LNK4199) says only that, and rustc shows linker
+        // output as warnings since 1.100.
+        println!("cargo:rustc-link-arg-bins=/IGNORE:4199");
     }
     println!("cargo:rerun-if-env-changed=PEERPARTY_HOOK_RUSTFLAGS");
     println!("cargo:rerun-if-env-changed=PEERPARTY_HOOKS");
@@ -121,21 +126,58 @@ fn main() {
     }
 }
 
-/// The profile's output directory (`debug`, `release`, `testexe`), from
-/// `target/<profile>/build/<pkg>/out` or `target/<triple>/<profile>/build/<pkg>/out`.
-fn profile_dir_of(out: &Path) -> Option<String> {
-    let build = out.parent()?.parent()?;
-    if build.file_name()?.to_str() != Some("build") {
-        return None;
-    }
-    build.parent()?.file_name()?.to_str().map(str::to_string)
+/// The `build` folder OUT_DIR is in: `<profile>/build/<pkg>-<hash>/out` (Cargo up to
+/// 1.99), or `<profile>/build/<pkg>/<hash>/out` (1.100's build-dir layout).
+fn build_dir_of(out: &Path) -> Option<&Path> {
+    out.ancestors().skip(2).take(2).find(|p| p.file_name().and_then(|n| n.to_str()) == Some("build"))
 }
 
-/// Commits since the package version's `v<version>` tag, 0 without git or the tag.
-fn build_number(root: &Path, version: &str) -> u32 {
+/// The target directory, from `target/<profile>/build/...` or
+/// `target/<triple>/<profile>/build/...` (`build_dir_of`).
+fn target_dir_of(out: &Path) -> Option<PathBuf> {
+    let up = build_dir_of(out)?.parent()?.parent()?;
+    let triple = env::var("TARGET").ok();
+    match up.file_name() {
+        Some(n) if triple.as_deref() == n.to_str() => up.parent().map(Path::to_path_buf),
+        _ => Some(up.to_path_buf()),
+    }
+}
+
+/// `p` with its `.` and `..` components worked out, as written (no `\\?\` prefix, which
+/// `canonicalize` would add and not every tool takes).
+fn normalized(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            c => out.push(c.as_os_str()),
+        }
+    }
+    out
+}
+
+/// The profile's output directory (`debug`, `release`, `testexe`): the folder that holds
+/// `build` (`build_dir_of`).
+fn profile_dir_of(out: &Path) -> Option<String> {
+    build_dir_of(out)?.parent()?.file_name()?.to_str().map(str::to_string)
+}
+
+/// Commits since the package version's `v<version>` tag (0 without git or the tag),
+/// and git's whole description of the build ("" without).
+fn build_number(root: &Path, version: &str) -> (u32, String) {
     // Rerun when HEAD moves or a tag appears (a missing path would rerun every build).
     let git = root.join(".git");
-    let mut watch: Vec<PathBuf> = ["HEAD", "refs/tags", "packed-refs"].iter().map(|p| git.join(p)).collect();
+    // And when the working tree may have changed (`--dirty`): git's index, and the
+    // launcher's own sources (the hook's are watched already).
+    let mut watch: Vec<PathBuf> = ["HEAD", "refs/tags", "packed-refs", "index"].iter().map(|p| git.join(p)).collect();
+    watch.push(root.join("launcher").join("src"));
+    watch.push(root.join("launcher").join("locales"));
     if let Ok(head) = std::fs::read_to_string(git.join("HEAD")) {
         if let Some(r) = head.trim().strip_prefix("ref: ") {
             watch.push(git.join(r));
@@ -149,13 +191,13 @@ fn build_number(root: &Path, version: &str) -> u32 {
     no_window(&mut git);
     let out = git
         .current_dir(root)
-        .args(["describe", "--tags", "--long", "--match", &tag])
+        .args(["describe", "--tags", "--long", "--dirty", "--match", &tag])
         .output()
         .ok()
         .filter(|o| o.status.success());
     let Some(out) = out else {
         println!("cargo:warning=no git tag {tag}: peerparty.exe's build number is 0");
-        return 0;
+        return (0, String::new());
     };
     // v0.1.0-5-gabc1234
     let text = String::from_utf8_lossy(&out.stdout);
@@ -163,7 +205,8 @@ fn build_number(root: &Path, version: &str) -> u32 {
     if !text.trim().is_empty() {
         println!("cargo:rustc-env=PEERPARTY_DESCRIBE={}", text.trim());
     }
-    text.trim().rsplitn(3, '-').nth(1).and_then(|n| n.parse().ok()).unwrap_or(0)
+    let clean = text.trim().trim_end_matches("-dirty");
+    (clean.rsplitn(3, '-').nth(1).and_then(|n| n.parse().ok()).unwrap_or(0), text.trim().to_string())
 }
 
 /// The exe's icon, manifest and VERSIONINFO (the package version plus the build
@@ -173,10 +216,11 @@ fn version_resource(root: &Path, out: &Path) {
         return;
     }
     let n = |k: &str| env::var(k).unwrap();
-    let build = build_number(root, &n("CARGO_PKG_VERSION"));
+    let (build, describe) = build_number(root, &n("CARGO_PKG_VERSION"));
     let (major, minor, patch) = (n("CARGO_PKG_VERSION_MAJOR"), n("CARGO_PKG_VERSION_MINOR"), n("CARGO_PKG_VERSION_PATCH"));
     let nums = format!("{major},{minor},{patch},{build}");
-    let v = format!("{major}.{minor}.{patch}.{build}");
+    // The strings name the commit too (the numbers can't).
+    let v = if describe.is_empty() { format!("{major}.{minor}.{patch}.{build}") } else { format!("{major}.{minor}.{patch}.{build} ({describe})") };
     println!("cargo:rerun-if-changed=src/icon_art.rs");
     let ico = out.join("peerparty.ico");
     std::fs::write(&ico, ico_file(&[16, 20, 24, 32, 40, 48, 64, 256])).expect("writing peerparty.ico");

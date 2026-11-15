@@ -262,6 +262,15 @@ impl App {
                             widgets::note(ui, Icon::Warning, theme::WARN, t!("together.join_invalid"));
                         }
                         let mut done = None;
+                        // Enter in the field joins, Esc cancels.
+                        if r.lost_focus() {
+                            let (enter, esc) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+                            if enter && valid {
+                                done = Some(Some(code.trim().to_string()));
+                            } else if esc {
+                                done = Some(None);
+                            }
+                        }
                         ui.horizontal_wrapped(|ui| {
                             if ui.add_enabled_ui(valid, |ui| widgets::button(ui, Some(Icon::Check), t!("together.join_go"), Kind::Primary)).inner.clicked() {
                                 done = Some(Some(code.trim().to_string()));

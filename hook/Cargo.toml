@@ -11,4 +11,8 @@ crate-type = ["cdylib"]
 [dependencies]
 peerparty_core = { path = "../core" }
 retour = "0.3.1"
-windows-sys = { workspace = true, features = ["Win32_Graphics_Gdi", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_DataExchange"] }
+# Voice (voice.rs): Opus in pure Rust, so the hook needs no C toolchain or codec DLL.
+# Its packet parsing and decoding are safe Rust (unsafe only in its SIMD kernels, each
+# guarded where it is called): it reads other players' packets inside the game.
+rusty-opus = "=1.1.1"
+windows-sys = { workspace = true, features = ["Win32_Graphics_Gdi", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_DataExchange", "Win32_System_Pipes", "Win32_System_Environment"] }

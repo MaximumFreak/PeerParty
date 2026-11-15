@@ -113,15 +113,34 @@ fn unreachable(host: &str) -> bool {
 }
 
 /// This process's loopback address for the service.
-fn address() -> Ipv4Addr {
+/// The loopback addresses this process may listen on, its own first: 127.80-95.x.y from
+/// its process id (unique for ids below 2^20, Windows' are far below that), then the
+/// ones after it, in case another process has it (an id wrapped round, or .0 taken as
+/// .1).
+fn addresses() -> impl Iterator<Item = Ipv4Addr> {
     let pid = std::process::id();
-    Ipv4Addr::new(127, 80, (pid >> 8) as u8, (pid as u8).max(1))
+    let first = ((pid & 0xF_FFFF) as u32).max(1);
+    (0..64u32).map(move |i| {
+        let n = (first + i) & 0xF_FFFF;
+        let n = if n & 0xFF == 0 { n | 1 } else { n };
+        Ipv4Addr::new(127, 80 + (n >> 16) as u8, (n >> 8) as u8, n as u8)
+    })
 }
+
+/// Connections served at once: only this process's game connects, a few at a time;
+/// one more than this waits to be accepted until one ends.
+const MAX_CONNECTIONS: usize = 64;
 
 static SERVER: OnceLock<Option<Ipv4Addr>> = OnceLock::new();
 
 /// Starts the service (once) and returns its address. Unity Gaming Services' stand-in
 /// (ugs/) shares it: requests are told apart by their Host header (http.rs).
+/// Whether this game's PlayFab is PeerParty's (its service is up): then every player's
+/// entity is the one their PeerParty id gives (`api::entity_of`), whatever they say.
+pub(crate) fn serving() -> bool {
+    SERVER.get().is_some_and(|s| s.is_some())
+}
+
 pub(crate) fn server() -> Option<Ipv4Addr> {
     *SERVER.get_or_init(|| {
         if !tls::ready() {
@@ -134,13 +153,18 @@ pub(crate) fn server() -> Option<Ipv4Addr> {
         if tls::arm_root_store() == 1 {
             log!("playfab ROOT store reads hooked (PeerParty's certificate is listed in this game only)");
         }
-        let ip = address();
-        let listener = match TcpListener::bind(SocketAddrV4::new(ip, 443)) {
-            Ok(l) => l,
+        let mut last = None;
+        let Some((ip, listener)) = addresses().find_map(|ip| match TcpListener::bind(SocketAddrV4::new(ip, 443)) {
+            Ok(l) => Some((ip, l)),
             Err(e) => {
-                log!("playfab service could not listen on {ip}:443: {e}");
-                return None;
+                last = Some((ip, e));
+                None
             }
+        }) else {
+            if let Some((ip, e)) = last {
+                log!("playfab service could not listen on {ip}:443 (or the addresses before it): {e}");
+            }
+            return None;
         };
         // This game's alone: it answers as the player's own PlayFab and Unity services
         // (their saved data too), so the typed-IP forwarder never brings another
@@ -148,9 +172,27 @@ pub(crate) fn server() -> Option<Ipv4Addr> {
         peerparty_core::own::tcp(443).forever();
         log!("playfab service on https://{ip}:443 (PlayFab's hosts resolve here)");
         std::thread::spawn(move || {
+            static OPEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            use std::sync::atomic::Ordering::SeqCst;
             for conn in listener.incoming() {
                 let Ok(conn) = conn else { continue };
-                std::thread::spawn(move || http::serve(conn));
+                while OPEN.load(SeqCst) >= MAX_CONNECTIONS {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                OPEN.fetch_add(1, SeqCst);
+                let started = std::thread::Builder::new().name("peerparty-playfab-conn".into()).spawn(move || {
+                    struct Done;
+                    impl Drop for Done {
+                        fn drop(&mut self) {
+                            OPEN.fetch_sub(1, SeqCst);
+                        }
+                    }
+                    let _done = Done;
+                    http::serve(conn)
+                });
+                if started.is_err() {
+                    OPEN.fetch_sub(1, SeqCst);
+                }
             }
         });
         Some(ip)

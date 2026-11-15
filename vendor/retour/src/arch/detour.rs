@@ -111,7 +111,10 @@ impl Detour {
 impl Drop for Detour {
   /// Disables the detour, if enabled.
   fn drop(&mut self) {
-    debug_assert!(unsafe { self.disable().is_ok() });
+    // The disable runs in every build: inside `debug_assert!` it was compiled out of
+    // release builds, leaving the patch pointing at a freed trampoline.
+    let disabled = unsafe { self.disable() };
+    debug_assert!(disabled.is_ok());
   }
 }
 

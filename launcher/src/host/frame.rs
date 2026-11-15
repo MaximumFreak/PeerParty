@@ -36,17 +36,30 @@ pub struct Shared {
     last: (usize, usize),
 }
 
+/// The least a block holds (a 1920x1200 frame); a bigger frame gets a bigger block.
+pub const MIN_CAPACITY: usize = 1920 * 1200;
+/// The most: 8K (7680x4320).
+pub const MAX_CAPACITY: usize = 7680 * 4320;
+
 impl Shared {
-    /// A block big enough for a 4K frame, named after the game's process.
-    pub fn create(pid: u32) -> Option<Shared> {
-        let capacity = 3840 * 2400;
-        let name = format!("Local\\peerparty-frame-{pid}");
+    /// A block for frames of up to `pixels` (within MIN_CAPACITY..MAX_CAPACITY), named
+    /// after the game's process and random digits, so nothing can open it by guessing
+    /// or make it first: one that already exists is refused.
+    pub fn create(pid: u32, pixels: usize) -> Option<Shared> {
+        let capacity = pixels.clamp(MIN_CAPACITY, MAX_CAPACITY);
+        let digits: String = peerparty_core::inet::crypto::random_array::<8>().iter().map(|b| format!("{b:02x}")).collect();
+        let name = format!("Local\\peerparty-frame-{pid}-{digits}");
         let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
         let size = HEADER + capacity * 4;
         let map = unsafe {
             CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, (size >> 32) as u32, size as u32, wide.as_ptr())
         };
         if map.is_null() {
+            return None;
+        }
+        // ERROR_ALREADY_EXISTS: someone else's block of that name.
+        if unsafe { windows_sys::Win32::Foundation::GetLastError() } == 183 {
+            unsafe { CloseHandle(map) };
             return None;
         }
         let view = unsafe { MapViewOfFile(map, FILE_MAP_ALL_ACCESS, 0, 0, size) };
@@ -58,6 +71,11 @@ impl Shared {
         s.put(0, MAGIC);
         s.put(28, capacity as u32);
         Some(s)
+    }
+
+    /// Whether a frame of `pixels` fits.
+    pub fn fits(&self, pixels: usize) -> bool {
+        pixels <= self.capacity
     }
 
     fn word(&self, off: usize) -> &AtomicU32 {

@@ -11,6 +11,18 @@ gets a `~<argument count>` suffix ("SendMessages~3"): peerparty looks methods up
 name and implements the newest signature, so it leaves that slot alone unless it has
 an implementation for that older shape too (on x86 the argument count decides how
 much stack the method pops).
+
+Valve sometimes added methods at the end of an interface without a new version string
+(SteamUtils005 has 19, 20 and 23 methods across SDKs 1.07 to 1.23a). Steam's client
+implements each version once, in its longest form, so where a version appears more than
+once the longest shape is kept (each shorter one must be a prefix of it).
+
+The SteamUtils, SteamUserStats, SteamApps, SteamUGC, SteamController and SteamInput
+tables were generated from Valve's SDK headers as Valve publishes them in its Proton
+repository (lsteamclient/steamworks_sdk_*/isteam*.h, one copy per SDK release, put in
+one folder with the SDK's name in front of each file's). That set starts at SDK 0.99,
+so it lacks some older versions the other families' tables have: generate only the
+families it adds, and keep the rest.
 """
 
 import os
@@ -29,13 +41,39 @@ FAMILIES = {
     "ISteamNetworkingUtils": ("SteamNetworkingUtils", "STEAMNETWORKINGUTILS_INTERFACE_VERSION"),
     "ISteamGameServer": ("SteamGameServer", "STEAMGAMESERVER_INTERFACE_VERSION"),
     "ISteamMatchmakingServers": ("SteamMatchMakingServers", "STEAMMATCHMAKINGSERVERS_INTERFACE_VERSION"),
+    "ISteamUtils": ("SteamUtils", "STEAMUTILS_INTERFACE_VERSION"),
+    "ISteamUserStats": ("STEAMUSERSTATS_INTERFACE_VERSION", "STEAMUSERSTATS_INTERFACE_VERSION"),
+    "ISteamApps": ("STEAMAPPS_INTERFACE_VERSION", "STEAMAPPS_INTERFACE_VERSION"),
+    "ISteamUGC": ("STEAMUGC_INTERFACE_VERSION", "STEAMUGC_INTERFACE_VERSION"),
+    "ISteamController": ("SteamController", "STEAMCONTROLLER_INTERFACE_VERSION"),
+    "ISteamInput": ("SteamInput", "STEAMINPUT_INTERFACE_VERSION"),
 }
-DEFINED = {"STEAM_WIN32", "_WIN32", "WIN32"}
+# The Steamworks SDK defines STEAMNETWORKINGSOCKETS_ENABLE_SDR (steamnetworkingtypes.h):
+# the relay and ping methods are in Steam's networking interfaces.
+DEFINED = {"STEAM_WIN32", "_WIN32", "WIN32", "STEAMNETWORKINGSOCKETS_ENABLE_SDR"}
+
+
+def condition(expr):
+    """An #if / #elif expression, as the C preprocessor reads it: defined(X) and
+    defined X against DEFINED, numbers, !, &&, ||, comparisons and parentheses; any
+    other name is 0."""
+    e = re.sub(r"\bdefined\s*\(\s*(\w+)\s*\)|\bdefined\s+(\w+)", lambda m: "1" if (m.group(1) or m.group(2)) in DEFINED else "0", expr)
+    e = e.replace("&&", " and ").replace("||", " or ")
+    e = re.sub(r"!(?!=)", " not ", e)
+    e = re.sub(r"\b[A-Za-z_]\w*\b", lambda m: m.group(0) if m.group(0) in ("and", "or", "not") else "0", e)
+    e = re.sub(r"\b(\d+)[uUlL]+\b", r"\1", e)
+    if not re.fullmatch(r"[\d\s()<>=!andortn]*", e):
+        return False
+    try:
+        return bool(eval(e, {"__builtins__": {}}, {}))
+    except Exception:
+        return False
 
 
 def preprocess(text):
     text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
     text = re.sub(r"//[^\n]*", "", text)
+    # Each open #if: [this branch on, some branch of it already taken].
     out, stack = [], []
     for line in text.split("\n"):
         s = line.strip()
@@ -43,16 +81,19 @@ def preprocess(text):
         if m:
             kind, arg = m.group(1), m.group(2).strip()
             if kind == "ifdef":
-                stack.append([arg in DEFINED, arg in DEFINED])
+                on = arg in DEFINED
+                stack.append([on, on])
             elif kind == "ifndef":
-                stack.append([arg not in DEFINED, arg not in DEFINED])
+                on = arg not in DEFINED
+                stack.append([on, on])
             elif kind == "if":
-                # Only "#if 0"-style and platform checks appear in these headers.
-                stack.append([False, False])
+                on = condition(arg)
+                stack.append([on, on])
             elif kind == "elif":
-                stack[-1][0] = False
+                on = not stack[-1][1] and condition(arg)
+                stack[-1] = [on, stack[-1][1] or on]
             elif kind == "else":
-                stack[-1][0] = not stack[-1][1]
+                stack[-1] = [not stack[-1][1], True]
             elif kind == "endif":
                 stack.pop()
             continue
@@ -85,6 +126,24 @@ def norm(params):
     return tuple(types)
 
 
+class Sig(tuple):
+    """A method's signature: (parameter types, return type, const). len() is the
+    parameter count (what `~N` names say)."""
+
+    def __new__(cls, params, ret, const):
+        t = super().__new__(cls, (tuple(params), ret, const))
+        return t
+
+    def __len__(self):
+        return len(self[0])
+
+    def __eq__(self, other):
+        return tuple.__eq__(self, other)
+
+    def __hash__(self):
+        return tuple.__hash__(self)
+
+
 def methods(body):
     # Strip nested braces (inline helpers) so only declarations remain.
     flat, depth = [], 0
@@ -110,9 +169,13 @@ def methods(body):
             args = [a.strip() for a in m.group(2).split(",")]
             name = args[1]
             types = tuple(args[2::2])
-            found.append((name, types))
+            found.append((name, Sig(types, args[0], False)))
         else:
-            found.append((m.group(4), norm(m.group(5))))
+            # The signature: the parameters' types, the return type and constness
+            # (a method whose return type changed is another method in that slot).
+            ret = re.sub(r"\s+", " ", m.group(3).replace("*", " * ").replace("&", " & ")).strip()
+            const = bool(re.search(r"\)\s*const\s*=\s*0\s*;$", m.group(0)))
+            found.append((m.group(4), Sig(norm(m.group(5)), ret, const)))
     # MSVC: overloads grouped at the first one's slot, in reverse declaration order.
     order, seen = [], {}
     for i, (name, sig) in enumerate(found):
@@ -147,6 +210,20 @@ def main(sdk):
                     version = d.group(1)
                 versions.append((version, methods(body)))
         versions.sort(key=lambda v: v[0])
+        if not versions:
+            continue
+        # One shape per version: the longest, which every other must start like.
+        longest = {}
+        for version, ms in versions:
+            kept = longest.get(version)
+            if kept is None or len(ms) > len(kept):
+                short, longer = (kept or []), ms
+                longest[version] = ms
+            else:
+                short, longer = ms, kept
+            if [n for n, _ in short] != [n for n, _ in longer[: len(short)]]:
+                sys.stderr.write("%s: shapes differ, not just added methods\n" % version)
+        versions = sorted(longest.items())
         newest = dict(versions[-1][1])
         for version, ms in versions:
             if any(v == version for v, _ in tables):

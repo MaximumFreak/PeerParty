@@ -132,6 +132,10 @@ struct Host {
     toast_canvas: raster::Canvas,
     window: Option<window::Layered>,
     toast_window: Option<window::Layered>,
+    /// Whether this copy was told it plays as a later slot (`toast.later_slot`).
+    slot_told: bool,
+    /// While toasts wait for the game to come back to the front: when they last did.
+    toasts_held: Option<Instant>,
     pads: pad::Pads,
     visible: bool,
     dirty: bool,
@@ -144,6 +148,8 @@ struct Host {
     /// Whether the overlay's pointer shows: only once the mouse moves or clicks after
     /// opening, and hidden again when the controller or keyboard navigates.
     pointer: bool,
+    /// A click that only showed the pointer: its release is swallowed too (left or not).
+    click_shown: Option<bool>,
     ppp: f32,
     started: Instant,
     // Hotkey edges.
@@ -180,6 +186,8 @@ struct Host {
     /// each new problem toasts once.
     fw_blocked: bool,
     unreachable: u64,
+    /// Copies of the game on another PeerParty, at the last state (toasted when it starts).
+    other_version: u64,
     /// A firewall fix under way: what to say when it's done, and whether it worked.
     fixing: Option<Receiver<(String, bool)>>,
     /// Opening hotkeys held at the last tick, seen whether or not they could open the
@@ -227,6 +235,8 @@ pub fn run(process: HANDLE, pid: u32, pipe: pipe::Pipe, exe: &Path, prefs: Prefs
         toast_canvas: raster::Canvas::new(0, 0),
         window: None,
         toast_window: None,
+        toasts_held: None,
+        slot_told: false,
         pads: pad::Pads::new(),
         visible: false,
         dirty: true,
@@ -234,6 +244,7 @@ pub fn run(process: HANDLE, pid: u32, pipe: pipe::Pipe, exe: &Path, prefs: Prefs
         hwnd_checked: None,
         cursor: egui::Pos2::new(400.0, 300.0),
         pointer: false,
+        click_shown: None,
         ppp: 1.0,
         started: Instant::now(),
         keys_down: [false; 4],
@@ -258,6 +269,7 @@ pub fn run(process: HANDLE, pid: u32, pipe: pipe::Pipe, exe: &Path, prefs: Prefs
         fw_checked: None,
         fw_blocked: false,
         unreachable: 0,
+        other_version: 0,
         fixing: None,
         diag_keys: [false; 4],
         key_left_told: false,
@@ -299,6 +311,7 @@ pub fn run(process: HANDLE, pid: u32, pipe: pipe::Pipe, exe: &Path, prefs: Prefs
         }
     }
     input::capture(false);
+    input::watch_hotkeys(&[]);
     host.saver.finish();
 }
 
@@ -537,9 +550,13 @@ impl Host {
                 self.frame_open();
             }
         } else if front && self.prefs.overlay && !gamebar {
+            // The game doesn't get the opening hotkeys (input.rs `watch_hotkeys`).
+            let vks: Vec<u32> = self.hotkeys().iter().filter(|(on, _)| *on).map(|(_, vk)| *vk).collect();
+            input::watch_hotkeys(&vks);
             self.check_open();
             polled = true;
         } else {
+            input::watch_hotkeys(&[]);
             self.why_not_open(front, gamebar);
             // A Home or hotkey still down when the game comes back to the front (Guide
             // closing Game Bar) isn't a press.
@@ -601,12 +618,23 @@ impl Host {
                         }
                     }
                 }
+                // Another copy of this game holds the PC's first player: this one is
+                // another player (its own name, id and saves). Said once.
+                if st.me_slot > 0 && !self.slot_told && self.prefs.toasts {
+                    self.slot_told = true;
+                    self.overlay.toast(crate::t!("toast.later_slot", name = st.me), crate::t!("toast.later_slot_detail").to_string());
+                }
                 // Players on our network we can't reach: say so once, when it starts.
                 let unreachable = st.lan_unreachable.unwrap_or(0);
                 if unreachable > 0 && self.unreachable == 0 && !self.visible {
                     self.overlay.toast(crate::t!("overlay.unreachable", n = unreachable), crate::t!("toast.unreachable_detail"));
                 }
                 self.unreachable = unreachable;
+                // And players of this game on another PeerParty, who never show up.
+                if st.other_version > 0 && self.other_version == 0 && !self.visible {
+                    self.overlay.toast(ui::other_version_title(&st), ui::other_version_detail(&st));
+                }
+                self.other_version = st.other_version;
                 self.seen_pending = st.pending.iter().map(|p| p.id).collect();
                 self.seen_peers = st.peers.iter().map(|p| p.id.clone()).collect();
                 self.first_state = false;
@@ -626,6 +654,12 @@ impl Host {
             Some("note") => {
                 let s = |k: &str| msg.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
                 self.overlay.note(&s("title"), &s("detail"), self.visible);
+                self.dirty = true;
+            }
+            Some("local_saves") => {
+                let s = |k: &str| msg.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+                let (service, path) = (s("service"), s("path"));
+                self.overlay.note(&crate::t!("toast.local_saves", service = service), &crate::t!("toast.local_saves_detail", service = service, path = path), self.visible);
                 self.dirty = true;
             }
             Some("close") => self.hide(),
@@ -696,9 +730,12 @@ impl Host {
         let shift = down(VK_SHIFT);
         let keys = self.hotkeys();
         let mut open = None;
+        // Taken from the game by the keyboard hook (which keeps it from the key state
+        // read below), or seen by polling where there's no hook.
+        let hit = input::take_hotkey();
         for (i, (on, vk)) in keys.iter().enumerate() {
             let d = down(*vk as i32);
-            if *on && shift && d && !self.keys_down[i] {
+            if *on && ((shift && d && !self.keys_down[i]) || hit == Some(*vk)) {
                 open = Some(HOTKEY_NAMES[i].to_string());
             }
             self.keys_down[i] = d;
@@ -772,6 +809,7 @@ impl Host {
         self.render.invalidate();
         self.cursor = egui::Pos2::new(((r.right - r.left) / 2) as f32 / self.ppp, ((r.bottom - r.top) / 2) as f32 / self.ppp);
         self.pointer = false;
+        self.click_shown = None;
         // Buttons held while opening don't act on the first frame.
         self.pad_prev = self.pads.poll();
         self.repeat = None;
@@ -858,8 +896,22 @@ impl Host {
                     self.cursor.x = (self.cursor.x + dx as f32 / self.ppp).clamp(0.0, screen.x - 1.0);
                     self.cursor.y = (self.cursor.y + dy as f32 / self.ppp).clamp(0.0, screen.y - 1.0);
                     moved = true;
+                    // A click after a move acts: the pointer shows from the move on.
+                    self.pointer = true;
                 }
                 input::Input::Button { left, down } => {
+                    // A click while the pointer is hidden only shows it: the player
+                    // hasn't seen where it is, so it doesn't act there.
+                    if !self.pointer && down {
+                        self.pointer = true;
+                        self.click_shown = Some(left);
+                        events.push(egui::Event::PointerMoved(self.cursor));
+                        continue;
+                    }
+                    if !down && self.click_shown == Some(left) {
+                        self.click_shown = None;
+                        continue;
+                    }
                     if !self.pointer {
                         self.pointer = true;
                         events.push(egui::Event::PointerMoved(self.cursor));
@@ -1129,14 +1181,21 @@ impl Host {
         }
     }
 
+    /// The frame block for drawing inside the game, made (or made again, bigger) for a
+    /// frame of `pixels`; the hook is told its name each time.
+    fn frame_for(&mut self, pixels: usize) {
+        if self.frame.as_ref().is_some_and(|f| f.fits(pixels)) {
+            return;
+        }
+        if let Some(f) = frame::Shared::create(self.pid, pixels) {
+            self.pipe.send(json!({"t": "frame", "name": f.name}));
+            self.frame = Some(f);
+        }
+    }
+
     fn present(&mut self, x: i32, y: i32, dirty: &[[i32; 4]]) {
         if self.use_ingame() {
-            if self.frame.is_none() {
-                self.frame = frame::Shared::create(self.pid);
-                if let Some(f) = &self.frame {
-                    self.pipe.send(json!({"t": "frame", "name": f.name}));
-                }
-            }
+            self.frame_for(self.render.canvas.w * self.render.canvas.h);
             if let Some(f) = self.frame.as_mut() {
                 let rects = self.overlay.panel_px(self.ppp).into_iter().collect::<Vec<_>>();
                 f.write(&self.render.canvas, 0, 0, true, &rects, Some(dirty));
@@ -1165,6 +1224,21 @@ impl Host {
             }
             return;
         }
+        // A toast in a window of its own is topmost: while another program is in front
+        // it would sit over that program, so it waits (one drawn inside the game goes
+        // wherever the game goes).
+        if !(self.use_ingame() && self.frame.is_some()) && !self.in_front() {
+            if let Some(w) = self.toast_window.as_mut() {
+                w.hide();
+            }
+            // The time away doesn't count against them (the last three are kept).
+            let now = Instant::now();
+            if let Some(last) = self.toasts_held.replace(now) {
+                self.overlay.delay_toasts(now - last);
+            }
+            return;
+        }
+        self.toasts_held = None;
         self.fonts();
         let Some(r) = self.game_rect() else { return };
         let (w, h) = ((r.right - r.left) as f32, (r.bottom - r.top) as f32);
@@ -1186,12 +1260,7 @@ impl Host {
         let cw = ((area.max.x * ppp).ceil() - x0).max(1.0) as usize;
         let ch = ((area.max.y * ppp).ceil() - y0).max(1.0) as usize;
         if self.use_ingame() {
-            if self.frame.is_none() {
-                self.frame = frame::Shared::create(self.pid);
-                if let Some(f) = &self.frame {
-                    self.pipe.send(json!({"t": "frame", "name": f.name}));
-                }
-            }
+            self.frame_for(w as usize * h as usize);
         }
         if self.use_ingame() && self.frame.is_some() {
             // Inside the game: the full-size canvas, mostly clear.

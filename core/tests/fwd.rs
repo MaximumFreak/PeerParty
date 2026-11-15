@@ -156,3 +156,70 @@ fn typed_ip_tcp_and_udp_cross_the_mesh() {
     // A datagram for a port B's game doesn't have is dropped, not delivered anywhere.
     assert!(fa.udp_from(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9)).is_none());
 }
+
+/// Another PC's server reached over the mesh by a game whose UDP socket is connected
+/// (Photon's client: `connect`, then plain `send` and `recv`): the socket is connected
+/// to the forwarder's local socket for that peer and port, and the server's answers,
+/// sent to whoever it heard from, come back from that same address.
+#[test]
+fn a_connected_udp_socket_reaches_a_server_on_the_other_pc() {
+    let port = 47600 + (std::process::id() % 250) as u16;
+    let game = format!("fwdtest-connected:{}", std::process::id());
+    let a = start(&game, port, "a");
+    let b = start(&game, port, "b");
+    meet(&a, &b);
+    let fa = Forwarder::new(a.clone(), None, quiet);
+    let fb = Forwarder::new(b.clone(), None, quiet);
+    fa.ensure_pump();
+    fb.ensure_pump();
+    let sb = Forwarder::address_of(b.me());
+
+    // B's "server" answers each datagram to its sender.
+    let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    server.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+    let sport = server.local_addr().unwrap().port();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop2 = stop.clone();
+    let echo = std::thread::spawn(move || {
+        let mut buf = [0u8; 2048];
+        while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Ok((n, from)) = server.recv_from(&mut buf) {
+                let mut reply = b"re:".to_vec();
+                reply.extend_from_slice(&buf[..n]);
+                server.send_to(&reply, from).unwrap();
+            }
+        }
+    });
+
+    // A's game: bound, then connected where ipfwd's connect detour sends it.
+    let client = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+    client.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+    let local = client.local_addr().unwrap().port();
+    let via = fa.udp_dest(SocketAddrV4::new(sb, sport), local).expect("a stand-in");
+    assert!(via.ip().is_loopback());
+    client.connect(via).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut buf = [0u8; 2048];
+    loop {
+        client.send(b"hello").unwrap();
+        if let Ok(n) = client.recv(&mut buf) {
+            assert_eq!(&buf[..n], b"re:hello");
+            break;
+        }
+        assert!(Instant::now() < deadline, "no answer reached the connected socket");
+    }
+    // Several in a row, as a session would.
+    for i in 0..20u8 {
+        client.send(&[i]).unwrap();
+    }
+    let mut got = 0;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while got < 15 && Instant::now() < deadline {
+        if client.recv(&mut buf).is_ok() {
+            got += 1;
+        }
+    }
+    assert!(got >= 15, "only {got} of 20 answers came back");
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    echo.join().unwrap();
+}

@@ -131,11 +131,19 @@ pub fn gap(layer: &str, what: &str) {
     }
 }
 
+/// The most distinct keys `throttle` counts at once.
+const MAX_KEYS: usize = 4096;
+
 /// Counts occurrences of `key` and says whether this one should be logged: the first
 /// `first` times, then at every power of two, so hot calls show their rate without
 /// flooding the log.
 pub fn throttle(map: &Mutex<HashMap<String, u64>>, key: &str, first: u64) -> Option<u64> {
     let mut m = map.lock().ok()?;
+    // Keys carry what varies (a host name, an id): a game that looks up thousands of
+    // names mustn't grow this without end. Full, the counts start over.
+    if m.len() >= MAX_KEYS && !m.contains_key(key) {
+        m.clear();
+    }
     let n = match m.get_mut(key) {
         Some(n) => {
             *n += 1;

@@ -39,7 +39,9 @@ impl Welcome {
             voice: p.voice,
             // Recommended off with strangers, whatever the stored default.
             public_voice: false,
-            auto_accept: if p.public { p.auto_accept } else { true },
+            // On: a public player's invite is asked about whatever this says (the
+            // hook's invite.rs never takes one by itself).
+            auto_accept: true,
             again: false,
         }
     }
@@ -157,8 +159,11 @@ impl App {
                 ui.add_space(20.0);
                 ui.horizontal(|ui| {
                     if w.step == 0 {
+                        // Skipped on the first run: the recommended answers, as Start
+                        // with nothing changed would save (and the name and language
+                        // given here). Run again from Settings, Skip changes nothing.
                         if widgets::button(ui, None, t!("welcome.skip"), Kind::Ghost).clicked() {
-                            done = Some(false);
+                            done = Some(!w.again);
                         }
                     } else if widgets::button(ui, Some(Icon::Back), t!("common.back"), Kind::Ghost).clicked() {
                         w.back();
@@ -259,8 +264,6 @@ impl App {
         ui.add_space(8.0);
         if choice(ui, Icon::Globe, VIOLET, t!("together.public"), t!("welcome.public"), w.public, false).clicked() {
             w.public = !w.public;
-            // Strangers: invites asked about, not taken.
-            w.auto_accept = !w.public;
         }
         ui.add_space(14.0);
         widgets::setting(ui, t!("together.voice"), t!("welcome.voice_sub"), |ui| {

@@ -365,17 +365,7 @@ pub(crate) fn resolve(name: &str) -> Option<usize> {
         note(name, "stops the game (anti-cheat)");
         return Some(anticheat_begin_session as *const () as usize);
     }
-    // rtc.rs answers the lobby's RTC room functions, so it comes before lobby.rs.
-    if let Some(f) = users::resolve(name)
-        .or_else(|| rtc::resolve(name))
-        .or_else(|| lobby::resolve(name))
-        .or_else(|| sessions::resolve(name))
-        .or_else(|| presence::resolve(name))
-        .or_else(|| custominvites::resolve(name))
-        .or_else(|| ui::resolve(name))
-        .or_else(|| p2p::resolve(name))
-        .or_else(|| storage::resolve(name))
-    {
+    if let Some(f) = lan_answer(name) {
         note(name, "lan");
         return Some(f);
     }
@@ -389,6 +379,14 @@ pub(crate) fn resolve(name: &str) -> Option<usize> {
         None if name.contains("_AddNotify") => (fail::Class::AddNotify, 4),
         None if name.contains("_RemoveNotify") => (fail::Class::Void, 3),
         None if name.ends_with("_Release") => (fail::Class::Void, 1),
+        // An interface the LAN layer answers hands the game PeerParty's handles: the real
+        // SDK must never get them. A function newer than the table there fails fast as its
+        // name suggests (x64 only: on x86 the argument count is part of the handler).
+        None if cfg!(target_pointer_width = "64") && lan_interface(name) => {
+            let (class, slots) = guess(name);
+            note(name, &format!("unknown, on an interface the LAN layer answers: fails fast ({class:?}, guessed from its name)"));
+            return fail::handler(class, slots).map(|h| fail::noted(name, h));
+        }
         None => {
             note(name, "unknown, passed to the SDK");
             return None;
@@ -399,6 +397,54 @@ pub(crate) fn resolve(name: &str) -> Option<usize> {
         note(name, &format!("fails fast ({class:?})"));
     }
     f
+}
+
+/// The LAN layer's own answer for `name`, if it has one. rtc.rs answers the lobby's RTC
+/// room functions, so it comes before lobby.rs.
+fn lan_answer(name: &str) -> Option<usize> {
+    users::resolve(name)
+        .or_else(|| rtc::resolve(name))
+        .or_else(|| lobby::resolve(name))
+        .or_else(|| sessions::resolve(name))
+        .or_else(|| presence::resolve(name))
+        .or_else(|| custominvites::resolve(name))
+        .or_else(|| ui::resolve(name))
+        .or_else(|| p2p::resolve(name))
+        .or_else(|| storage::resolve(name))
+}
+
+/// `EOS_Lobby_Foo` -> `EOS_Lobby_`.
+fn interface_of(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix("EOS_")?;
+    let end = rest.find('_')?;
+    Some(&name[..4 + end + 1])
+}
+
+/// Whether the LAN layer answers functions of `name`'s interface (so its handles there
+/// are PeerParty's): some function of the table with that prefix is answered.
+fn lan_interface(name: &str) -> bool {
+    static OURS: LazyLock<Mutex<std::collections::HashMap<String, bool>>> = LazyLock::new(Mutex::default);
+    let Some(prefix) = interface_of(name) else { return false };
+    if let Some(v) = OURS.lock().unwrap().get(prefix) {
+        return *v;
+    }
+    let v = table::TABLE.iter().filter(|(n, _, _)| n.starts_with(prefix)).any(|(n, _, _)| lan_answer(n).is_some());
+    OURS.lock().unwrap().insert(prefix.to_string(), v);
+    v
+}
+
+/// A fail-fast shape for a function newer than the table, from its name: a copy hands
+/// back nothing (its out handle, the last of three arguments, nulled), a count or a
+/// getter answers 0, the rest EOS_NoConnection.
+fn guess(name: &str) -> (fail::Class, u8) {
+    let verb = name.rsplit('_').next().unwrap_or(name);
+    if verb.starts_with("Copy") {
+        (fail::Class::Copy(2), 3)
+    } else if verb.starts_with("Get") || verb.ends_with("Count") || verb.starts_with("Is") {
+        (fail::Class::Zero, 4)
+    } else {
+        (fail::Class::Result, 4)
+    }
 }
 
 static NOTED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
@@ -523,6 +569,23 @@ unsafe extern "system" fn detour_tick(platform: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A function newer than the table on an interface the LAN layer answers never
+    /// reaches the real SDK; on one it doesn't (real handles), it does.
+    #[test]
+    fn unknown_functions_on_lan_interfaces_fail_fast() {
+        assert_eq!(interface_of("EOS_Lobby_Foo_Bar"), Some("EOS_Lobby_"));
+        assert_eq!(interface_of("EOS_Initialize"), None);
+        assert!(lan_interface("EOS_Lobby_SomethingNew"));
+        assert!(!lan_interface("EOS_Achievements_SomethingNew"));
+        assert_eq!(guess("EOS_Lobby_CopyThingByIndex"), (fail::Class::Copy(2), 3));
+        assert_eq!(guess("EOS_Lobby_GetThingCount"), (fail::Class::Zero, 4));
+        assert_eq!(guess("EOS_Lobby_DoThing"), (fail::Class::Result, 4));
+        if cfg!(target_pointer_width = "64") {
+            assert!(resolve("EOS_Lobby_SomethingNew").is_some());
+        }
+        assert!(resolve("EOS_Achievements_SomethingNew").is_none());
+    }
 
     #[test]
     fn the_restart_check_says_carry_on() {

@@ -190,9 +190,17 @@ struct Conn {
     /// The SteamID at the other end when that is not the LAN player's own (a game
     /// server they host), else 0.
     remote_id: u64,
-    /// A ConnectByIPAddress made before anyone listening there was found: who it's
-    /// for (the IP, if one was given, and the port) and when it gives up.
-    waiting: Option<(Option<std::net::Ipv4Addr>, u16, Instant)>,
+    /// A connection made before anyone was found there, and when it gives up.
+    waiting: Option<(Wait, Instant)>,
+}
+
+/// Who a connection made too early waits for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wait {
+    /// ConnectByIPAddress: someone listening on the port (at the IP, if one was given).
+    Ip(Option<std::net::Ipv4Addr>, u16),
+    /// ConnectP2P: a SteamID whose player (or game server) isn't known yet.
+    Steam(u64),
 }
 
 struct Listen {
@@ -254,9 +262,16 @@ fn lan() -> Option<&'static Lan> {
     net::lan()
 }
 
+/// A connection, listen socket or poll group handle: 0x5050xxxx, skipping any still in
+/// use when the 16-bit counter wraps.
 fn new_handle(s: &mut State) -> u32 {
-    s.next += 1;
-    0x5050_0000 | (s.next & 0xffff)
+    loop {
+        s.next = s.next.wrapping_add(1);
+        let h = 0x5050_0000 | (s.next & 0xffff);
+        if !s.conns.contains_key(&h) && !s.listens.contains_key(&h) && !s.groups.contains(&h) {
+            return h;
+        }
+    }
 }
 
 fn now_us() -> i64 {
@@ -421,7 +436,7 @@ fn nonce() -> String {
 /// when not the player's (0).
 /// `wait_for`: an IP connection with nobody listening there yet waits for them (see
 /// IP_WAIT) instead of failing at once.
-fn connect(peer: Option<PeerId>, socket: String, cb: usize, addr: IpAddr, server: bool, remote_id: u64, wait_for: Option<(Option<std::net::Ipv4Addr>, u16)>) -> u32 {
+fn connect(peer: Option<PeerId>, socket: String, cb: usize, addr: IpAddr, server: bool, remote_id: u64, wait_for: Option<Wait>) -> u32 {
     let mut s = S.lock().unwrap();
     let h = new_handle(&mut s);
     let mut c = new_conn(peer, socket.clone(), 0, cb, addr);
@@ -435,11 +450,12 @@ fn connect(peer: Option<PeerId>, socket: String, cb: usize, addr: IpAddr, server
             lan.accept(p, &socket);
             log!("steam-lan gns connecting {h:#x} to {p} on {socket}");
         }
-        (None, Some(_), Some((ip, port))) => {
-            // A join right as the game starts (a "join IP" before the host's
-            // presence arrived): tick() looks again until IP_WAIT is up.
-            s.conns.get_mut(&h).unwrap().waiting = Some((ip, port, Instant::now() + IP_WAIT));
-            log!("steam-lan gns connect {h:#x} on {socket}: nobody listening on port {port} yet, waiting up to {}s", IP_WAIT.as_secs());
+        (None, Some(_), Some(wait)) => {
+            // A join right as the game starts (a "join IP", or an invite's SteamID,
+            // before the host's presence arrived): tick() looks again until IP_WAIT
+            // is up.
+            s.conns.get_mut(&h).unwrap().waiting = Some((wait, Instant::now() + IP_WAIT));
+            log!("steam-lan gns connect {h:#x} on {socket}: nobody there yet ({wait:?}), waiting up to {}s", IP_WAIT.as_secs());
         }
         _ => {
             if let Some(c) = s.conns.get_mut(&h) {
@@ -460,17 +476,22 @@ const IP_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
 /// fail the ones whose time is up.
 fn retry_waiting() {
     let Some(lan) = lan() else { return };
-    let waiting: Vec<(u32, Option<std::net::Ipv4Addr>, u16, Instant)> = {
+    let waiting: Vec<(u32, Wait, Instant)> = {
         let s = S.lock().unwrap();
-        s.conns.iter().filter_map(|(h, c)| c.waiting.map(|(ip, port, until)| (*h, ip, port, until))).collect()
+        s.conns.iter().filter_map(|(h, c)| c.waiting.map(|(w, until)| (*h, w, until))).collect()
     };
     if waiting.is_empty() {
         return;
     }
     let now = Instant::now();
-    for (h, ip, port, until) in waiting {
-        let peer = find_ip_listener(ip, port);
-        let remote = peer.map_or(0, |p| ip_listener_server(p, port));
+    for (h, wait, until) in waiting {
+        let (peer, remote) = match wait {
+            Wait::Ip(ip, port) => {
+                let peer = find_ip_listener(ip, port);
+                (peer, peer.map_or(0, |p| ip_listener_server(p, port)))
+            }
+            Wait::Steam(id) => (peer_of(id), if crate::steamgs::is_server(id) { id } else { 0 }),
+        };
         let mut s = S.lock().unwrap();
         let Some(c) = s.conns.get_mut(&h) else { continue };
         if c.waiting.is_none() || c.state != CONNECTING {
@@ -479,6 +500,9 @@ fn retry_waiting() {
         }
         match peer {
             Some(p) => {
+                if matches!(wait, Wait::Steam(_)) {
+                    c.addr = ip_addr(lan.peer_ip(p), 0);
+                }
                 c.waiting = None;
                 c.peer = Some(p);
                 c.remote_id = remote;
@@ -796,7 +820,7 @@ vmethod! {
         let port = a.port;
         let remote = peer.map_or(0, |p| ip_listener_server(p, port));
         let cb = unsafe { option_callback(n, opts, CB_STATUS) };
-        let wait = Some((ip.filter(|ip| !ip.is_loopback() && !ip.is_unspecified()), port));
+        let wait = Some(Wait::Ip(ip.filter(|ip| !ip.is_loopback() && !ip.is_unspecified()), port));
         connect(peer, format!("{PREFIX}ip:{port}:{}", nonce()), cb, a, server_side(this), remote, wait)
     }
 }
@@ -826,7 +850,10 @@ vmethod! {
         // A game server's SteamID: it, not its host player, is who answers.
         let remote = unsafe { identity_steam_id(who) }.filter(|id| crate::steamgs::is_server(*id)).unwrap_or(0);
         let cb = unsafe { option_callback(n, opts, CB_STATUS) };
-        connect(peer, format!("{PREFIX}p2p:{port}:{}", nonce()), cb, addr, server_side(this), remote, None)
+        // A SteamID not known yet (an invite read before its sender's presence came
+        // in) waits for them a few seconds, as Steam would while it found the route.
+        let wait = unsafe { identity_steam_id(who) }.filter(|&id| id != 0).map(Wait::Steam);
+        connect(peer, format!("{PREFIX}p2p:{port}:{}", nonce()), cb, addr, server_side(this), remote, wait)
     }
 }
 

@@ -2,9 +2,13 @@
 //! eos/rtc.rs; PlayFab Party chat, see party/chat.rs). There is no voice server on a
 //! LAN: a room is a core socket
 //! `rtc:<room>` between the copies that joined it. Members announce themselves on the
-//! control channel (join, here, leave); audio goes as raw 16-bit PCM frames on an
-//! unreliable channel (no Opus: a LAN has room for 32 KB/s per speaker, and it keeps
-//! PeerParty free of a codec), and room data (EOS_RTCData) on a reliable one.
+//! control channel (join, here, leave); audio goes as Opus packets on an unreliable
+//! channel (about 3 KB/s per speaker instead of 32 KB/s of raw PCM: it matters over the
+//! internet, and to a host with many speakers), and room data (EOS_RTCData) on a
+//! reliable one. A frame Opus can't take as it is (a rate or length outside Opus's) still
+//! goes as raw 16-bit PCM. Each room keeps one encoder for what it sends and one decoder
+//! per speaker it hears (`Opus`); a packet that won't decode is dropped, and a decoder
+//! that fails on one starts over.
 //!
 //! Sound devices: when a game leaves microphone and speakers to the SDK (EOS's
 //! default; "manual audio" off), PeerParty does the SDK's part with Windows' waveIn /
@@ -63,6 +67,8 @@ const HERE: u8 = 2;
 const LEAVE: u8 = 3;
 const AUDIO: u8 = 4;
 const DATA: u8 = 5;
+/// An Opus packet: rate (u32), channels (u8), samples per channel (u16), the packet.
+const OPUS: u8 = 6;
 /// A room's events waiting for the game: past this the oldest go (a game that never
 /// takes them, or a player sending faster than it does).
 const EVENTS_MAX: usize = 4096;
@@ -101,6 +107,8 @@ struct Room {
     device_in: bool,
     device_out: bool,
     volume_out: f32,
+    /// Our own voice's volume as sent (EOS UpdateSendingVolume), 1 unchanged.
+    volume_in: f32,
     peer_volume: HashMap<PeerId, f32>,
     /// Where each speaker sits, -1 (left) to 1 (right).
     peer_pan: HashMap<PeerId, f32>,
@@ -117,6 +125,103 @@ struct Room {
     greeted: HashSet<PeerId>,
     /// Members the player blocked: no audio or data either way (EOS BlockParticipant).
     blocked: HashSet<PeerId>,
+    opus: Opus,
+}
+
+/// A room's Opus state: the encoder for what we send (for one format at a time) and a
+/// decoder for each speaker's format.
+#[derive(Default)]
+struct Opus {
+    enc: Option<((u32, u32), rusty_opus::OpusEncoder)>,
+    dec: HashMap<PeerId, ((u32, u32), rusty_opus::OpusDecoder)>,
+}
+
+/// Opus's rates, and a frame's length (samples per channel) when it's one Opus takes:
+/// 2.5, 5, 10, 20, 40 or 60 ms.
+const OPUS_RATES: [u32; 5] = [8_000, 12_000, 16_000, 24_000, 48_000];
+
+fn opus_takes(f: &Frame) -> Option<usize> {
+    if !OPUS_RATES.contains(&f.rate) || !(1..=2).contains(&f.channels) || f.samples.len() % f.channels as usize != 0 {
+        return None;
+    }
+    let n = f.samples.len() / f.channels as usize;
+    let per_ms = f.rate as usize / 1000;
+    [per_ms * 5 / 2, per_ms * 5, per_ms * 10, per_ms * 20, per_ms * 40, per_ms * 60].contains(&n).then_some(n)
+}
+
+/// What a voice frame is sent at: wideband voice at 24 kb/s, more for 48 kHz and stereo.
+fn opus_bitrate(rate: u32, channels: u32) -> i32 {
+    let mono = if rate >= 24_000 { 32_000 } else if rate >= 16_000 { 24_000 } else { 16_000 };
+    if channels == 2 { mono * 3 / 2 } else { mono }
+}
+
+impl Opus {
+    /// A frame as an OPUS message, when Opus takes it.
+    fn encode(&mut self, f: &Frame) -> Option<Vec<u8>> {
+        let n = opus_takes(f)?;
+        let shape = (f.rate, f.channels);
+        if self.enc.as_ref().is_none_or(|(s, _)| *s != shape) {
+            let mut e = rusty_opus::OpusEncoder::new(f.rate as i32, f.channels as usize, rusty_opus::Application::Voip).ok()?;
+            e.bitrate_bps = opus_bitrate(f.rate, f.channels);
+            self.enc = Some((shape, e));
+        }
+        let (_, e) = self.enc.as_mut()?;
+        let mut out = vec![0u8; 8 + 1275 * 3];
+        out[0] = OPUS;
+        out[1..5].copy_from_slice(&f.rate.to_le_bytes());
+        out[5] = f.channels as u8;
+        out[6..8].copy_from_slice(&(n as u16).to_le_bytes());
+        let pcm: Vec<f32> = f.samples.iter().map(|s| f32::from(*s) / 32768.0).collect();
+        let len = match e.encode(&pcm, n, &mut out[8..]) {
+            Ok(len) => len,
+            Err(_) => {
+                self.enc = None;
+                return None;
+            }
+        };
+        out.truncate(8 + len);
+        Some(out)
+    }
+
+    /// A speaker's OPUS message as a frame. Anything off (a format or length Opus has
+    /// no such frame of, no packet at all, a packet that won't decode) is dropped; a
+    /// decoder that failed starts over with the next packet.
+    fn decode(&mut self, from: PeerId, b: &[u8]) -> Option<Frame> {
+        // An empty packet would be a lost one to the decoder (it would make one up).
+        if b.len() <= 8 || b[0] != OPUS {
+            return None;
+        }
+        let rate = u32::from_le_bytes(b[1..5].try_into().ok()?);
+        let channels = b[5] as u32;
+        let n = u16::from_le_bytes([b[6], b[7]]) as usize;
+        if !(1..=2).contains(&channels) || opus_takes(&Frame { rate, channels, samples: vec![0; n * channels as usize] }).is_none() {
+            return None;
+        }
+        let shape = (rate, channels);
+        if self.dec.get(&from).is_none_or(|(s, _)| *s != shape) {
+            if self.dec.len() >= 64 && !self.dec.contains_key(&from) {
+                return None;
+            }
+            let d = rusty_opus::OpusDecoder::new(rate as i32, channels as usize).ok()?;
+            self.dec.insert(from, (shape, d));
+        }
+        let (_, d) = self.dec.get_mut(&from)?;
+        let mut pcm = vec![0f32; n * channels as usize];
+        // A decoder is someone else's code reading a stranger's bytes: if it ever
+        // panics on one (it is written not to), that stays with this packet.
+        let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| d.decode(&b[8..], n, &mut pcm)));
+        match got {
+            Ok(Ok(got)) if got == n => {
+                let samples = pcm.iter().map(|s| (s * 32768.0).clamp(-32768.0, 32767.0) as i16).collect();
+                Some(Frame { rate, channels, samples })
+            }
+            Ok(_) => None,
+            Err(_) => {
+                self.dec.remove(&from);
+                None
+            }
+        }
+    }
 }
 
 impl Room {
@@ -131,6 +236,7 @@ impl Room {
             device_in,
             device_out,
             volume_out: 1.0,
+            volume_in: 1.0,
             peer_volume: HashMap::new(),
             peer_pan: HashMap::new(),
             heard: HashMap::new(),
@@ -140,6 +246,7 @@ impl Room {
             last_sent: None,
             greeted: HashSet::new(),
             blocked: HashSet::new(),
+            opus: Opus::default(),
         }
     }
 
@@ -185,6 +292,41 @@ static S: LazyLock<Mutex<State>> = LazyLock::new(Mutex::default);
 
 fn socket(room: &str) -> String {
     format!("{SOCKET_PREFIX}{room}")
+}
+
+/// The player's own switches from the overlay, over every room of every SDK: their
+/// microphone off (nothing they say goes out), and players they don't want to hear.
+static MIC_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PLAYER_MUTED: LazyLock<Mutex<HashSet<PeerId>>> = LazyLock::new(Mutex::default);
+
+/// The overlay's microphone switch.
+pub fn set_mic(on: bool) {
+    MIC_OFF.store(!on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn mic_on() -> bool {
+    !MIC_OFF.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The overlay's "Mute their voice" for `peer`.
+pub fn set_player_muted(peer: PeerId, muted: bool) {
+    let mut m = PLAYER_MUTED.lock().unwrap();
+    if muted {
+        if m.len() < 1024 {
+            m.insert(peer);
+        }
+    } else {
+        m.remove(&peer);
+    }
+}
+
+pub fn player_muted(peer: PeerId) -> bool {
+    PLAYER_MUTED.lock().unwrap().contains(&peer)
+}
+
+/// Whether any voice room is joined (the overlay shows its voice switches then).
+pub fn in_use() -> bool {
+    !S.lock().unwrap().rooms.is_empty()
 }
 
 pub fn devices_allowed() -> bool {
@@ -329,6 +471,17 @@ pub fn set_volume(room: &str, peer: Option<PeerId>, volume: f32) -> bool {
     .is_some()
 }
 
+/// Our voice's volume as sent to the room (EOS: 0-100, 50 = unchanged).
+pub fn set_sending_volume(room: &str, volume: f32) -> bool {
+    let v = if volume.is_finite() { (volume / 50.0).clamp(0.0, 2.0) } else { 1.0 };
+    with_room(room, |r| r.volume_in = v).is_some()
+}
+
+/// Samples scaled by `gain`, held to 16 bits.
+fn scaled(samples: &[i16], gain: f32) -> Vec<i16> {
+    samples.iter().map(|&s| (s as f32 * gain).round().clamp(i16::MIN as f32, i16::MAX as f32) as i16).collect()
+}
+
 /// Where a participant's voice plays, from -1 (all left) through 0 (both sides alike)
 /// to 1 (all right).
 pub fn set_pan(room: &str, peer: PeerId, pan: f32) -> bool {
@@ -396,16 +549,28 @@ fn decode_audio(b: &[u8]) -> Option<Frame> {
 
 /// Sends a frame the game (or the microphone) produced to the room. False if not in it.
 pub fn send_audio(lan: &Lan, room: &str, frame: &Frame) -> bool {
-    let members = {
+    let (members, gain) = {
         let s = S.lock().unwrap();
         let Some(r) = s.rooms.get(room) else { return false };
-        if !r.sending {
+        if !r.sending || !mic_on() {
             return true;
         }
-        r.audio_to()
+        (r.audio_to(), r.volume_in)
     };
-    with_room(room, |r| r.last_sent = Some(Instant::now()));
-    let msg = encode_audio(frame);
+    let scaled_frame;
+    let frame = if (gain - 1.0).abs() < f32::EPSILON {
+        frame
+    } else {
+        scaled_frame = Frame { rate: frame.rate, channels: frame.channels, samples: scaled(&frame.samples, gain) };
+        &scaled_frame
+    };
+    let opus = with_room(room, |r| {
+        r.last_sent = Some(Instant::now());
+        // Nobody to send it to: the encoder isn't run.
+        if members.is_empty() { None } else { r.opus.encode(frame) }
+    })
+    .flatten();
+    let msg = opus.unwrap_or_else(|| encode_audio(frame));
     for p in members {
         send(lan, p, room, CH_AUDIO, &msg, false);
     }
@@ -552,13 +717,14 @@ pub fn pump(lan: &Lan) {
                         r.events.push_back(RoomEvent::Left(p.peer));
                     }
                 }
-                AUDIO => {
+                AUDIO | OPUS => {
                     if !r.members.contains(&p.peer) {
                         r.members.insert(p.peer);
                         r.events.push_back(RoomEvent::Joined(p.peer));
                     }
-                    if r.hears(p.peer) {
-                        if let Some(f) = decode_audio(&p.data) {
+                    if r.hears(p.peer) && !player_muted(p.peer) {
+                        let f = if kind == OPUS { r.opus.decode(p.peer, &p.data) } else { decode_audio(&p.data) };
+                        if let Some(f) = f {
                             if r.heard.insert(p.peer, Instant::now()).is_none() {
                                 r.events.push_back(RoomEvent::Speaking(p.peer, true));
                             }
@@ -1061,6 +1227,69 @@ mod devices {
 mod tests {
     use super::*;
 
+    /// A voice frame of a shape Opus takes goes as Opus and comes back as audio of the
+    /// same format, much smaller; another shape goes as raw PCM.
+    #[test]
+    fn voice_goes_as_opus() {
+        let (mut a, mut b) = (Opus::default(), Opus::default());
+        let speaker = PeerId([1; 16]);
+        for (rate, channels, n) in [(16_000, 1, 320), (48_000, 2, 960), (48_000, 1, 480), (24_000, 1, 1440), (8_000, 1, 160)] {
+            let mut total = 0;
+            let mut energy = 0f64;
+            for k in 0..25 {
+                let samples: Vec<i16> =
+                    (0..n * channels as usize).map(|i| ((((k * n) + i / channels as usize) as f64 * 1300.0 / rate as f64).sin() * 9000.0) as i16).collect();
+                let f = Frame { rate, channels, samples };
+                let msg = a.encode(&f).expect("Opus takes it");
+                total += msg.len();
+                let back = b.decode(speaker, &msg).expect("decodes");
+                assert_eq!((back.rate, back.channels, back.samples.len()), (rate, channels, f.samples.len()));
+                if k > 5 {
+                    energy += back.samples.iter().map(|s| (*s as f64).powi(2)).sum::<f64>();
+                }
+            }
+            let raw = 25 * (6 + n * channels as usize * 2);
+            assert!(total * 4 < raw, "{rate} Hz x{channels}: {total} bytes, raw {raw}");
+            assert!(energy > 0.0, "{rate} Hz x{channels}: silence came back");
+        }
+        // Not Opus's: an odd rate, an odd length, three channels.
+        for f in [
+            Frame { rate: 44_100, channels: 1, samples: vec![0; 441] },
+            Frame { rate: 16_000, channels: 1, samples: vec![0; 300] },
+            Frame { rate: 48_000, channels: 3, samples: vec![0; 1440] },
+        ] {
+            assert!(a.encode(&f).is_none(), "{f:?}");
+        }
+    }
+
+    /// What a speaker's Opus messages may claim: a bad header or packet is dropped, and
+    /// junk never takes the decoder down.
+    #[test]
+    fn bad_opus_messages_are_dropped() {
+        let mut o = Opus::default();
+        let p = PeerId([1; 16]);
+        let head = |rate: u32, ch: u8, n: u16| {
+            let mut b = vec![OPUS];
+            b.extend_from_slice(&rate.to_le_bytes());
+            b.push(ch);
+            b.extend_from_slice(&n.to_le_bytes());
+            b
+        };
+        for b in [head(44_100, 1, 441), head(16_000, 3, 320), head(16_000, 1, 321), head(16_000, 0, 320), vec![OPUS, 1, 2]] {
+            assert!(o.decode(p, &b).is_none());
+        }
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        for _ in 0..3000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let mut b = head(16_000, 1, 320);
+            b.extend((0..(x % 200) as usize).map(|i| (x >> (i % 56)) as u8));
+            let _ = o.decode(p, &b);
+        }
+        assert!(o.dec.len() <= 1);
+    }
+
     #[test]
     fn audio_frames_round_trip() {
         let f = Frame { rate: 48_000, channels: 2, samples: vec![1, -2, 300, -32768, 32767, 0] };
@@ -1170,7 +1399,7 @@ mod tests {
         wait("the stranger to be a member", &mut got, &mut turn, &|_| members(&room) == [them.me()]);
         got.clear();
         send_audio(&me, &room, &Frame { rate: 16_000, channels: 1, samples: vec![3; 320] });
-        wait("our audio to reach them", &mut got, &mut turn, &|g| g.iter().any(|m| m.first() == Some(&AUDIO)));
+        wait("our audio to reach them", &mut got, &mut turn, &|g| g.iter().any(|m| m.first() == Some(&OPUS)));
 
         // Shown the door (which takes the invite back), they are out of the room too.
         them.join_by_id("test.lobby", &lobby.id).unwrap();

@@ -34,6 +34,12 @@ const DIM: Color32 = Color32::from_rgb(150, 158, 175);
 #[derive(Default, Clone)]
 pub struct GameState {
     pub me: String,
+    /// Which of this PC's player slots this copy holds: 0 is the first player, 1 and up
+    /// another copy of the game on this PC (another player, saves of its own).
+    pub me_slot: u32,
+    /// A voice chat is on in the game, and whether the player's microphone is.
+    pub voice_in_use: bool,
+    pub mic_on: bool,
     pub peers: Vec<Peer>,
     pub lobby: Option<LobbyInfo>,
     pub pending: Vec<PendingInvite>,
@@ -55,6 +61,10 @@ pub struct GameState {
     /// Players on our network we hear but can't connect to (their firewall, most likely).
     /// None: the game's PeerParty engine isn't running (an older hook doesn't say either).
     pub lan_unreachable: Option<u64>,
+    /// Copies of this game heard running another PeerParty, which can't connect to this
+    /// one, and whether any of them is newer.
+    pub other_version: u64,
+    pub newer_version: bool,
 }
 
 /// Windows Firewall keeps other players out of the game (or hasn't been told to let
@@ -118,6 +128,8 @@ pub struct Peer {
     pub via: String,
     /// A public player's key fingerprint.
     pub fp: String,
+    /// The player muted their voice here (the overlay's "Mute their voice").
+    pub muted: bool,
 }
 
 impl Peer {
@@ -190,7 +202,10 @@ impl GameState {
             internet_on: v.get("internet_on").and_then(Value::as_bool).unwrap_or(true),
             internet_configured: v.get("internet_configured").and_then(Value::as_bool).unwrap_or(!internet_list.is_empty()),
             lan_unreachable: v.get("lan_unreachable").and_then(Value::as_f64).map(|n| n.max(0.0) as u64),
+            other_version: v.get("lan_other_version").and_then(Value::as_f64).map_or(0, |n| n.max(0.0) as u64),
+            newer_version: v.get("lan_newer_version").and_then(Value::as_bool).unwrap_or(false),
             me: v.get("me").map(|m| s(m, "name")).unwrap_or_default(),
+            me_slot: v.get("me").and_then(|m| m.get("slot")).and_then(Value::as_u64).map_or(0, |n| n as u32),
             peers: arr(v, "peers")
                 .iter()
                 .map(|p| Peer {
@@ -204,8 +219,11 @@ impl GameState {
                     this_pc: p.get("this_pc").and_then(Value::as_bool).unwrap_or(false),
                     via: s(p, "via"),
                     fp: s(p, "fp"),
+                    muted: p.get("muted").and_then(Value::as_bool).unwrap_or(false),
                 })
                 .collect(),
+            voice_in_use: v.get("voice").and_then(|x| x.get("in_use")).and_then(Value::as_bool).unwrap_or(false),
+            mic_on: v.get("voice").and_then(|x| x.get("mic")).and_then(Value::as_bool).unwrap_or(true),
             lobby: v.get("lobby").filter(|l| l.is_object()).map(|l| LobbyInfo {
                 id: s(l, "id"),
                 kind: s(l, "kind"),
@@ -351,6 +369,12 @@ enum Action {
     Join(usize),
     Profile(usize),
     Block(usize),
+    /// The player's microphone, in every voice chat of the game.
+    ToggleMic,
+    /// Mute or hear again this player's voice.
+    ToggleMute(usize),
+    /// Takes back the block just made (`Overlay::blocked`).
+    Unblock,
     Accept(usize),
     Decline(usize),
     ToggleAutoAccept,
@@ -510,7 +534,27 @@ pub struct Overlay {
     /// Whether `frame` paints the panel's background itself (the host draws it once
     /// and keeps it instead: see `background`).
     pub paints_background: bool,
+    /// Block pressed once for this player (by id): a second press within BLOCK_ARMED
+    /// blocks them.
+    block_armed: Option<(String, Instant)>,
+    /// The player just blocked (id, name): the Players page offers Undo for BLOCK_UNDO.
+    blocked: Option<(String, String, Instant)>,
 }
+
+/// The opening hotkeys, in `Prefs.hotkeys`' order.
+const KEY_NAMES: [&str; 4] = ["Shift+Tab", "Shift+F3", "Shift+F1", "Shift+F2"];
+
+/// Which of the hotkeys open the overlay in a game with `foreign` store overlays: the
+/// host's rule (`usable_hotkeys`), with Home / Guide or a chord as the other ways in.
+fn usable_keys(prefs: &Prefs, foreign: &[String]) -> [bool; 4] {
+    let hk = &prefs.hotkeys;
+    let other = hk.guide || hk.chord.count_ones() >= 2;
+    super::usable_hotkeys([hk.shift_tab, hk.shift_f3, hk.shift_f1, hk.shift_f2], foreign, other)
+}
+
+/// How long Block waits for its second press, and how long Undo is offered after.
+const BLOCK_ARMED: Duration = Duration::from_secs(5);
+const BLOCK_UNDO: Duration = Duration::from_secs(30);
 
 /// The notice for someone new in the game: a player "is playing too", a dedicated
 /// server "is running", and nothing for another copy on this PC (the player's own).
@@ -519,6 +563,16 @@ pub fn arrival_text(p: &Peer) -> Option<String> {
         return None;
     }
     Some(if p.server { t!("toast.server_running", name = p.name) } else { t!("toast.playing_too", name = p.name) })
+}
+
+/// Players of this game who run another PeerParty: they never show up as players, and
+/// this says why.
+pub fn other_version_title(st: &GameState) -> String {
+    t!("overlay.other_version", n = st.other_version).into()
+}
+
+pub fn other_version_detail(st: &GameState) -> String {
+    if st.newer_version { t!("overlay.other_version_newer") } else { t!("overlay.other_version_older") }.into()
 }
 
 /// An invite's wording from the hook ("invited you", "asks to join you"), translated.
@@ -574,6 +628,8 @@ impl Overlay {
             firewall: None,
             panel: None,
             paints_background: true,
+            block_armed: None,
+            blocked: None,
         }
     }
 
@@ -625,6 +681,13 @@ impl Overlay {
         }
     }
 
+    /// Toasts that couldn't be seen for `d` stay that much longer.
+    pub fn delay_toasts(&mut self, d: Duration) {
+        for t in &mut self.toasts {
+            t.until += d;
+        }
+    }
+
     pub fn has_toasts(&self) -> bool {
         self.toasts.iter().any(|t| t.until > Instant::now())
     }
@@ -642,6 +705,9 @@ impl Overlay {
         }
         if let Some(n) = self.state.lan_unreachable.filter(|&n| n > 0) {
             rows.push(Row::info(t!("overlay.unreachable", n = n), t!("overlay.unreachable_detail")).icon(Icon::Warning, Tone::Warn));
+        }
+        if self.state.other_version > 0 {
+            rows.push(Row::info(other_version_title(&self.state), other_version_detail(&self.state)).icon(Icon::Warning, Tone::Warn));
         }
         rows
     }
@@ -772,6 +838,12 @@ impl Overlay {
                 if st.codes {
                     rows.push(self.paste_row());
                 }
+                if let Some((_, name, _)) = self.blocked.as_ref().filter(|b| b.2.elapsed() < BLOCK_UNDO) {
+                    rows.push(Row::action(t!("overlay.blocked_now", name = name), t!("overlay.blocked_now_detail"), Action::Unblock, t!("overlay.undo")).icon(Icon::Shield, Tone::Warn));
+                }
+                if st.voice_in_use {
+                    rows.push(Row::toggle(t!("overlay.mic"), t!("overlay.mic_detail"), st.mic_on, Action::ToggleMic).icon(Icon::Mic, Tone::Plain));
+                }
                 if st.peers.is_empty() {
                     rows.push(Row::info(t!("overlay.no_players"), t!("overlay.no_players_detail")));
                 }
@@ -881,7 +953,10 @@ impl Overlay {
             }
             Page::Settings => {
                 let hk = &prefs.hotkeys;
-                let keys: Vec<&str> = [(hk.shift_tab, "Shift+Tab"), (hk.shift_f3, "Shift+F3"), (hk.shift_f1, "Shift+F1"), (hk.shift_f2, "Shift+F2")].iter().filter(|k| k.0).map(|k| k.1).collect();
+                // The keys that open it in this game: one a store overlay loaded here
+                // opens on too is left to that overlay (host's `usable_hotkeys`).
+                let usable = usable_keys(prefs, &st.foreign);
+                let keys: Vec<&str> = KEY_NAMES.iter().zip(usable).filter(|k| k.1).map(|k| *k.0).collect();
                 let mut open_with = keys.join(", ");
                 if hk.guide {
                     if !open_with.is_empty() {
@@ -926,11 +1001,17 @@ impl Overlay {
             }
             Page::Hotkeys => {
                 let hk = &prefs.hotkeys;
+                let usable = usable_keys(prefs, &st.foreign);
+                let on = [hk.shift_tab, hk.shift_f3, hk.shift_f1, hk.shift_f2];
+                let detail = |i: usize, own: &'static str| -> String {
+                    // On, but this game's store overlay has it.
+                    if on[i] && !usable[i] { t!("toast.key_left", key = KEY_NAMES[i], store = super::HOTKEY_OWNERS[i].1) } else { own.to_string() }
+                };
                 vec![
-                    Row::toggle("Shift+Tab", t!("settings.key_steam"), hk.shift_tab, Action::Hotkey(0)),
-                    Row::toggle("Shift+F3", t!("settings.key_epic"), hk.shift_f3, Action::Hotkey(1)),
-                    Row::toggle("Shift+F1", t!("settings.key_ea"), hk.shift_f1, Action::Hotkey(2)),
-                    Row::toggle("Shift+F2", t!("settings.key_ubisoft"), hk.shift_f2, Action::Hotkey(3)),
+                    Row::toggle("Shift+Tab", detail(0, t!("settings.key_steam")), hk.shift_tab, Action::Hotkey(0)),
+                    Row::toggle("Shift+F3", detail(1, t!("settings.key_epic")), hk.shift_f3, Action::Hotkey(1)),
+                    Row::toggle("Shift+F1", detail(2, t!("settings.key_ea")), hk.shift_f1, Action::Hotkey(2)),
+                    Row::toggle("Shift+F2", detail(3, t!("settings.key_ubisoft")), hk.shift_f2, Action::Hotkey(3)),
                     Row::toggle(t!("settings.key_guide"), t!("settings.key_guide_sub"), hk.guide, Action::Hotkey(4)),
                     Row {
                         value: if hk.chord.count_ones() >= 2 { super::pad::names(hk.chord) } else { t!("overlay.none").into() },
@@ -951,10 +1032,19 @@ impl Overlay {
                 if !p.status.is_empty() {
                     rows.push(Row::info(t!("overlay.status"), p.status.clone()));
                 }
+                if st.voice_in_use && !p.server {
+                    rows.push(Row::toggle(t!("overlay.mute_them"), t!("overlay.mute_them_detail"), p.muted, Action::ToggleMute(i)).icon(Icon::Mic, Tone::Plain));
+                }
                 rows.push(Row::action(t!("overlay.invite_to_yours"), "", Action::Invite(i), t!("overlay.invite")));
                 rows.push(Row::action(t!("overlay.join_theirs"), "", Action::Join(i), t!("overlay.join")));
                 if p.public() {
-                    rows.push(Row::action(t!("overlay.block"), t!("overlay.block_detail"), Action::Block(i), t!("overlay.block_button")).icon(Icon::Shield, Tone::Warn));
+                    let armed = self.block_armed.as_ref().is_some_and(|(a, at)| a == &p.id && at.elapsed() < BLOCK_ARMED);
+                    let row = if armed {
+                        Row::action(t!("overlay.block_sure", name = p.name), t!("overlay.block_detail"), Action::Block(i), t!("overlay.block_again"))
+                    } else {
+                        Row::action(t!("overlay.block"), t!("overlay.block_detail"), Action::Block(i), t!("overlay.block_button"))
+                    };
+                    rows.push(Row { id: "block".into(), ..row.icon(Icon::Shield, Tone::Warn) });
                 }
                 rows
             }
@@ -992,10 +1082,33 @@ impl Overlay {
                     self.open(Page::Profile(id), false);
                 }
             }
+            // Two presses: the first asks, the second (within BLOCK_ARMED) blocks.
             Action::Block(i) => {
                 if let Some(p) = st.peers.get(i).filter(|p| p.public()) {
-                    out.push(msg(serde_json::json!({"t": "block", "peer": p.id})));
-                    self.open(Page::Players, false);
+                    let armed = self.block_armed.take().is_some_and(|(a, at)| a == p.id && at.elapsed() < BLOCK_ARMED);
+                    if armed {
+                        out.push(msg(serde_json::json!({"t": "block", "peer": p.id})));
+                        self.blocked = Some((p.id.clone(), p.name.clone(), Instant::now()));
+                        self.open(Page::Players, false);
+                    } else {
+                        self.block_armed = Some((p.id.clone(), Instant::now()));
+                    }
+                }
+            }
+            Action::ToggleMic => {
+                let on = !self.state.mic_on;
+                self.state.mic_on = on;
+                out.push(msg(serde_json::json!({"t": "mic", "on": on})));
+            }
+            Action::ToggleMute(i) => {
+                if let Some(p) = self.state.peers.get_mut(i) {
+                    p.muted = !p.muted;
+                    out.push(msg(serde_json::json!({"t": "mute", "peer": p.id, "on": p.muted})));
+                }
+            }
+            Action::Unblock => {
+                if let Some((id, ..)) = self.blocked.take().filter(|b| b.2.elapsed() < BLOCK_UNDO) {
+                    out.push(msg(serde_json::json!({"t": "unblock", "peer": id})));
                 }
             }
             Action::Accept(i) => {
@@ -1213,7 +1326,9 @@ impl Overlay {
             let name = tab_name(page);
             let badge = match page {
                 Page::Players if !self.state.pending.is_empty() => Some((self.state.pending.len().to_string(), GOOD)),
-                Page::Network if self.firewall.is_some() || self.state.lan_unreachable.is_some_and(|n| n > 0) => Some(("!".to_string(), theme::WARN)),
+                Page::Network if self.firewall.is_some() || self.state.lan_unreachable.is_some_and(|n| n > 0) || self.state.other_version > 0 => {
+                    Some(("!".to_string(), theme::WARN))
+                }
                 _ => None,
             };
             let tw = painter.layout_no_wrap(name.to_string(), theme::strong(14.0), TEXT).size().x;
@@ -1596,8 +1711,16 @@ mod tests {
         let mut prefs = Prefs::default();
         o.act(Action::Block(0), &mut prefs, &mut out);
         assert!(out.is_empty());
+        // The first press asks; the second blocks; Undo takes it back.
+        o.act(Action::Block(1), &mut prefs, &mut out);
+        assert!(out.is_empty(), "one press blocked");
         o.act(Action::Block(1), &mut prefs, &mut out);
         assert!(matches!(&out[..], [Cmd::Hook(v)] if v["t"] == "block" && v["peer"] == "cc"));
+        let undo = o.rows(&prefs).into_iter().find(|r| r.main == Action::Unblock).expect("no Undo row");
+        assert!(undo.title.contains(&o.state.peers[1].name), "{}", undo.title);
+        out.clear();
+        o.act(Action::Unblock, &mut prefs, &mut out);
+        assert!(matches!(&out[..], [Cmd::Hook(v)] if v["t"] == "unblock" && v["peer"] == "cc"));
     }
 
     /// A dedicated server is listed by its own name as a server: no version warning
@@ -1651,6 +1774,48 @@ mod tests {
     /// The Network page's internet switch: it shows the game's state,
     /// Select flips it (saved, and sent to the game), left / right still switch pages,
     /// and off hides the room and public status. Not set up: no switch, just how to.
+    /// With a voice chat on, Players has the microphone switch and a player's page
+    /// "Mute their voice"; each goes to the hook.
+    #[test]
+    fn voice_switches_show_while_voice_is_on() {
+        let mut o = Overlay::new("Game".into());
+        o.state = sample_state();
+        let prefs = Prefs::default();
+        o.open(Page::Players, false);
+        assert!(!o.rows(&prefs).iter().any(|r| r.main == Action::ToggleMic), "no voice, no switch");
+        o.state.voice_in_use = true;
+        o.state.mic_on = true;
+        assert!(o.rows(&prefs).iter().any(|r| r.main == Action::ToggleMic));
+        let mut out = Vec::new();
+        let mut p = Prefs::default();
+        o.act(Action::ToggleMic, &mut p, &mut out);
+        assert!(matches!(&out[..], [Cmd::Hook(v)] if v["t"] == "mic" && v["on"] == false));
+        let id = o.state.peers[0].id.clone();
+        o.open(Page::Profile(id.clone()), false);
+        assert!(o.rows(&prefs).iter().any(|r| r.main == Action::ToggleMute(0)));
+        out.clear();
+        o.act(Action::ToggleMute(0), &mut p, &mut out);
+        assert!(matches!(&out[..], [Cmd::Hook(v)] if v["t"] == "mute" && v["peer"] == id.as_str() && v["on"] == true));
+    }
+
+    /// With Steam's overlay loaded in the game, Shift+Tab is left to it: Settings lists
+    /// what does open the overlay, and the key's row says where Shift+Tab goes.
+    #[test]
+    fn a_key_left_to_a_store_overlay_isnt_listed_as_opening_it() {
+        let mut o = Overlay::new("Game".into());
+        o.state = sample_state();
+        o.state.foreign = vec!["steam".into()];
+        let mut prefs = Prefs::default();
+        prefs.hotkeys.shift_tab = true;
+        prefs.hotkeys.shift_f3 = true;
+        o.open(Page::Settings, false);
+        let row = o.rows(&prefs).into_iter().find(|r| r.main == Action::Open(PageRef::Hotkeys)).unwrap();
+        assert!(row.detail.contains("Shift+F3") && !row.detail.contains("Shift+Tab"), "{}", row.detail);
+        o.open(Page::Hotkeys, false);
+        let tab = o.rows(&prefs).into_iter().find(|r| r.title == "Shift+Tab").unwrap();
+        assert!(tab.detail.contains("Steam"), "{}", tab.detail);
+    }
+
     #[test]
     fn internet_page_switches_internet_play() {
         let mut o = Overlay::new("Game".into());
@@ -1712,6 +1877,7 @@ mod tests {
         assert!(top.main == Action::FixFirewall(false) && top.second == Action::FixFirewall(true));
         assert!(top.change.is_none(), "left / right stay free for switching pages");
         assert!(rows.iter().any(|r| r.title == "2 players on your network can't be reached"), "{:?}", rows.iter().map(|r| &r.title).collect::<Vec<_>>());
+        assert!(!rows.iter().any(|r| r.title.contains("PeerParty version")), "nobody on another version");
 
         let mut prefs = Prefs::default();
         let mut out = Vec::new();
@@ -1728,6 +1894,24 @@ mod tests {
         o.firewall = None;
         let rows = o.rows(&Prefs::default());
         assert!(!rows.iter().any(|r| matches!(r.main, Action::FixFirewall(_)) || r.title.contains("can't be reached")));
+    }
+
+    /// Players of the game on another PeerParty never show up as players: the Network
+    /// page says how many, and who should update.
+    #[test]
+    fn players_on_another_peerparty_are_explained() {
+        let mut o = Overlay::new("Game".into());
+        o.state = GameState::from_json(&serde_json::json!({"t": "state", "internet": [], "lan_unreachable": 0, "lan_other_version": 2, "lan_newer_version": true}));
+        o.open(Page::Network, false);
+        let rows = o.rows(&Prefs::default());
+        let row = rows.iter().find(|r| r.title == "2 players of this game run a different version of PeerParty").expect("the row");
+        assert!(row.detail.starts_with("Theirs is newer: update PeerParty on this PC"), "{}", row.detail);
+        o.state = GameState::from_json(&serde_json::json!({"t": "state", "internet": [], "lan_other_version": 1, "lan_newer_version": false}));
+        let rows = o.rows(&Prefs::default());
+        let row = rows.iter().find(|r| r.title == "A player of this game runs a different version of PeerParty").expect("the row");
+        assert!(row.detail.starts_with("Theirs is older: they need to update"), "{}", row.detail);
+        o.state = GameState::from_json(&serde_json::json!({"t": "state", "internet": []}));
+        assert!(!o.rows(&Prefs::default()).iter().any(|r| r.title.contains("PeerParty")));
     }
 
     /// Left on the Network page's switch row goes to Players, right to Settings.

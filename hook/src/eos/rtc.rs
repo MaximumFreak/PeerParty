@@ -51,8 +51,6 @@ const DATA_HANDLE: usize = 0x5050_DA7A;
 
 /// The game uses lobby voice rooms.
 static LOBBY_VOICE: AtomicBool = AtomicBool::new(false);
-/// Lobby rooms: manual audio input / output, as the lobby's LocalRTCOptions asked.
-static LOBBY_MANUAL: Mutex<(bool, bool)> = Mutex::new((false, false));
 /// Lobby ids whose room we're in, and lobbies whose room the game left by hand.
 static LOBBY_ROOMS: LazyLock<Mutex<HashMap<String, bool>>> = LazyLock::new(Mutex::default);
 static LOCAL: AtomicUsize = AtomicUsize::new(0);
@@ -83,26 +81,62 @@ struct LocalRtcOptions {
     Flags: u32,
     bUseManualAudioInput: i32,
     bUseManualAudioOutput: i32,
+    /// From version 2 (EOS_LOBBY_LOCALRTCOPTIONS_API_LATEST 2).
+    bLocalAudioDeviceInputStartsMuted: i32,
 }
 
-/// The game created or joined a lobby with voice; `options` is its LocalRTCOptions.
-pub(crate) fn lobby_voice(options: usize) {
+/// How the game wants a lobby's room: (manual input, manual output, starts muted).
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+struct RoomWish {
+    manual_in: bool,
+    manual_out: bool,
+    muted: bool,
+}
+
+impl RoomWish {
+    fn of(options: usize) -> RoomWish {
+        if options == 0 {
+            return RoomWish::default();
+        }
+        let o = unsafe { &*(options as *const LocalRtcOptions) };
+        RoomWish { manual_in: o.bUseManualAudioInput != 0, manual_out: o.bUseManualAudioOutput != 0, muted: o.ApiVersion >= 2 && o.bLocalAudioDeviceInputStartsMuted != 0 }
+    }
+}
+
+/// What the game asked for each lobby's room (CreateLobby's or JoinRTCRoom's
+/// LocalRTCOptions); a lobby not here gets the SDK's defaults.
+static LOBBY_WISHES: LazyLock<Mutex<HashMap<String, RoomWish>>> = LazyLock::new(Mutex::default);
+
+/// The game created a lobby with a voice room (`lobby`), or asked for one's room again;
+/// `options` is its LocalRTCOptions.
+pub(crate) fn lobby_voice_for(lobby: &str, options: usize) {
     if !LOBBY_VOICE.swap(true, Ordering::Relaxed) {
         log_once("lobby voice rooms on");
     }
-    if options != 0 {
-        let o = unsafe { &*(options as *const LocalRtcOptions) };
-        *LOBBY_MANUAL.lock().unwrap() = (o.bUseManualAudioInput != 0, o.bUseManualAudioOutput != 0);
+    let mut w = LOBBY_WISHES.lock().unwrap();
+    if w.len() < 256 || w.contains_key(lobby) {
+        w.insert(lobby.to_string(), RoomWish::of(options));
     }
+}
+
+/// The game created a lobby with a voice room (its id not known yet): rooms are on.
+pub(crate) fn lobby_voice(_options: usize) {
+    if !LOBBY_VOICE.swap(true, Ordering::Relaxed) {
+        log_once("lobby voice rooms on");
+    }
+}
+
+/// Whether a lobby has a voice room: its creator asked for one (lobby.rs keeps that
+/// with the lobby, so every member's PC knows).
+fn lobby_has_room(lobby: &peerparty_core::Lobby) -> bool {
+    super::lobby::has_rtc_room(lobby)
 }
 
 fn log_once(what: &str) {
     crate::log::throttled(&format!("eos-rtc {what}"), 1, |_| crate::log!("eos-rtc {what}"));
 }
 
-pub(crate) fn lobby_rooms_on() -> bool {
-    LOBBY_VOICE.load(Ordering::Relaxed)
-}
+
 
 pub(super) fn resolve(name: &str) -> Option<usize> {
     Some(match name {
@@ -123,7 +157,8 @@ pub(super) fn resolve(name: &str) -> Option<usize> {
         "EOS_RTCAudio_SendAudio" => send_audio as *const () as usize,
         "EOS_RTCAudio_UpdateSending" => update_sending as *const () as usize,
         "EOS_RTCAudio_UpdateReceiving" => update_receiving as *const () as usize,
-        "EOS_RTCAudio_UpdateSendingVolume" | "EOS_RTCAudio_UpdateReceivingVolume" => update_volume as *const () as usize,
+        "EOS_RTCAudio_UpdateSendingVolume" => update_sending_volume as *const () as usize,
+        "EOS_RTCAudio_UpdateReceivingVolume" => update_receiving_volume as *const () as usize,
         "EOS_RTCAudio_UpdateParticipantVolume" => update_participant_volume as *const () as usize,
         "EOS_RTCAudio_AddNotifyParticipantUpdated" => notify_audio_participant as *const () as usize,
         "EOS_RTCAudio_AddNotifyAudioBeforeRender" => notify_before_render as *const () as usize,
@@ -440,15 +475,23 @@ struct VolumeOptions {
     Volume: f32,
 }
 
-/// Sending volume isn't applied (the microphone's level is the player's); receiving
-/// volume scales what PeerParty plays.
-unsafe extern "system" fn update_volume(_h: usize, o: *const VolumeOptions, cd: usize, cb: usize) {
+/// Sending volume scales our voice as it goes to the room; receiving volume scales
+/// everything PeerParty plays from it.
+unsafe extern "system" fn update_sending_volume(_h: usize, o: *const VolumeOptions, cd: usize, cb: usize) {
+    update_volume(o, cd, cb, |room, v| voice::set_sending_volume(room, v))
+}
+
+unsafe extern "system" fn update_receiving_volume(_h: usize, o: *const VolumeOptions, cd: usize, cb: usize) {
+    update_volume(o, cd, cb, |room, v| voice::set_volume(room, None, v))
+}
+
+fn update_volume(o: *const VolumeOptions, cd: usize, cb: usize, set: impl Fn(&str, f32) -> bool) {
     if o.is_null() {
         return complete(cb, cd, INVALID_PARAMETERS, 0, "", 0f32);
     }
     let o = unsafe { &*o };
     let room = str_of(o.RoomName);
-    let ok = voice::joined(&key(&room));
+    let ok = set(&key(&room), o.Volume);
     complete(cb, cd, if ok { SUCCESS } else { NOT_FOUND }, o.LocalUserId, &room, o.Volume);
 }
 
@@ -764,8 +807,9 @@ struct LobbyRoomOptions {
     LocalRTCOptions: usize,
 }
 
-fn in_lobby(lobby: &str) -> bool {
-    lan().is_some_and(|l| l.my_lobbies("eos.lobby").iter().any(|x| x.id == lobby))
+/// Whether we're in `lobby` and it has a voice room.
+fn in_room_lobby(lobby: &str) -> bool {
+    lan().is_some_and(|l| l.my_lobbies("eos.lobby").iter().any(|x| x.id == lobby && lobby_has_room(x)))
 }
 
 unsafe extern "system" fn get_rtc_room_name(
@@ -777,9 +821,9 @@ unsafe extern "system" fn get_rtc_room_name(
     if o.is_null() || len.is_null() {
         return INVALID_PARAMETERS;
     }
-    lobby_voice(0);
+    // Asking is no reason to start voice: only a lobby with a room has one.
     let lobby = str_of(unsafe { (*o).LobbyId });
-    if !in_lobby(&lobby) {
+    if !in_room_lobby(&lobby) {
         return NOT_FOUND;
     }
     let name = lobby_room(&lobby);
@@ -800,9 +844,8 @@ unsafe extern "system" fn is_rtc_room_connected(_h: usize, o: *const LobbyRoomOp
     if o.is_null() || out.is_null() {
         return INVALID_PARAMETERS;
     }
-    lobby_voice(0);
     let lobby = str_of(unsafe { (*o).LobbyId });
-    if !in_lobby(&lobby) {
+    if !in_room_lobby(&lobby) {
         return NOT_FOUND;
     }
     unsafe { *out = voice::joined(&key(&lobby_room(&lobby))) as i32 };
@@ -810,7 +853,6 @@ unsafe extern "system" fn is_rtc_room_connected(_h: usize, o: *const LobbyRoomOp
 }
 
 unsafe extern "system" fn notify_lobby_room(_h: usize, _o: usize, cd: usize, cb: usize) -> u64 {
-    lobby_voice(0);
     add_listener(Kind::LobbyRtcConnection, cb, cd, None)
 }
 
@@ -834,11 +876,11 @@ unsafe extern "system" fn join_lobby_room(_h: usize, o: *const LobbyRoomOptions,
         return lobby_done(cb, cd, INVALID_PARAMETERS, "");
     }
     let o = unsafe { &*o };
-    lobby_voice(o.LocalRTCOptions);
     let lobby = str_of(o.LobbyId);
-    if !in_lobby(&lobby) {
+    if !in_room_lobby(&lobby) {
         return lobby_done(cb, cd, NOT_FOUND, &lobby);
     }
+    lobby_voice_for(&lobby, o.LocalRTCOptions);
     LOBBY_ROOMS.lock().unwrap().remove(&lobby);
     sync_lobby_rooms();
     lobby_done(cb, cd, SUCCESS, &lobby);
@@ -885,12 +927,18 @@ fn fire_lobby_room(lobby: &str, connected: bool) {
 /// Lobby rooms follow the lobbies: joined when we're in a lobby (unless the game left
 /// its room by hand), left with it.
 fn sync_lobby_rooms() {
-    if !lobby_rooms_on() {
-        return;
+    // Every tick: looked at four times a second at most.
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap();
+        if last.is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(250)) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
     }
     let Some(lan) = lan() else { return };
-    let lobbies: Vec<String> = lan.my_lobbies("eos.lobby").into_iter().map(|l| l.id).collect();
-    let (manual_in, manual_out) = *LOBBY_MANUAL.lock().unwrap();
+    // Only lobbies with a voice room: each joined as the game asked for it.
+    let lobbies: Vec<String> = lan.my_lobbies("eos.lobby").into_iter().filter(lobby_has_room).map(|l| l.id).collect();
     let mut changes = Vec::new();
     {
         let mut rooms = LOBBY_ROOMS.lock().unwrap();
@@ -910,8 +958,13 @@ fn sync_lobby_rooms() {
     for (l, join) in changes {
         let room = key(&lobby_room(&l));
         if join {
-            voice::join(lan, &room, !manual_in, !manual_out);
+            let wish = LOBBY_WISHES.lock().unwrap().get(&l).copied().unwrap_or_default();
+            voice::join(lan, &room, !wish.manual_in, !wish.manual_out);
+            if wish.muted {
+                voice::set_sending(&room, false);
+            }
         } else {
+            LOBBY_WISHES.lock().unwrap().remove(&l);
             voice::leave(lan, &room);
         }
         fire_lobby_room(&l, join);
@@ -1076,9 +1129,11 @@ pub fn pump(lan: &Lan) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::mem::{offset_of, size_of};
+    #[cfg(target_pointer_width = "64")]
+    use std::mem::offset_of;
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn layouts_match_the_headers_on_x64() {
         assert_eq!(offset_of!(JoinRoomOptions, Flags), 48);
         assert_eq!(offset_of!(JoinRoomOptions, bManualAudioOutputEnabled), 56);

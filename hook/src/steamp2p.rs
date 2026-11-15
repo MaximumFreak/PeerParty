@@ -30,6 +30,75 @@ const TO_CLIENT: &str = "steam:p2p:gc";
 static CONTACTED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<peerparty_core::PeerId>>> =
     std::sync::LazyLock::new(Default::default);
 
+/// The channels each side has used with each remote SteamID (client side false, game
+/// server side true): Steam ends a session when the last of them is closed.
+static USED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<(bool, u64), std::collections::HashSet<i32>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn used(server: bool, remote: u64, chan: i32) {
+    USED.lock().unwrap().entry((server, remote)).or_default().insert(chan);
+}
+
+/// Closes one channel; true when it was the last one with that remote.
+fn close_used(server: bool, remote: u64, chan: i32) -> bool {
+    let mut m = USED.lock().unwrap();
+    let Some(set) = m.get_mut(&(server, remote)) else {
+        return false;
+    };
+    set.remove(&chan);
+    if set.is_empty() {
+        m.remove(&(server, remote));
+        return true;
+    }
+    false
+}
+
+/// The sockets a session with `remote` rides, as this side sees it.
+fn session_sockets(server: bool, remote: u64) -> Option<(peerparty_core::PeerId, &'static [&'static str])> {
+    if server {
+        return Some((peer_of(remote)?, &[TO_SERVER, TO_CLIENT]));
+    }
+    let (peer, socket) = route(remote)?;
+    Some((peer, if socket == TO_SERVER { &[TO_SERVER, TO_CLIENT] } else { &[SOCKET] }))
+}
+
+/// Steam's P2PSessionState_t for a session, or None when there is none (not asked
+/// for, or only asked for by the peer and not yet accepted).
+fn session_state(lan: &Lan, server: bool, remote: u64) -> Option<SessionState> {
+    let (peer, sockets) = session_sockets(server, remote)?;
+    let infos: Vec<peerparty_core::ChanInfo> = sockets.iter().filter_map(|s| lan.channel_info(peer, s)).collect();
+    let open = infos.iter().any(|i| i.open);
+    let connecting = !open && infos.iter().any(|i| i.connecting);
+    if !open && !connecting {
+        return None;
+    }
+    let ip = match lan.peer_ip(peer) {
+        Some(std::net::IpAddr::V4(v4)) if open => u32::from(v4),
+        _ => 0,
+    };
+    Some(SessionState {
+        active: open as u8,
+        connecting: connecting as u8,
+        error: 0,
+        relay: 0,
+        bytes_queued: infos.iter().map(|i| i.held_bytes).sum::<usize>().min(i32::MAX as usize) as i32,
+        packets_queued: infos.iter().map(|i| i.held_packets).sum::<usize>().min(i32::MAX as usize) as i32,
+        ip,
+        port: 0,
+    })
+}
+
+/// Whether a lost session is news: not reported for the same side and SteamID in the
+/// last two seconds.
+fn first_failure(server: bool, remote: u64) -> bool {
+    static LAST: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<(bool, u64), std::time::Instant>>> =
+        std::sync::LazyLock::new(Default::default);
+    let mut m = LAST.lock().unwrap();
+    let now = std::time::Instant::now();
+    m.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(2));
+    m.insert((server, remote), now).is_none()
+}
+
 const P2P_SESSION_REQUEST: i32 = 1202;
 const P2P_SESSION_CONNECT_FAIL: i32 = 1203;
 const VALIDATE_AUTH_TICKET_RESPONSE: i32 = 143;
@@ -133,6 +202,7 @@ vmethod! {
         if socket == TO_SERVER {
             CONTACTED.lock().unwrap().insert(peer);
         }
+        used(false, remote, chan);
         let body = crate::steamlan::ids_out(peer, body);
         let r = lan.send(peer, socket, channel(chan), &body, reliable, true, true);
         crate::log::throttled("steam-lan SendP2PPacket", 4, |n| {
@@ -160,6 +230,7 @@ vmethod! {
             return false;
         };
         crate::steamlan::ids_in(p.peer, &mut p.data);
+        used(false, sender(&p), chan);
         // A short buffer truncates; the packet is consumed either way.
         let n = p.data.len().min(cap as usize);
         unsafe {
@@ -193,6 +264,7 @@ vmethod! {
 
 vmethod! {
     fn close_session(_this: usize, remote: u64) -> bool {
+        USED.lock().unwrap().remove(&(false, remote));
         match (lan(), route(remote)) {
             (Some(lan), Some((p, socket))) => {
                 lan.close(p, Some(socket));
@@ -206,30 +278,43 @@ vmethod! {
     }
 }
 
-vmethod! { fn close_channel(_this: usize, remote: u64, _chan: i32) -> bool { route(remote).is_some() } }
-
 vmethod! {
-    fn get_session_state(_this: usize, remote: u64, out: *mut SessionState) -> bool {
+    /// Closing the last channel used with a player ends the session, as on Steam.
+    fn close_channel(this: usize, remote: u64, chan: i32) -> bool {
         if route(remote).is_none() {
             return false;
         }
-        if !out.is_null() {
-            unsafe {
-                out.write(SessionState {
-                    active: 1,
-                    connecting: 0,
-                    error: 0,
-                    relay: 0,
-                    bytes_queued: 0,
-                    packets_queued: 0,
-                    ip: 0,
-                    port: 0,
-                })
-            };
+        if close_used(false, remote, chan) {
+            unsafe { close_session(this, remote) };
         }
         true
     }
 }
+
+vmethod! {
+    fn gs_close_channel(this: usize, remote: u64, chan: i32) -> bool {
+        if peer_of(remote).is_none() {
+            return false;
+        }
+        if close_used(true, remote, chan) {
+            unsafe { gs_close(this, remote) };
+        }
+        true
+    }
+}
+
+fn write_state(server: bool, remote: u64, out: *mut SessionState) -> bool {
+    let Some(state) = lan().and_then(|l| session_state(l, server, remote)) else {
+        return false;
+    };
+    if !out.is_null() {
+        unsafe { out.write(state) };
+    }
+    true
+}
+
+vmethod! { fn get_session_state(_this: usize, remote: u64, out: *mut SessionState) -> bool { write_state(false, remote, out) } }
+vmethod! { fn gs_session_state(_this: usize, remote: u64, out: *mut SessionState) -> bool { write_state(true, remote, out) } }
 
 vmethod! { fn allow_relay(_this: usize, _allow: bool) -> bool { true } }
 
@@ -242,8 +327,8 @@ pub fn server_networking() -> Vec<(&'static str, usize)> {
         ("ReadP2PPacket", gs_read as *const () as usize),
         ("AcceptP2PSessionWithUser", gs_accept as *const () as usize),
         ("CloseP2PSessionWithUser", gs_close as *const () as usize),
-        ("CloseP2PChannelWithUser", close_channel as *const () as usize),
-        ("GetP2PSessionState", get_session_state as *const () as usize),
+        ("CloseP2PChannelWithUser", gs_close_channel as *const () as usize),
+        ("GetP2PSessionState", gs_session_state as *const () as usize),
         ("AllowP2PPacketRelay", allow_relay as *const () as usize),
     ]
 }
@@ -257,6 +342,7 @@ vmethod! {
             return false;
         }
         let body = if len == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(data, len as usize) } };
+        used(true, remote, chan);
         let body = crate::steamlan::ids_out(peer, body);
         let r = lan.send(peer, TO_CLIENT, channel(chan), &body, kind >= 2, true, true);
         crate::log::throttled("steam-lan server SendP2PPacket", 4, |n| {
@@ -284,6 +370,7 @@ vmethod! {
             return false;
         };
         crate::steamlan::ids_in(p.peer, &mut p.data);
+        used(true, steam_id(p.peer), chan);
         let n = p.data.len().min(cap as usize);
         unsafe {
             if n > 0 && !dest.is_null() {
@@ -315,6 +402,7 @@ vmethod! {
 
 vmethod! {
     fn gs_close(_this: usize, remote: u64) -> bool {
+        USED.lock().unwrap().remove(&(true, remote));
         match (lan(), peer_of(remote)) {
             (Some(lan), Some(p)) => {
                 lan.close(p, Some(TO_SERVER));
@@ -375,6 +463,9 @@ vmethod! {
             len,
             identity
         );
+        if h != 0 {
+            unsafe { crate::steamlan::add_ticket_proof(ticket, max, len) };
+        }
         crate::steamlan::auth_ticket_issued(h)
     }
 }
@@ -401,8 +492,12 @@ vmethod! {
 
 vmethod! {
     fn begin_auth_session(this: usize, ticket: *const u8, len: i32, user: u64) -> i32 {
-        if peer_of(user).is_none() {
+        let Some(peer) = peer_of(user) else {
             return call_real!(this, "BeginAuthSession", fn(*const u8, i32, u64) -> i32, 1, ticket, len, user);
+        };
+        let verdict = crate::steamlan::auth_verdict(ticket, len, user, peer);
+        if verdict != 0 {
+            return verdict;
         }
         // k_EBeginAuthSessionResultOK, then k_EAuthSessionResponseOK.
         // Sign-in between PeerParty players (LEGAL.md, "Sign-in is answered locally"): OK
@@ -461,14 +556,26 @@ pub fn on_event(ev: &Event) {
             socket,
             reason: CloseReason::Lost,
         } if is_steam_p2p(socket) || is_to_server(socket) => {
-            let fail = bytes(&ConnectFail {
-                remote: steam_id(*peer),
-                error: P2P_TIMEOUT,
-            });
-            if is_to_server(socket) {
-                crate::steam::inject_server(P2P_SESSION_CONNECT_FAIL, fail);
+            // The game-server sockets carry both directions: a client that sent to
+            // this host's game server hears that the game server is gone; the host's
+            // game server hears that the player is.
+            let server_link = socket == TO_SERVER || socket == TO_CLIENT;
+            let client_side = !server_link || CONTACTED.lock().unwrap().contains(peer);
+            let remote = if server_link && client_side {
+                crate::steamgs::server_id_of(*peer).unwrap_or_else(|| steam_id(*peer))
             } else {
+                steam_id(*peer)
+            };
+            // Both of a game server link's sockets close together: one callback.
+            if !first_failure(!client_side, remote) {
+                return;
+            }
+            USED.lock().unwrap().remove(&(!client_side, remote));
+            let fail = bytes(&ConnectFail { remote, error: P2P_TIMEOUT });
+            if client_side {
                 crate::steam::inject(P2P_SESSION_CONNECT_FAIL, fail);
+            } else {
+                crate::steam::inject_server(P2P_SESSION_CONNECT_FAIL, fail);
             }
         }
         _ => {}

@@ -238,6 +238,29 @@ pub struct UserInfoTargetOptions {
     pub TargetUserId: Id,
 }
 
+/// EOS_UserInfo_BestDisplayName.
+#[repr(C)]
+pub struct BestDisplayName {
+    pub ApiVersion: i32,
+    pub UserId: Id,
+    pub DisplayName: *const c_char,
+    pub DisplayNameSanitized: *const c_char,
+    pub Nickname: *const c_char,
+    /// EOS_OnlinePlatformType: EOS_OPT_Epic is 100.
+    pub PlatformType: u32,
+}
+
+pub const BESTDISPLAYNAME_API: i32 = 1;
+
+/// EOS_Connect_GetProductUserIdMappingOptions.
+#[repr(C)]
+pub struct GetProductUserIdMappingOptions {
+    pub ApiVersion: i32,
+    pub LocalUserId: Id,
+    pub AccountIdType: i32,
+    pub TargetProductUserId: Id,
+}
+
 #[repr(C)]
 pub struct UserInfo {
     pub ApiVersion: i32,

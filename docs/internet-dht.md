@@ -77,8 +77,10 @@ DHT) with no friend needed.
    connection is a player's only once that key has signed for it, whichever way it came.
    A datagram is passed on only if it names the player the tunnel was proved to be.
 9. **Keepalives**: one every 5 s. A peer silent for 30 s is dropped, a tunnel that ends
-   says goodbye (CLOSE), and the DHT finds them again. A peer the LAN already reaches
-   gets no tunnel.
+   says goodbye (CLOSE, marked "leaving" when the copy quits, switches internet play
+   off or blocks the peer), and the DHT finds them again. A peer dropped without that
+   mark keeps its place for 10 s while its tunnel comes back (docs/design.md, "Dropped
+   connections"). A peer the LAN already reaches gets no tunnel.
 
 **Design choices.** Everyone in a room announces and looks up the same topic, so both
 sides punch at the same time with no rendezvous server. Public STUN servers are used as
@@ -99,7 +101,8 @@ peers (`PEERPARTY_INET_PEERS`) are IPv4 only.
 
 **TCP keepalive and send queues.** Every mesh TCP connection has keepalive
 (idle 10 s, probes every 1 s: a vanished PC is noticed in about 20 s), and a peer's send
-queue is capped at 64 MiB; a peer that stops reading is cut and reconnects.
+queue is capped at 64 MiB; a peer that stops reading is cut and reconnects, picking up
+where it left if it does so within 10 s.
 
 **LAN first.** A peer found on both the LAN and through the internet uses
 the LAN. If the LAN path appears later (a friend joins your Wi-Fi mid-game), the peer moves

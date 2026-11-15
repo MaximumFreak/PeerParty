@@ -80,8 +80,11 @@ what is covered and what can't be.
 ## Download and run
 
 Download `peerparty.exe` from the [Releases](../../releases) page; there is nothing to
-install. It isn't code-signed, so Windows SmartScreen may say "Windows protected your PC"
-the first time: choose **More info**, then **Run anyway**.
+install. It isn't code-signed, so Windows can't tell you who made it: before you run it,
+check it is the file the release names. Each release's notes end with its SHA-256; in
+PowerShell, `Get-FileHash .\peerparty.exe` must print the same. Only then, if Windows
+SmartScreen says "Windows protected your PC" the first time, choose **More info**, then
+**Run anyway**. A file from anywhere else, or one whose hash differs, isn't PeerParty's.
 
 Double-click it for the launcher window. It lists your Steam, Epic, GOG and Xbox app
 games and any game folders you add; pick one and press **Play** (or A on a controller).
@@ -206,10 +209,11 @@ lines in it show what each layer did.
 
 ## Build from source
 
-On Windows with the Rust toolchain (MSVC) and the 32-bit target for 32-bit games' hook:
+On Windows with rustup and the MSVC build tools: `rust-toolchain.toml` names the Rust
+version PeerParty is tested with, and rustup fetches it (with the 32-bit target for
+32-bit games' hook) the first time you build:
 
 ```
-rustup target add i686-pc-windows-msvc
 cargo build --release
 ```
 

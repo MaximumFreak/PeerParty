@@ -278,6 +278,27 @@ fn a_silent_caller_learns_nothing() {
     a.shutdown();
 }
 
+/// A sign-in ticket's proof says whose it is: another PC takes it as its maker's, not
+/// as anyone else's, and an altered or missing one is told apart.
+#[test]
+fn an_auth_ticket_proves_its_maker() {
+    let port = 47650 + (std::process::id() % 290) as u16;
+    let game = format!("test:ticket:{}", std::process::id());
+    let a = start(&game, port, "a");
+    let b = start(&game, port + 1, "b");
+    let mut ticket = b"steam_api's own ticket bytes".to_vec();
+    ticket.extend(a.auth_ticket().expect("a proof"));
+    assert_eq!(b.check_auth_ticket(&ticket, a.me()), Some(true));
+    assert_eq!(b.check_auth_ticket(&ticket, b.me()), Some(false), "a's ticket claimed as b's");
+    let mut altered = ticket.clone();
+    let last = altered.len() - 1;
+    altered[last] ^= 1;
+    assert_eq!(b.check_auth_ticket(&altered, a.me()), Some(false));
+    assert_eq!(b.check_auth_ticket(b"no proof at all", a.me()), None);
+    a.shutdown();
+    b.shutdown();
+}
+
 /// An id is its key's hash, and a connection is a player's only once that key has signed
 /// for it. Before, whoever could reach the engine's port could say it was any player
 /// whose id it knew: a friend, and (the LAN counting for more than the internet) in
@@ -374,6 +395,8 @@ fn an_id_cant_be_claimed_without_its_key() {
 /// was briefly gone never opened once it was back.
 #[test]
 fn member_searches_abandoned_joins_and_channels_asked_for_early() {
+    // A break counts as leaving here (no grace: see core/tests/link_drop.rs for one).
+    let _timing = TestTiming::install(TestIntervals { link_grace: Some(Duration::ZERO), ..TestIntervals::NONE });
     let port = 48560 + (std::process::id() % 300) as u16;
     let game = format!("test:small:{}", std::process::id());
     let a = start(&game, port, "a");
@@ -455,4 +478,53 @@ fn member_searches_abandoned_joins_and_channels_asked_for_early() {
     for l in [&a, &b, &c] {
         l.shutdown();
     }
+}
+
+/// A Join that reaches a lobby's old owner, after it left and handed the lobby on, is
+/// pointed to the new owner and goes through, well inside the join's 5 seconds.
+#[test]
+fn a_join_sent_to_an_owner_that_handed_the_lobby_on_reaches_the_new_one() {
+    let port = 48900 + (std::process::id() % 250) as u16;
+    let game = format!("test-handed:{}", std::process::id());
+    let a = start(&game, port, "a");
+    let b = start(&game, port, "b");
+    let c = start(&game, port, "c");
+    let (mut ea, mut eb, mut ec) = (Vec::new(), Vec::new(), Vec::new());
+    for (me, seen, others) in [(&a, &mut ea, [b.me(), c.me()]), (&b, &mut eb, [a.me(), c.me()]), (&c, &mut ec, [a.me(), b.me()])] {
+        for o in others {
+            wait(me, seen, |e| *e == Event::PeerJoined(o));
+        }
+    }
+    let mut spec = Lobby::new("eos.lobby");
+    spec.bucket = "handed".into();
+    let hosted = a.create_lobby(spec).unwrap();
+    b.join(&hosted).unwrap();
+    wait(&b, &mut eb, |e| matches!(e, Event::JoinDone { result: JoinResult::Ok, .. }));
+    wait(&a, &mut ea, |e| matches!(e, Event::MemberStatus { status: MemberStatus::Joined, .. }));
+
+    // A leaves: B owns it now. C still has the listing that names A.
+    a.leave(&hosted.id).unwrap();
+    wait(&b, &mut eb, |e| matches!(e, Event::MemberStatus { member, status: MemberStatus::Promoted, .. } if *member == b.me()));
+    let asked = Instant::now();
+    c.join(&hosted).unwrap();
+    let pump = |l: &Lan| {
+        l.tick();
+        l.poll()
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let done = loop {
+        ea.extend(pump(&a));
+        eb.extend(pump(&b));
+        ec.extend(pump(&c));
+        if let Some(i) = ec.iter().position(|e| matches!(e, Event::JoinDone { .. })) {
+            break ec.remove(i);
+        }
+        assert!(Instant::now() < deadline, "no answer: {ec:#?}");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(done, Event::JoinDone { lobby: hosted.id.clone(), result: JoinResult::Ok });
+    assert!(asked.elapsed() < Duration::from_secs(3), "answered by the new owner, not timed out ({:?})", asked.elapsed());
+    let l = c.lobby(&hosted.id).unwrap();
+    assert_eq!(l.owner, b.me());
+    assert!(l.member(c.me()).is_some() && l.member(a.me()).is_none());
 }

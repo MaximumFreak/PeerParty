@@ -61,12 +61,16 @@ impl PadThread {
         self.front.store(front, Ordering::Relaxed);
     }
 
-    /// The buttons held now.
+    /// The buttons held now, and any that went down and up again since the last look:
+    /// a quick tap while the window was busy (both changes waiting) still counts as a
+    /// press, held for this one look.
     pub fn held(&mut self) -> u32 {
+        let mut seen = self.held;
         while let Ok((b, style)) = self.rx.try_recv() {
+            seen |= b;
             self.held = b;
             self.style = style;
         }
-        self.held
+        seen
     }
 }

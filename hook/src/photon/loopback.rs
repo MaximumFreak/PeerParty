@@ -8,7 +8,7 @@ use super::crypto::{Aes256, Dh};
 use super::enet::{self, Peer, State};
 use super::host::{Host, Options};
 use super::message::Proto;
-use super::server::{ev, key, op};
+use super::server::{err, ev, key, op};
 use super::value::*;
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
@@ -178,6 +178,8 @@ fn start() -> (Host, Arc<Mutex<Vec<String>>>) {
         tcp_ports: [0; 3],
         ws_ports: [0; 3],
         advertise: Box::new(|_| "127.0.0.1".into()),
+        player: Box::new(|_| None),
+        allow: Arc::new(|_| true),
         log: Arc::new(move |s: &str| l2.lock().unwrap().push(s.to_owned())),
     })
     .unwrap();
@@ -470,6 +472,51 @@ fn to_game(name: &'static str, ns: SocketAddr, user: &str, proto: Proto, op_code
     }
     c.ok(op_code, p);
     c
+}
+
+/// A room the master has handed its creator but that isn't made yet can't be taken by
+/// another client naming it on the game server (it would make it with its own options,
+/// as its master); once made, it is joined as any room.
+#[test]
+fn a_room_being_created_is_its_creators() {
+    let (host, _logs) = start();
+    let ns = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), host.ports[0][0]);
+    let master_of = |name: &'static str, user: &str| {
+        let mut c = Client::connect(name, ns, Proto::V18, None);
+        let auth = c.ok(
+            op::AUTHENTICATE,
+            vec![
+                (key::APP_VERSION, Value::Str("v".into())),
+                (key::APPLICATION_ID, Value::Str(APP.into())),
+                (key::USER_ID, Value::Str(user.into())),
+            ],
+        );
+        let (master, token) = (addr(&str_param(&auth, key::ADDRESS)), str_param(&auth, key::TOKEN));
+        c.leave();
+        let mut c = Client::connect(name, master, Proto::V18, None);
+        c.ok(op::AUTHENTICATE, vec![(key::TOKEN, Value::Str(token))]);
+        c
+    };
+    let to_gs = |name: &'static str, r: &Response| {
+        let (gs, token) = (addr(&str_param(r, key::ADDRESS)), str_param(r, key::TOKEN));
+        let mut c = Client::connect(name, gs, Proto::V18, None);
+        c.ok(op::AUTHENTICATE, vec![(key::TOKEN, Value::Str(token))]);
+        c
+    };
+    let mut a = master_of("A", "alice");
+    let ra = a.ok(op::CREATE_GAME, vec![(key::GAME_ID, Value::Str("hers".into()))]);
+    let mut b = master_of("B", "bob");
+    let rb = b.ok(op::CREATE_GAME, vec![(key::GAME_ID, Value::Str("his".into()))]);
+    let mut b_gs = to_gs("B", &rb);
+    let taken = b_gs.request(op::CREATE_GAME, vec![(key::GAME_ID, Value::Str("hers".into()))]);
+    assert_eq!(taken.ret, err::GAME_DOES_NOT_EXIST, "a room only reserved");
+    let mut a_gs = to_gs("A", &ra);
+    a_gs.ok(op::CREATE_GAME, vec![(key::GAME_ID, Value::Str("hers".into()))]);
+    // Made now: B may name it (the usual join checks apply).
+    b_gs.ok(op::JOIN_GAME, vec![(key::GAME_ID, Value::Str("hers".into()))]);
+    for c in [a, b, a_gs, b_gs] {
+        c.leave();
+    }
 }
 
 #[test]

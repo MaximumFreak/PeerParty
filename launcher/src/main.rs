@@ -60,6 +60,7 @@
 #[cfg(not(target_arch = "x86_64"))]
 compile_error!("peerparty.exe is x64 only; it injects 32-bit games itself");
 
+mod anticheat;
 mod firewall;
 mod gameroot;
 mod host;
@@ -91,7 +92,40 @@ use windows_sys::Win32::System::Threading::{
     QueueUserAPC, ResumeThread, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
 };
 
-const USAGE: &str = "usage: peerparty [--room CODE] [--public] [--set key=value] [--log-dir DIR] [--multi-instance] [--copy-saves] <game.exe> [args...]\n         plays the game through peerparty: the local network, plus the internet with --room or --public\n         a simple .bat or .cmd that starts the game works too: peerparty starts the program it runs\n         --set changes one setting for this run: name=Alex, voice=off, internet=off, overlay=off, auto_accept=on, ... (docs/usage.md)\n       peerparty --invite   (invites every other player to the game in front)\n       peerparty --new-room   (makes a room code for internet play)\n       peerparty --net-test   (checks this PC's internet path: STUN, NAT type, the DHT)\n       peerparty --pads   (lists the controllers the overlay reads, and their buttons)\n       peerparty --firewall <game.exe>   (whether Windows Firewall lets other players connect to it)\n       peerparty --fix-firewall <game.exe> [--public]   (as administrator: lets them, on private and domain networks, and public ones with --public)\n       peerparty --blocked | --block FINGERPRINT | --unblock FINGERPRINT|all   (public players you blocked)\n       peerparty --friends | --friend FINGERPRINT | --unfriend FINGERPRINT|all   (friends for PEERPARTY_PUBLIC_FRIENDS_ONLY=1)";
+const USAGE: &str = "usage: peerparty [--room CODE] [--public] [--set key=value] [--log-dir DIR] [--multi-instance] [--copy-saves] <game.exe> [args...]\n         plays the game through peerparty: the local network, plus the internet with --room or --public\n         a simple .bat or .cmd that starts the game works too: peerparty starts the program it runs\n         --set changes one setting for this run: name=Alex, voice=off, internet=off, overlay=off, auto_accept=on, ... (docs/usage.md)\n       peerparty --invite   (invites every other player to the game in front)\n       peerparty --new-room   (makes a room code for internet play)\n       peerparty --net-test   (checks this PC's internet path: STUN, NAT type, the DHT)\n       peerparty --pads   (lists the controllers the overlay reads, and their buttons)\n       peerparty --firewall <game.exe>   (whether Windows Firewall lets other players connect to it)\n       peerparty --fix-firewall <game.exe> [--public]   (as administrator: lets them, on private and domain networks, and public ones with --public)\n       peerparty --remove-firewall   (as administrator: removes every firewall rule peerparty added)\n       peerparty --blocked | --block FINGERPRINT | --unblock FINGERPRINT|all   (public players you blocked)\n       peerparty --friends | --friend FINGERPRINT | --unfriend FINGERPRINT|all   (friends for PEERPARTY_PUBLIC_FRIENDS_ONLY=1)";
+
+/// Why a game didn't start, for the launcher window, which says it in the player's
+/// language (the English line stays for the command line and the logs). Started with
+/// `--why` (the window does), PeerParty prints `peerparty-why: <reason>\t<value>` after
+/// its English line; the window's `ui::why_text` turns it into words.
+static WHY: std::sync::Mutex<Option<(&'static str, String)>> = std::sync::Mutex::new(None);
+static WHY_LINES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Notes the reason (the last one noted wins) and hands back the English text.
+fn why(reason: &'static str, value: impl ToString, english: String) -> String {
+    *WHY.lock().unwrap_or_else(|e| e.into_inner()) = Some((reason, value.to_string()));
+    english
+}
+
+/// The `peerparty-why:` line, when asked for and a reason was noted.
+fn print_why() {
+    if !WHY_LINES.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    if let Some((reason, value)) = WHY.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        eprintln!("peerparty-why: {reason}\t{}", value.replace(['\t', '\r', '\n'], " "));
+    }
+}
+
+/// An OS error from starting the game, as a reason: "elevation" for one that must run
+/// as administrator (ERROR_ELEVATION_REQUIRED), else "os" with Windows' own message
+/// (already in the system's language).
+fn os_why(english: String, e: &std::io::Error) -> String {
+    match e.raw_os_error() {
+        Some(740) => why("elevation", "", english),
+        _ => why("os", e, english),
+    }
+}
 
 /// `--blocked`, `--block FP`, `--unblock FP|all`: the public-sessions block list.
 /// `--friends`, `--friend FP`, `--unfriend FP|all`: the same for the friends list.
@@ -243,6 +277,7 @@ fn main() -> ExitCode {
         Ok(code) => std::process::exit(code as i32),
         Err(e) => {
             eprintln!("peerparty: {e}");
+            print_why();
             ExitCode::from(1)
         }
     }
@@ -311,6 +346,10 @@ fn run() -> Result<u32, String> {
                 args.next();
                 copy_saves = true;
             }
+            Some("--why") => {
+                args.next();
+                WHY_LINES.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             Some("--room") => {
                 args.next();
                 let code = args.next().ok_or(USAGE)?.to_string_lossy().into_owned();
@@ -373,6 +412,16 @@ fn run() -> Result<u32, String> {
                     }
                 };
             }
+            // As administrator: PeerParty's firewall rules, for every game, go.
+            Some("--remove-firewall") => {
+                return match firewall::remove_all() {
+                    Ok(msg) => {
+                        eprintln!("peerparty: {msg}");
+                        Ok(0)
+                    }
+                    Err(e) => Err(format!("removing the firewall rules failed (run it as administrator): {e}")),
+                };
+            }
             Some("--pads") => {
                 host::print_pads(30);
                 return Ok(0);
@@ -393,14 +442,14 @@ fn run() -> Result<u32, String> {
     let exe = PathBuf::from(args.next().ok_or(USAGE)?);
     let game_args: Vec<OsString> = args.collect();
 
-    let exe = fs::canonicalize(&exe).map_err(|e| format!("{}: {e}", exe.display()))?;
+    let exe = fs::canonicalize(&exe).map_err(|e| missing(&exe, &e))?;
     let exe = strip_verbatim(&exe);
     // What the player chose (a .bat stays the game's name in Settings and Recent).
     let listed = exe.clone();
     // A .bat or .cmd: the program it runs is the game (wrapper.rs).
     let (exe, game_args, script_cwd) = if wrapper::is_script(&exe) {
         let w = wrapper::read(&exe, &game_args)?;
-        let real = fs::canonicalize(&w.exe).map_err(|e| format!("{}: {e}", w.exe.display()))?;
+        let real = fs::canonicalize(&w.exe).map_err(|e| missing(&w.exe, &e))?;
         eprintln!("peerparty: {} runs {}: starting that", exe.display(), w.exe.display());
         for (k, v) in &w.vars {
             unsafe { env::set_var(k, v) };
@@ -412,6 +461,10 @@ fn run() -> Result<u32, String> {
     // A packaged game's program can only be run, not read (its files allow execute but not
     // read data), and `--attach` works out its bitness from the running process.
     let pkg = packaged::find(&exe);
+    // Before anything runs in the game (anticheat.rs).
+    if let Some(found) = anticheat::refuse(&exe) {
+        return Err(why("anticheat", &found, format!("{} uses anti-cheat ({found}); peerparty doesn't start games that do (LEGAL.md)", exe.display())));
+    }
 
     let log_dir = log_dir.unwrap_or_else(|| env::temp_dir().join("peerparty").join("logs"));
     fs::create_dir_all(&log_dir).map_err(|e| format!("{}: {e}", log_dir.display()))?;
@@ -480,7 +533,7 @@ fn run() -> Result<u32, String> {
                     env::set_var("PEERPARTY_ROOM", code.to_string());
                     eprintln!("peerparty: internet play on, room {}", code.fingerprint());
                 }
-                None => return Err(format!("{room:?} isn't a room code (peerparty --new-room makes one)")),
+                None => return Err(why("room", "", format!("{room:?} isn't a room code (peerparty --new-room makes one)"))),
             }
         }
         // Public sessions: anyone online with PeerParty and this game.
@@ -545,7 +598,7 @@ fn run() -> Result<u32, String> {
     let x86 = match pe_machine(&exe)? {
         0x8664 => false,
         0x014c => true,
-        m => return Err(format!("unsupported machine type {m:#x}")),
+        m => return Err(why("machine", "", format!("unsupported machine type {m:#x}"))),
     };
     let dll = hooks::extract(x86)?;
 
@@ -591,6 +644,10 @@ fn run() -> Result<u32, String> {
         }
         let line = exit_line(ended.code, ended.ran);
         eprintln!("peerparty: {line}");
+        if let Some(c) = ended.code.filter(|&c| c != 0) {
+            why(if c == 0xC000_0135 { "exit_dll" } else { "exit" }, format!("{c:#010X}"), String::new());
+            print_why();
+        }
         log_exit(&log_dir, &ended.exe, ended.pid, &line);
         Ok(ended.code.unwrap_or(1))
     }
@@ -803,10 +860,8 @@ unsafe fn start_injected(
             &mut pi,
         ) == 0
         {
-            return Err(format!(
-                "CreateProcess failed: {}",
-                std::io::Error::last_os_error()
-            ));
+            let e = std::io::Error::last_os_error();
+            return Err(os_why(format!("CreateProcess failed: {e}"), &e));
         }
 
         let fail = |what: String| {
@@ -822,11 +877,16 @@ unsafe fn start_injected(
             inject_x64(&pi, dll)
         };
         if let Err(what) = injected {
-            return Err(fail(what));
+            return Err(fail(why("inject", "", what)));
         }
         // Before it runs, so every program it starts is in the job too.
         if tree.is_some_and(|t| !t.add(pi.hProcess)) {
             eprintln!("peerparty: can't watch the programs the game starts ({}); waiting for this one only", std::io::Error::last_os_error());
+        }
+        // An x64 game's hook loads once it runs (the APC): it says so on this event, and
+        // a game it never loads in is reported (a 32-bit one's load was waited for).
+        if !x86 {
+            watch_hook_load(&pi);
         }
         if ResumeThread(pi.hThread) == u32::MAX {
             return Err(fail(format!(
@@ -835,6 +895,43 @@ unsafe fn start_injected(
             )));
         }
         Ok(pi)
+    }
+}
+
+/// The event the hook sets once it has loaded in process `pid` (hook/src/lib.rs).
+pub(crate) fn loaded_event(pid: u32) -> Vec<u16> {
+    wide(OsStr::new(&format!("Local\\peerparty-loaded-{pid}")))
+}
+
+/// Made before the game runs: a thread waits for the hook's word that it loaded, and
+/// says so in PeerParty's output when it hasn't within LOAD_WAIT while the game still
+/// runs (security software can stop a DLL from loading without a word to us).
+unsafe fn watch_hook_load(pi: &PROCESS_INFORMATION) {
+    use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcess, WaitForMultipleObjects};
+    const LOAD_WAIT: u32 = 20_000;
+    unsafe {
+        let event = CreateEventW(ptr::null(), 1, 0, loaded_event(pi.dwProcessId).as_ptr());
+        if event.is_null() {
+            return;
+        }
+        let mut process = ptr::null_mut();
+        let me = GetCurrentProcess();
+        if DuplicateHandle(me, pi.hProcess, me, &mut process, 0, 0, DUPLICATE_SAME_ACCESS) == 0 {
+            CloseHandle(event);
+            return;
+        }
+        let (event, process, pid) = (event as usize, process as usize, pi.dwProcessId);
+        std::thread::spawn(move || {
+            let handles = [event as _, process as _];
+            let r = WaitForMultipleObjects(2, handles.as_ptr(), 0, LOAD_WAIT);
+            // Loaded (WAIT_OBJECT_0), or the game ended first: nothing to say.
+            if r == WAIT_TIMEOUT {
+                eprintln!("peerparty: the game (pid {pid}) runs without peerparty: its hook hasn't loaded after {} s (security software may have stopped it)", LOAD_WAIT / 1000);
+            }
+            CloseHandle(event as _);
+            CloseHandle(process as _);
+        });
     }
 }
 
@@ -863,6 +960,12 @@ pub(crate) unsafe fn write_remote(pi: &PROCESS_INFORMATION, bytes: &[u8]) -> Res
         }
         Ok(remote as usize)
     }
+}
+
+/// The game (or the program a .bat runs) can't be opened.
+fn missing(exe: &Path, e: &std::io::Error) -> String {
+    let english = format!("{}: {e}", exe.display());
+    if e.kind() == std::io::ErrorKind::NotFound { why("missing", exe.display(), english) } else { os_why(english, e) }
 }
 
 pub(crate) fn os_error(what: &str) -> String {
@@ -898,9 +1001,10 @@ fn pe_machine(exe: &Path) -> Result<u16, String> {
         buf.get(o..o + 4)
             .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     };
-    let nt = rd32(0x3c).ok_or("not a PE file")? as usize;
+    let not_pe = || why("not_program", exe.display(), format!("{} is not a PE file", exe.display()));
+    let nt = rd32(0x3c).ok_or_else(not_pe)? as usize;
     if rd16(0) != Some(0x5a4d) || rd32(nt) != Some(0x4550) {
-        return Err(format!("{} is not a PE file", exe.display()));
+        return Err(not_pe());
     }
     rd16(nt + 4).ok_or_else(|| "truncated PE header".into())
 }

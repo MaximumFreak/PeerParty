@@ -8,7 +8,8 @@
 //! identity, so each copy keeps the same ids across runs and other copies can work out
 //! anyone's entity id (Party endpoints carry it). Calls PeerParty has no data for (title
 //! data, CloudScript, catalogs, groups) succeed with nothing in them, the way a title
-//! with nothing configured answers. A CloudScript function that deletes the player's
+//! with nothing configured answers; one it has no stand-in for at all gets its result's
+//! lists and maps, empty (`empty_result`). A CloudScript function that deletes the player's
 //! account (its name says delete and account) deletes nothing and answers
 //! `NOT_NEEDED` as its result: there is no PlayFab account to delete.
 //!
@@ -149,13 +150,15 @@ fn save(s: &Saved) {
     if let Some(d) = p.parent() {
         let _ = std::fs::create_dir_all(d);
     }
+    crate::ipc::local_store("PlayFab", &p);
     if crate::saves::write_whole(&p, j.to_string().as_bytes()).is_err() {
         log!("playfab: couldn't save the player's data to {}", p.display());
     }
 }
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(Mutex::default);
-/// Matchmaking runs one request at a time (searches share one event queue).
+/// Matchmaking decides one ticket at a time (the LAN search before it runs without it:
+/// each search takes only its own answer from the shared event queue).
 static MATCHING: Mutex<()> = Mutex::new(());
 
 fn ok(data: Json) -> (u16, String) {
@@ -467,10 +470,99 @@ pub fn handle(req: &Request) -> (u16, String) {
             ok(Json::obj(vec![("TicketIds", Json::Arr(ids))]))
         }
         other => {
-            crate::log::gap("playfab", &format!("{other} (no stand-in, answered with an empty success)"));
-            ok(Json::Obj(vec![]))
+            let data = empty_result(other, &body, &now);
+            let shaped = if matches!(&data, Json::Obj(p) if !p.is_empty()) { "its result's empty fields" } else { "an empty success" };
+            crate::log::gap("playfab", &format!("{other} (no stand-in, answered with {shaped})"));
+            ok(data)
         }
     }
+}
+
+/// What a call PeerParty has no stand-in for answers: its result as a title with nothing
+/// set up has it, with the lists and maps a game reads from it empty rather than missing
+/// (a game that loops over a missing list reads null and can crash). Calls PlayFab has are
+/// named here; for any other read (`Get`, `List`, `Find`, `Search`) a plural noun in its
+/// name is taken as an empty list (`ListFooBars` gets `FooBars` and `Bars`). Fields a
+/// result model doesn't have are ignored by PlayFab's SDKs. Anything else gets `{}`.
+fn empty_result(path: &str, body: &Json, now: &str) -> Json {
+    let lower = path.to_ascii_lowercase();
+    let Some((service, name)) = lower.trim_start_matches('/').split_once('/') else { return Json::Obj(vec![]) };
+    let arr = || Json::Arr(vec![]);
+    let map = || Json::Obj(vec![]);
+    let echo = |k: &str| body.get(k).clone();
+    let rankings = || Json::obj(vec![("Rankings", arr()), ("EntryCount", Json::Num(0.0)), ("Version", Json::Num(0.0))]);
+    let known = match (service, name) {
+        ("client" | "server", n) => match n {
+            "getadplacements" => Some(Json::obj(vec![("AdPlacements", arr())])),
+            "getcharacterdata" | "getcharacterreadonlydata" | "getcharacterinternaldata" => {
+                Some(Json::obj(vec![("CharacterId", echo("CharacterId")), ("Data", map()), ("DataVersion", Json::Num(0.0))]))
+            }
+            "getcharacterleaderboard" | "getleaderboardaroundcharacter" | "getleaderboardforusercharacters" => {
+                Some(Json::obj(vec![("Leaderboard", arr())]))
+            }
+            "getcharacterstatistics" => Some(Json::obj(vec![("CharacterStatistics", map())])),
+            "getcurrentgames" => Some(Json::obj(vec![("Games", arr()), ("GameCount", Json::Num(0.0)), ("PlayerCount", Json::Num(0.0))])),
+            "getgameserverregions" => Some(Json::obj(vec![("Regions", arr())])),
+            "getplayersegments" | "getplayersinsegment" => {
+                Some(Json::obj(vec![("Segments", arr()), ("PlayerProfiles", arr()), ("ProfilesInSegment", Json::Num(0.0))]))
+            }
+            "getplayerstatisticversions" => Some(Json::obj(vec![("StatisticVersions", arr())])),
+            "getplayertags" => Some(Json::obj(vec![
+                ("PlayFabId", if body.get("PlayFabId").is_null() { Json::str(playfab_id()) } else { echo("PlayFabId") }),
+                ("Tags", arr()),
+            ])),
+            "getplayertrades" => Some(Json::obj(vec![("AcceptedTrades", arr()), ("OpenedTrades", arr())])),
+            n if n.starts_with("getplayfabidsfrom") => Some(Json::obj(vec![("Data", arr())])),
+            "getpublisherdata" | "gettitleinternaldata" | "getuserinternaldata" | "getuserpublisherinternaldata" => {
+                Some(Json::obj(vec![("Data", map()), ("DataVersion", Json::Num(0.0))]))
+            }
+            "getsharedgroupdata" => Some(Json::obj(vec![("Data", map()), ("Members", arr())])),
+            "gettime" => Some(Json::obj(vec![("Time", Json::str(now))])),
+            "getphotonauthenticationtoken" => Some(Json::obj(vec![("PhotonCustomAuthenticationToken", Json::str(""))])),
+            "getuserbans" => Some(Json::obj(vec![("BanData", arr())])),
+            _ => None,
+        },
+        ("object", "getobjects") => Some(Json::obj(vec![("Objects", map()), ("ProfileVersion", Json::Num(0.0)), ("Entity", entity_key(&entity_id()))])),
+        ("file", "getfiles") => Some(Json::obj(vec![("Metadata", map()), ("ProfileVersion", Json::Num(0.0)), ("Entity", entity_key(&entity_id()))])),
+        ("profile", "getprofiles") => Some(Json::obj(vec![("Profiles", arr())])),
+        ("profile", "gettitleplayersfrommasterplayeraccountids") => Some(Json::obj(vec![("TitlePlayerAccounts", map())])),
+        ("group", "listgroupmembers") => Some(Json::obj(vec![("Members", arr())])),
+        ("group", "listgroupinvitations") => Some(Json::obj(vec![("Invitations", arr())])),
+        ("group", "listgroupapplications") => Some(Json::obj(vec![("Applications", arr())])),
+        ("group", "listgroupblocks") => Some(Json::obj(vec![("BlockedEntities", arr())])),
+        ("experimentation", "gettreatmentassignment") => {
+            Some(Json::obj(vec![("TreatmentAssignment", Json::obj(vec![("Variants", arr()), ("Variables", arr())]))]))
+        }
+        ("leaderboard", "getleaderboard" | "getleaderboardaroundentity" | "getleaderboardforentities" | "getfriendleaderboardforentity") => {
+            Some(rankings())
+        }
+        ("statistic", "getstatistics") => Some(Json::obj(vec![("Statistics", map()), ("Entity", entity_key(&entity_id()))])),
+        ("statistic", "getstatisticsforentities") => Some(Json::obj(vec![("EntitiesStatistics", arr())])),
+        ("catalog", "getitemreviews") => Some(Json::obj(vec![("Reviews", arr())])),
+        ("inventory", "gettransactionhistory") => Some(Json::obj(vec![("Transactions", arr())])),
+        ("localization", "getlanguagelist") => Some(Json::obj(vec![("LanguageList", arr())])),
+        ("cloudscript", n) if n.starts_with("list") && n.ends_with("functions") => Some(Json::obj(vec![("Functions", arr())])),
+        ("match", "listserverbackfillticketsforplayer") => Some(Json::obj(vec![("TicketIds", arr())])),
+        ("match", "getqueuestatistics") => Some(Json::obj(vec![("NumberOfPlayersMatching", Json::Num(0.0))])),
+        _ => None,
+    };
+    if let Some(j) = known {
+        return j;
+    }
+    // Any other read: the plural noun at the end of its name, whole and as its last word.
+    let original = path.trim_start_matches('/').split_once('/').map_or("", |(_, n)| n);
+    let Some(noun) = ["Get", "List", "Find", "Search"].iter().find_map(|v| original.strip_prefix(v)).filter(|n| !n.is_empty()) else {
+        return Json::Obj(vec![]);
+    };
+    let plural = |w: &str| w.ends_with('s') && !(w.ends_with("ss") || w.ends_with("us") || w.ends_with("is"));
+    let last = noun.rfind(|c: char| c.is_ascii_uppercase()).map_or(noun, |i| &noun[i..]);
+    let mut fields: Vec<(&str, Json)> = Vec::new();
+    for w in [noun, last] {
+        if plural(w) && !fields.iter().any(|(k, _)| *k == w) {
+            fields.push((w, arr()));
+        }
+    }
+    Json::obj(fields)
 }
 
 fn player_profile() -> Json {
@@ -947,29 +1039,41 @@ fn get_ticket(body: &Json) -> (u16, String) {
 /// Matches a waiting ticket if its pair is on the LAN, or cancels it once it has waited
 /// too long. False if there's no such ticket.
 fn advance(lan: &peerparty_core::Lan, id: &str) -> bool {
-    let _one = MATCHING.lock().unwrap();
-    tidy(lan);
     let id = id.to_string();
-    let (queue, entity, data, created, expired) = {
+    let read = || {
         let s = STATE.lock().unwrap();
-        let Some(t) = s.tickets.get(&id) else {
-            return false;
-        };
-        if t.canceled.is_some() || t.matched.is_some() {
+        let t = s.tickets.get(&id)?;
+        let open = t.canceled.is_none() && t.matched.is_none();
+        Some(open.then(|| (t.queue.clone(), t.entity.clone(), t.data.clone(), t.created, t.started.elapsed().as_secs_f64() > t.give_up)))
+    };
+    {
+        let _one = MATCHING.lock().unwrap();
+        tidy(lan);
+    }
+    let queue = match read() {
+        None => return false,
+        Some(None) => return true,
+        // Waited too long: no search needed to say so.
+        Some(Some(t)) if t.4 => {
+            let _one = MATCHING.lock().unwrap();
+            cancel(|tid, _| tid == id, "Timeout");
             return true;
         }
-        (
-            t.queue.clone(),
-            t.entity.clone(),
-            t.data.clone(),
-            t.created,
-            t.started.elapsed().as_secs_f64() > t.give_up,
-        )
+        Some(Some(t)) => t.0,
+    };
+    // The search waits up to SEARCH_WAIT for the LAN's answers: not while holding the
+    // guard, so polls of other tickets aren't held up behind it.
+    let all = search(lan, &queue);
+    let _one = MATCHING.lock().unwrap();
+    // Read again under the guard: another poll may have matched or ended it meanwhile.
+    let (entity, data, created, expired) = match read() {
+        None => return false,
+        Some(None) => return true,
+        Some(Some((_, entity, data, created, expired))) => (entity, data, created, expired),
     };
     if expired {
         cancel(|tid, _| tid == id, "Timeout");
     } else {
-        let all = search(lan, &queue);
         let me = View {
             id: id.clone(),
             entity,
@@ -1231,6 +1335,26 @@ mod tests {
         assert!(deletes_account("DeleteAccount") && deletes_account("delete_user_account"));
         assert!(!deletes_account("deletePlayerSave") && !deletes_account("reportUser"));
         assert!(matches!(script_result("reportUser"), Json::Null));
+    }
+
+    /// A call with no stand-in answers with its result's collections, empty, not missing.
+    #[test]
+    fn unknown_reads_get_their_results_empty_fields() {
+        let body = Json::parse(r#"{"CharacterId":"C1"}"#).unwrap();
+        let get = |path: &str| empty_result(path, &body, "2026-01-01T00:00:00.000Z").to_string();
+        assert_eq!(get("/Client/GetPlayerTrades"), r#"{"AcceptedTrades":[],"OpenedTrades":[]}"#);
+        assert_eq!(get("/Server/GetSharedGroupData"), r#"{"Data":{},"Members":[]}"#);
+        assert_eq!(get("/Client/GetPlayFabIDsFromSteamIDs"), r#"{"Data":[]}"#);
+        assert_eq!(get("/client/getcharacterdata"), r#"{"CharacterId":"C1","Data":{},"DataVersion":0}"#);
+        assert_eq!(get("/Client/GetTime"), r#"{"Time":"2026-01-01T00:00:00.000Z"}"#);
+        assert!(get("/Leaderboard/GetLeaderboardAroundEntity").starts_with(r#"{"Rankings":[]"#));
+        assert_eq!(get("/CloudScript/ListHttpFunctions"), r#"{"Functions":[]}"#);
+        // Not named: a plural noun is a list; anything else is a bare success.
+        assert_eq!(get("/Client/GetFooBars"), r#"{"FooBars":[],"Bars":[]}"#);
+        assert_eq!(get("/Thing/ListWidgets"), r#"{"Widgets":[]}"#);
+        assert_eq!(get("/Thing/GetBuildStatus"), "{}");
+        assert_eq!(get("/Client/ReportPlayer"), "{}");
+        assert_eq!(get("/Client/Get"), "{}");
     }
 
     #[test]

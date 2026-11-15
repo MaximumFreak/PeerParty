@@ -45,6 +45,9 @@ const MAX_PINS: usize = 4096;
 const MAX_SESSION_PINS: usize = 65536;
 /// What a copy signs to prove its key to the copy it shakes hands with on the mesh.
 const HELLO_CONTEXT: &[u8] = b"peerparty mesh hello v3";
+const TICKET_CONTEXT: &[u8] = b"peerparty auth ticket v1";
+/// What a copy signs to set up a connection through another player (`lan::relay`).
+const RELAY_CONTEXT: &[u8] = b"peerparty relay v1\0";
 
 fn local_dir() -> Option<PathBuf> {
     std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("peerparty"))
@@ -133,6 +136,18 @@ impl IdentityKey {
         self.key.verifying_key().to_bytes()
     }
 
+    /// A game's sign-in ticket's proof (`Lan::auth_ticket`): this key's signature over
+    /// the game and a number made up for this ticket.
+    pub fn sign_ticket(&self, game: &str, nonce: &[u8; 16]) -> [u8; SIG_LEN] {
+        self.sign(&ticket_transcript(game, nonce))
+    }
+
+    /// A relayed connection's offer or answer (`lan::relay`): this key's signature over
+    /// `t`, under a context nothing else is signed with.
+    pub fn sign_relay(&self, t: &[u8]) -> [u8; SIG_LEN] {
+        self.sign(&[RELAY_CONTEXT, t].concat())
+    }
+
     pub fn fingerprint(&self) -> String {
         fingerprint(&self.public())
     }
@@ -154,11 +169,31 @@ fn hello_transcript(game: &str, signer: (PeerId, &[u8; 16]), verifier: (PeerId, 
     t
 }
 
+fn ticket_transcript(game: &str, nonce: &[u8; 16]) -> Vec<u8> {
+    let mut t = Vec::with_capacity(TICKET_CONTEXT.len() + 4 + game.len() + 16);
+    t.extend_from_slice(TICKET_CONTEXT);
+    t.extend_from_slice(&(game.len() as u32).to_le_bytes());
+    t.extend_from_slice(game.as_bytes());
+    t.extend_from_slice(nonce);
+    t
+}
+
+/// Whether `sig` is `IdentityKey::sign_ticket` by the holder of `key`; the id it proves
+/// is `PeerId::of_key(key)`.
+pub fn ticket_proves(key: &[u8; KEY_LEN], sig: &[u8; SIG_LEN], game: &str, nonce: &[u8; 16]) -> bool {
+    VerifyingKey::from_bytes(key).is_ok_and(|vk| vk.verify_strict(&ticket_transcript(game, nonce), &Signature::from_bytes(sig)).is_ok())
+}
+
 /// Whether `sig` is `IdentityKey::sign_hello` by the holder of `key`, as `signer`, for
 /// `verifier` (us), and `key` is the one `signer`'s id comes from.
 pub fn hello_proves(key: &[u8; KEY_LEN], sig: &[u8; SIG_LEN], game: &str, signer: (PeerId, &[u8; 16]), verifier: (PeerId, &[u8; 16])) -> bool {
     PeerId::of_key(key) == signer.0
         && VerifyingKey::from_bytes(key).is_ok_and(|vk| vk.verify_strict(&hello_transcript(game, signer, verifier), &Signature::from_bytes(sig)).is_ok())
+}
+
+/// Whether `sig` is `IdentityKey::sign_relay` of `t` by the holder of `key`.
+pub fn relay_proves(key: &[u8; KEY_LEN], sig: &[u8; SIG_LEN], t: &[u8]) -> bool {
+    VerifyingKey::from_bytes(key).is_ok_and(|vk| vk.verify_strict(&[RELAY_CONTEXT, t].concat(), &Signature::from_bytes(sig)).is_ok())
 }
 
 /// A public key's short, shareable form: "3fa9-c1d2-0b7e-55aa" (64 bits of a hash).
@@ -510,12 +545,29 @@ pub struct RateLimit {
 
 const MAX_TRACKED: usize = 4096;
 
+/// What limits and cooldowns count an address as: an IPv6 one by its /64 (one home or
+/// one host gets a /64, and picks any address in it at will), an IPv4 one (mapped into
+/// IPv6 or not) as itself.
+pub fn limit_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let s = v6.segments();
+                IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+            }
+        },
+        v4 => v4,
+    }
+}
+
 impl RateLimit {
     pub fn new(burst: f32, per_sec: f32) -> RateLimit {
         RateLimit { map: HashMap::new(), burst, per_sec }
     }
 
     pub fn allow(&mut self, ip: IpAddr, now: Instant) -> bool {
+        let ip = limit_key(ip);
         if !self.map.contains_key(&ip) && self.map.len() >= MAX_TRACKED {
             // Forget addresses whose bucket has refilled anyway.
             let full = Duration::from_secs_f32(self.burst / self.per_sec);
@@ -777,5 +829,11 @@ mod tests {
             r.allow(IpAddr::V4(i.into()), t);
         }
         assert!(r.tracked() <= MAX_TRACKED);
+        // Every address of one IPv6 /64 shares a bucket; another /64 has its own.
+        let mut r = RateLimit::new(5.0, 2.0);
+        let n = (0..10u16).filter(|i| r.allow(format!("2001:db8:1:2::{i:x}").parse().unwrap(), t)).count();
+        assert_eq!(n, 5);
+        assert!(r.allow("2001:db8:1:3::1".parse().unwrap(), t));
+        assert_eq!(limit_key("::ffff:203.0.113.1".parse().unwrap()), ip);
     }
 }

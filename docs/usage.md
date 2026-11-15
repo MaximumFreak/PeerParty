@@ -171,7 +171,8 @@ both.
   Unreal's layout, or the program's own folder above ones named like `bin` or `Win64`;
   `PEERPARTY_GAME_ROOT` sets it) and goes into programs started from inside it, so a
   launcher or starter program in the game's folder passes PeerParty on to the game. The
-  overlay goes to the program that loads a game SDK or opens a window of a game's size.
+  overlay goes to the program that loads a game SDK or opens a window of a game's size,
+  and so does your player name: a starter never takes it, so the game isn't "Name (2)".
   Never followed: anything outside that folder, anti-cheat starters, installers of
   what the game needs (`_CommonRedist`, `vcredist`, ...), crash reporters, and anything
   the game starts once it has loaded a game SDK itself. PeerParty runs until the last of
@@ -197,8 +198,10 @@ both.
   the log say so: put a `steam_appid.txt` holding the id (the number in the address of
   its Steam store page) next to the game's program. The Steam client still has to be running, and stays in charge of the
   game's licence.
-- `--multi-instance`: let a second copy start on the same PC (Unity's single-instance
-  mutex).
+- `--multi-instance`: let a second copy start on the same PC: a named mutex that reads
+  as a single-instance check (Unity's, or one whose name says "instance" or holds the
+  game's program name; stores' and Windows' own are left alone) is made per copy, and
+  FindWindow doesn't find the other copy's windows.
 - `--copy-saves`: this copy starts from player 1's progress, for games that don't
   offer multiplayer from a fresh save. A second copy plays under LAN ids (SteamID, EOS
   id, PlayFab id); the first time the game touches a path that contains one, the same
@@ -240,7 +243,9 @@ both.
 - `PEERPARTY_SKIP=layer,...`: turns PeerParty layers off for a game that objects to
   one: `swap`, `invite`, `eos`, `steam`, `party`, `pfmp`, `playfab`, `photon`, `ugs`, `galaxy`, `dns`,
   `padblock` (holding controllers back while the overlay shows), `present` (drawing the
-  overlay inside the game), `ipfwd` (typed-IP forwarding to internet players), and
+  overlay inside the game), `ipfwd` (typed-IP forwarding to internet players, and the
+  path to another PC's Photon servers; without it they're reached directly, which that
+  PC's firewall must allow), and
   `calls` (the call logging in SDK modules). The launcher
   window's game panel has these as checkboxes (Advanced).
 - `PEERPARTY_GAME=name`: the game key players meet under, normally the exe's name
@@ -296,9 +301,12 @@ What the hook does:
 - Hooks Steamworks, PlayFab Party, PlayFab Lobby & Matchmaking, and
   PlayFab Core exports, and logs each call. Interface version strings and callback
   ids are included. Hot calls are throttled.
-- Hooks `getaddrinfo`, `GetAddrInfoW`, `GetAddrInfoExW`, `DnsQuery_A`, and
-  `DnsQuery_W`, and logs the hostname.
+- Hooks `getaddrinfo`, `GetAddrInfoW`, `GetAddrInfoExA/W`, `gethostbyname`,
+  `DnsQuery_A/W` and `DnsQueryEx`, and logs the hostname.
 - EOS exports are logged the same way.
+- Doesn't start a game at all when its program is an anti-cheat starter or has an
+  anti-cheat module (.dll) beside it (launcher/src/anticheat.rs); an installer in a
+  subfolder alone isn't enough.
 - Stops the game if an EasyAntiCheat or BattlEye module loads, or, with the EOS layer
   on, when the game starts an EOS Anti-Cheat session (`EOS_AntiCheatClient_BeginSession`
   or `EOS_AntiCheatServer_BeginSession`). The SDK's other anti-cheat exports aren't a
@@ -337,8 +345,9 @@ version that keeps Epic's append-only struct rule:
   Unless the game feeds and renders audio itself ("manual audio"), PeerParty records
   the microphone (only while a room is sending, and only frames with voice in them)
   through Windows' echo cancellation and noise suppression (the Voice Capture DSP;
-  `PEERPARTY_VOICE_AEC=0` skips it) and plays the room's voices on the speakers, as raw
-  16 kHz PCM over the LAN. The device lists are Windows' own microphones and speakers;
+  `PEERPARTY_VOICE_AEC=0` skips it) and plays the room's voices on the speakers. Voice
+  travels as Opus (about 3 KB/s per speaker; a frame Opus can't take as it is goes as
+  raw PCM). The device lists are Windows' own microphones and speakers;
   EOS's default is Sound settings' default device, and the game's device settings move
   PeerParty's microphone and speakers (AudioDevicesChanged fires when Windows' list
   changes).
@@ -369,7 +378,9 @@ steamlan.rs) works for native C++ games and for wrappers (Steamworks.NET, Facepu
   Valve's Steam client runs the game, or `STEAMID` mode is `official`), so players
   never share one; its saves keyed by SteamID start from a copy of the old ones. A
   second copy on the same PC gets a LAN one and a numbered name. Auth tickets between
-  LAN players are accepted locally (LEGAL.md).
+  LAN players are accepted locally (LEGAL.md): a copy without Valve's Steam client puts
+  a signed proof of its player on the end of its tickets, and a ticket for a player that
+  isn't theirs is refused.
 - Unreliable P2P (Steam and EOS) goes over UDP once a peer has answered a UDP ping;
   until then, or behind a firewall that blocks UDP, it stays on the TCP connection.
 
@@ -379,7 +390,10 @@ In a game started through PeerParty, PlayFab (hook/src/party.rs, hook/src/pfmp.r
   library never starts. A Party network is a LAN lobby, its descriptor serializes to
   `PP1-<guid>`, endpoints are its members, and endpoint messages ride LAN channels
   (`party:<guid>`), reliable or not as the game asks. State changes arrive through
-  `PartyStartProcessingStateChanges` in the SDK's documented order. Layouts follow
+  `PartyStartProcessingStateChanges` in the SDK's documented order. A user gets in
+  with one of the network's invitations, checked by the copy that owns the network (a
+  wrong one gets `UserNotAuthorized`, as from Party's service). Invitations can be
+  revoked by their creator (or by anyone, when made that way). Layouts follow
   Party.h as mirrored by PlayFab's open-source Unity plugin
   (github.com/PlayFab/PlayFabPartyUnity) and Party_c.h from the C++ SDK
   (nuget.org/packages/Microsoft.PlayFab.PlayFabParty.Cpp.Windows).
@@ -588,8 +602,10 @@ tunnel. Off unless a code is set. How it works and its limits: docs/internet-dht
   players on your network are heard but can't be reached, the overlay says so: their
   PC's firewall is the likely cause, and they fix it on their PC.
   `peerparty --firewall game.exe` prints the same check; `peerparty --fix-firewall
-  game.exe [--public]` (as administrator) does the fix. Rules set by an organisation's
-  policy are reported, not changed.
+  game.exe [--public]` (as administrator) does the fix: two Allow rules for the game,
+  TCP and UDP, in the group `peerparty`. They stay after PeerParty is gone, as the
+  game's own rules would; `peerparty --remove-firewall` (as administrator) removes every
+  rule PeerParty added. Rules set by an organisation's policy are reported, not changed.
 - `PEERPARTY_INET_PORT=N`: a fixed UDP port; `PEERPARTY_INET_PEERS=host:port,...`: also
   punch these addresses (a forwarded port, a VPN; IPv6 as `[addr]:port`); `PEERPARTY_INET_DHT=0`: those
   addresses only; `PEERPARTY_INET_BOOTSTRAP`, `PEERPARTY_INET_STUN`: other DHT routers or
@@ -621,7 +637,8 @@ unchanged and work at the same time. Details: docs/public-sessions.md.
   with `--set public_voice=on`, or with `PEERPARTY_PUBLIC_VOICE=1` (the environment wins).
   "Invite everyone on your network" never reaches them, and their invites always wait
   for you to accept.
-- Block a player from the overlay (Players > their Details > **Block this player**) or
+- Block a player from the overlay (Players > their Details > **Block this player**,
+  pressed twice; **Undo** on Players for 30 s after) or
   with `peerparty --block FINGERPRINT`. `--blocked` lists them and `--unblock FP|all`
   removes them (also Settings > Unblock all).
 - Public IPs are **never shown**: not in the overlay, Settings, names, logs (short tags
@@ -650,6 +667,9 @@ peerparty.exe already stays running beside the game it started (it hands the gam
 code to a .bat or Steam), so it also draws an overlay for it. The game only ever sees
 PeerParty's SDK answers and, while the overlay shows, its controllers held still.
 
+- The opening hotkey is taken from the game (it doesn't reach the game's own menus).
+  While a voice chat is on, Players has **Your microphone** (every voice chat of the
+  game) and a player's page **Mute their voice**.
 - Opens with **Shift+Tab** (Steam's and GOG's key) or **Shift+F3** (Epic's), optionally
   Shift+F1 (EA) and Shift+F2 (Ubisoft), any controller's **Home / Xbox Guide** button
   (it only opens the overlay; B or Start closes it), or a **controller chord** you record

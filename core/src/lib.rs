@@ -16,14 +16,15 @@ pub mod fwd;
 mod id;
 pub mod inet;
 mod lan;
+mod link;
 mod lobby;
 mod mesh;
 pub mod own;
 pub mod release;
 mod wire;
 
-pub use id::{Identity, PeerId};
-pub use lan::{CloseReason, Event, Lan, LobbyError, MemberStatus, Options, Packet, SendResult, TestIntervals, TestTiming, Trust, choose_internet, internet_wanted};
+pub use id::{Identity, PeerId, take_slot_from};
+pub use lan::{ChanInfo, CloseReason, Event, JoinCheck, Lan, LobbyError, MemberStatus, Options, Packet, SendResult, TestIntervals, TestTiming, Trust, choose_internet, internet_wanted};
 pub use lobby::{
     Attr, Filter, Lobby, Member, Op, Permission, Query, Value, find_attr, remove_attr, set_attr,
 };

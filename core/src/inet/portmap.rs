@@ -155,7 +155,7 @@ pub fn map(client: Ipv4Addr, gateway: Option<Ipv4Addr>, port: u16) -> Result<Map
     } else {
         why.push("PCP/NAT-PMP: no gateway on the LAN".to_string());
     }
-    let found = ssdp_search(client, Duration::from_secs(2));
+    let found = from_gateway(ssdp_search(client, Duration::from_secs(2)), gateway);
     if found.is_empty() {
         why.push("UPnP: no router answered".into());
     }
@@ -358,6 +358,16 @@ fn parse_url(u: &str) -> Option<(SocketAddr, String)> {
 /// Safe to put in a request line or header: printable ASCII, no quotes or brackets.
 fn clean(s: &str) -> bool {
     !s.is_empty() && s.len() < 512 && s.bytes().all(|b| b.is_ascii_graphic() && !matches!(b, b'"' | b'<' | b'>' | b'\\'))
+}
+
+/// The SSDP answers to use: with a default gateway known, only the gateway's (any other
+/// device on the LAN that answers isn't the way out to the internet, and could be
+/// anyone's); without one, any LAN answer.
+fn from_gateway(found: Vec<(Ipv4Addr, String)>, gateway: Option<Ipv4Addr>) -> Vec<(Ipv4Addr, String)> {
+    match gateway {
+        Some(gw) => found.into_iter().filter(|(ip, _)| *ip == gw).collect(),
+        None => found,
+    }
 }
 
 /// Gateways answering an SSDP search on the LAN: (address, description URL).
@@ -878,6 +888,14 @@ mod tests {
         let add = s.iter().rev().find(|r| r.contains("#AddPortMapping")).unwrap();
         assert!(add.contains("<NewInternalClient>127.0.0.1<") && add.contains("<NewInternalPort>1234<") && add.contains("<NewProtocol>UDP<"));
         assert!(s.last().unwrap().contains("#DeletePortMapping") && s.last().unwrap().contains(&format!("<NewExternalPort>{}<", m.external_port)));
+    }
+
+    #[test]
+    fn upnp_listens_only_to_the_gateway_when_there_is_one() {
+        let answers = vec![(Ipv4Addr::new(192, 168, 1, 50), "http://192.168.1.50:5000/d.xml".to_string()), (Ipv4Addr::new(192, 168, 1, 1), "http://192.168.1.1:1900/d.xml".to_string())];
+        let kept = from_gateway(answers.clone(), Some(Ipv4Addr::new(192, 168, 1, 1)));
+        assert_eq!(kept, vec![answers[1].clone()]);
+        assert_eq!(from_gateway(answers.clone(), None), answers);
     }
 
     #[test]

@@ -202,8 +202,10 @@ impl Server {
         self.links.values().filter(|h| *h == host).count()
     }
 
-    /// Forgets allocations and DTLS sessions that went quiet.
-    pub fn expire(&mut self, now: Instant) {
+    /// Forgets allocations and DTLS sessions that went quiet. Returns the host
+    /// allocations dropped (their join codes go too): one is kept while it is bound, and
+    /// for `UNBOUND_KEY_LIFE` after it was made.
+    pub fn expire(&mut self, now: Instant) -> Vec<AllocId> {
         self.tls.retain(|_, s| now.duration_since(s.last_seen) < IDLE);
         let before = self.bound.len();
         let gone: Vec<AllocId> = self.bound.iter().filter(|(_, (_, at, _))| now.duration_since(*at) >= IDLE).map(|(id, _)| *id).collect();
@@ -214,12 +216,23 @@ impl Server {
                 self.keys.remove(id);
             }
         }
+        let (bound, keys) = (&self.bound, &self.keys);
+        let hosts_gone: Vec<AllocId> = self
+            .hosts
+            .keys()
+            .filter(|id| !bound.contains_key(*id) && keys.get(*id).is_none_or(|(_, made)| now.duration_since(*made) >= UNBOUND_KEY_LIFE))
+            .copied()
+            .collect();
+        for id in &hosts_gone {
+            self.hosts.remove(id);
+        }
         let (bound, hosts) = (&self.bound, &self.hosts);
         self.keys.retain(|id, (_, made)| hosts.contains_key(id) || bound.contains_key(id) || now.duration_since(*made) < UNBOUND_KEY_LIFE);
-        if self.bound.len() != before {
-            let bound = &self.bound;
-            self.links.retain(|c, _| bound.contains_key(c));
+        if self.bound.len() != before || !hosts_gone.is_empty() {
+            let (bound, hosts) = (&self.bound, &self.hosts);
+            self.links.retain(|c, h| bound.contains_key(c) && hosts.contains_key(h));
         }
+        hosts_gone
     }
 
     /// Whether `from` is the address `id` is bound from (which counts as life).
@@ -448,7 +461,14 @@ fn relay() -> Option<&'static Running> {
 /// Housekeeping from the event pump.
 pub fn tick() {
     if let Some(Some(r)) = RELAY_SERVER.get() {
-        r.server.lock().unwrap().expire(Instant::now());
+        let gone = r.server.lock().unwrap().expire(Instant::now());
+        for id in gone {
+            let Some(a) = ALLOCS.lock().unwrap().remove(&guid(&id)) else { continue };
+            log!("ugs relay: allocation {} expired{}", guid(&id), a.code.as_deref().map(|c| format!(", join code {c} with it")).unwrap_or_default());
+            if let (Some(code), Some(lan)) = (a.code, net::lan()) {
+                let _ = lan.destroy(&format!("relay:{code}"));
+            }
+        }
     }
 }
 
@@ -752,6 +772,13 @@ mod tests {
         s
     }
 
+    fn ping(id: &AllocId) -> Vec<u8> {
+        let mut p = header(PING).to_vec();
+        p.extend_from_slice(id);
+        p.extend_from_slice(&1u16.to_le_bytes());
+        p
+    }
+
     fn connect(client: &AllocId, host: &AllocId) -> Vec<u8> {
         let mut p = header(CONNECT_REQUEST).to_vec();
         p.extend_from_slice(client);
@@ -909,6 +936,9 @@ mod tests {
         let now = Instant::now();
         let (host, a) = ([1u8; 16], [2u8; 16]);
         let mut s = server(host, 4, &[a], now);
+        // The host is bound and still talking (an unbound one would go too).
+        s.handle(addr(1), &bind(&host, true), now);
+        s.handle(addr(1), &ping(&host), now + UNBOUND_KEY_LIFE);
         s.expire(now + UNBOUND_KEY_LIFE + Duration::from_secs(1));
         assert!(s.keys.contains_key(&host) && !s.keys.contains_key(&a));
         assert!(s.handle(addr(2), &bind(&a, false), now).is_empty());
@@ -1003,6 +1033,25 @@ mod tests {
         assert_eq!(s.clients_of(&[1; 16]), 0);
         let r = relay_msg(&[2; 16], &[1; 16], b"x");
         assert_eq!(s.handle(addr(2), &r, t0)[0].1[3], ERROR);
+    }
+
+    #[test]
+    fn a_host_allocation_lasts_while_bound_and_goes_once_quiet() {
+        let t0 = Instant::now();
+        let mut s = server([1; 16], 1, &[], t0);
+        s.handle(addr(1), &bind(&[1; 16], true), t0);
+        // Still talking long after it was made: kept.
+        let later = t0 + UNBOUND_KEY_LIFE + Duration::from_secs(5);
+        s.handle(addr(1), &ping(&[1; 16]), later);
+        assert!(s.expire(later).is_empty());
+        assert!(s.hosts.contains_key(&[1; 16]));
+        // Quiet past IDLE: unbound, and past its life, so gone with its key.
+        assert_eq!(s.expire(later + IDLE + Duration::from_secs(1)), vec![[1; 16]]);
+        assert!(!s.hosts.contains_key(&[1; 16]) && !s.keys.contains_key(&[1; 16]));
+        // Never bound: gone once its life is up, not before.
+        let mut s = server([3; 16], 1, &[], t0);
+        assert!(s.expire(t0 + UNBOUND_KEY_LIFE - Duration::from_secs(1)).is_empty());
+        assert_eq!(s.expire(t0 + UNBOUND_KEY_LIFE), vec![[3; 16]]);
     }
 
     #[test]

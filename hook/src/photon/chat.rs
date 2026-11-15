@@ -76,14 +76,27 @@ pub const OFFLINE: i32 = 0;
 pub const ONLINE: i32 = 2;
 /// Messages kept per channel for history requests.
 const HISTORY: usize = 100;
+/// The most channels kept (per PeerParty, every app together), and the most one
+/// connection may be subscribed to: past them, new channels are refused.
+const MAX_CHANNELS: usize = 4096;
+const MAX_SUBSCRIBED: usize = 256;
+/// How long a channel nobody is subscribed to keeps its history.
+const IDLE_KEEP: std::time::Duration = std::time::Duration::from_secs(600);
 
-#[derive(Default)]
 struct Channel {
     subscribers: BTreeSet<u64>,
     history: VecDeque<(i32, String, Value)>,
     last_id: i32,
     max_subscribers: i32,
     publish_subscribers: bool,
+    /// When something last happened in it (for IDLE_KEEP).
+    active: std::time::Instant,
+}
+
+impl Default for Channel {
+    fn default() -> Channel {
+        Channel { subscribers: BTreeSet::new(), history: VecDeque::new(), last_id: 0, max_subscribers: 0, publish_subscribers: false, active: std::time::Instant::now() }
+    }
 }
 
 struct User {
@@ -102,6 +115,10 @@ pub struct Chat {
     users: BTreeMap<u64, User>,
     /// (app id, channel name).
     channels: HashMap<(String, String), Channel>,
+    /// (app id, user id) -> the PeerParty player who first signed in as it: a user id
+    /// names one player (another can't sign in as them and read their private
+    /// messages or speak for them).
+    owners: HashMap<(String, String), super::server::Player>,
 }
 
 fn event(code: u8, params: Params) -> EventMsg {
@@ -109,9 +126,39 @@ fn event(code: u8, params: Params) -> EventMsg {
 }
 
 impl Chat {
-    /// A chat client signed in on connection `conn`.
-    pub fn signed_in(&mut self, conn: u64, app: &str, user: &str) {
+    /// A chat client signed in on connection `conn`, as PeerParty player `player` when
+    /// known. False when that user id is another player's.
+    pub fn signed_in(&mut self, conn: u64, app: &str, user: &str, player: Option<super::server::Player>) -> bool {
+        if let Some(p) = player {
+            let key = (app.to_string(), user.to_string());
+            match self.owners.get(&key) {
+                Some(owner) if *owner != p => return false,
+                Some(_) => {}
+                None => {
+                    if self.owners.len() >= 4096 {
+                        // Ids no connection uses any more go first.
+                        let users = &self.users;
+                        self.owners.retain(|(a, u), _| users.values().any(|x| &x.app == a && &x.id == u));
+                    }
+                    self.owners.insert(key, p);
+                }
+            }
+        }
         self.users.insert(conn, User { app: app.into(), id: user.into(), friends: BTreeSet::new(), status: ONLINE, message: None });
+        true
+    }
+
+    /// Forgets channels nobody is subscribed to that have been quiet for IDLE_KEEP.
+    fn expire(&mut self) {
+        self.channels.retain(|_, c| !c.subscribers.is_empty() || (!c.history.is_empty() && c.active.elapsed() < IDLE_KEEP));
+    }
+
+    /// Whether a new channel may be made.
+    fn room_for_channel(&mut self) -> bool {
+        if self.channels.len() >= MAX_CHANNELS {
+            self.expire();
+        }
+        self.channels.len() < MAX_CHANNELS
     }
 
     pub fn is_chat(&self, conn: u64) -> bool {
@@ -164,6 +211,7 @@ impl Chat {
         let (app, me) = (u.app.clone(), u.id.clone());
         let p = &req.params;
         let mut out = Events::new();
+        self.expire();
         match req.code {
             op::SUBSCRIBE => {
                 let names = param(p, key::CHANNELS).and_then(Value::as_strs).unwrap_or_default();
@@ -172,7 +220,15 @@ impl Chat {
                 let props = param(p, key::PROPERTIES).and_then(props_of);
                 let mut results = Vec::new();
                 for (i, name) in names.iter().enumerate() {
-                    let ch = self.channels.entry((app.clone(), name.clone())).or_default();
+                    let key = (app.clone(), name.clone());
+                    let mine = self.channels.values().filter(|c| c.subscribers.contains(&conn)).count();
+                    let known = self.channels.contains_key(&key);
+                    if (!known && !self.room_for_channel()) || (mine >= MAX_SUBSCRIBED && !self.channels.get(&key).is_some_and(|c| c.subscribers.contains(&conn))) {
+                        results.push(false);
+                        continue;
+                    }
+                    let ch = self.channels.entry(key).or_default();
+                    ch.active = std::time::Instant::now();
                     if ch.subscribers.is_empty() && names.len() == 1 {
                         if let Some((max, publish)) = props {
                             ch.max_subscribers = max;
@@ -231,7 +287,11 @@ impl Chat {
             op::PUBLISH => {
                 let Some(name) = param(p, key::CHANNEL).and_then(Value::as_str).map(str::to_owned) else { return (-6, out) };
                 let message = param(p, key::MESSAGE).cloned().unwrap_or(Value::Null);
-                let ch = self.channels.entry((app.clone(), name.clone())).or_default();
+                // Only into a channel one is subscribed to, as Photon Chat has it.
+                let Some(ch) = self.channels.get_mut(&(app.clone(), name.clone())).filter(|c| c.subscribers.contains(&conn)) else {
+                    return (-3, out);
+                };
+                ch.active = std::time::Instant::now();
                 ch.last_id += 1;
                 let id = ch.last_id;
                 ch.history.push_back((id, me.clone(), message));
@@ -247,7 +307,12 @@ impl Chat {
             op::SEND_PRIVATE => {
                 let Some(to) = param(p, key::USER_ID).and_then(Value::as_str).map(str::to_owned) else { return (-6, out) };
                 let message = param(p, key::MESSAGE).cloned().unwrap_or(Value::Null);
-                let ch = self.channels.entry((app.clone(), private_channel(&me, &to))).or_default();
+                let key = (app.clone(), private_channel(&me, &to));
+                if !self.channels.contains_key(&key) && !self.room_for_channel() {
+                    return (-3, out);
+                }
+                let ch = self.channels.entry(key).or_default();
+                ch.active = std::time::Instant::now();
                 ch.last_id += 1;
                 let id = ch.last_id;
                 let base = vec![(key::SENDER, Value::Str(me.clone())), (key::MESSAGE, message), (key::MSG_ID, Value::Int(id))];
@@ -372,9 +437,9 @@ mod tests {
     #[test]
     fn channels_private_messages_and_friends() {
         let mut chat = Chat::default();
-        chat.signed_in(1, "app", "ann");
-        chat.signed_in(2, "app", "bob");
-        chat.signed_in(3, "other", "bob");
+        chat.signed_in(1, "app", "ann", None);
+        chat.signed_in(2, "app", "bob", None);
+        chat.signed_in(3, "other", "bob", None);
         // Ann subscribes to a channel that publishes its subscribers, then Bob joins.
         let props = Value::Dict(DictTy { key: Ty::Any, val: Ty::Any }, vec![(Value::Byte(254), Value::Bool(true))]);
         let (r, e) = chat.op(1, &req(op::SUBSCRIBE, vec![(key::CHANNELS, Value::Strs(vec!["lobby".into()])), (key::PROPERTIES, props)]));
@@ -389,7 +454,7 @@ mod tests {
         assert_eq!(codes(&e, 1), vec![ev::CHAT_MESSAGES]);
         assert_eq!(codes(&e, 2), vec![ev::CHAT_MESSAGES]);
         assert_eq!(param(&e[0].1.params, key::SENDERS), Some(&Value::Strs(vec!["ann".into()])));
-        chat.signed_in(4, "app", "cat");
+        chat.signed_in(4, "app", "cat", None);
         let (_, e) = chat.op(4, &req(op::SUBSCRIBE, vec![(key::CHANNELS, Value::Strs(vec!["lobby".into()])), (key::HISTORY_LENGTH, Value::Int(-1))]));
         assert_eq!(codes(&e, 4), vec![ev::SUBSCRIBE, ev::CHAT_MESSAGES]);
         // A private message: to Bob in this app only, and a copy back naming Bob.
@@ -413,12 +478,26 @@ mod tests {
     fn full_channels_refuse_and_unknown_ops_fail() {
         let mut chat = Chat::default();
         for (c, u) in [(1, "a"), (2, "b")] {
-            chat.signed_in(c, "app", u);
+            chat.signed_in(c, "app", u, None);
         }
         let props = Value::Hashtable(vec![(Value::Byte(255), Value::Int(1))]);
         chat.op(1, &req(op::SUBSCRIBE, vec![(key::CHANNELS, Value::Strs(vec!["x".into()])), (key::PROPERTIES, props)]));
         let (_, e) = chat.op(2, &req(op::SUBSCRIBE, vec![(key::CHANNELS, Value::Strs(vec!["x".into()]))]));
         assert_eq!(param(&e[0].1.params, key::SUBSCRIBE_RESULTS), Some(&Value::Bools(vec![false])));
         assert_eq!(chat.op(1, &req(77, vec![])).0, -2);
+        // Publishing needs the channel subscribed.
+        let (r, e) = chat.op(2, &req(op::PUBLISH, vec![(key::CHANNEL, Value::Str("x".into())), (key::MESSAGE, Value::Str("hi".into()))]));
+        assert_eq!(r, -3);
+        assert!(e.is_empty());
+    }
+
+    /// A chat user id is the first PeerParty player's who signed in as it.
+    #[test]
+    fn a_user_id_names_one_player() {
+        let mut chat = Chat::default();
+        assert!(chat.signed_in(1, "app", "ann", Some([1; 16])));
+        assert!(!chat.signed_in(2, "app", "ann", Some([2; 16])), "another player as Ann");
+        assert!(chat.signed_in(3, "app", "ann", Some([1; 16])), "Ann's second connection");
+        assert!(chat.signed_in(4, "other", "ann", Some([2; 16])), "another app's Ann");
     }
 }

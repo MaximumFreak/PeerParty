@@ -520,9 +520,21 @@ fn find_prop<'a>(props: &'a [(CString, CString)], key: &str) -> Option<&'a CStri
     props.iter().find(|(k, _)| k.to_bytes() == key.as_bytes()).map(|(_, v)| v)
 }
 
-/// The entity behind a LAN member, once its attributes have arrived.
+/// The entity behind a LAN member, once its attributes have arrived. With PeerParty's
+/// PlayFab answering here it is the one the member's PeerParty id gives, not what the
+/// member says it is: no member can pass as another's entity (take its seat, have the
+/// owner act on it). With the real PlayFab, entities are the service's own.
 fn member_entity(m: &Member) -> Option<(String, String)> {
     let id = attr_text(&m.attrs, "pf")?;
+    if crate::playfab::serving() {
+        let real = api::entity_of(m.id);
+        if id != real {
+            crate::log::throttled(&format!("pfmp-lan entity {}", m.id), 1, |_| {
+                log!("pfmp-lan member {} says it is entity {id}; it is {real}", m.id)
+            });
+        }
+        return Some((real, ENTITY_TYPE.into()));
+    }
     let ty = attr_text(&m.attrs, "pft").unwrap_or_else(|| ENTITY_TYPE.into());
     Some((id, ty))
 }
@@ -796,6 +808,13 @@ pub fn loaded() -> bool {
 }
 
 pub fn attach(base: usize, module_name: &str, exports: &[Export]) -> HashSet<usize> {
+    // The generic answers (one body for any number of arguments) are only right where
+    // the caller cleans the stack (x64); in a 32-bit game's stdcall they would unbalance
+    // it. Until those have exact signatures, a 32-bit game keeps its own SDK.
+    if cfg!(target_arch = "x86") {
+        log!("pfmp-lan: off in 32-bit games (its stand-ins are x64-only for now): {module_name} runs as it is");
+        return HashSet::new();
+    }
     crate::swap::register(base, module_name, resolve);
     net::subscribe(Front::PfLobby);
     LOADED.store(true, Ordering::Relaxed);
@@ -2853,7 +2872,8 @@ unsafe extern "system" fn lobby_send_invite(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::mem::{offset_of, size_of};
+    #[cfg(target_pointer_width = "64")]
+    use std::mem::offset_of;
 
     #[test]
     #[cfg(target_pointer_width = "64")]

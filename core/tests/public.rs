@@ -233,6 +233,11 @@ fn a_blocked_player_is_dropped_and_stays_out() {
     assert_eq!(c.peer_name(ida).as_deref(), Some("Ann"));
     // Not a public player: no blocking room or LAN peers this way.
     assert!(a.block_peer(PeerId([7; 16])).is_err());
+    // Undo: off the list, its address forgiven, and B is back without waiting out the
+    // block's ten minutes.
+    assert_eq!(a.unblock(&fp), Ok(true));
+    assert_eq!(a.public_status().unwrap().blocked, 0);
+    wait_all(&lans, &mut seen, 30, |s| joined(&s[0], idb));
     for l in lans {
         l.shutdown();
     }
@@ -1251,6 +1256,59 @@ fn a_stranger_cant_answer_a_join_for_a_friends_lobby() {
     j.join_by_id("test.lobby", &own).unwrap();
     assert_eq!(join_result(&lans, &mut seen, 1, &own, 10), JoinResult::Ok);
     assert_eq!(j.lobby(&own).map(|l| l.owner), Some(is));
+    for l in lans {
+        l.shutdown();
+    }
+}
+
+/// A join by id that two LAN players answer for under different keys (one hosts a lobby
+/// of its own under the other's lobby's id): neither is taken, and neither keeps us as a
+/// member. With only the real one left it goes through, and as soon as everyone has
+/// answered.
+#[test]
+fn a_join_by_id_two_lan_players_answer_for_goes_nowhere() {
+    let game = format!("test:public-dispute:{}", std::process::id());
+    let lan = |name: &str| {
+        Lan::start(Options {
+            game: game.clone(),
+            identity: Identity::ephemeral(name),
+            discovery_port: base_port(60),
+            extra_targets: Vec::new(),
+            log,
+            internet: None,
+            public: None,
+            lan_discovery: true,
+        })
+        .expect("start")
+    };
+    let (o, f, j) = (lan("o"), lan("f"), lan("j"));
+    let lans = [&o, &f, &j];
+    let mut seen = vec![Vec::new(), Vec::new(), Vec::new()];
+    let (io, i_f, ij) = (o.me(), f.me(), j.me());
+    wait_all(&lans, &mut seen, 60, |e| joined(&e[2], io) && joined(&e[2], i_f) && joined(&e[1], io));
+    let id = format!("disputed-{}", std::process::id());
+    let lobby = || {
+        let mut l = Lobby::new("test.lobby");
+        l.id = id.clone();
+        l.max_members = 4;
+        l.join_by_id = true;
+        l
+    };
+    o.create_lobby(lobby()).unwrap();
+    f.create_lobby(lobby()).unwrap();
+    j.join_by_id("test.lobby", &id).unwrap();
+    assert_eq!(join_result(&lans, &mut seen, 2, &id, 10), JoinResult::NotFound, "one of two answers was taken");
+    assert!(j.lobby(&id).is_none());
+    wait_all(&lans, &mut seen, 10, |_| {
+        o.lobby(&id).is_some_and(|l| l.member(ij).is_none()) && f.lobby(&id).is_some_and(|l| l.member(ij).is_none())
+    });
+
+    f.leave(&id).unwrap();
+    let t0 = Instant::now();
+    j.join_by_id("test.lobby", &id).unwrap();
+    assert_eq!(join_result(&lans, &mut seen, 2, &id, 10), JoinResult::Ok);
+    assert!(t0.elapsed() < Duration::from_secs(2), "everyone answered, yet it took {:?}", t0.elapsed());
+    assert_eq!(j.lobby(&id).map(|l| l.owner), Some(io));
     for l in lans {
         l.shutdown();
     }

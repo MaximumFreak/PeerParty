@@ -9,6 +9,9 @@
 //! and reach the game through `PartyStartProcessingStateChanges`, in the order the
 //! Party SDK documents (connect, authenticate, endpoint created...).
 //!
+//! Who may use a network is the network owner's copy's call (party/auth.rs): a joiner's
+//! user is shown to the others once the owner has checked its invitation.
+//!
 //! Chat controls, text chat and voice chat are carried too (party/chat.rs): a chat
 //! control the game connects to a network is a member attribute like an endpoint,
 //! and its voice and text ride voice.rs's room `party:<guid>`. Transcription and
@@ -18,6 +21,7 @@
 //! PartyCSharpSDK.Interop) and Party_c.h from the C++ SDK
 //! (nuget.org/packages/Microsoft.PlayFab.PlayFabParty.Cpp.Windows).
 
+mod auth;
 mod chat;
 pub mod xbl;
 
@@ -27,7 +31,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-use peerparty_core::{Attr, Event, JoinResult, Lan, Lobby, MemberStatus, Packet, PeerId, SendResult, Value};
+use peerparty_core::{Attr, Event, JoinResult, Lan, Lobby, Member, MemberStatus, Packet, PeerId, SendResult, Value, find_attr, set_attr};
 
 use crate::log;
 use crate::net::{self, Front};
@@ -38,6 +42,9 @@ const SOCKET_PREFIX: &str = "party:";
 const DESCRIPTOR_PREFIX: &str = "PP1-";
 const REGION: &str = "LAN";
 const ENTITY_KEY: &str = "ep";
+/// The member attribute with the unique identifier our endpoint took in the network
+/// (`choose_uid`): every PC shows that one, so two players never share one.
+const UID_KEY: &str = "uid";
 
 const OK: u32 = 0;
 /// PeerParty's "not supported here" (chat, kicking, unknown functions).
@@ -71,7 +78,9 @@ const NETWORK_DESTROYED: u32 = 20;
 const ENDPOINT_MESSAGE_RECEIVED: u32 = 21;
 const DATA_BUFFERS_RETURNED: u32 = 22;
 const CREATE_INVITATION_COMPLETED: u32 = 51;
+const REVOKE_INVITATION_COMPLETED: u32 = 52;
 const INVITATION_CREATED: u32 = 53;
+const INVITATION_DESTROYED: u32 = 54;
 
 // PARTY_STATE_CHANGE_RESULT
 const SUCCEEDED: u32 = 0;
@@ -335,6 +344,26 @@ struct InvitationCreated {
     invitation: usize,
 }
 
+#[repr(C)]
+struct RevokeInvitationCompleted {
+    ty: u32,
+    result: u32,
+    detail: u32,
+    network: usize,
+    user: usize,
+    async_id: usize,
+    invitation: usize,
+}
+
+#[repr(C)]
+struct InvitationDestroyed {
+    ty: u32,
+    network: usize,
+    invitation: usize,
+    reason: u32,
+    detail: u32,
+}
+
 // ---- PeerParty's objects ----
 
 struct User {
@@ -356,9 +385,15 @@ struct Endpoint {
 
 struct Invitation {
     network: usize,
+    id: String,
+    /// `config.identifier` points into it.
     _id: CString,
+    /// Seen counting in the network's lobby (auth.rs), so a later absence means it went.
+    seen: bool,
     creator: CString,
     config: Box<InvitationConfig>,
+    /// The entity ids `config` points at, and the array of their pointers.
+    _entities: (Vec<CString>, Vec<usize>),
 }
 
 struct Network {
@@ -378,6 +413,8 @@ struct Network {
     chats: Vec<usize>,
     local_chats: Vec<usize>,
     pending_chats: Vec<(usize, usize)>,
+    /// Our user's authentication, waiting for the owner's verdict (auth.rs).
+    auth: Option<auth::Pending>,
 }
 
 /// A queued change's struct with room after it: bindings may read every change as their
@@ -423,8 +460,9 @@ struct State {
     endpoints: HashMap<usize, Endpoint>,
     invitations: HashMap<usize, Invitation>,
     contexts: HashMap<usize, usize>,
-    /// Networks we created and haven't connected to yet: guid -> (config, invitation id).
-    hosted: HashMap<String, (NetConfig, String)>,
+    /// Networks we created and haven't connected to yet: guid -> (config, invitation id,
+    /// the entity ids it is for, its revocability).
+    hosted: HashMap<String, (NetConfig, String, Vec<String>, u32)>,
     queue: Vec<Change>,
     /// Batches handed out by PartyStartProcessingStateChanges that the game hasn't
     /// returned all of yet, oldest first. Games may hold several, and return their
@@ -454,6 +492,9 @@ struct State {
     /// per message made each pump quadratic on the game thread.
     early_from: HashSet<(PeerId, usize)>,
     traffic: Traffic,
+    /// Members of networks we own that aren't let in yet, since when (auth.rs).
+    unadmitted: HashMap<(String, PeerId), Instant>,
+    auth_ticked: Option<Instant>,
 }
 
 /// Endpoint message counts since PartyInitialize, for the log's traffic summaries.
@@ -532,6 +573,13 @@ pub fn loaded() -> bool {
 }
 
 pub fn attach(base: usize, module_name: &str, exports: &[Export]) -> HashSet<usize> {
+    // The generic answers (one body for any number of arguments) are only right where
+    // the caller cleans the stack (x64); in a 32-bit game's stdcall they would unbalance
+    // it. Until those have exact signatures, a 32-bit game keeps its own SDK.
+    if cfg!(target_arch = "x86") {
+        log!("party-lan: off in 32-bit games (its stand-ins are x64-only for now): {module_name} runs as it is");
+        return HashSet::new();
+    }
     crate::swap::register(base, module_name, resolve);
     net::subscribe(Front::Party);
     LOADED.store(true, Ordering::Relaxed);
@@ -578,6 +626,32 @@ fn uid_of(peer: PeerId) -> u16 {
     u16::from_le_bytes([peer.0[0], peer.0[1]]) | 1
 }
 
+/// The unique identifier our endpoint takes in a network whose other members have
+/// `taken`: the one from our id unless it's taken, else the next free one after it
+/// (identifiers are odd, never 0).
+fn choose_uid(me: PeerId, taken: &[u16]) -> u16 {
+    let mut uid = uid_of(me);
+    for _ in 0..0x8000 {
+        if !taken.contains(&uid) {
+            return uid;
+        }
+        uid = uid.wrapping_add(2) | 1;
+    }
+    uid_of(me)
+}
+
+/// The identifiers the members of a network published (`UID_KEY`), by member.
+fn published_uids(lan: &peerparty_core::Lan, guid: &str) -> HashMap<PeerId, u16> {
+    lan.lobby(guid)
+        .map(|l| {
+            l.members
+                .iter()
+                .filter_map(|m| peerparty_core::find_attr(&m.attrs, UID_KEY).and_then(|a| a.value.text().parse::<u16>().ok()).map(|u| (m.id, u)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn cstring(s: &str) -> CString {
     CString::new(s.replace('\0', "")).unwrap()
 }
@@ -588,6 +662,18 @@ unsafe fn text(p: *const c_char) -> String {
     } else {
         crate::read::cstr(p as usize).unwrap_or_default()
     }
+}
+
+/// The entity ids an invitation configuration names (none: it's for anyone).
+unsafe fn invitation_entities(c: *const InvitationConfig) -> Vec<String> {
+    if c.is_null() {
+        return Vec::new();
+    }
+    let (n, p) = unsafe { ((*c).entity_count, (*c).entity_ids as *const *const c_char) };
+    if p.is_null() {
+        return Vec::new();
+    }
+    (0..n.min(1024) as usize).map(|i| unsafe { text(*p.add(i)) }).filter(|e| !e.is_empty()).collect()
 }
 
 unsafe fn put<T>(out: *mut T, v: T) {
@@ -804,7 +890,8 @@ impl State {
             .map(|l| {
                 l.members
                     .iter()
-                    .filter(|m| m.id != me)
+                    // Only those the owner let in (auth.rs), whatever else they publish.
+                    .filter(|m| m.id != me && auth::admitted(&l, m.id))
                     .map(|m| {
                         let chat = text_of(&m.attrs, chat::CHAT_KEY).map(|e| {
                             (e, text_of(&m.attrs, chat::CHAT_LANGUAGE_KEY).unwrap_or_default())
@@ -878,15 +965,19 @@ impl State {
                     device
                 }
             };
+            // With PeerParty's PlayFab, a player's entity is the one their id gives
+            // (pfmp.rs `member_entity`): an endpoint can't claim another player's.
+            let ep_entity = ep_entity.map(|e| if crate::playfab::serving() { crate::playfab::entity_of(peer) } else { e });
             if let Some(entity) = ep_entity.filter(|_| want_ep && ep_of(self, peer).is_none()) {
                 let ep = handle();
+                let uid = published_uids(lan, &self.networks[&net].guid).get(&peer).copied().unwrap_or_else(|| uid_of(peer));
                 self.endpoints.insert(
                     ep,
                     Endpoint {
                         network: net,
                         peer: Some(peer),
                         entity: cstring(&entity),
-                        uid: uid_of(peer),
+                        uid,
                         device,
                         user: 0,
                     },
@@ -1018,22 +1109,46 @@ impl State {
         self.log_traffic("left a network");
     }
 
-    fn add_invitation(&mut self, net: usize, id: &str, creator: &str) -> usize {
+    /// The invitation our user got in with, listed in the network as its creator's
+    /// member attribute has it (auth.rs), unless it is there already.
+    fn add_joined_invitation(&mut self, lan: &Lan, net: usize, id: &str) {
+        let Some(n) = self.networks.get(&net) else { return };
+        if id.is_empty() || n.invitations.iter().any(|h| self.invitations.get(h).is_some_and(|i| i.id == id)) {
+            return;
+        }
+        let made = lan.lobby(&n.guid).and_then(|l| auth::live(&l, id));
+        let (creator, entities, revocability) = match made {
+            Some(m) => (
+                if crate::playfab::serving() { crate::playfab::entity_of(m.creator) } else { String::new() },
+                m.entities,
+                m.revocability,
+            ),
+            None => (String::new(), Vec::new(), 0),
+        };
+        self.add_invitation(net, id, &creator, &entities, revocability);
+    }
+
+    fn add_invitation(&mut self, net: usize, id: &str, creator: &str, entities: &[String], revocability: u32) -> usize {
         let id_c = cstring(id);
         let h = handle();
+        let names: Vec<CString> = entities.iter().map(|e| cstring(e)).collect();
+        let ptrs: Vec<usize> = names.iter().map(|c| c.as_ptr() as usize).collect();
         let config = Box::new(InvitationConfig {
             identifier: id_c.as_ptr() as usize,
-            revocability: 0,
-            entity_count: 0,
-            entity_ids: 0,
+            revocability,
+            entity_count: ptrs.len() as u32,
+            entity_ids: if ptrs.is_empty() { 0 } else { ptrs.as_ptr() as usize },
         });
         self.invitations.insert(
             h,
             Invitation {
                 network: net,
+                id: id.to_string(),
                 _id: id_c,
+                seen: false,
                 creator: cstring(creator),
                 config,
+                _entities: (names, ptrs),
             },
         );
         if let Some(n) = self.networks.get_mut(&net) {
@@ -1147,6 +1262,7 @@ fn pump(s: &mut State) {
     if s.chat_used {
         chat::pump_chat(s, lan);
     }
+    s.auth_tick(lan);
     if s.traffic.last.is_none_or(|t| t.elapsed() >= TRAFFIC_EVERY) {
         s.log_traffic("so far");
     }
@@ -1306,6 +1422,7 @@ fn resolve(name: &str) -> Option<usize> {
         "PartyNetworkGetDevices" => party_network_get_devices as *const () as usize,
         "PartyNetworkGetInvitations" => party_network_get_invitations as *const () as usize,
         "PartyNetworkCreateInvitation" => party_network_create_invitation as *const () as usize,
+        "PartyNetworkRevokeInvitation" => party_network_revoke_invitation as *const () as usize,
         "PartyNetworkGetDeviceConnectionType" => party_network_connection_type as *const () as usize,
         "PartyNetworkGetNetworkStatistics" => party_network_statistics as *const () as usize,
         "PartyEndpointSendMessage" => party_endpoint_send as *const () as usize,
@@ -1640,6 +1757,8 @@ unsafe extern "system" fn party_create_new_network(
     } else {
         invitation_id
     };
+    let entities = unsafe { invitation_entities(invitation) };
+    let revocability = if invitation.is_null() { 0 } else { unsafe { (*invitation).revocability } };
     let guid = new_guid();
     let mut lobby = Lobby::new(NS);
     lobby.id = guid.clone();
@@ -1650,6 +1769,8 @@ unsafe extern "system" fn party_create_new_network(
     lobby.permission = peerparty_core::Permission::Friends;
     lobby.join_by_id = true;
     lobby.host_migration = true;
+    // The network's first invitation is our user's, as Party has it (auth.rs).
+    lobby.members = vec![Member { id: lan.me(), attrs: vec![auth::invitation_attr(&invitation_id, &entities, revocability)] }];
     if let Err(e) = lan.create_lobby(lobby) {
         log!("party-lan could not create a network: {e:?}");
         return E_UNSUPPORTED;
@@ -1667,7 +1788,7 @@ unsafe extern "system" fn party_create_new_network(
         config.max_devices
     );
     let mut s = STATE.lock().unwrap();
-    s.hosted.insert(guid, (config, invitation_id.clone()));
+    s.hosted.insert(guid, (config, invitation_id.clone(), entities, revocability));
     s.push_with(
         CreateNewNetworkCompleted {
             ty: CREATE_NEW_NETWORK_COMPLETED,
@@ -1708,7 +1829,7 @@ unsafe extern "system" fn party_connect_to_network(
         unsafe { put(out, h) };
         return OK;
     }
-    let (config, invitation) = s.hosted.remove(&guid).unwrap_or((
+    let (config, invitation, entities, revocability) = s.hosted.remove(&guid).unwrap_or((
         NetConfig {
             max_users: 32,
             max_devices: 32,
@@ -1718,6 +1839,8 @@ unsafe extern "system" fn party_connect_to_network(
             direct_peer: 0,
         },
         String::new(),
+        Vec::new(),
+        0,
     ));
     let h = handle();
     s.networks.insert(
@@ -1735,12 +1858,13 @@ unsafe extern "system" fn party_connect_to_network(
             chats: Vec::new(),
             local_chats: Vec::new(),
             pending_chats: Vec::new(),
+            auth: None,
         },
     );
     unsafe { put(out, h) };
     let me = crate::playfab::entity_id();
     if !invitation.is_empty() {
-        s.add_invitation(h, &invitation, &me);
+        s.add_invitation(h, &invitation, &me, &entities, revocability);
     }
     if lan.is_owner(&guid) || lan.lobby(&guid).is_some() {
         s.networks.get_mut(&h).unwrap().connected = true;
@@ -1793,31 +1917,24 @@ unsafe extern "system" fn party_network_authenticate(
     invitation: *const c_char,
     async_id: usize,
 ) -> u32 {
+    let Some(lan) = net::lan() else {
+        return E_UNSUPPORTED;
+    };
     let invitation = unsafe { text(invitation) };
     let mut s = STATE.lock().unwrap();
+    let entity = s.users.get(&user).map(|u| u.entity.to_string_lossy().to_string()).unwrap_or_else(crate::playfab::entity_id);
     let Some(n) = s.networks.get_mut(&net) else {
         return E_BAD_HANDLE;
     };
-    n.user = user;
-    if n.invitations.is_empty() && !invitation.is_empty() {
-        let creator = String::new();
-        s.add_invitation(net, &invitation, &creator);
+    if n.auth.is_some() {
+        return E_BAD_ARG;
     }
-    s.push_with(
-        AuthenticateCompleted {
-            ty: AUTHENTICATE_LOCAL_USER_COMPLETED,
-            result: SUCCEEDED,
-            detail: 0,
-            network: net,
-            user,
-            invitation: 0,
-            async_id,
-        },
-        Vec::new(),
-        Vec::new(),
-        Some(cstring(&invitation)),
-        |c, _, _, t| c.invitation = t,
-    );
+    n.user = user;
+    n.auth = Some(auth::Pending { user, entity, invitation: invitation.clone(), async_id, until: Instant::now() + auth::AUTH_WAIT, published: false });
+    // The invitation is listed once it lets the user in (auth.rs's `auth_done`).
+    // The owner's verdict comes later (auth.rs); ours, as the owner, at once.
+    s.auth_ticked = None;
+    s.auth_tick(lan);
     OK
 }
 
@@ -1872,13 +1989,22 @@ unsafe extern "system" fn party_network_create_endpoint(
         .unwrap_or_else(crate::playfab::entity_id);
     let ep = handle();
     let device = s.local_device;
+    let taken: Vec<u16> = {
+        let mut t: Vec<u16> = published_uids(lan, &guid).into_iter().filter(|(p, _)| *p != lan.me()).map(|(_, u)| u).collect();
+        // Members that published none show their id's.
+        if let Some(l) = lan.lobby(&guid) {
+            t.extend(l.members.iter().filter(|m| m.id != lan.me() && peerparty_core::find_attr(&m.attrs, UID_KEY).is_none()).map(|m| uid_of(m.id)));
+        }
+        t
+    };
+    let uid = choose_uid(lan.me(), &taken);
     s.endpoints.insert(
         ep,
         Endpoint {
             network: net,
             peer: None,
             entity: cstring(&entity),
-            uid: uid_of(lan.me()),
+            uid,
             device,
             user,
         },
@@ -1904,7 +2030,8 @@ unsafe extern "system" fn party_network_create_endpoint(
         value: Value::Str(entity.clone()),
         public: true,
     };
-    if let Err(e) = lan.update(&guid, None, &[attr], &[]) {
+    let uid_attr = Attr { key: UID_KEY.into(), value: Value::Str(uid.to_string()), public: true };
+    if let Err(e) = lan.update(&guid, None, &[uid_attr, attr], &[]) {
         log!("party-lan endpoint on {guid}: {e:?}");
     }
     log!("party-lan endpoint {entity} on network {guid}");
@@ -1923,7 +2050,7 @@ extern "system" fn party_network_destroy_endpoint(net: usize, ep: usize, async_i
     n.local_endpoint = None;
     let guid = n.guid.clone();
     if let Some(lan) = net::lan() {
-        let _ = lan.update(&guid, None, &[], &[ENTITY_KEY.to_string()]);
+        let _ = lan.update(&guid, None, &[], &[ENTITY_KEY.to_string(), UID_KEY.to_string()]);
     }
     s.push(DestroyEndpointCompleted {
         ty: DESTROY_ENDPOINT_COMPLETED,
@@ -2061,16 +2188,24 @@ unsafe extern "system" fn party_network_create_invitation(
         unsafe { text((*config).identifier as *const c_char) }
     };
     let id = if id.is_empty() { new_guid() } else { id };
+    let entities = unsafe { invitation_entities(config) };
+    let revocability = if config.is_null() { 0 } else { unsafe { (*config).revocability } };
     let mut s = STATE.lock().unwrap();
-    if !s.networks.contains_key(&net) {
+    let Some(n) = s.networks.get(&net) else {
         return E_BAD_HANDLE;
+    };
+    // Published for the owner's checks (auth.rs): it lets in whom it names.
+    if let Some(lan) = net::lan() {
+        if let Err(e) = lan.update(&n.guid, None, &[auth::invitation_attr(&id, &entities, revocability)], &[]) {
+            log!("party-lan invitation on {}: {e:?}", n.guid);
+        }
     }
     let creator = s
         .users
         .get(&user)
         .map(|u| u.entity.to_string_lossy().to_string())
         .unwrap_or_default();
-    let inv = s.add_invitation(net, &id, &creator);
+    let inv = s.add_invitation(net, &id, &creator, &entities, revocability);
     unsafe { put(out, inv) };
     s.push(CreateInvitationCompleted {
         ty: CREATE_INVITATION_COMPLETED,
@@ -2084,6 +2219,39 @@ unsafe extern "system" fn party_network_create_invitation(
     s.push(InvitationCreated {
         ty: INVITATION_CREATED,
         network: net,
+        invitation: inv,
+    });
+    OK
+}
+
+/// Revokes an invitation our user made, or one anyone may revoke (auth.rs).
+extern "system" fn party_network_revoke_invitation(net: usize, user: usize, inv: usize, async_id: usize) -> u32 {
+    let Some(lan) = net::lan() else {
+        return E_UNSUPPORTED;
+    };
+    let mut s = STATE.lock().unwrap();
+    let Some(n) = s.networks.get(&net) else {
+        return E_BAD_HANDLE;
+    };
+    let guid = n.guid.clone();
+    let Some(i) = s.invitations.get(&inv) else {
+        return E_BAD_HANDLE;
+    };
+    if i.network != net {
+        return E_BAD_ARG;
+    }
+    let id = i.id.clone();
+    let result = s.revoke(lan, &guid, &id);
+    if result == SUCCEEDED {
+        s.drop_invitation(net, inv);
+    }
+    s.push(RevokeInvitationCompleted {
+        ty: REVOKE_INVITATION_COMPLETED,
+        result,
+        detail: 0,
+        network: net,
+        user,
+        async_id,
         invitation: inv,
     });
     OK
@@ -2117,7 +2285,8 @@ unsafe extern "system" fn party_endpoint_send(
         return E_UNSUPPORTED;
     };
     let mut s = STATE.lock().unwrap();
-    let Some(e) = s.endpoints.get(&ep) else {
+    // A destroyed endpoint's handle lives until the game has seen it go: it can't send.
+    let Some(e) = s.endpoints.get(&ep).filter(|_| !s.forgotten(ep)) else {
         return E_BAD_HANDLE;
     };
     // Only our own endpoints send: a remote one's messages would go out as if from us.
@@ -2135,15 +2304,18 @@ unsafe extern "system" fn party_endpoint_send(
     let peers: Vec<PeerId> = if target_count == 0 || targets.is_null() {
         n.remote
             .iter()
+            .filter(|r| !s.forgotten(**r))
             .filter_map(|r| s.endpoints.get(r).and_then(|x| x.peer))
             .collect()
     } else {
-        (0..target_count as usize)
-            .filter_map(|i| {
-                let t = unsafe { targets.add(i).read_unaligned() };
-                s.endpoints.get(&t).and_then(|x| x.peer)
-            })
-            .collect()
+        let wanted: Vec<usize> = (0..target_count as usize).map(|i| unsafe { targets.add(i).read_unaligned() }).collect();
+        // Every target is an endpoint of this network (Party's rule): one of another
+        // network's would get this network's message.
+        if wanted.iter().any(|t| s.endpoints.get(t).is_some_and(|x| x.network != network)) {
+            log!("party-lan PartyEndpointSendMessage to an endpoint of another network: refused");
+            return E_BAD_ARG;
+        }
+        wanted.iter().filter(|t| !s.forgotten(**t)).filter_map(|t| s.endpoints.get(t).and_then(|x| x.peer)).collect()
     };
     let bufs: Vec<DataBuffer> = (0..buffer_count as usize)
         .map(|i| unsafe { buffers.add(i).read_unaligned() })
@@ -2290,6 +2462,18 @@ unsafe extern "system" fn party_invitation_get_configuration(inv: usize, out: *m
 mod tests {
     use super::*;
 
+    /// Our endpoint's identifier is the one from our id unless another member has it,
+    /// then the next free odd one.
+    #[test]
+    fn endpoint_identifiers_are_unique_in_a_network() {
+        let me = PeerId([0x10, 0x20, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+        let mine = uid_of(me);
+        assert_eq!(choose_uid(me, &[]), mine);
+        assert_eq!(choose_uid(me, &[mine]), mine.wrapping_add(2) | 1);
+        assert_eq!(choose_uid(me, &[mine, mine.wrapping_add(2) | 1]), mine.wrapping_add(4) | 1);
+        assert_eq!(choose_uid(me, &[7]) & 1, 1);
+    }
+
     /// Every change has room for the whole union a binding reads (440 bytes in
     /// PlayFab's Unity plugin) after its start, however small its own struct.
     #[test]
@@ -2356,6 +2540,7 @@ mod tests {
                 chats: Vec::new(),
                 local_chats: Vec::new(),
                 pending_chats: Vec::new(),
+                auth: None,
             },
         );
         s

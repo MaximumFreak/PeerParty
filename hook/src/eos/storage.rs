@@ -491,6 +491,7 @@ unsafe extern "system" fn player_write(_h: usize, o: *const TransferOptions, cd:
         if result == SUCCESS {
             let saved = path(Store::Player, &name).and_then(|p| {
                 std::fs::create_dir_all(p.parent()?).ok()?;
+                crate::ipc::local_store("EOS", &p);
                 crate::saves::write_whole(&p, &contents).ok()
             });
             if saved.is_none() {

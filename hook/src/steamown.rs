@@ -24,20 +24,19 @@
 //! copy of its class's vtable (one per class) whose two `Run` slots swap and then call the
 //! class's own; the copy keeps the RTTI pointer before it and every other slot as it was.
 //!
-//! Not covered: a native game calling `ISteamUserStats`, `ISteamApps` or `ISteamUGC`
-//! through their C++ interfaces with its own SteamID (PeerParty has no vtable layouts
-//! for them; games ask for their own stats with `RequestCurrentStats`, which takes no
-//! id), and SteamIDs inside structs those return. `PEERPARTY_SKIP=steamown` turns all
-//! of this off.
+//! A native game calling `ISteamUserStats`, `ISteamApps` or `ISteamUGC` through their
+//! C++ interfaces gets the same: those interfaces are stand-ins (steamobj.rs) whose
+//! methods here map the SteamID and call the real object's. Not covered: SteamIDs inside
+//! other structs those return. `PEERPARTY_SKIP=steamown` turns all of this off.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_char;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, RwLock};
 
 use crate::log;
 use crate::pe::Export;
-use crate::steamobj::vmethod;
+use crate::steamobj::{call_real, unwrap, vmethod};
 
 /// The SteamID the game is shown, and steam_api's for the same player; 0 while unset.
 static OWN: AtomicU64 = AtomicU64::new(0);
@@ -280,7 +279,9 @@ vmethod! {
 
 // ---- flat functions ----
 
-static REAL: LazyLock<Mutex<HashMap<String, usize>>> = LazyLock::new(Mutex::default);
+/// Written when steam_api loads, read on every swapped call: a read lock, so calls from
+/// several game threads never wait on each other.
+static REAL: LazyLock<RwLock<HashMap<String, usize>>> = LazyLock::new(RwLock::default);
 
 const FLAT: &[&str] = &[
     "SteamAPI_ISteamUserStats_RequestUserStats",
@@ -296,7 +297,7 @@ const FLAT: &[&str] = &[
 
 /// steam_api's exports: the real flat functions this module stands in front of.
 pub fn note(exports: &[Export]) {
-    let mut real = REAL.lock().unwrap();
+    let mut real = REAL.write().unwrap();
     for e in exports {
         if FLAT.contains(&e.name.as_str()) {
             real.insert(e.name.clone(), e.addr as usize);
@@ -305,7 +306,7 @@ pub fn note(exports: &[Export]) {
 }
 
 fn real(name: &str) -> Option<usize> {
-    REAL.lock().unwrap().get(name).copied()
+    REAL.read().unwrap().get(name).copied()
 }
 
 /// PeerParty's stand-in for flat function `name`, if it maps SteamIDs.
@@ -328,12 +329,14 @@ pub fn resolve(name: &str) -> Option<usize> {
     Some(f)
 }
 
+/// Calls steam_api's flat function: `this` first, the real object (a C++ stand-in's
+/// methods below would map the SteamID again).
 macro_rules! flat {
-    ($name:literal, fn($($t:ty),*) -> $r:ty, $default:expr $(, $arg:expr)*) => {
+    ($name:literal, fn(usize $(, $t:ty)*) -> $r:ty, $default:expr, $this:expr $(, $arg:expr)*) => {
         match real($name) {
             Some(f) => {
-                let f: unsafe extern "C" fn($($t),*) -> $r = unsafe { std::mem::transmute(f) };
-                unsafe { f($($arg),*) }
+                let f: unsafe extern "C" fn(usize $(, $t)*) -> $r = unsafe { std::mem::transmute(f) };
+                unsafe { f(unwrap($this) $(, $arg)*) }
             }
             None => $default,
         }
@@ -420,6 +423,147 @@ unsafe extern "C" fn create_query_user_ugc(this: usize, account: u32, list: i32,
         consumer,
         page
     )
+}
+
+// ---- the C++ interfaces (steamobj.rs's stand-ins): the same, on the real object ----
+
+/// ISteamUserStats' methods that take or give a SteamID. GetUserStat's two overloads
+/// (int32 and float: one slot each, `@N`, steamobj.rs) take the same arguments but for
+/// the pointer, so each is mapped the same way to its own slot.
+pub fn user_stats() -> Vec<(&'static str, usize)> {
+    if crate::net::skip("steamown") {
+        return Vec::new();
+    }
+    vec![
+        ("RequestUserStats", v_request_user_stats as *const () as usize),
+        ("GetUserStat~3@0", v_get_user_stat_0 as *const () as usize),
+        ("GetUserStat~3@1", v_get_user_stat_1 as *const () as usize),
+        ("GetUserAchievement", v_get_user_achievement as *const () as usize),
+        ("GetUserAchievementAndUnlockTime", v_get_user_achievement_time as *const () as usize),
+        ("DownloadLeaderboardEntriesForUsers", v_download_entries_for_users as *const () as usize),
+        ("GetDownloadedLeaderboardEntry", v_get_downloaded_entry as *const () as usize),
+    ]
+}
+
+pub fn apps() -> Vec<(&'static str, usize)> {
+    if crate::net::skip("steamown") {
+        return Vec::new();
+    }
+    vec![("GetAppOwner", v_get_app_owner as *const () as usize)]
+}
+
+pub fn ugc() -> Vec<(&'static str, usize)> {
+    if crate::net::skip("steamown") {
+        return Vec::new();
+    }
+    vec![("CreateQueryUserUGCRequest", v_create_query_user_ugc as *const () as usize)]
+}
+
+vmethod! {
+    fn v_request_user_stats(this: usize, id: u64) -> u64 {
+        call_real!(this, "RequestUserStats", fn(u64) -> u64, 0, to_steam(id))
+    }
+}
+
+vmethod! {
+    fn v_get_user_stat_0(this: usize, id: u64, name: *const c_char, out: *mut u8) -> bool {
+        call_real!(this, "GetUserStat~3@0", fn(u64, *const c_char, *mut u8) -> bool, false, to_steam(id), name, out)
+    }
+}
+
+vmethod! {
+    fn v_get_user_stat_1(this: usize, id: u64, name: *const c_char, out: *mut u8) -> bool {
+        call_real!(this, "GetUserStat~3@1", fn(u64, *const c_char, *mut u8) -> bool, false, to_steam(id), name, out)
+    }
+}
+
+vmethod! {
+    fn v_get_user_achievement(this: usize, id: u64, name: *const c_char, out: *mut bool) -> bool {
+        call_real!(this, "GetUserAchievement", fn(u64, *const c_char, *mut bool) -> bool, false, to_steam(id), name, out)
+    }
+}
+
+vmethod! {
+    fn v_get_user_achievement_time(this: usize, id: u64, name: *const c_char, out: *mut bool, time: *mut u32) -> bool {
+        call_real!(
+            this,
+            "GetUserAchievementAndUnlockTime",
+            fn(u64, *const c_char, *mut bool, *mut u32) -> bool,
+            false,
+            to_steam(id),
+            name,
+            out,
+            time
+        )
+    }
+}
+
+vmethod! {
+    fn v_download_entries_for_users(this: usize, board: u64, ids: *mut u64, n: i32) -> u64 {
+        let mut mapped: Vec<u64> = if ids.is_null() || n <= 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(ids, n as usize) }.iter().map(|&id| to_steam(id)).collect()
+        };
+        let p = if mapped.is_empty() { ids } else { mapped.as_mut_ptr() };
+        call_real!(this, "DownloadLeaderboardEntriesForUsers", fn(u64, *mut u64, i32) -> u64, 0, board, p, n)
+    }
+}
+
+vmethod! {
+    fn v_get_downloaded_entry(this: usize, entries: u64, index: i32, entry: *mut u64, details: *mut i32, max: i32) -> bool {
+        let ok = call_real!(
+            this,
+            "GetDownloadedLeaderboardEntry",
+            fn(u64, i32, *mut u64, *mut i32, i32) -> bool,
+            false,
+            entries,
+            index,
+            entry,
+            details,
+            max
+        );
+        if ok && !entry.is_null() {
+            unsafe { *entry = to_game(*entry) };
+        }
+        ok
+    }
+}
+
+vmethod! {
+    /// Returns a CSteamID: through the hidden pointer after `this`.
+    fn v_get_app_owner(this: usize, ret: *mut u64) -> *mut u64 {
+        let r = call_real!(this, "GetAppOwner", fn(*mut u64) -> *mut u64, std::ptr::null_mut(), ret);
+        let r = if r.is_null() && !ret.is_null() {
+            unsafe { *ret = 0 };
+            ret
+        } else {
+            r
+        };
+        if !r.is_null() {
+            unsafe { *r = to_game(*r) };
+        }
+        r
+    }
+}
+
+vmethod! {
+    #[allow(clippy::too_many_arguments)]
+    fn v_create_query_user_ugc(this: usize, account: u32, list: i32, matching: i32, sort: i32, creator: u32, consumer: u32, page: u32) -> u64 {
+        call_real!(
+            this,
+            "CreateQueryUserUGCRequest",
+            fn(u32, i32, i32, i32, u32, u32, u32) -> u64,
+            0,
+            account_to_steam(account),
+            list,
+            matching,
+            sort,
+            creator,
+            consumer,
+            page
+        )
+    }
 }
 
 #[cfg(test)]

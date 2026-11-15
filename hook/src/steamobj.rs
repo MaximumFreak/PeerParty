@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_char;
-use std::sync::{LazyLock, Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex, OnceLock, RwLock};
 
 use retour::GenericDetour;
 
@@ -52,7 +52,7 @@ pub(crate) use vmethod;
 /// Calls the real object's method `name` for a stand-in `this`, or gives `default`
 /// when this version has no such method.
 macro_rules! call_real {
-    ($this:expr, $name:literal, fn($($t:ty),*) -> $r:ty, $default:expr $(, $arg:expr)* $(,)?) => {{
+    ($this:expr, $name:expr, fn($($t:ty),*) -> $r:ty, $default:expr $(, $arg:expr)* $(,)?) => {{
         match unsafe { $crate::steamobj::real_method($this, $name) } {
             Some((real, f)) => {
                 #[cfg(target_arch = "x86")]
@@ -82,7 +82,9 @@ struct Proxy {
 /// real object -> stand-in, so a game asking twice gets the same object.
 static PROXIES: LazyLock<Mutex<HashMap<usize, usize>>> = LazyLock::new(Mutex::default);
 /// stand-in -> real.
-static REALS: LazyLock<Mutex<HashMap<usize, usize>>> = LazyLock::new(Mutex::default);
+/// Read on every call through a stand-in: a read lock, so game threads never wait on each
+/// other there.
+static REALS: LazyLock<RwLock<HashMap<usize, usize>>> = LazyLock::new(RwLock::default);
 /// Real objects by family ("SteamUser"), newest first seen, for PeerParty's own calls.
 static SEEN: LazyLock<Mutex<HashMap<&'static str, (usize, &'static str)>>> =
     LazyLock::new(Mutex::default);
@@ -149,9 +151,14 @@ fn layout(version: &str) -> Option<(&'static str, &'static [&'static str])> {
         .map(|(v, names)| (*v, *names))
 }
 
-/// The slot of `name` in `version`, when it has the newest signature.
+/// The slot of `name` in `version`, when it has the newest signature. An overloaded
+/// method's slots share a name: `name@N` is the Nth of them (from 0, in vtable order).
 pub fn slot(version: &str, name: &str) -> Option<usize> {
-    layout(version)?.1.iter().position(|n| *n == name)
+    let names = layout(version)?.1;
+    match name.rsplit_once('@').and_then(|(n, k)| Some((n, k.parse::<usize>().ok()?))) {
+        Some((n, k)) => names.iter().enumerate().filter(|(_, x)| **x == n).nth(k).map(|(i, _)| i),
+        None => names.iter().position(|n| *n == name),
+    }
 }
 
 /// PeerParty's methods for an interface version, for a client or the game server.
@@ -168,6 +175,11 @@ fn overrides(family: &str, version: &str, server: bool) -> Vec<(&'static str, us
         "SteamNetworkingSockets" => crate::steamgns::sockets(version),
         "SteamNetworkingMessages" => crate::steamgns::messages(),
         "SteamNetworkingUtils" => crate::steamgns::utils(),
+        "SteamUtils" => crate::steam::utils(),
+        "SteamInput" | "SteamController" => crate::steamlan::input(),
+        "STEAMUSERSTATS_INTERFACE_VERSION" if !server => crate::steamown::user_stats(),
+        "STEAMAPPS_INTERFACE_VERSION" if !server => crate::steamown::apps(),
+        "STEAMUGC_INTERFACE_VERSION" if !server => crate::steamown::ugc(),
         _ => Vec::new(),
     }
 }
@@ -182,7 +194,7 @@ pub fn wrap_as(real: usize, version: &str, server: bool) -> usize {
     if real == 0 || !crate::net::enabled() {
         return real;
     }
-    if REALS.lock().unwrap().contains_key(&real) {
+    if REALS.read().unwrap().contains_key(&real) {
         return real;
     }
     if let Some(p) = PROXIES.lock().unwrap().get(&real) {
@@ -203,15 +215,22 @@ pub fn wrap_as(real: usize, version: &str, server: bool) -> usize {
         return real;
     };
     let mut ours = 0;
+    // How many slots of each name came before: an overload's `name@N` (see `slot`).
+    let mut before: HashMap<&str, usize> = HashMap::new();
     let vtable: Vec<usize> = names
         .iter()
         .enumerate()
-        .map(|(i, n)| match mine.iter().find(|(m, _)| m == n) {
-            Some((_, f)) => {
-                ours += 1;
-                *f
+        .map(|(i, n)| {
+            let k = before.entry(n).or_insert(0);
+            let nth = format!("{n}@{k}");
+            *k += 1;
+            match mine.iter().find(|(m, _)| *m == nth).or_else(|| mine.iter().find(|(m, _)| m == n)) {
+                Some((_, f)) => {
+                    ours += 1;
+                    *f
+                }
+                None => stubs + i * STUB,
             }
-            None => stubs + i * STUB,
         })
         .collect();
     let vtable = Box::leak(vtable.into_boxed_slice()).as_ptr();
@@ -222,7 +241,7 @@ pub fn wrap_as(real: usize, version: &str, server: bool) -> usize {
         server,
     })) as *const Proxy as usize;
     PROXIES.lock().unwrap().insert(real, proxy);
-    REALS.lock().unwrap().insert(proxy, real);
+    REALS.write().unwrap().insert(proxy, real);
     if !server {
         SEEN.lock()
             .unwrap()
@@ -239,12 +258,12 @@ pub fn wrap_as(real: usize, version: &str, server: bool) -> usize {
 
 /// The real object behind a stand-in (anything else comes back as is).
 pub fn unwrap(p: usize) -> usize {
-    REALS.lock().unwrap().get(&p).copied().unwrap_or(p)
+    REALS.read().unwrap().get(&p).copied().unwrap_or(p)
 }
 
 /// (real object, real method) for a stand-in's method `name`.
 pub unsafe fn real_method(this: usize, name: &str) -> Option<(usize, usize)> {
-    if !REALS.lock().unwrap().contains_key(&this) {
+    if !REALS.read().unwrap().contains_key(&this) {
         return None;
     }
     let proxy = unsafe { &*(this as *const Proxy) };
@@ -256,7 +275,7 @@ pub unsafe fn real_method(this: usize, name: &str) -> Option<(usize, usize)> {
 /// Whether `this` is one of our stand-ins for a game server's interface (one the game
 /// fetched on the game server's pipe, or through the game server's accessors).
 pub fn is_server(this: usize) -> bool {
-    REALS.lock().unwrap().contains_key(&this) && unsafe { (*(this as *const Proxy)).server }
+    REALS.read().unwrap().contains_key(&this) && unsafe { (*(this as *const Proxy)).server }
 }
 
 /// A real interface the game has fetched (family "SteamUser"), as its stand-in, for
@@ -277,6 +296,12 @@ fn client() -> Vec<(&'static str, usize)> {
         ("GetISteamNetworking", get_networking as *const () as usize),
         ("GetISteamGameServer", get_game_server as *const () as usize),
         ("GetISteamGenericInterface", get_generic as *const () as usize),
+        ("GetISteamUtils", get_utils as *const () as usize),
+        ("GetISteamUserStats", get_user_stats as *const () as usize),
+        ("GetISteamApps", get_apps as *const () as usize),
+        ("GetISteamUGC", get_ugc as *const () as usize),
+        ("GetISteamController", get_controller as *const () as usize),
+        ("GetISteamInput", get_input as *const () as usize),
     ]
 }
 
@@ -300,6 +325,20 @@ client_getter!(get_matchmaking_servers, "GetISteamMatchmakingServers");
 client_getter!(get_networking, "GetISteamNetworking");
 client_getter!(get_game_server, "GetISteamGameServer");
 client_getter!(get_generic, "GetISteamGenericInterface");
+client_getter!(get_user_stats, "GetISteamUserStats");
+client_getter!(get_apps, "GetISteamApps");
+client_getter!(get_ugc, "GetISteamUGC");
+client_getter!(get_controller, "GetISteamController");
+client_getter!(get_input, "GetISteamInput");
+
+vmethod! {
+    /// ISteamUtils takes only the pipe: the game server's pipe gets the server's.
+    fn get_utils(this: usize, pipe: i32, version: *const c_char) -> usize {
+        let real = call_real!(this, "GetISteamUtils", fn(i32, *const c_char) -> usize, 0, pipe, version);
+        let server = crate::steamgs::server_pipe() == Some(pipe);
+        wrap_as(real, &crate::read::cstr(version as usize).unwrap_or_default(), server)
+    }
+}
 
 // ---- steam_api exports that hand out interfaces ----
 
@@ -385,9 +424,15 @@ legacy!(legacy_networking, "SteamNetworking");
 legacy!(legacy_matchmaking_servers, "SteamMatchmakingServers");
 legacy!(legacy_game_server, "SteamGameServer");
 legacy!(legacy_game_server_networking, "SteamGameServerNetworking");
+legacy!(legacy_utils, "SteamUtils");
+legacy!(legacy_game_server_utils, "SteamGameServerUtils");
+legacy!(legacy_user_stats, "SteamUserStats");
+legacy!(legacy_apps, "SteamApps");
+legacy!(legacy_ugc, "SteamUGC");
+legacy!(legacy_controller, "SteamController");
 
 /// The old accessors' stand-in functions, by export name, for the by-name swap.
-static LEGACY_FNS: [(&str, LegacyFn); 8] = [
+static LEGACY_FNS: [(&str, LegacyFn); 14] = [
     ("SteamClient", legacy_client),
     ("SteamUser", legacy_user),
     ("SteamFriends", legacy_friends),
@@ -396,6 +441,12 @@ static LEGACY_FNS: [(&str, LegacyFn); 8] = [
     ("SteamMatchmakingServers", legacy_matchmaking_servers),
     ("SteamGameServer", legacy_game_server),
     ("SteamGameServerNetworking", legacy_game_server_networking),
+    ("SteamUtils", legacy_utils),
+    ("SteamGameServerUtils", legacy_game_server_utils),
+    ("SteamUserStats", legacy_user_stats),
+    ("SteamApps", legacy_apps),
+    ("SteamUGC", legacy_ugc),
+    ("SteamController", legacy_controller),
 ];
 
 // ---- the flat API's accessors ----
@@ -425,6 +476,8 @@ fn flat_accessor(name: &str) -> Option<(String, bool)> {
         "NetworkingSockets" => ("SteamNetworkingSockets", false),
         "NetworkingMessages" => ("SteamNetworkingMessages", false),
         "NetworkingUtils" => ("SteamNetworkingUtils", false),
+        "Utils" => ("SteamUtils", false),
+        "GameServerUtils" => ("SteamUtils", true),
         "GameServer" => ("SteamGameServer", true),
         "GameServerNetworking" => ("SteamNetworking", true),
         "GameServerNetworkingSockets" => ("SteamNetworkingSockets", true),
@@ -515,7 +568,7 @@ fn flat_interface(name: &str) -> Option<(&str, &str)> {
         iface,
         "SteamUser" | "SteamFriends" | "SteamMatchmaking" | "SteamMatchmakingServers" | "SteamNetworking"
             | "SteamNetworkingSockets" | "SteamNetworkingMessages" | "SteamNetworkingUtils" | "SteamGameServer"
-            | "SteamClient"
+            | "SteamClient" | "SteamUtils"
     );
     (ours && !method.is_empty()).then_some((iface, method))
 }
@@ -528,7 +581,7 @@ fn flat_method(name: &str) -> Option<&str> {
 /// The stand-in's own method `name` (PeerParty's, or the stub to the real one), when
 /// `this` is a stand-in whose version has that method.
 unsafe fn member(this: usize, name: &str) -> Option<usize> {
-    if !REALS.lock().unwrap().contains_key(&this) {
+    if !REALS.read().unwrap().contains_key(&this) {
         return None;
     }
     let proxy = unsafe { &*(this as *const Proxy) };
@@ -668,11 +721,115 @@ flat_returns_id!(
 );
 flat_returns_id!(flat_lobby_owner, "SteamAPI_ISteamMatchmaking_GetLobbyOwner", "GetLobbyOwner", lobby: u64);
 
+// ---- ISteamNetworkingUtils's inline helpers ----
+//
+// `SetGlobalConfigValueInt32`, `SetGlobalCallback_SteamNetConnectionStatusChanged` and the
+// rest are inline in the header: each is one SetConfigValue call. steam_api's flat
+// exports of them run that body on the object they're given, and a flat function
+// PeerParty doesn't answer gets the real object, so the call would go to Steam's
+// SetConfigValue and never reach the stand-in's (steamgns.rs keeps the game's status
+// callbacks there). These run the same bodies on the stand-in.
+
+const CFG_GLOBAL: i32 = 1;
+const CFG_CONNECTION: i32 = 4;
+const CFG_INT32: i32 = 1;
+const CFG_FLOAT: i32 = 3;
+const CFG_STRING: i32 = 4;
+const CFG_PTR: i32 = 5;
+
+/// `SetConfigValue` on the stand-in (PeerParty's), else steam_api's flat one with the
+/// real object.
+fn utils_set_config(this: usize, value: i32, scope: i32, obj: isize, kind: i32, arg: *const u8) -> bool {
+    if let Some(f) = unsafe { member(this, "SetConfigValue") } {
+        #[cfg(target_arch = "x86")]
+        let f: unsafe extern "thiscall" fn(usize, i32, i32, isize, i32, *const u8) -> bool =
+            unsafe { std::mem::transmute(f) };
+        #[cfg(not(target_arch = "x86"))]
+        let f: unsafe extern "C" fn(usize, i32, i32, isize, i32, *const u8) -> bool = unsafe { std::mem::transmute(f) };
+        return unsafe { f(this, value, scope, obj, kind, arg) };
+    }
+    let Some(real) = FLAT_REAL.get().and_then(|r| r.get("SteamAPI_ISteamNetworkingUtils_SetConfigValue").copied()) else {
+        return false;
+    };
+    let f: unsafe extern "C" fn(usize, i32, i32, isize, i32, *const u8) -> bool = unsafe { std::mem::transmute(real) };
+    unsafe { f(unwrap(this), value, scope, obj, kind, arg) }
+}
+
+unsafe extern "C" fn cfg_global_i32(this: usize, value: i32, v: i32) -> bool {
+    utils_set_config(this, value, CFG_GLOBAL, 0, CFG_INT32, &v as *const i32 as *const u8)
+}
+unsafe extern "C" fn cfg_global_f32(this: usize, value: i32, v: f32) -> bool {
+    utils_set_config(this, value, CFG_GLOBAL, 0, CFG_FLOAT, &v as *const f32 as *const u8)
+}
+unsafe extern "C" fn cfg_global_str(this: usize, value: i32, v: *const c_char) -> bool {
+    utils_set_config(this, value, CFG_GLOBAL, 0, CFG_STRING, v as *const u8)
+}
+/// A pointer value is passed as a pointer to the pointer.
+unsafe extern "C" fn cfg_global_ptr(this: usize, value: i32, v: usize) -> bool {
+    utils_set_config(this, value, CFG_GLOBAL, 0, CFG_PTR, &v as *const usize as *const u8)
+}
+unsafe extern "C" fn cfg_conn_i32(this: usize, conn: u32, value: i32, v: i32) -> bool {
+    utils_set_config(this, value, CFG_CONNECTION, conn as isize, CFG_INT32, &v as *const i32 as *const u8)
+}
+unsafe extern "C" fn cfg_conn_f32(this: usize, conn: u32, value: i32, v: f32) -> bool {
+    utils_set_config(this, value, CFG_CONNECTION, conn as isize, CFG_FLOAT, &v as *const f32 as *const u8)
+}
+unsafe extern "C" fn cfg_conn_str(this: usize, conn: u32, value: i32, v: *const c_char) -> bool {
+    utils_set_config(this, value, CFG_CONNECTION, conn as isize, CFG_STRING, v as *const u8)
+}
+
+/// `SteamNetworkingConfigValue_t`: the option, its type, and the value (a string's is
+/// its pointer).
+#[repr(C)]
+struct ConfigValue {
+    value: i32,
+    kind: i32,
+    val: u64,
+}
+
+unsafe extern "C" fn cfg_struct(this: usize, opt: *const ConfigValue, scope: i32, obj: isize) -> bool {
+    if opt.is_null() {
+        return false;
+    }
+    let o = unsafe { &*opt };
+    let arg = if o.kind == CFG_STRING { o.val as usize as *const u8 } else { &o.val as *const u64 as *const u8 };
+    utils_set_config(this, o.value, scope, obj, o.kind, arg)
+}
+
+macro_rules! global_callback {
+    ($fn:ident, $value:expr) => {
+        unsafe extern "C" fn $fn(this: usize, f: usize) -> bool {
+            unsafe { cfg_global_ptr(this, $value, f) }
+        }
+    };
+}
+
+global_callback!(cb_status, 201);
+global_callback!(cb_auth, 202);
+global_callback!(cb_relay, 203);
+global_callback!(cb_session_request, 204);
+global_callback!(cb_session_failed, 205);
+global_callback!(cb_fake_ip, 207);
+
 fn adapters() -> Vec<(&'static str, usize)> {
     if FLAT_REAL.get().is_none() {
         return Vec::new();
     }
     vec![
+        ("SteamAPI_ISteamNetworkingUtils_SetGlobalConfigValueInt32", cfg_global_i32 as *const () as usize),
+        ("SteamAPI_ISteamNetworkingUtils_SetGlobalConfigValueFloat", cfg_global_f32 as *const () as usize),
+        ("SteamAPI_ISteamNetworkingUtils_SetGlobalConfigValueString", cfg_global_str as *const () as usize),
+        ("SteamAPI_ISteamNetworkingUtils_SetGlobalConfigValuePtr", cfg_global_ptr as *const () as usize),
+        ("SteamAPI_ISteamNetworkingUtils_SetConnectionConfigValueInt32", cfg_conn_i32 as *const () as usize),
+        ("SteamAPI_ISteamNetworkingUtils_SetConnectionConfigValueFloat", cfg_conn_f32 as *const () as usize),
+        ("SteamAPI_ISteamNetworkingUtils_SetConnectionConfigValueString", cfg_conn_str as *const () as usize),
+        ("SteamAPI_ISteamNetworkingUtils_SetConfigValueStruct", cfg_struct as *const () as usize),
+        ("SteamAPI_ISteamNetworkingUtils_SetGlobalCallback_SteamNetConnectionStatusChanged", cb_status as *const () as usize),
+        ("SteamAPI_ISteamNetworkingUtils_SetGlobalCallback_SteamNetAuthenticationStatusChanged", cb_auth as *const () as usize),
+        ("SteamAPI_ISteamNetworkingUtils_SetGlobalCallback_SteamRelayNetworkStatusChanged", cb_relay as *const () as usize),
+        ("SteamAPI_ISteamNetworkingUtils_SetGlobalCallback_MessagesSessionRequest", cb_session_request as *const () as usize),
+        ("SteamAPI_ISteamNetworkingUtils_SetGlobalCallback_MessagesSessionFailed", cb_session_failed as *const () as usize),
+        ("SteamAPI_ISteamNetworkingUtils_SetGlobalCallback_FakeIPResult", cb_fake_ip as *const () as usize),
         ("SteamAPI_ISteamUser_GetSteamID", flat_user_steam_id as *const () as usize),
         ("SteamAPI_ISteamGameServer_GetSteamID", flat_server_steam_id as *const () as usize),
         ("SteamAPI_ISteamGameServer_CreateUnauthenticatedUserConnection", flat_unauthenticated as *const () as usize),
@@ -785,7 +942,7 @@ pub fn attach(base: usize, exports: &[Export]) -> Vec<usize> {
     }
     // The old accessors take no version: it's the one this steam_api.dll was built
     // with, the only one of its family named in the image.
-    let image = unsafe { image_bytes(base) };
+    let image = unsafe { data_sections(base) };
     let mut legacy = Vec::new();
     for (export, fam, f, server) in [
         ("SteamClient", "SteamClient", legacy_client as LegacyFn, false),
@@ -796,8 +953,14 @@ pub fn attach(base: usize, exports: &[Export]) -> Vec<usize> {
         ("SteamMatchmakingServers", "SteamMatchMakingServers", legacy_matchmaking_servers as LegacyFn, false),
         ("SteamGameServer", "SteamGameServer", legacy_game_server as LegacyFn, true),
         ("SteamGameServerNetworking", "SteamNetworking", legacy_game_server_networking as LegacyFn, true),
+        ("SteamUtils", "SteamUtils", legacy_utils as LegacyFn, false),
+        ("SteamGameServerUtils", "SteamUtils", legacy_game_server_utils as LegacyFn, true),
+        ("SteamUserStats", "STEAMUSERSTATS_INTERFACE_VERSION", legacy_user_stats as LegacyFn, false),
+        ("SteamApps", "STEAMAPPS_INTERFACE_VERSION", legacy_apps as LegacyFn, false),
+        ("SteamUGC", "STEAMUGC_INTERFACE_VERSION", legacy_ugc as LegacyFn, false),
+        ("SteamController", "SteamController", legacy_controller as LegacyFn, false),
     ] {
-        let (Some(a), Some(version)) = (find(export), newest_named(image, fam)) else {
+        let (Some(a), Some(version)) = (find(export), image.iter().filter_map(|s| newest_named(s, fam)).max()) else {
             continue;
         };
         let target: LegacyFn = unsafe { std::mem::transmute(a) };
@@ -834,25 +997,46 @@ where
     })
 }
 
-/// The mapped image of a module.
-unsafe fn image_bytes(base: usize) -> &'static [u8] {
+/// A module's readable, initialized, non-code sections (where its strings are): not the
+/// code, and not the gaps between sections.
+unsafe fn data_sections(base: usize) -> Vec<&'static [u8]> {
+    const CODE: u32 = 0x20; // IMAGE_SCN_CNT_CODE
+    const INITIALIZED: u32 = 0x40; // IMAGE_SCN_CNT_INITIALIZED_DATA
+    const EXECUTE: u32 = 0x2000_0000; // IMAGE_SCN_MEM_EXECUTE
+    const READ: u32 = 0x4000_0000; // IMAGE_SCN_MEM_READ
     unsafe {
         let nt = base + *((base + 0x3c) as *const u32) as usize;
-        // OptionalHeader.SizeOfImage sits at the same offset in PE32 and PE32+.
-        let size = *((nt + 0x18 + 0x38) as *const u32) as usize;
-        std::slice::from_raw_parts(base as *const u8, size)
+        let count = *((nt + 6) as *const u16) as usize;
+        let optional = *((nt + 20) as *const u16) as usize;
+        let first = nt + 24 + optional;
+        (0..count)
+            .filter_map(|i| {
+                let h = first + i * 40;
+                let size = *((h + 8) as *const u32) as usize; // VirtualSize
+                let rva = *((h + 12) as *const u32) as usize;
+                let raw = *((h + 16) as *const u32) as usize; // SizeOfRawData
+                let flags = *((h + 36) as *const u32);
+                let data = flags & INITIALIZED != 0 && flags & READ != 0 && flags & (CODE | EXECUTE) == 0;
+                // Past SizeOfRawData a section is zeros: nothing to find there.
+                let len = size.min(raw);
+                (data && len > 0).then(|| std::slice::from_raw_parts((base + rva) as *const u8, len))
+            })
+            .collect()
     }
 }
 
-/// The highest "<family>NNN" string in `image`, e.g. "SteamFriends015".
+/// The highest "<family>NNN" string in `image`, e.g. "SteamFriends015". A match that
+/// isn't one (too near the end, more digits) is skipped, not the end of the search.
 fn newest_named(image: &[u8], family: &str) -> Option<String> {
     let pat = family.as_bytes();
     let mut best: Option<String> = None;
     for i in memchr_all(image, pat) {
-        let digits = image.get(i + pat.len()..i + pat.len() + 3)?;
+        let Some(digits) = image.get(i + pat.len()..i + pat.len() + 3) else {
+            continue;
+        };
         let end = image.get(i + pat.len() + 3).copied();
         if digits.iter().all(u8::is_ascii_digit) && end == Some(0) {
-            let v = format!("{family}{}", std::str::from_utf8(digits).ok()?);
+            let v = format!("{family}{}", String::from_utf8_lossy(digits));
             if layout(&v).is_some() && best.as_ref().is_none_or(|b| v > *b) {
                 best = Some(v);
             }
@@ -887,8 +1071,27 @@ mod tests {
         // A changed signature is left alone, or taken by its older shape's name.
         assert_eq!(slot("SteamUser019", "GetAuthSessionTicket"), None);
         assert!(slot("SteamNetworkingSockets008", "SendMessages~3").is_some());
+        // ISteamUtils's call results: slots 11-13 until GetCSERIPPort went in 011.
+        assert_eq!(slot("SteamUtils005", "IsAPICallCompleted"), Some(11));
+        assert_eq!(slot("SteamUtils005", "GetAPICallResult"), Some(13));
+        assert_eq!(slot("SteamUtils010", "GetAPICallFailureReason"), Some(12));
+        assert_eq!(slot("SteamUtils011", "IsAPICallCompleted"), Some(10));
+        assert_eq!(slot("SteamClient010", "GetISteamUtils"), Some(9));
         assert!(slot("SteamNetworkingSockets004", "ConnectP2P~2").is_some());
         assert!(TABLES.iter().all(|(_, n)| n.len() <= MAX_SLOTS));
+        // The C++ interfaces steamown and Steam Input's gating stand in front of.
+        for v in ["SteamInput001", "SteamInput006", "SteamController003", "SteamController008"] {
+            assert!(slot(v, "GetDigitalActionData").is_some() && slot(v, "GetAnalogActionData").is_some(), "{v}");
+        }
+        assert!(slot("STEAMAPPS_INTERFACE_VERSION008", "GetAppOwner").is_some());
+        assert!(slot("STEAMUGC_INTERFACE_VERSION016", "CreateQueryUserUGCRequest").is_some());
+        // GetUserStat's two overloads: two slots of one name, told apart by `@N`.
+        let a = slot("STEAMUSERSTATS_INTERFACE_VERSION012", "GetUserStat~3@0").unwrap();
+        let b = slot("STEAMUSERSTATS_INTERFACE_VERSION012", "GetUserStat~3@1").unwrap();
+        assert_eq!(b, a + 1);
+        assert_eq!(slot("STEAMUSERSTATS_INTERFACE_VERSION012", "GetUserStat~3"), Some(a));
+        assert_eq!(slot("STEAMUSERSTATS_INTERFACE_VERSION012", "GetUserStat~3@2"), None);
+        assert!(slot("STEAMUSERSTATS_INTERFACE_VERSION012", "GetUserAchievementAndUnlockTime").is_some());
     }
 
     // A fake ISteamNetworking005: each method returns the `this` it was given plus
@@ -928,6 +1131,60 @@ mod tests {
         crate::steamp2p::networking()
     }
 
+    // A fake ISteamInput006's GetDigitalActionData (C++: the struct through a pointer
+    // after `this`) and two GetUserStat overloads that say which slot they are.
+    vmethod! { fn fake_digital(_this: usize, out: *mut u8, _i: u64, _a: u64) -> *mut u8 { unsafe { *out = 1; *out.add(1) = 1 }; out } }
+    vmethod! { fn fake_stat_0(_this: usize, _id: u64, _n: *const c_char, out: *mut u8) -> bool { unsafe { *out = 10 }; true } }
+    vmethod! { fn fake_stat_1(_this: usize, _id: u64, _n: *const c_char, out: *mut u8) -> bool { unsafe { *out = 11 }; true } }
+
+    #[test]
+    fn cpp_steam_input_reads_rest_and_overloads_keep_their_slots() {
+        unsafe { std::env::set_var("PEERPARTY_ACTIVE", "1") };
+        #[cfg(target_arch = "x86")]
+        type Digital = unsafe extern "thiscall" fn(usize, *mut u8, u64, u64) -> *mut u8;
+        #[cfg(not(target_arch = "x86"))]
+        type Digital = unsafe extern "C" fn(usize, *mut u8, u64, u64) -> *mut u8;
+        #[cfg(target_arch = "x86")]
+        type Stat = unsafe extern "thiscall" fn(usize, u64, *const c_char, *mut u8) -> bool;
+        #[cfg(not(target_arch = "x86"))]
+        type Stat = unsafe extern "C" fn(usize, u64, *const c_char, *mut u8) -> bool;
+
+        let v = "SteamInput006";
+        let mut vt = vec![0usize; layout(v).unwrap().1.len()];
+        let at = slot(v, "GetDigitalActionData").unwrap();
+        vt[at] = fake_digital as *const () as usize;
+        let real = Box::leak(Box::new(vt.as_ptr() as usize)) as *const usize as usize;
+        let proxy = wrap(real, v);
+        assert_ne!(proxy, real, "ISteamInput is a stand-in");
+        let pvt = unsafe { *(proxy as *const *const usize) };
+        let f: Digital = unsafe { std::mem::transmute(*pvt.add(at)) };
+        let mut d = [0u8; 2];
+        unsafe { f(proxy, d.as_mut_ptr(), 1, 2) };
+        assert_eq!(d, [1, 1]);
+        crate::overlay::set_visible_for_test(true);
+        unsafe { f(proxy, d.as_mut_ptr(), 1, 2) };
+        crate::overlay::set_visible_for_test(false);
+        assert_eq!(d, [0, 1], "released while the overlay shows, still active");
+
+        let v = "STEAMUSERSTATS_INTERFACE_VERSION012";
+        let mut vt = vec![0usize; layout(v).unwrap().1.len()];
+        let (a, b) = (slot(v, "GetUserStat~3@0").unwrap(), slot(v, "GetUserStat~3@1").unwrap());
+        vt[a] = fake_stat_0 as *const () as usize;
+        vt[b] = fake_stat_1 as *const () as usize;
+        let real = Box::leak(Box::new(vt.as_ptr() as usize)) as *const usize as usize;
+        let proxy = wrap(real, v);
+        assert_ne!(proxy, real, "ISteamUserStats is a stand-in");
+        let pvt = unsafe { *(proxy as *const *const usize) };
+        for (i, want) in [(a, 10u8), (b, 11)] {
+            let f: Stat = unsafe { std::mem::transmute(*pvt.add(i)) };
+            assert_ne!(unsafe { *pvt.add(i) }, stubs().unwrap() + i * STUB, "PeerParty's method in slot {i}");
+            let mut out = 0u8;
+            assert!(unsafe { f(proxy, 5, c"x".as_ptr(), &mut out) });
+            assert_eq!(out, want, "slot {i} reached its own real overload");
+        }
+        std::mem::forget(vt);
+    }
+
     #[test]
     fn flat_accessors_name_their_interface_version() {
         let got = |n: &str| flat_accessor(n);
@@ -937,6 +1194,8 @@ mod tests {
         assert_eq!(got("SteamAPI_SteamNetworkingSockets_v008"), Some(("SteamNetworkingSockets008".into(), false)));
         assert_eq!(got("SteamAPI_SteamGameServer_v015"), Some(("SteamGameServer015".into(), true)));
         assert_eq!(got("SteamAPI_SteamGameServerNetworking_v006"), Some(("SteamNetworking006".into(), true)));
+        assert_eq!(got("SteamAPI_SteamUtils_v010"), Some(("SteamUtils010".into(), false)));
+        assert_eq!(got("SteamAPI_SteamGameServerUtils_v010"), Some(("SteamUtils010".into(), true)));
         assert_eq!(
             got("SteamAPI_SteamGameServerNetworkingMessages_SteamAPI_v002"),
             Some(("SteamNetworkingMessages002".into(), true))
@@ -946,7 +1205,7 @@ mod tests {
         assert_eq!(got("SteamAPI_ISteamUser_GetSteamID"), None);
         assert_eq!(got("SteamAPI_SteamUser_vX"), None);
         // Every client accessor names a version PeerParty has a layout for.
-        for v in ["SteamUser023", "SteamFriends017", "SteamMatchMaking009", "SteamNetworking006"] {
+        for v in ["SteamUser023", "SteamFriends017", "SteamMatchMaking009", "SteamNetworking006", "SteamUtils010"] {
             assert!(layout(v).is_some(), "{v}");
         }
     }
@@ -957,5 +1216,22 @@ mod tests {
         assert_eq!(newest_named(img, "SteamFriends").as_deref(), Some("SteamFriends015"));
         assert_eq!(newest_named(img, "SteamUser").as_deref(), Some("SteamUser019"));
         assert_eq!(newest_named(img, "SteamNetworking"), None);
+        // A family name too near the end doesn't hide the versions before it.
+        let img = b"..SteamUser019\0..SteamUser01";
+        assert_eq!(newest_named(img, "SteamUser").as_deref(), Some("SteamUser019"));
+        let img = b"..SteamUser019\0..SteamUser";
+        assert_eq!(newest_named(img, "SteamUser").as_deref(), Some("SteamUser019"));
+    }
+
+    #[test]
+    fn this_modules_data_sections_hold_its_strings() {
+        unsafe extern "system" {
+            fn GetModuleHandleW(name: *const u16) -> usize;
+        }
+        let base = unsafe { GetModuleHandleW(std::ptr::null()) };
+        let s = unsafe { data_sections(base) };
+        assert!(!s.is_empty());
+        let marker = std::hint::black_box("SteamFriends015\0");
+        assert!(s.iter().any(|d| newest_named(d, "SteamFriends").is_some()), "{marker}");
     }
 }

@@ -69,6 +69,9 @@ pub fn hand_over() {
 
 static HANDED_OVER: AtomicBool = AtomicBool::new(false);
 
+/// Players blocked from the overlay in this run, with their fingerprints (for Undo).
+static BLOCKED: Mutex<Vec<(PeerId, String)>> = Mutex::new(Vec::new());
+
 /// Whether this process has let the launcher go to a program it started.
 pub fn handed_over() -> bool {
     HANDED_OVER.load(Ordering::Relaxed)
@@ -87,6 +90,26 @@ pub fn send(msg: Json) {
 pub fn note(title: &str, detail: &str) {
     if connected() {
         send(Json::obj(vec![("t", Json::str("note")), ("title", Json::str(title)), ("detail", Json::str(detail))]));
+    }
+}
+
+/// A game first wrote to one of PeerParty's stand-ins for a service's cloud saves or
+/// player data (`service`: "EOS", "PlayFab", ...): said once per service, in the log
+/// and as a notice in the overlay (in the player's language), that it stays on this PC
+/// in `path`, out of reach of the real service and of other PCs.
+pub fn local_store(service: &'static str, path: &std::path::Path) {
+    static SAID: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    {
+        let mut said = SAID.lock().unwrap();
+        if said.contains(&service) {
+            return;
+        }
+        said.push(service);
+    }
+    let folder = path.parent().unwrap_or(path).display().to_string();
+    log!("saves: {service}'s cloud saves and player data are kept on this PC, in {folder}: the real {service} service and other PCs don't see them");
+    if connected() {
+        send(Json::obj(vec![("t", Json::str("local_saves")), ("service", Json::str(service)), ("path", Json::str(&folder))]));
     }
 }
 
@@ -131,6 +154,17 @@ fn run(base: String) {
         }
         std::thread::sleep(Duration::from_millis(100));
     };
+    // The pipe's server must be the launcher the name was made by (its pid is in it):
+    // nothing else can stand in for it, even with an instance of the same name.
+    if let Some(want) = launcher_pid(&base) {
+        use std::os::windows::io::AsRawHandle;
+        let mut got = 0u32;
+        let ok = unsafe { windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId(down.as_raw_handle() as _, &mut got) } != 0;
+        if !ok || got != want {
+            log!("ipc: the pipe {base} is served by process {got}, not the launcher ({want}); the overlay is off");
+            return;
+        }
+    }
     log!("ipc: connected to the launcher at {base}");
     let (tx, rx) = mpsc::channel::<String>();
     *OUT.lock().unwrap() = Some(tx);
@@ -138,13 +172,13 @@ fn run(base: String) {
     let _ = std::thread::Builder::new()
         .name("peerparty-ipc-out".into())
         .spawn(move || writer(up, rx));
-    let reader = BufReader::new(down);
-    for line in reader.lines() {
-        let Ok(line) = line else { break };
+    let mut reader = BufReader::new(down);
+    let mut line = Vec::new();
+    while read_line_capped(&mut reader, &mut line, MAX_LINE) {
         if HANDED_OVER.load(Ordering::Relaxed) {
             return;
         }
-        if let Some(msg) = Json::parse(&line) {
+        if let Some(msg) = std::str::from_utf8(&line).ok().and_then(Json::parse) {
             command(&msg);
         }
     }
@@ -181,6 +215,33 @@ fn writer(mut up: std::fs::File, rx: Receiver<String>) {
         }
         last_state = state;
         last_sent = Instant::now();
+    }
+}
+
+/// The longest command line taken from the launcher (a frame name, settings, a paste).
+const MAX_LINE: usize = 1 << 20;
+
+/// The launcher's pid from a pipe name (`\\.\pipe\peerparty-<pid>-<digits>`).
+fn launcher_pid(base: &str) -> Option<u32> {
+    let rest = base.rsplit('\\').next()?.strip_prefix("peerparty-")?;
+    rest.split('-').next()?.parse().ok()
+}
+
+/// Reads one line of at most `max` bytes (without its newline): false at the end, on an
+/// error, or for a longer line (the connection then ends).
+fn read_line_capped(r: &mut impl BufRead, buf: &mut Vec<u8>, max: usize) -> bool {
+    use std::io::Read;
+    buf.clear();
+    match r.by_ref().take(max as u64 + 1).read_until(b'\n', buf) {
+        Ok(0) | Err(_) => false,
+        Ok(_) if buf.last() == Some(&b'\n') => {
+            buf.pop();
+            if buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
+            true
+        }
+        Ok(_) => false,
     }
 }
 
@@ -226,8 +287,42 @@ fn command(msg: &Json) {
                 && let Some(lan) = crate::net::lan_if_started()
             {
                 match lan.block_peer(p) {
-                    Ok(fp) => log!("ipc: blocked public player {p} ({fp})"),
+                    Ok(fp) => {
+                        log!("ipc: blocked public player {p} ({fp})");
+                        let mut b = BLOCKED.lock().unwrap();
+                        b.retain(|(q, _)| *q != p);
+                        if b.len() >= 16 {
+                            b.remove(0);
+                        }
+                        b.push((p, fp));
+                    }
                     Err(e) => log!("ipc: can't block {p}: {e}"),
+                }
+            }
+        }
+        // The overlay's Undo, for a player blocked from it in this run.
+        // The overlay's voice switches (voice.rs): the microphone, and one player.
+        "mic" => {
+            let on = matches!(msg.get("on"), Json::Bool(true));
+            crate::voice::set_mic(on);
+            log!("ipc: microphone {}", if on { "on" } else { "off" });
+        }
+        "mute" => {
+            if let Some(p) = peer_arg(msg, "peer") {
+                let on = matches!(msg.get("on"), Json::Bool(true));
+                crate::voice::set_player_muted(p, on);
+                log!("ipc: {p}'s voice {}", if on { "muted" } else { "heard again" });
+            }
+        }
+        "unblock" => {
+            if let Some(p) = peer_arg(msg, "peer")
+                && let Some(lan) = crate::net::lan_if_started()
+            {
+                let fp = BLOCKED.lock().unwrap().iter().find(|(q, _)| *q == p).map(|(_, f)| f.clone());
+                match fp.map(|fp| lan.unblock(&fp)) {
+                    Some(Ok(_)) => log!("ipc: unblocked public player {p}"),
+                    Some(Err(e)) => log!("ipc: can't unblock {p}: {e}"),
+                    None => log!("ipc: can't unblock {p}: not blocked in this run"),
                 }
             }
         }
@@ -334,7 +429,9 @@ fn state() -> String {
     fields.push(("internet_configured", Json::Bool(lan.map_or_else(crate::ipfwd::internet_configured, |l| l.internet_configured()))));
     let name_of = |p: PeerId| lan.and_then(|l| l.peer_name(p)).unwrap_or_else(|| format!("Player {}", &p.hex()[..6]));
     if let Some(l) = lan {
-        fields.push(("me", Json::obj(vec![("id", Json::str(l.me().hex())), ("name", Json::str(l.name()))])));
+        // Which of this PC's player slots this copy holds (0: the first player).
+        let slot = if l.server() || l.slot() == u32::MAX { 0 } else { l.slot() };
+        fields.push(("me", Json::obj(vec![("id", Json::str(l.me().hex())), ("name", Json::str(l.name())), ("slot", Json::Num(f64::from(slot)))])));
     }
     let here = crate::invite::current_lobby();
     if let Some(lobby) = &here {
@@ -404,10 +501,12 @@ fn state() -> String {
                 ("via", Json::str(via)),
                 ("fp", Json::str(fp)),
                 ("same_build", Json::Bool(crate::net::same_build(p))),
+                ("muted", Json::Bool(crate::voice::player_muted(p))),
             ])
         })
         .collect();
     fields.push(("peers", Json::Arr(peers)));
+    fields.push(("voice", Json::obj(vec![("in_use", Json::Bool(crate::voice::in_use())), ("mic", Json::Bool(crate::voice::mic_on()))])));
     // The overlay's Internet page: how internet play is doing, with no addresses (the
     // status keeps them out already; ports and counts only).
     let mut internet = Vec::new();
@@ -452,6 +551,11 @@ fn state() -> String {
     // Only while the engine runs: the overlay checks the firewall then.
     if let Some(l) = lan {
         fields.push(("lan_unreachable", Json::Num(l.unreachable().len() as f64)));
+        // Players of this game on another PeerParty: they can't connect, and the overlay
+        // says why (and who should update).
+        let other = l.other_versions();
+        fields.push(("lan_other_version", Json::Num(other.len() as f64)));
+        fields.push(("lan_newer_version", Json::Bool(other.iter().any(|newer| *newer))));
     }
     let pending: Vec<Json> = crate::invite::pending()
         .into_iter()
@@ -485,4 +589,20 @@ fn on_this_pc(peer: peerparty_core::PeerId) -> bool {
     }
     seen.push((peer, here));
     here
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_launcher_pid_comes_from_the_pipe_name() {
+        assert_eq!(launcher_pid(r"\\.\pipe\peerparty-4242-0011aabbccddeeff"), Some(4242));
+        assert_eq!(launcher_pid(r"\\.\pipe\something-else"), None);
+        let mut r = std::io::Cursor::new(b"{\"t\":\"note\"}\nxxxxxxxxxx\n".to_vec());
+        let mut line = Vec::new();
+        assert!(read_line_capped(&mut r, &mut line, 16));
+        assert_eq!(line, b"{\"t\":\"note\"}");
+        assert!(!read_line_capped(&mut r, &mut line, 4));
+    }
 }

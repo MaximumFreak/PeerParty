@@ -53,6 +53,11 @@ type CreateInternal = unsafe extern "system" fn(
 
 static CREATE: OnceLock<GenericDetour<CreateInternal>> = OnceLock::new();
 
+/// The grant events made for followed children, by pid, until their claim is answered.
+static GRANTS: std::sync::Mutex<Vec<(u32, usize)>> = std::sync::Mutex::new(Vec::new());
+/// Whether a child's claim to be the game was granted (the first one only).
+static GRANTED: AtomicBool = AtomicBool::new(false);
+
 #[repr(C)]
 pub struct ProcessInformation {
     process: usize,
@@ -62,6 +67,71 @@ pub struct ProcessInformation {
 }
 
 const CREATE_SUSPENDED: u32 = 0x4;
+const CREATE_UNICODE_ENVIRONMENT: u32 = 0x400;
+
+/// An environment block, as CreateProcess takes it.
+enum Block {
+    Wide(Vec<u16>),
+    Ansi(Vec<u8>),
+}
+
+/// Whether an environment entry ("NAME=value") is one of PeerParty's.
+fn is_ours<T: Copy + Into<u32>>(entry: &[T]) -> bool {
+    const PREFIX: &[u8] = b"PEERPARTY_";
+    entry.len() >= PREFIX.len() && entry.iter().zip(PREFIX).all(|(&c, &p)| c.into() < 128 && (c.into() as u8).to_ascii_uppercase() == p)
+}
+
+/// The entries of a block that ends in an empty one, without PeerParty's; None when it
+/// has none of PeerParty's (it can go as it is).
+///
+/// # Safety
+/// `block` points at a whole environment block.
+unsafe fn filter_block<T: Copy + Into<u32>>(block: *const T) -> Option<Vec<T>> {
+    let mut out = Vec::new();
+    let mut dropped = false;
+    let mut at = block;
+    loop {
+        let len = (0..).take_while(|&i| unsafe { *at.add(i) }.into() != 0).count();
+        if len == 0 {
+            break;
+        }
+        let entry = unsafe { std::slice::from_raw_parts(at, len) };
+        if is_ours(entry) {
+            dropped = true;
+        } else {
+            out.extend_from_slice(entry);
+            out.push(unsafe { *at.add(len) });
+        }
+        at = unsafe { at.add(len + 1) };
+    }
+    // The block's end: an empty entry (two NULs for an empty block).
+    let nul = unsafe { *at };
+    if out.is_empty() {
+        out.push(nul);
+    }
+    out.push(nul);
+    dropped.then_some(out)
+}
+
+/// The environment a child left alone gets: the one it was given (wide or ANSI), else
+/// this process's, without PeerParty's variables. None: nothing to take out.
+fn scrubbed_env(env: usize, unicode: bool) -> Option<Block> {
+    use windows_sys::Win32::System::Environment::{FreeEnvironmentStringsW, GetEnvironmentStringsW};
+    if env != 0 {
+        return if unicode {
+            unsafe { filter_block(env as *const u16) }.map(Block::Wide)
+        } else {
+            unsafe { filter_block(env as *const u8) }.map(Block::Ansi)
+        };
+    }
+    let own = unsafe { GetEnvironmentStringsW() };
+    if own.is_null() {
+        return None;
+    }
+    let block = unsafe { filter_block(own as *const u16) };
+    unsafe { FreeEnvironmentStringsW(own) };
+    block.map(Block::Wide)
+}
 
 fn follow_all() -> bool {
     std::env::var("PEERPARTY_FOLLOW").is_ok_and(|v| v == "1")
@@ -100,6 +170,18 @@ fn game_root() -> Option<&'static str> {
 /// Set once this process loads a game SDK: it is the game, so what it starts from then
 /// on (a server, a tool) isn't followed, and a followed child may take the pipe.
 static SDK_SEEN: AtomicBool = AtomicBool::new(false);
+
+/// Whether a game SDK loaded in this process (so it is the game).
+pub fn sdk_seen() -> bool {
+    SDK_SEEN.load(Ordering::Relaxed)
+}
+
+/// Whether this process may still turn out to be only the game's starter: no game SDK
+/// here, and a program it started (and peerparty followed) hasn't yet said whether it
+/// is the game.
+pub fn starter_pending() -> bool {
+    !sdk_seen() && !GRANTS.lock().unwrap().is_empty()
+}
 
 /// A game SDK loaded here (watch.rs).
 pub fn sdk_loaded(name: &str) {
@@ -206,30 +288,76 @@ fn long_wstr(p: *const u16) -> String {
     String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(p, n) })
 }
 
-/// The program a CreateProcess call starts: its application name, or the first word of
-/// its command line.
-fn image_of(app: *const u16, cmd: *const u16) -> String {
+/// The program a CreateProcess call starts: its application name, or what Windows reads
+/// from its command line (`program_of`), in `dir` when relative.
+fn image_of(app: *const u16, cmd: *const u16, dir: *const u16) -> String {
     let a = long_wstr(app);
     if !a.is_empty() {
-        return a;
+        return full_image(&a, dir);
     }
-    let line = long_wstr(cmd);
-    let line = line.trim_start();
-    match line.strip_prefix('"') {
-        Some(rest) => rest.split('"').next().unwrap_or("").to_string(),
-        None => line.split(' ').next().unwrap_or("").to_string(),
+    program_of(&long_wstr(cmd), &|candidate: &str| {
+        let full = full_image(candidate, dir);
+        let p = std::path::Path::new(&full);
+        p.is_file() || (p.extension().is_none() && p.with_extension("exe").is_file())
+    })
+    .map(|p| full_image(&p, dir))
+    .unwrap_or_default()
+}
+
+/// The program a command line starts, as CreateProcess reads one without an application
+/// name: a quoted first word as it is; unquoted, the shortest run of its first words
+/// (split at spaces and tabs) that names a file (`exists`), so `C:\Program Files\Game\
+/// game.exe -x` is the game, not `C:\Program`. Else the first word. `.exe` is added
+/// to a name without an extension, as Windows does.
+fn program_of(line: &str, exists: &dyn Fn(&str) -> bool) -> Option<String> {
+    let line = line.trim_start_matches([' ', '\t']);
+    if let Some(rest) = line.strip_prefix('"') {
+        let p = rest.split('"').next().unwrap_or("");
+        return (!p.is_empty()).then(|| with_exe(p));
     }
+    let mut first = None;
+    for (i, c) in line.char_indices().chain(std::iter::once((line.len(), ' '))) {
+        if c == ' ' || c == '\t' {
+            let candidate = &line[..i];
+            if candidate.is_empty() {
+                continue;
+            }
+            first.get_or_insert(candidate);
+            if exists(candidate) {
+                return Some(with_exe(candidate));
+            }
+        }
+    }
+    first.map(with_exe)
+}
+
+fn with_exe(p: &str) -> String {
+    if std::path::Path::new(p).extension().is_none() { format!("{p}.exe") } else { p.to_string() }
 }
 
 /// Programs a game starts beside itself that are never the game: crash reporters and
 /// Epic's helper. Following one gave it the overlay (a game can start its crash
 /// reporter before it has a window), and some games end themselves when their crash
 /// reporter is interfered with.
-const NOT_GAMES: [&str; 5] = ["crashreportclient", "unitycrashhandler", "crashpad_handler", "epiconlineservices", "crashreporter"];
+const NOT_GAMES: [&str; 17] = [
+    "crashreportclient", "unitycrashhandler", "crashpad_handler", "epiconlineservices", "crashreporter", "crashsender", "crashhandler", "crashrpt",
+    "bssndrpt", "bugsplat", "sentry_", "werfault", "steamerrorreporter", "backtrace", "bugreporter", "errorreporter", "minidump",
+];
+
+/// Programs that only show a page or a store inside a game (embedded browsers, store
+/// and launcher helpers): a window of theirs can be game-sized, so following one could
+/// hand it the overlay.
+const HELPERS: [&str; 10] = [
+    "cefsharp.browsersubprocess", "cefprocess", "qtwebengineprocess", "msedgewebview2", "steamwebhelper", "upc.exe", "uplaywebcore", "ubisoftconnect",
+    "eaconnect", "eabackgroundservice",
+];
 
 /// Anti-cheat starters: the game refuses anti-cheat (watch.rs), and touching these is
 /// what gets a player flagged.
-const ANTICHEAT: [&str; 7] = ["start_protected_game", "easyanticheat", "eac_launcher", "battleye", "beservice", "beclient", "eac_"];
+const ANTICHEAT: [&str; 14] = [
+    "start_protected_game", "easyanticheat", "eac_launcher", "battleye", "beservice", "beclient", "eac_", "gameguard", "gamemon", "xigncode",
+    "xxd-", "vgc.exe", "vgtray", "ace-",
+];
 
 /// Installers of what a game needs (run on its first start by some stores and
 /// starters), and uninstallers.
@@ -239,9 +367,12 @@ const INSTALLERS: [&str; 16] = [
 ];
 
 /// Folders inside a game's that hold installers or anti-cheat, never the game.
-const NOT_GAME_DIRS: [&str; 9] = [
+const NOT_GAME_DIRS: [&str; 12] = [
     "\\_commonredist\\", "\\redist\\", "\\redistributables\\", "\\directx\\", "\\prerequisites\\", "\\prereqs\\", "\\__installer\\", "\\easyanticheat\\",
     "\\battleye\\",
+    "\\gameguard\\",
+    "\\xigncode\\",
+    "\\crashreporter\\",
 ];
 
 /// Why a program is never followed, whatever folder it is in. `path` is `norm_path`'s.
@@ -249,6 +380,9 @@ fn never_followed(path: &str) -> Option<&'static str> {
     let file = path.rsplit('\\').next().unwrap_or(path);
     if NOT_GAMES.iter().any(|n| file.starts_with(n)) {
         return Some("a crash reporter or Epic's helper");
+    }
+    if HELPERS.iter().any(|n| file.starts_with(n)) {
+        return Some("a browser or store helper");
     }
     if ANTICHEAT.iter().any(|n| file.starts_with(n)) || file.ends_with("_be.exe") {
         return Some("anti-cheat");
@@ -308,9 +442,19 @@ fn full_image(image: &str, dir: *const u16) -> String {
     if p.is_absolute() || image.starts_with(r"\\") {
         return image.to_string();
     }
-    let base = Some(long_wstr(dir)).filter(|d| !d.is_empty()).map(std::path::PathBuf::from).or_else(|| std::env::current_dir().ok());
-    match base {
-        Some(b) => b.join(p).to_string_lossy().into_owned(),
+    // Where CreateProcess looks for a relative name: this program's folder, then the
+    // current folder (the child's `dir` isn't searched, but is the best guess left).
+    let bases: Vec<std::path::PathBuf> = [
+        std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.to_path_buf())),
+        std::env::current_dir().ok(),
+        Some(long_wstr(dir)).filter(|d| !d.is_empty()).map(std::path::PathBuf::from),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let found = bases.iter().map(|b| b.join(p)).find(|f| f.is_file() || (f.extension().is_none() && f.with_extension("exe").is_file()));
+    match found.or_else(|| bases.last().map(|b| b.join(p))) {
+        Some(f) => f.to_string_lossy().into_owned(),
         None => image.to_string(),
     }
 }
@@ -325,8 +469,22 @@ fn follow_event(pid: u32) -> Vec<u16> {
     wide(&format!("Local\\peerparty-follow-{pid}"))
 }
 
-/// In the parent, before the child `pid` runs: the event it signals once it is the game.
+/// The event a parent sets for a child whose claim it granted: the child connects to the
+/// launcher only then (or once the parent is gone), so of two children that both look
+/// like the game, only the first gets the overlay.
+fn grant_event(pid: u32) -> Vec<u16> {
+    wide(&format!("Local\\peerparty-follow-{pid}-go"))
+}
+
+/// In the parent, before the child `pid` runs: the event it signals once it is the game
+/// (and its grant, `grant_event`, made with it).
 fn make_follow_event(pid: u32) -> Option<usize> {
+    let grant = unsafe { windows_sys::Win32::System::Threading::CreateEventW(std::ptr::null(), 1, 0, grant_event(pid).as_ptr()) };
+    if grant.is_null() {
+        log!("child: no grant event for pid {pid}: {}", std::io::Error::last_os_error());
+        return None;
+    }
+    GRANTS.lock().unwrap().push((pid, grant as usize));
     let event = unsafe { windows_sys::Win32::System::Threading::CreateEventW(std::ptr::null(), 1, 0, follow_event(pid).as_ptr()) };
     if event.is_null() {
         log!("child: no hand-over event for pid {pid}: {}", std::io::Error::last_os_error());
@@ -348,14 +506,45 @@ fn hand_over_when_claimed(event: usize, process: usize, pid: u32, image: &str) {
     let image = image.to_string();
     let _ = std::thread::Builder::new().name("peerparty-follow".into()).spawn(move || {
         let handles: Vec<HANDLE> = [event, child].into_iter().filter(|&h| h != 0).map(|h| h as HANDLE).collect();
-        if unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, INFINITE) } == 0 {
-            log!("child: {image} (pid {pid}) is the game: the launcher goes to it");
-            crate::ipc::hand_over();
+        let claimed = unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, INFINITE) } == 0;
+        let grant = {
+            let mut g = GRANTS.lock().unwrap();
+            let at = g.iter().position(|(p, _)| *p == pid);
+            at.map(|i| g.remove(i).1)
+        };
+        if claimed {
+            // Once: a second program that looks like the game too doesn't take the
+            // overlay from the first.
+            if GRANTED.swap(true, Ordering::SeqCst) || crate::ipc::handed_over() {
+                log!("child: {image} (pid {pid}) looks like the game too, but the overlay went to another program already");
+            } else {
+                log!("child: {image} (pid {pid}) is the game: the launcher goes to it");
+                give_up_lan();
+                crate::ipc::hand_over();
+                if let Some(g) = grant {
+                    unsafe { windows_sys::Win32::System::Threading::SetEvent(g as _) };
+                }
+            }
         }
-        for h in handles {
+        for h in handles.into_iter().chain(grant.map(|g| g as HANDLE)) {
             unsafe { CloseHandle(h) };
         }
     });
+}
+
+/// A starter that started its LAN before the game it started said it is the game (it
+/// waited long enough to take itself for the game: a menu before the game starts, with
+/// internet play set up) lets it go: its player slot goes to the game, which waits for
+/// it (core's `take_slot_from`), and its peers see it leave.
+fn give_up_lan() {
+    if sdk_seen() {
+        return;
+    }
+    let Some(lan) = crate::net::lan_if_started() else { return };
+    log!("child: this starter's LAN goes, so the game it started is this PC's player");
+    lan.release_port_maps();
+    lan.shutdown();
+    lan.release_slot();
 }
 
 /// The process that started this one, opened to wait on (None if it is gone already).
@@ -410,13 +599,21 @@ fn game_window() -> bool {
 /// or the parent gone), then connects. False otherwise: connect now.
 pub fn claim_later() -> bool {
     use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent, WaitForSingleObject};
+    use windows_sys::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent, WaitForMultipleObjects, WaitForSingleObject};
+    const SYNCHRONIZE: u32 = 0x0010_0000;
     let event = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, follow_event(std::process::id()).as_ptr()) };
     if event.is_null() {
         return false;
     }
     let event = event as usize;
     let parent = parent_process();
+    // A slot the starter holds is ours once this is the game (`give_up_lan` there).
+    if let Some(p) = parent {
+        let pid = unsafe { windows_sys::Win32::System::Threading::GetProcessId(p as _) };
+        if pid != 0 {
+            peerparty_core::take_slot_from(pid);
+        }
+    }
     log!("child: started by a starter that passed peerparty on; the overlay comes here once this is the game");
     let _ = std::thread::Builder::new().name("peerparty-claim".into()).spawn(move || {
         let why = loop {
@@ -441,13 +638,33 @@ pub fn claim_later() -> bool {
             }
             std::thread::sleep(std::time::Duration::from_millis(250));
         };
-        log!("child: this is the game ({why}): taking the launcher's pipe");
+        log!("child: this is the game ({why}): asking for the launcher's pipe");
+        // The parent's answer: its grant (no other program took the overlay first), or
+        // its end (then nothing else holds the pipe).
+        let grant = unsafe { OpenEventW(SYNCHRONIZE, 0, grant_event(std::process::id()).as_ptr()) };
         unsafe {
             SetEvent(event as _);
             CloseHandle(event as _);
+        }
+        let granted = match (grant.is_null(), parent) {
+            (true, _) | (_, None) => true,
+            (false, Some(p)) => {
+                let handles = [grant, p as _];
+                let r = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, 10_000) };
+                r == 0 || r == 1
+            }
+        };
+        unsafe {
+            if !grant.is_null() {
+                CloseHandle(grant);
+            }
             if let Some(p) = parent {
                 CloseHandle(p as _);
             }
+        }
+        if !granted {
+            log!("child: the overlay went to another program; this one goes without it");
+            return;
         }
         crate::ipc::start();
     });
@@ -579,9 +796,20 @@ unsafe extern "system" fn create_hook(
         }
     }
     let _leave = Leave;
-    let image = full_image(&image_of(app, cmd), dir);
+    let image = image_of(app, cmd, dir);
     if let Err(why) = follow_verdict(&image) {
         log!("child: {image} is left alone ({why})");
+        // A program left alone gets no PeerParty variables: they mean nothing to it, and
+        // the room code and pipe name shouldn't travel on in a crash report's copy of its
+        // environment. PeerParty's own program keeps them (its `--attach` needs them).
+        let ours = is_peerparty(&norm_path(&image), std::env::var("PEERPARTY_EXE").ok().map(|e| norm_path(&e)).as_deref());
+        if !ours && let Some(block) = scrubbed_env(env, flags & CREATE_UNICODE_ENVIRONMENT != 0) {
+            let (env, flags) = match &block {
+                Block::Wide(b) => (b.as_ptr() as usize, flags | CREATE_UNICODE_ENVIRONMENT),
+                Block::Ansi(b) => (b.as_ptr() as usize, flags),
+            };
+            return unsafe { real.call(token, app, cmd, pa, ta, inherit, flags, env, dir, si, pi, new_token) };
+        }
         return unsafe { real.call(token, app, cmd, pa, ta, inherit, flags, env, dir, si, pi, new_token) };
     }
     let asked_suspended = flags & CREATE_SUSPENDED != 0;
@@ -615,11 +843,33 @@ unsafe extern "system" fn create_hook(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_peerparty, is_unreal_starter_dir, norm_dir, norm_path, verdict};
+    use super::{filter_block, is_peerparty, program_of, is_unreal_starter_dir, norm_dir, norm_path, verdict};
     use std::fs;
 
     fn follows(image: &str, root: &str, sdk_seen: bool) -> bool {
         verdict(&norm_path(image), false, &[], norm_dir(root).as_deref(), sdk_seen).is_ok()
+    }
+
+    #[test]
+    fn an_unquoted_command_line_is_read_as_windows_reads_it() {
+        let game = r"C:\Program Files\Some Game\Game.exe";
+        let exists = |c: &str| c == game;
+        assert_eq!(program_of(r"C:\Program Files\Some Game\Game.exe -windowed", &exists).as_deref(), Some(game));
+        assert_eq!(program_of(r#""C:\Program Files\Some Game\Game.exe" -x"#, &|_| false).as_deref(), Some(game));
+        assert_eq!(program_of("  Game -x", &|_| false).as_deref(), Some("Game.exe"), "the first word, with .exe");
+        assert_eq!(program_of("Game.exe\t-x", &|_| false).as_deref(), Some("Game.exe"));
+        assert_eq!(program_of("", &|_| false), None);
+    }
+
+    #[test]
+    fn a_child_left_alone_gets_no_peerparty_variables() {
+        let block: Vec<u16> = "A=1\0peerparty_room=PP1-x\0PEERPARTY_PIPE=p\0B=2\0\0".encode_utf16().collect();
+        let out = unsafe { filter_block(block.as_ptr()) }.expect("ours were in it");
+        assert_eq!(String::from_utf16(&out).unwrap(), "A=1\0B=2\0\0");
+        let ansi = b"A=1\0B=2\0\0";
+        assert!(unsafe { filter_block(ansi.as_ptr()) }.is_none(), "nothing to take out");
+        let only = b"PEERPARTY_ROOM=x\0\0";
+        assert_eq!(unsafe { filter_block(only.as_ptr()) }.unwrap(), b"\0\0");
     }
 
     #[test]
@@ -661,9 +911,17 @@ mod tests {
             r"D:\Games\Some Game\unins000.exe",
             r"D:\Games\Some Game\Engine\Binaries\Win64\CrashReportClient.exe",
             r"D:\Games\Some Game\UnityCrashHandler64.exe",
+            r"D:\Games\Some Game\BsSndRpt64.exe",
+            r"D:\Games\Some Game\CrashSender1403.exe",
+            r"D:\Games\Some Game\CefSharp.BrowserSubprocess.exe",
+            r"D:\Games\Some Game\QtWebEngineProcess.exe",
+            r"D:\Games\Some Game\GameGuard\GameMon.des",
+            r"D:\Games\Some Game\xigncode\x3.xem",
         ] {
             assert!(!follows(image, root, false), "{image}");
         }
+        assert!(follows(r"D:\Games\Some Game\Sentry Tower.exe", root, false), "a game's own name");
+        assert!(follows(r"D:\Games\Some Game\Upcoming.exe", root, false), "a game's own name");
         // Even when following everything.
         assert!(verdict(&norm_path(r"C:\x\start_protected_game.exe"), true, &[], None, false).is_err());
         assert!(verdict(&norm_path(r"C:\x\Game.exe"), true, &[], None, false).is_ok());

@@ -193,6 +193,9 @@ struct App {
     ctx: egui::Context,
     settings: Settings,
     scanned: Vec<Game>,
+    /// A rescan's finds so far: they replace `scanned` once it's done, so the library
+    /// (its filter, the open game) doesn't empty out while it runs.
+    rescanned: Option<Vec<Game>>,
     entries: Vec<Game>,
     recent: HashMap<String, u64>,
     scanning: bool,
@@ -289,6 +292,7 @@ impl App {
             ctx,
             settings,
             scanned: Vec::new(),
+            rescanned: None,
             entries: Vec::new(),
             recent: HashMap::new(),
             scanning: scan,
@@ -386,7 +390,7 @@ impl App {
     fn rescan(&mut self) {
         let (tx, rx) = channel();
         self.found_rx = rx;
-        self.scanned.clear();
+        self.rescanned = Some(Vec::new());
         self.scanning = true;
         start_scan(&self.ctx, self.settings.folders.clone(), tx);
         self.reload_recent();
@@ -559,7 +563,8 @@ impl App {
     /// Starts peerparty.exe for a game; a thread of its own waits for it to end.
     fn spawn(&mut self, key: &str, name: &str, args: Vec<String>, player: u8) -> bool {
         let mut cmd = Command::new(&self.peerparty);
-        cmd.args(&args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+        // `--why`: a failure's reason comes as a line the window can translate.
+        cmd.arg("--why").args(&args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
         match platform::quiet(&mut cmd).spawn() {
             Ok(mut child) => {
                 let id = self.next_session;
@@ -642,8 +647,7 @@ impl App {
             // PeerParty returns the game's own exit code; only a quick failure is news.
             if code != Some(0) && s.started.elapsed() < Duration::from_secs(20) {
                 let text = s.stderr.lock().unwrap().clone();
-                let why = text.lines().rev().find(|l| !l.trim().is_empty()).map(|l| l.trim_start_matches("peerparty: ").to_string());
-                let why = why.unwrap_or_else(|| t!("snack.exited_at_once").to_string());
+                let why = why_text(&text).unwrap_or_else(|| t!("snack.exited_at_once").to_string());
                 self.say(t!("snack.didnt_start", game = s.name, n = s.player, why = why), false);
             }
             self.reload_recent();
@@ -1409,10 +1413,21 @@ impl eframe::App for App {
         let mut changed = false;
         while let Ok(f) = self.found_rx.try_recv() {
             match f {
-                Found::Game(g) => self.scanned.push(g),
-                Found::Done => self.scanning = false,
+                Found::Game(g) => match self.rescanned.as_mut() {
+                    Some(r) => r.push(g),
+                    None => {
+                        self.scanned.push(g);
+                        changed = true;
+                    }
+                },
+                Found::Done => {
+                    if let Some(r) = self.rescanned.take() {
+                        self.scanned = r;
+                    }
+                    self.scanning = false;
+                    changed = true;
+                }
             }
-            changed = true;
         }
         if changed {
             self.rebuild();
@@ -1442,16 +1457,26 @@ impl eframe::App for App {
         }
         let typing = ctx.egui_wants_keyboard_input();
         if self.welcome.is_none() && ctx.input(|i| i.key_pressed(Key::Escape)) && ctx.memory(|m| m.focused()).is_none() && !egui::Popup::is_any_open(&ctx) {
+            // The details panel's close says Esc: it goes before the search.
             if self.view != View::Library {
                 self.view = View::Library;
-            } else if !self.search.is_empty() {
-                self.search.clear();
-            } else {
+            } else if self.selected.is_some() {
                 self.selected = None;
+            } else {
+                self.search.clear();
             }
         }
         let enter = self.welcome.is_none() && !typing && self.view == View::Library && ctx.memory(|m| m.focused()).is_none() && ctx.input(|i| i.key_pressed(Key::Enter));
         if self.view == View::Library && self.welcome.is_none() {
+            // The arrow keys move through the grid as the d-pad does, while nothing
+            // has the focus (with something focused they move the focus).
+            if !typing && ctx.memory(|m| m.focused()).is_none() && !egui::Popup::is_any_open(&ctx) {
+                for (k, bit) in [(Key::ArrowUp, pad::UP), (Key::ArrowDown, pad::DOWN), (Key::ArrowLeft, pad::LEFT), (Key::ArrowRight, pad::RIGHT)] {
+                    if ctx.input(|i| i.key_pressed(k)) {
+                        self.pad_fire |= bit;
+                    }
+                }
+            }
             self.grid_pad(&ctx);
         }
 
@@ -1510,6 +1535,32 @@ fn hover_in(ui: &egui::Ui, rect: Rect) -> Option<Pos2> {
     ui.ctx().pointer_hover_pos().filter(|p| rect.contains(*p))
 }
 
+/// Why a game didn't start, from what peerparty.exe wrote: its `peerparty-why:` line in
+/// the player's language, else its last line as it is (English), else None.
+fn why_text(stderr: &str) -> Option<String> {
+    let reason = stderr.lines().rev().find_map(|l| l.strip_prefix("peerparty-why: ")).map(|r| {
+        let (key, value) = r.split_once('\t').unwrap_or((r, ""));
+        (key.trim().to_string(), value.trim().to_string())
+    });
+    let said = match reason.as_ref().map(|(k, v)| (k.as_str(), v.clone())) {
+        Some(("missing", v)) => Some(t!("why.missing", path = v)),
+        Some(("not_program", v)) => Some(t!("why.not_program", path = v)),
+        Some(("machine", _)) => Some(t!("why.machine").to_string()),
+        Some(("elevation", _)) => Some(t!("why.elevation").to_string()),
+        Some(("os", v)) => Some(t!("why.os", error = v)),
+        Some(("room", _)) => Some(t!("why.room").to_string()),
+        Some(("inject", _)) => Some(t!("why.inject").to_string()),
+        Some(("exit", v)) => Some(t!("why.exit", code = v)),
+        Some(("exit_dll", _)) => Some(t!("why.exit_dll").to_string()),
+        Some(("anticheat", v)) => Some(t!("why.anticheat", file = v)),
+        _ => None,
+    };
+    said.or_else(|| {
+        let last = stderr.lines().rev().find(|l| !l.trim().is_empty() && !l.starts_with("peerparty-why: "))?;
+        Some(last.trim_start_matches("peerparty: ").to_string())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1518,6 +1569,17 @@ mod tests {
     fn game(name: &str, source: Source) -> Game {
         let exe = PathBuf::from(format!(r"C:\Games\{name}\{}.exe", name.replace(' ', "")));
         Game { name: name.into(), dir: exe.parent().unwrap().to_path_buf(), exe, source, cover: None, art: None }
+    }
+
+    #[test]
+    fn a_reason_line_is_said_in_words_and_anything_else_is_shown_as_it_is() {
+        let said = why_text("peerparty: C:\\x.exe: The system cannot find the file specified. (os error 2)\npeerparty-why: missing\tC:\\x.exe\n");
+        assert_eq!(said.as_deref(), Some(t!("why.missing", path = "C:\\x.exe").as_str()));
+        let said = why_text("peerparty: game exited after 0.2 s with exit code 1 (0x00000001)\npeerparty-why: exit\t0x00000001\n");
+        assert_eq!(said.as_deref(), Some(t!("why.exit", code = "0x00000001").as_str()));
+        // A reason this window doesn't know: the English line.
+        assert_eq!(why_text("peerparty: something new\npeerparty-why: later\t\n").as_deref(), Some("something new"));
+        assert_eq!(why_text("\n"), None);
     }
 
     fn sample() -> Vec<Game> {

@@ -294,24 +294,21 @@ fn lan_first_needs_no_tunnel_and_the_tunnel_takes_over_when_the_lan_goes() {
     let until = Instant::now() + Duration::from_secs(8);
     pump_until(&a, &mut ea, &b, &mut eb, 15, "a few seconds", |_, _| Instant::now() >= until);
     assert!(a.internet_status().unwrap().peers.iter().any(|p| p.connected), "{:#?}", a.internet_status());
-    assert_eq!((bridged(&a), bridged(&b)), (0, 0));
+    // Under load the room session can finish before LAN discovery finds the peer and
+    // carry the mesh until the LAN takes over; it winds down then, as when moving to
+    // the LAN (`a_room_peer_moves_to_the_lan_without_leaving`).
+    pump_until(&a, &mut ea, &b, &mut eb, 30, "the tunnel to carry nothing", |a, b| bridged(a) == 0 && bridged(b) == 0);
     assert_eq!((joined(&ea, b.me()), joined(&eb, a.me())), (1, 1));
-    // The LAN goes away: the tunnel takes over (a leave and a join: the peer was gone).
+    // The LAN goes away: the tunnel takes over within the grace a dropped peer gets,
+    // so nobody leaves.
     a.set_lan_discovery(false);
     b.set_lan_discovery(false);
     a.cut_connection(b.me());
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while joined(&ea, b.me()) < 2 || joined(&eb, a.me()) < 2 {
-        a.tick();
-        b.tick();
-        ea.extend(a.poll());
-        eb.extend(b.poll());
-        assert!(Instant::now() < deadline, "the tunnel never took over: a {ea:#?}; b {eb:#?}");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(trust(Trust::Room)(&a, &b));
-    assert_eq!((joined(&ea, b.me()), left(&ea, b.me())), (2, 1), "{ea:#?}");
-    assert_eq!((joined(&eb, a.me()), left(&eb, a.me())), (2, 1), "{eb:#?}");
+    pump_until(&a, &mut ea, &b, &mut eb, 30, "the tunnel to take over", trust(Trust::Room));
+    let until = Instant::now() + Duration::from_secs(1);
+    pump_until(&a, &mut ea, &b, &mut eb, 10, "a moment", |_, _| Instant::now() >= until);
+    assert_eq!((joined(&ea, b.me()), left(&ea, b.me())), (1, 0), "{ea:#?}");
+    assert_eq!((joined(&eb, a.me()), left(&eb, a.me())), (1, 0), "{eb:#?}");
     open_channel(&a, &mut ea, &b, &mut eb);
     a.shutdown();
     b.shutdown();

@@ -125,7 +125,7 @@ fn read_tcp(sock: usize, from: SocketAddr, mut s: TcpStream, tx: mpsc::Sender<In
                     break;
                 }
                 let len = u32::from_be_bytes([h[0], h[1], h[2], h[3]]) as usize;
-                if !(7..=1 << 20).contains(&len) {
+                if !(7..=enet::MAX_MESSAGE + 7).contains(&len) {
                     break;
                 }
                 let mut msg = vec![0u8; len - 7];
@@ -170,7 +170,7 @@ fn read_ws(sock: usize, from: SocketAddr, mut s: TcpStream, tx: mpsc::Sender<Inp
             _ => {}
         }
         msg.extend_from_slice(&payload);
-        if msg.len() > 1 << 20 {
+        if msg.len() > enet::MAX_MESSAGE {
             break;
         }
         if !fin {
@@ -234,12 +234,52 @@ pub struct Options {
     /// WebSocket ports to listen on, by role; 0 picks a free port (tests).
     pub ws_ports: [u16; 3],
     pub advertise: Box<dyn Fn(std::net::SocketAddr) -> String + Send>,
+    /// The PeerParty player behind a client address (server.rs `Config::player`).
+    pub player: Box<dyn Fn(std::net::SocketAddr) -> Option<super::server::Player> + Send>,
+    /// Whether a client at that address may talk to the servers at all: the sockets
+    /// listen on every address (LAN players come straight to this PC), but only this PC
+    /// and PeerParty's players get an answer, not any other device on the network.
+    pub allow: Arc<dyn Fn(std::net::SocketAddr) -> bool + Send + Sync>,
     pub log: Arc<dyn Fn(&str) + Send + Sync>,
 }
 
+/// `Options::allow`, asked once per address every ALLOW_FOR (it can look at every peer).
+struct Allowed {
+    allow: Arc<dyn Fn(SocketAddr) -> bool + Send + Sync>,
+    seen: HashMap<IpAddr, (bool, Instant)>,
+}
+
+const ALLOW_FOR: Duration = Duration::from_secs(2);
+
+impl Allowed {
+    fn new(allow: Arc<dyn Fn(SocketAddr) -> bool + Send + Sync>) -> Allowed {
+        Allowed { allow, seen: HashMap::new() }
+    }
+
+    fn check(&mut self, from: SocketAddr) -> bool {
+        if let Some((ok, at)) = self.seen.get(&from.ip())
+            && at.elapsed() < ALLOW_FOR
+        {
+            return *ok;
+        }
+        if self.seen.len() > 4096 {
+            self.seen.clear();
+        }
+        let ok = (self.allow)(from);
+        self.seen.insert(from.ip(), (ok, Instant::now()));
+        ok
+    }
+}
+
 impl Options {
-    pub fn standard(bind: IpAddr, advertise: Box<dyn Fn(std::net::SocketAddr) -> String + Send>, log: Arc<dyn Fn(&str) + Send + Sync>) -> Self {
-        Options { bind, ports: PORTS, tcp_ports: TCP_PORTS, ws_ports: WS_PORTS, advertise, log }
+    pub fn standard(
+        bind: IpAddr,
+        advertise: Box<dyn Fn(std::net::SocketAddr) -> String + Send>,
+        player: Box<dyn Fn(std::net::SocketAddr) -> Option<super::server::Player> + Send>,
+        allow: Arc<dyn Fn(std::net::SocketAddr) -> bool + Send + Sync>,
+        log: Arc<dyn Fn(&str) + Send + Sync>,
+    ) -> Self {
+        Options { bind, ports: PORTS, tcp_ports: TCP_PORTS, ws_ports: WS_PORTS, advertise, player, allow, log }
     }
 }
 
@@ -280,10 +320,12 @@ impl Host {
             s.set_read_timeout(Some(Duration::from_millis(200)))?;
             senders.push(Some(s.try_clone()?));
             let (tx, stop) = (tx.clone(), stop.clone());
+            let mut allowed = Allowed::new(opt.allow.clone());
             threads.push(thread::Builder::new().name(format!("pp-photon-rx{i}")).spawn(move || {
                 let mut buf = vec![0u8; 65536];
                 while !stop.load(Ordering::Relaxed) {
                     match s.recv_from(&mut buf) {
+                        Ok((_, from)) if !allowed.check(from) => {}
                         Ok((n, from)) => {
                             let data = &buf[..n];
                             if is_region_ping(data) {
@@ -312,9 +354,11 @@ impl Host {
             tcp_ports[r] = l.local_addr()?.port();
             l.set_nonblocking(true)?;
             let (tx, stop) = (tx.clone(), stop.clone());
+            let mut allowed = Allowed::new(opt.allow.clone());
             threads.push(thread::Builder::new().name(format!("pp-photon-tcp{r}")).spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
                     match l.accept() {
+                        Ok((_, from)) if !allowed.check(from) => {}
                         Ok((s, from)) => {
                             let _ = s.set_nonblocking(false);
                             let _ = s.set_nodelay(true);
@@ -350,9 +394,11 @@ impl Host {
             }
             l.set_nonblocking(true)?;
             let (tx, stop) = (tx.clone(), stop.clone());
+            let mut allowed = Allowed::new(opt.allow.clone());
             threads.push(thread::Builder::new().name(format!("pp-photon-ws{r}")).spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
                     match l.accept() {
+                        Ok((_, from)) if !allowed.check(from) => {}
                         Ok((s, from)) => {
                             let _ = s.set_nonblocking(false);
                             let _ = s.set_nodelay(true);
@@ -372,6 +418,7 @@ impl Host {
             tcp_ports,
             ws_ports,
             advertise: opt.advertise,
+            player: opt.player,
             log: Box::new(move |s| log(s)),
         });
         let (stop2, conns2, log) = (stop.clone(), connections.clone(), opt.log.clone());

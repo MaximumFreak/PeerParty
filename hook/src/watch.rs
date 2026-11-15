@@ -321,6 +321,9 @@ fn consider(m: Mod) {
             let n = crate::xboxlive::winhttp::attach(&table.code);
             log!("xboxlive {} hooked {n} (the game's Xbox Live calls are traced)", m.full);
         }
+    } else if m.name.eq_ignore_ascii_case("user32.dll") && crate::instance::enabled() {
+        let n = crate::instance::attach_user32(&table.code);
+        log!("instance {} hooked {n}", m.full);
     } else if m.name.eq_ignore_ascii_case("dnsapi.dll") {
         let n = if crate::net::skip("dns") { 0 } else { crate::dns::attach_dnsapi(&table.code) };
         log!("dns {} hooked {n}", m.full);
@@ -761,6 +764,9 @@ mod tests {
                     summary.samples
                 );
             }
+        }
+        if ran == 0 {
+            crate::skip("no SDK image to probe: no Steam client here and PPTEST_SDK_DLLS names none");
         }
     }
 }

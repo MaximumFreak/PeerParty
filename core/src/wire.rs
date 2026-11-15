@@ -3,11 +3,17 @@
 //! malformed field and the message is dropped.
 
 use crate::id::PeerId;
-use crate::lobby::{Attr, Filter, Lobby, Member, Op, Permission, Query, Value};
+use crate::lobby::{Attr, Claim, Filter, Lobby, Member, Op, Permission, Query, Value};
 
 /// 3: the hello carries the sender's key and is followed by `Proof`; a peer id is its
-/// key's hash.
-pub const VERSION: u16 = 3;
+/// key's hash. 4: a session survives a dropped connection (`Session`, `Ack`, `Bye`).
+/// 5: `JoinElsewhere`. 6: a join carries a secret its owner checks; a member that lost
+/// only its own link to a lobby's owner asks the others (`OwnerCheck`, `OwnerHere`).
+/// 7: unlisted lobbies. 8: session messages carry their numbers (`Numbered`, `Resend`);
+/// a connection can run through another player (`Relay`, `RelayEnd`); lobbies carry
+/// their owner's signed claim (`Claim`), `State` the lobby's secret key for its members
+/// and `JoinReply` the claim.
+pub const VERSION: u16 = 8;
 /// Larger frames are a broken or hostile peer.
 pub const MAX_FRAME: usize = 1 << 24;
 /// Room set aside for a list before its elements are read, at most. A count only has to
@@ -16,6 +22,12 @@ pub const MAX_FRAME: usize = 1 << 24;
 /// lobbies must not get gigabytes set aside for them (a 32-bit game has no such room,
 /// and running out ends the process). The list still grows as far as real elements come.
 const PREALLOC: usize = 256;
+/// What a decoded message may take in memory, at most: this many times its frame (plus
+/// a little). Each list element is charged ELEMENT_COST on top of its bytes: a frame of
+/// tiny attributes or members costs many times its size once decoded, and a peer's
+/// frame mustn't become a hundred megabytes of lobbies.
+const DECODE_FACTOR: usize = 8;
+const ELEMENT_COST: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JoinResult {
@@ -24,6 +36,8 @@ pub enum JoinResult {
     NotFound,
     NotAllowed,
     TimedOut,
+    /// The owner's front end refused the secret the join came with (a lobby's password).
+    WrongSecret,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -57,14 +71,21 @@ pub enum Msg {
     },
     Join {
         lobby: String,
+        /// What the joiner was given to get in (a lobby's password, an invitation): the
+        /// owner's front end checks it (`Lan::set_join_check`). Empty for none.
+        secret: String,
     },
     JoinReply {
         lobby: String,
         result: JoinResult,
+        /// The answering owner's claim to the lobby (see `Claim`).
+        claim: Claim,
     },
-    /// The owner's full snapshot, sent to every member after any change.
+    /// The owner's full snapshot, sent to every member after any change, with the
+    /// lobby's secret key (see `Claim`; zeros for none).
     State {
         lobby: Lobby,
+        secret: [u8; 32],
     },
     Leave {
         lobby: String,
@@ -107,8 +128,71 @@ pub enum Msg {
     },
     /// The last message on a connection the sender moved off (to a better path: LAN
     /// over a room tunnel, a room over public sessions): everything after it comes on
-    /// the new connection. Older copies drop it as malformed.
+    /// the new connection.
     Moved,
+    /// The first message on a connection to a peer we haven't heard this from since it
+    /// connected or came back (see `link`): our process's session, the one we hold for
+    /// the peer (0: none), and where our side of it stands.
+    Session {
+        mine: u64,
+        yours: u64,
+        sent: u64,
+        recv: u64,
+        first: u64,
+    },
+    /// How many of the peer's messages we have (see `link`): it needn't keep them.
+    Ack {
+        recv: u64,
+    },
+    /// The sender is leaving for good (not a dropped connection): no need to wait for
+    /// it to come back.
+    Bye,
+    /// The answer to a Join sent to a player that doesn't own the lobby (any more): ask
+    /// `owner`, which does as far as the sender knows.
+    JoinElsewhere {
+        lobby: String,
+        owner: PeerId,
+    },
+    /// From a member whose connection to a lobby's owner is gone, to the lobby's other
+    /// members: is `owner` still there for you? A member that still reaches it passes
+    /// the question on to it; the owner answers with `OwnerHere`.
+    OwnerCheck {
+        lobby: String,
+        owner: PeerId,
+    },
+    /// The owner still runs the lobby (from the owner to the member that passed the
+    /// question on, and from that member to the one that asked): only the asker's own
+    /// link to it broke, so the asker is out of the lobby rather than electing a new
+    /// owner of its own.
+    OwnerHere {
+        lobby: String,
+    },
+    /// A counted message of the sender's session and its number there (see `link`):
+    /// every message that counts goes in one of these.
+    Numbered {
+        n: u64,
+        msg: Box<Msg>,
+    },
+    /// Send again everything you keep past `from`: what came from the sender has a gap
+    /// there (see `link`).
+    Resend {
+        from: u64,
+    },
+    /// Bytes of a connection between `from` and `to` that runs through the player in
+    /// between (see `lan::relay`): from an end to the player in between, and on from
+    /// it to the other end. `stream` tells the connections apart.
+    Relay {
+        stream: u64,
+        from: PeerId,
+        to: PeerId,
+        data: Vec<u8>,
+    },
+    /// That connection is over (or refused), the same way.
+    RelayEnd {
+        stream: u64,
+        from: PeerId,
+        to: PeerId,
+    },
 }
 
 #[derive(Default)]
@@ -179,6 +263,12 @@ impl W {
             self.id(&m.id);
             self.attrs(&m.attrs);
         }
+        self.claim(&l.claim);
+    }
+    fn claim(&mut self, c: &Claim) {
+        self.0.extend_from_slice(&c.key);
+        self.u64(c.term);
+        self.0.extend_from_slice(&c.sig);
     }
     fn query(&mut self, q: &Query) {
         self.str(&q.namespace);
@@ -216,11 +306,13 @@ impl W {
 pub struct R<'a> {
     b: &'a [u8],
     p: usize,
+    /// What list elements may still cost (DECODE_FACTOR).
+    budget: usize,
 }
 
 impl<'a> R<'a> {
     pub fn new(b: &'a [u8]) -> Self {
-        R { b, p: 0 }
+        R { b, p: 0, budget: b.len().saturating_mul(DECODE_FACTOR) + 4096 }
     }
     fn take(&mut self, n: usize) -> Option<&'a [u8]> {
         let end = self.p.checked_add(n)?;
@@ -253,7 +345,12 @@ impl<'a> R<'a> {
     fn count(&mut self) -> Option<usize> {
         let n = self.u32()? as usize;
         // Every element is at least a byte; a count beyond what's left is a lie.
-        (n <= self.b.len() - self.p).then_some(n)
+        if n > self.b.len() - self.p {
+            return None;
+        }
+        // And every element costs something in memory, over the decode's budget.
+        self.budget = self.budget.checked_sub(n.saturating_mul(ELEMENT_COST))?;
+        Some(n)
     }
     fn value(&mut self) -> Option<Value> {
         Some(match self.u8()? {
@@ -293,6 +390,7 @@ impl<'a> R<'a> {
                 attrs: self.attrs()?,
             });
         }
+        let claim = self.claim()?;
         Some(Lobby {
             id,
             namespace,
@@ -305,7 +403,11 @@ impl<'a> R<'a> {
             join_by_id: flags & 4 != 0,
             attrs,
             members,
+            claim,
         })
+    }
+    fn claim(&mut self) -> Option<Claim> {
+        Some(Claim { key: self.take(32)?.try_into().ok()?, term: self.u64()?, sig: self.take(64)?.try_into().ok()? })
     }
     fn op(&mut self) -> Option<Op> {
         Some(match self.u8()? {
@@ -363,6 +465,7 @@ fn join_result(v: u8) -> Option<JoinResult> {
         2 => JoinResult::NotFound,
         3 => JoinResult::NotAllowed,
         4 => JoinResult::TimedOut,
+        5 => JoinResult::WrongSecret,
         _ => return None,
     })
 }
@@ -412,18 +515,21 @@ impl Msg {
                     w.lobby(l);
                 }
             }
-            Msg::Join { lobby } => {
+            Msg::Join { lobby, secret } => {
                 w.u8(4);
                 w.str(lobby);
+                w.str(secret);
             }
-            Msg::JoinReply { lobby, result } => {
+            Msg::JoinReply { lobby, result, claim } => {
                 w.u8(5);
                 w.str(lobby);
                 w.u8(*result as u8);
+                w.claim(claim);
             }
-            Msg::State { lobby } => {
+            Msg::State { lobby, secret } => {
                 w.u8(6);
                 w.lobby(lobby);
+                w.0.extend_from_slice(secret);
             }
             Msg::Leave { lobby } => {
                 w.u8(7);
@@ -483,8 +589,65 @@ impl Msg {
                 }
             }
             Msg::Moved => w.u8(17),
+            Msg::Session { mine, yours, sent, recv, first } => {
+                w.u8(19);
+                for v in [mine, yours, sent, recv, first] {
+                    w.u64(*v);
+                }
+            }
+            Msg::Ack { recv } => {
+                w.u8(20);
+                w.u64(*recv);
+            }
+            Msg::Bye => w.u8(21),
+            Msg::JoinElsewhere { lobby, owner } => {
+                w.u8(22);
+                w.str(lobby);
+                w.id(owner);
+            }
+            Msg::OwnerCheck { lobby, owner } => {
+                w.u8(23);
+                w.str(lobby);
+                w.id(owner);
+            }
+            Msg::OwnerHere { lobby } => {
+                w.u8(24);
+                w.str(lobby);
+            }
+            Msg::Numbered { n, msg } => {
+                w.u8(25);
+                w.u64(*n);
+                let head = std::mem::take(&mut w.0);
+                w.0 = msg.encode_onto(head);
+            }
+            Msg::Resend { from } => {
+                w.u8(26);
+                w.u64(*from);
+            }
+            Msg::Relay { stream, from, to, data } => {
+                w.u8(27);
+                w.u64(*stream);
+                w.id(from);
+                w.id(to);
+                w.bytes(data);
+            }
+            Msg::RelayEnd { stream, from, to } => {
+                w.u8(28);
+                w.u64(*stream);
+                w.id(from);
+                w.id(to);
+            }
         }
         w.0
+    }
+
+    /// What goes before a message sent as number `n` of a session (`Msg::Numbered`), so
+    /// the message itself is encoded straight after it, not cloned into one.
+    pub fn numbered_head(n: u64) -> Vec<u8> {
+        let mut h = Vec::with_capacity(9);
+        h.push(25);
+        h.extend_from_slice(&n.to_le_bytes());
+        h
     }
 
     pub fn decode(b: &[u8]) -> Option<Msg> {
@@ -513,12 +676,13 @@ impl Msg {
                 }
                 Msg::SearchReply { search, lobbies }
             }
-            4 => Msg::Join { lobby: r.str()? },
+            4 => Msg::Join { lobby: r.str()?, secret: r.str()? },
             5 => Msg::JoinReply {
                 lobby: r.str()?,
                 result: join_result(r.u8()?)?,
+                claim: r.claim()?,
             },
-            6 => Msg::State { lobby: r.lobby()? },
+            6 => Msg::State { lobby: r.lobby()?, secret: r.take(32)?.try_into().ok()? },
             7 => Msg::Leave { lobby: r.str()? },
             8 => Msg::MemberAttrs {
                 lobby: r.str()?,
@@ -549,6 +713,24 @@ impl Msg {
                 Msg::Invite { connect, lobby }
             }
             17 => Msg::Moved,
+            19 => Msg::Session { mine: r.u64()?, yours: r.u64()?, sent: r.u64()?, recv: r.u64()?, first: r.u64()? },
+            20 => Msg::Ack { recv: r.u64()? },
+            21 => Msg::Bye,
+            22 => Msg::JoinElsewhere { lobby: r.str()?, owner: r.id()? },
+            23 => Msg::OwnerCheck { lobby: r.str()?, owner: r.id()? },
+            24 => Msg::OwnerHere { lobby: r.str()? },
+            25 => {
+                let n = r.u64()?;
+                // Exactly one message that counts: never a number around a number.
+                let msg = Msg::decode(&b[r.p..])?;
+                if matches!(msg, Msg::Numbered { .. }) || !crate::link::counted(&msg) {
+                    return None;
+                }
+                return Some(Msg::Numbered { n, msg: Box::new(msg) });
+            }
+            26 => Msg::Resend { from: r.u64()? },
+            27 => Msg::Relay { stream: r.u64()?, from: r.id()?, to: r.id()?, data: r.bytes()? },
+            28 => Msg::RelayEnd { stream: r.u64()?, from: r.id()?, to: r.id()? },
             _ => return None,
         };
         (r.p == b.len()).then_some(msg)
@@ -574,6 +756,17 @@ impl Beacon {
         w.id(&self.id);
         w.u16(self.port);
         w.0
+    }
+
+    /// A beacon's wire version, game and id, whatever its version: copies on other
+    /// versions are told apart from no copy at all (`Sink::other_version`). Every version
+    /// so far starts the same way.
+    pub fn peek(b: &[u8]) -> Option<(u16, String, PeerId)> {
+        if b.get(..4)? != BEACON_MAGIC {
+            return None;
+        }
+        let mut r = R::new(&b[4..]);
+        Some((r.u16()?, r.str()?, r.id()?))
     }
 
     pub fn decode(b: &[u8]) -> Option<Beacon> {
@@ -641,9 +834,11 @@ mod tests {
             Msg::JoinReply {
                 lobby: "x".into(),
                 result: JoinResult::Full,
+                claim: Claim::make(&[3; 32], "x", PeerId([1; 16]), 2),
             },
             Msg::State {
                 lobby: lobby.clone(),
+                secret: [5; 32],
             },
             Msg::ChanData {
                 socket: "s".into(),
@@ -666,10 +861,49 @@ mod tests {
                 lobby: None,
             },
             Msg::Moved,
+            Msg::Session { mine: 1, yours: 2, sent: 3, recv: 4, first: 5 },
+            Msg::Ack { recv: u64::MAX },
+            Msg::Bye,
+            Msg::JoinElsewhere { lobby: "x".into(), owner: PeerId([9; 16]) },
+            Msg::OwnerCheck { lobby: "x".into(), owner: PeerId([8; 16]) },
+            Msg::OwnerHere { lobby: "x".into() },
+            Msg::Numbered { n: 7, msg: Box::new(Msg::Leave { lobby: "x".into() }) },
+            Msg::Resend { from: 9 },
+            Msg::Relay { stream: 3, from: PeerId([1; 16]), to: PeerId([2; 16]), data: vec![4, 5] },
+            Msg::RelayEnd { stream: 3, from: PeerId([1; 16]), to: PeerId([2; 16]) },
         ];
         for m in all {
             assert_eq!(Msg::decode(&m.encode()), Some(m));
         }
+    }
+
+    /// A number goes only around one message that counts: not around another number,
+    /// nor around what is about the stream itself.
+    #[test]
+    fn numbers_wrap_one_counted_message() {
+        let wrap = |inner: &Msg| {
+            let mut b = Msg::numbered_head(4);
+            b.extend_from_slice(&inner.encode());
+            b
+        };
+        let leave = Msg::Leave { lobby: "x".into() };
+        assert_eq!(Msg::decode(&wrap(&leave)), Some(Msg::Numbered { n: 4, msg: Box::new(leave.clone()) }));
+        assert_eq!(wrap(&leave), Msg::Numbered { n: 4, msg: Box::new(leave.clone()) }.encode());
+        for not in [Msg::Ack { recv: 1 }, Msg::Bye, Msg::Numbered { n: 1, msg: Box::new(leave) }] {
+            assert!(Msg::decode(&wrap(&not)).is_none(), "{not:?}");
+        }
+    }
+
+    #[test]
+    fn a_claim_holds_only_for_its_lobby_owner_and_term() {
+        let secret = crate::lobby::new_lobby_secret();
+        let c = Claim::make(&secret, "lobby", PeerId([1; 16]), 3);
+        assert_eq!(c.key, crate::lobby::lobby_key(&secret));
+        assert!(c.holds("lobby", PeerId([1; 16])));
+        assert!(!c.holds("lobby", PeerId([2; 16])));
+        assert!(!c.holds("other", PeerId([1; 16])));
+        assert!(!Claim { term: 4, ..c }.holds("lobby", PeerId([1; 16])));
+        assert!(!Claim::default().holds("lobby", PeerId::default()));
     }
 
     #[test]
@@ -700,6 +934,16 @@ mod tests {
         assert_eq!(Msg::decode(&m.encode()), Some(m));
     }
 
+    /// A frame packed with the smallest elements there are (an attribute with no key and
+    /// a bool is 7 bytes, and far more once decoded) is refused once that would pass the
+    /// decode budget; a few of them are fine.
+    #[test]
+    fn tiny_elements_cant_blow_up_in_memory() {
+        let tiny = |n: usize| Msg::MemberAttrs { lobby: "x".into(), attrs: (0..n).map(|_| Attr { key: String::new(), value: Value::Bool(true), public: true }).collect() };
+        assert!(Msg::decode(&tiny(100).encode()).is_some());
+        assert!(Msg::decode(&tiny(200_000).encode()).is_none());
+    }
+
     /// A frame that claims as many elements as it has bytes, with none of them there, is
     /// dropped without room for them being set aside first (16 million lobbies would be
     /// gigabytes: more than a 32-bit game has).
@@ -725,7 +969,13 @@ mod tests {
             id: PeerId([4; 16]),
             port: 5000,
         };
-        assert_eq!(Beacon::decode(&b.encode()), Some(b));
+        assert_eq!(Beacon::peek(&b.encode()), Some((VERSION, b.game.clone(), b.id)));
+        assert_eq!(Beacon::decode(&b.encode()), Some(b.clone()));
         assert!(Beacon::decode(b"nope").is_none());
+        // Another version's: not a beacon to answer, but seen for what it is.
+        let mut other = b.encode();
+        other[4..6].copy_from_slice(&(VERSION - 1).to_le_bytes());
+        assert!(Beacon::decode(&other).is_none());
+        assert_eq!(Beacon::peek(&other), Some((VERSION - 1, b.game, b.id)));
     }
 }

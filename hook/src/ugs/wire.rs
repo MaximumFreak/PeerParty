@@ -298,6 +298,17 @@ fn commands(text: &str, conn: u64, tx: &Sender<Out>) -> Vec<String> {
     replies
 }
 
+/// The longest message (all its frames together) a socket takes. Wire's commands are a
+/// few hundred bytes; anything near this is not a game talking to Wire, and the socket
+/// is closed (1009, message too big) rather than buffered without end.
+const MESSAGE_MAX: usize = 1 << 20;
+
+/// Whether what a socket holds has outgrown any message it may send: the frames of the
+/// message so far plus what is waiting to be read as a frame (a header is at most 14).
+fn too_big(message: usize, pending: usize) -> bool {
+    message > MESSAGE_MAX || pending > MESSAGE_MAX + 14
+}
+
 /// Runs one WebSocket on an upgraded HTTPS connection until it closes.
 pub fn serve(mut tls: TlsStream, req: &Request, mut pending: Vec<u8>) {
     let Some(key) = req.header("Sec-WebSocket-Key").map(str::to_string) else {
@@ -346,6 +357,10 @@ pub fn serve(mut tls: TlsStream, req: &Request, mut pending: Vec<u8>) {
                 _ => {}
             }
         }
+        if too_big(message.len(), pending.len()) {
+            let _ = tls.write_all(&frame(8, &1009u16.to_be_bytes()));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("a message over {MESSAGE_MAX} bytes")));
+        }
         match tls.read(&mut chunk) {
             Ok(0) => return Ok(()),
             Ok(n) => pending.extend_from_slice(&chunk[..n]),
@@ -366,6 +381,13 @@ mod tests {
 
     fn hex(b: &[u8]) -> String {
         b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    #[test]
+    fn a_socket_takes_no_message_past_the_limit() {
+        assert!(!too_big(MESSAGE_MAX, MESSAGE_MAX + 14));
+        assert!(too_big(MESSAGE_MAX + 1, 0), "frames of one message together");
+        assert!(too_big(0, MESSAGE_MAX + 15), "one frame still arriving");
     }
 
     #[test]

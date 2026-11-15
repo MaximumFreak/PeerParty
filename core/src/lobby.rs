@@ -51,14 +51,25 @@ pub enum Permission {
     /// for an SDK's "friends" lobbies, and for what stands behind a lobby (a party
     /// network).
     Friends = 3,
+    /// Found only by those who have it in hand (its id or its exact bucket, a join
+    /// code) and then joined like a public one by anyone: for UGS private lobbies, which
+    /// anyone with the code may join but no query lists.
+    Unlisted = 4,
 }
 
 impl Permission {
+    /// Whether a stranger (a public player) may find it, by a search it matches, and
+    /// join it.
+    pub fn open_to_strangers(self) -> bool {
+        matches!(self, Permission::Public | Permission::Unlisted)
+    }
+
     pub fn from_u8(v: u8) -> Permission {
         match v {
             1 => Permission::Presence,
             2 => Permission::InviteOnly,
             3 => Permission::Friends,
+            4 => Permission::Unlisted,
             _ => Permission::Public,
         }
     }
@@ -85,6 +96,79 @@ pub struct Lobby {
     pub join_by_id: bool,
     pub attrs: Vec<Attr>,
     pub members: Vec<Member>,
+    /// Its owner's signed claim to it (see `Claim`); none in a lobby a front end made up
+    /// to join by id.
+    pub claim: Claim,
+}
+
+/// Who owns a lobby, signed. Every lobby has a key pair its creator makes; its members
+/// hold the secret half (`Msg::State` carries it to them, and only to them), so whoever
+/// owns it next can sign, and anyone checks a claim against the public half. A copy
+/// that has a lobby's key (from a search, an invite, its own membership) takes word of
+/// that lobby only with a claim the key signed: nobody outside it can answer for it or
+/// take it over. `term` counts the owners: lower than one already seen is an old claim.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Claim {
+    pub key: [u8; 32],
+    pub term: u64,
+    pub sig: [u8; 64],
+}
+
+impl Default for Claim {
+    fn default() -> Claim {
+        Claim { key: [0; 32], term: 0, sig: [0; 64] }
+    }
+}
+
+impl std::fmt::Debug for Claim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_none() {
+            return f.write_str("Claim(none)");
+        }
+        write!(f, "Claim({:02x}{:02x}{:02x}{:02x}.., term {})", self.key[0], self.key[1], self.key[2], self.key[3], self.term)
+    }
+}
+
+impl Claim {
+    pub fn is_none(&self) -> bool {
+        self.key == [0; 32]
+    }
+
+    /// `owner`'s claim to lobby `id` for `term`, signed with the lobby's secret.
+    pub fn make(secret: &[u8; 32], id: &str, owner: PeerId, term: u64) -> Claim {
+        use ed25519_dalek::Signer;
+        let sk = ed25519_dalek::SigningKey::from_bytes(secret);
+        let key = sk.verifying_key().to_bytes();
+        Claim { key, term, sig: sk.sign(&transcript(&key, id, owner, term)).to_bytes() }
+    }
+
+    /// Whether this is the lobby key's own word that `owner` owns lobby `id`.
+    pub fn holds(&self, id: &str, owner: PeerId) -> bool {
+        !self.is_none()
+            && ed25519_dalek::VerifyingKey::from_bytes(&self.key).is_ok_and(|vk| {
+                vk.verify_strict(&transcript(&self.key, id, owner, self.term), &ed25519_dalek::Signature::from_bytes(&self.sig)).is_ok()
+            })
+    }
+}
+
+/// A new lobby's secret key.
+pub fn new_lobby_secret() -> [u8; 32] {
+    crate::inet::crypto::random_array()
+}
+
+/// The public half of a lobby's secret key, as its claims carry it.
+pub fn lobby_key(secret: &[u8; 32]) -> [u8; 32] {
+    ed25519_dalek::SigningKey::from_bytes(secret).verifying_key().to_bytes()
+}
+
+fn transcript(key: &[u8; 32], id: &str, owner: PeerId, term: u64) -> Vec<u8> {
+    let mut t = b"peerparty lobby owner\0".to_vec();
+    t.extend_from_slice(key);
+    t.extend_from_slice(&(id.len() as u32).to_le_bytes());
+    t.extend_from_slice(id.as_bytes());
+    t.extend_from_slice(&owner.0);
+    t.extend_from_slice(&term.to_le_bytes());
+    t
 }
 
 impl Lobby {
@@ -101,6 +185,7 @@ impl Lobby {
             join_by_id: false,
             attrs: Vec::new(),
             members: Vec::new(),
+            claim: Claim::default(),
         }
     }
 
@@ -223,8 +308,16 @@ pub fn matches(lobby: &Lobby, q: &Query) -> bool {
         }
     }
     // An open search only finds advertised lobbies. One aimed at an id or a player is
-    // looking for that lobby in particular.
-    if q.lobby_id.is_none() && q.member.is_none() && !matches!(lobby.permission, Permission::Public | Permission::Friends) {
+    // looking for that lobby in particular; so is one for an exact bucket (a join code),
+    // which finds an unlisted lobby too.
+    let aimed = q.lobby_id.is_some() || q.member.is_some();
+    let by_code = q.filters.iter().any(|f| matches!(f, Filter::Bucket { op: Op::Eq, .. }));
+    let found = match lobby.permission {
+        Permission::Public | Permission::Friends => true,
+        Permission::Unlisted => aimed || by_code,
+        Permission::Presence | Permission::InviteOnly => aimed,
+    };
+    if !found {
         return false;
     }
     q.filters.iter().all(|f| match f {
@@ -351,6 +444,7 @@ mod tests {
         l.permission = Permission::Friends;
         assert!(matches(&l, &Query::new("eos.lobby")));
         assert_eq!(Permission::from_u8(Permission::Friends as u8), Permission::Friends);
+        assert_eq!(Permission::from_u8(Permission::Unlisted as u8), Permission::Unlisted);
     }
 
     #[test]
@@ -371,5 +465,25 @@ mod tests {
         let v = lobby().public_view();
         assert!(v.attr("secret").is_none());
         assert!(v.attr("mode").is_some());
+    }
+
+    #[test]
+    fn an_unlisted_lobby_is_found_by_its_id_or_code_only() {
+        let mut l = lobby();
+        l.bucket = "ABC123".into();
+        l.permission = Permission::Unlisted;
+        let open = Query::new(&l.namespace);
+        assert!(!matches(&l, &open), "an open search doesn't list it");
+        let mut by_code = Query::new(&l.namespace);
+        by_code.filters.push(Filter::Bucket { op: Op::Eq, value: "abc123".into() });
+        assert!(matches(&l, &by_code));
+        let mut other_code = Query::new(&l.namespace);
+        other_code.filters.push(Filter::Bucket { op: Op::Ne, value: "XYZ".into() });
+        assert!(!matches(&l, &other_code), "only an exact code finds it");
+        let mut by_id = Query::new(&l.namespace);
+        by_id.lobby_id = Some(l.id.clone());
+        assert!(matches(&l, &by_id));
+        l.permission = Permission::InviteOnly;
+        assert!(!matches(&l, &by_code), "invite-only lobbies stay unfound by bucket");
     }
 }

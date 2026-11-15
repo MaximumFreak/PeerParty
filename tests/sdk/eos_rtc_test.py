@@ -64,7 +64,8 @@ add("EOS_RTCAudio_AddNotifyParticipantUpdated")(audio, C.byref(ro), None,
     cb(Speaking, lambda i: ev["speaking"].append((text_id(i.ParticipantId), i.bSpeaking))))
 def on_render(i):
     b = i.Buffer.contents
-    ev["frames"].append((text_id(i.ParticipantId), b.FramesCount, b.SampleRate, b.Channels, b.Frames[0], b.Frames[b.FramesCount - 1]))
+    # Voice travels as Opus, which is lossy: the frame's format and its loudness, not its samples.
+    ev["frames"].append((text_id(i.ParticipantId), b.FramesCount, b.SampleRate, b.Channels, max(abs(b.Frames[k]) for k in range(b.FramesCount))))
 add("EOS_RTCAudio_AddNotifyAudioBeforeRender")(audio, C.byref(ro), None, cb(Render, on_render))
 add("EOS_RTCData_AddNotifyDataReceived")(data, C.byref(ro), None,
     cb(DataGot, lambda i: ev["data"].append((text_id(i.ParticipantId), C.string_at(i.Data, i.DataLengthBytes)))))
@@ -126,8 +127,9 @@ if ROLE == "A":
     check("B's leaving is seen", (oid, 1, ROOM) in ev["status"], ev["status"])
 else:
     tick_until(plat, lambda: len(ev["frames"]) >= 3 and ev["data"], 15, "audio and data from A")
-    f = ev["frames"][0] if ev["frames"] else None
-    check("audio frames arrive from A", f and f[0] == oid and f[1:4] == (480, 48000, 1) and f[4] == 0 and f[5] == 4790, f)
+    f = ev["frames"][-1] if ev["frames"] else None
+    peak = max((x[4] for x in ev["frames"]), default=0)
+    check("audio frames arrive from A", f and f[0] == oid and f[1:4] == (480, 48000, 1) and 2000 < peak < 9000, (f, peak))
     check("room data arrives from A", ev["data"] and ev["data"][0] == (oid, b"hello-rtc"), ev["data"][:1])
     check("A shows as speaking", (oid, 1) in ev["speaking"], ev["speaking"])
     open(flag("B"), "w").write("1")

@@ -79,6 +79,12 @@ pub fn resolve(name: &str) -> Option<usize> {
         "EOS_UserInfo_QueryUserInfo" => userinfo_query as *const () as usize,
         "EOS_UserInfo_CopyUserInfo" => userinfo_copy as *const () as usize,
         "EOS_UserInfo_Release" => free as *const () as usize,
+        // Both options start with ApiVersion, LocalUserId, TargetUserId; the platform
+        // asked for doesn't matter, a LAN player has one name.
+        "EOS_UserInfo_CopyBestDisplayName" => userinfo_best_name as *const () as usize,
+        "EOS_UserInfo_CopyBestDisplayNameWithPlatform" => userinfo_best_name as *const () as usize,
+        "EOS_UserInfo_BestDisplayName_Release" => free as *const () as usize,
+        "EOS_Connect_GetProductUserIdMapping" => connect_get_puid_mapping as *const () as usize,
         _ => return None,
     })
 }
@@ -227,6 +233,7 @@ unsafe extern "system" fn connect_copy_user_info(
 
 /// EOS_EExternalAccountType: EPIC 0, STEAM 1, PSN 2, XBL 3.
 const EAT_EPIC: i32 = 0;
+const EAT_STEAM: i32 = 1;
 const EAT_XBL: i32 = 3;
 
 /// The LAN player behind an external account id: an Xbox user by XUID, an Epic one by
@@ -235,8 +242,53 @@ fn peer_of_external(kind: i32, id: &str) -> Option<peerparty_core::PeerId> {
     match kind {
         EAT_XBL => crate::xboxlive::peer_of(id.trim().parse().ok()?),
         EAT_EPIC => peerparty_core::PeerId::from_hex(id.trim()),
+        EAT_STEAM => crate::steamlan::peer_of(id.trim().parse().ok()?),
         _ => None,
     }
+}
+
+/// The account id of the type asked for behind a ProductUserId: the XUID for Xbox
+/// Live, else the LAN id the player is shown under (as CopyProductUserInfo gives it).
+fn external_id(peer: peerparty_core::PeerId, kind: i32) -> String {
+    match kind {
+        EAT_XBL => crate::xboxlive::xuid_of(peer).to_string(),
+        EAT_STEAM => crate::steamlan::steam_id(peer).to_string(),
+        _ => peer.hex(),
+    }
+}
+
+unsafe extern "system" fn connect_get_puid_mapping(
+    _h: usize,
+    o: *const abi::GetProductUserIdMappingOptions,
+    buf: *mut c_char,
+    len: *mut i32,
+) -> i32 {
+    if o.is_null() || len.is_null() {
+        return INVALID_PARAMETERS;
+    }
+    let (kind, target) = unsafe { ((*o).AccountIdType, (*o).TargetProductUserId) };
+    let Some(peer) = ids::peer_of_puid(target) else {
+        return NOT_FOUND;
+    };
+    let text = external_id(peer, kind);
+    trace("EOS_Connect_GetProductUserIdMapping", || format!("type {kind} {peer:?} -> {text}"));
+    unsafe { copy_text(&text, buf, len) }
+}
+
+/// Copies `text` and its terminator into an EOS caller's buffer, or says how long it
+/// must be (EOS_LimitExceeded).
+unsafe fn copy_text(text: &str, buf: *mut c_char, len: *mut i32) -> i32 {
+    let need = text.len() as i32 + 1;
+    unsafe {
+        if buf.is_null() || *len < need {
+            *len = need;
+            return LIMIT_EXCEEDED;
+        }
+        std::ptr::copy_nonoverlapping(text.as_ptr(), buf as *mut u8, text.len());
+        *buf.add(text.len()) = 0;
+        *len = need;
+    }
+    SUCCESS
 }
 
 unsafe extern "system" fn connect_get_mapping(_h: usize, o: *const abi::GetExternalAccountMappingOptions) -> usize {
@@ -259,20 +311,26 @@ unsafe extern "system" fn connect_copy_by_account_type(
     if out.is_null() || o.is_null() {
         return INVALID_PARAMETERS;
     }
-    if unsafe { (*o).AccountIdType } != EAT_XBL {
+    let kind = unsafe { (*o).AccountIdType };
+    if kind == EAT_EPIC {
         return unsafe { connect_copy_user_info(_h, o.cast(), out) };
     }
     unsafe { *out = 0 };
     let Some(peer) = ids::peer_of_puid(unsafe { (*o).TargetUserId }) else {
         return INVALID_USER;
     };
+    // A LAN player has an Xbox Live and a Steam account as the LAN layer shows them,
+    // and no other kind: a record typed EPIC would be read as the kind asked for.
+    if kind != EAT_XBL && kind != EAT_STEAM {
+        return NOT_FOUND;
+    }
     let mut keep = Vec::new();
     let info = abi::ExternalAccountInfo {
         ApiVersion: abi::CONNECT_EXTERNALACCOUNTINFO_API,
         ProductUserId: ids::puid(peer),
         DisplayName: owned_str(&mut keep, &name_of(peer)),
-        AccountId: owned_str(&mut keep, &crate::xboxlive::xuid_of(peer).to_string()),
-        AccountIdType: EAT_XBL,
+        AccountId: owned_str(&mut keep, &external_id(peer, kind)),
+        AccountIdType: kind,
         LastLoginTime: -1,
     };
     unsafe { *out = hand_out(info, keep) };
@@ -591,9 +649,48 @@ unsafe extern "system" fn userinfo_copy(
     SUCCESS
 }
 
+/// EOS_OPT_Epic.
+const PLATFORM_EPIC: u32 = 100;
+
+unsafe extern "system" fn userinfo_best_name(
+    _h: usize,
+    o: *const abi::UserInfoTargetOptions,
+    out: *mut usize,
+) -> i32 {
+    if out.is_null() || o.is_null() {
+        return INVALID_PARAMETERS;
+    }
+    unsafe { *out = 0 };
+    let Some(peer) = ids::peer_of_epic(unsafe { (*o).TargetUserId }) else {
+        return NOT_FOUND;
+    };
+    let name = name_of(peer);
+    let mut keep = Vec::new();
+    let info = abi::BestDisplayName {
+        ApiVersion: abi::BESTDISPLAYNAME_API,
+        UserId: ids::epic(peer),
+        DisplayName: owned_str(&mut keep, &name),
+        DisplayNameSanitized: owned_str(&mut keep, &name),
+        Nickname: owned_str(&mut keep, &name),
+        PlatformType: PLATFORM_EPIC,
+    };
+    unsafe { *out = hand_out(info, keep) };
+    SUCCESS
+}
+
 #[cfg(test)]
 mod tests {
     use super::{abi, describe_login};
+
+    #[test]
+    fn external_ids_copy_like_the_sdk() {
+        let mut buf = [0 as std::ffi::c_char; 8];
+        let mut len = 3;
+        assert_eq!(unsafe { super::copy_text("12345", buf.as_mut_ptr(), &mut len) }, super::LIMIT_EXCEEDED);
+        assert_eq!(len, 6);
+        assert_eq!(unsafe { super::copy_text("12345", buf.as_mut_ptr(), &mut len) }, super::SUCCESS);
+        assert_eq!(unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_str().unwrap(), "12345");
+    }
 
     fn login(kind: i32, token: &std::ffi::CStr) -> String {
         let creds = abi::AuthCredentials { ApiVersion: 3, Id: c"".as_ptr(), Token: token.as_ptr(), Type: kind };

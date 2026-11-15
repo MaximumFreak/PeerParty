@@ -14,6 +14,11 @@
 //! A watchdog: the host's loop stamps a heartbeat every tick, and if it hasn't for 1.5 s
 //! (stalled) the hooks stop taking input, so the PC never ends up without a keyboard and
 //! mouse because of PeerParty.
+//!
+//! While the overlay is closed and the game in front, the keyboard hook alone stays in
+//! (`watch_hotkeys`): it takes only the press of an opening hotkey (Shift held, one of
+//! the keys that are on) and its release, so the game never sees Shift+Tab and the like
+//! open its own menus as the overlay opens. Every other key goes on to the game.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
@@ -41,6 +46,11 @@ static ALT: AtomicBool = AtomicBool::new(false);
 /// Keys whose press the hook took, by virtual-key code.
 static TAKEN: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
 static HEARTBEAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Watching for the opening hotkeys (`watch_hotkeys`), and which keys they are.
+static WATCHING: AtomicBool = AtomicBool::new(false);
+static HOTKEYS: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
+/// The hotkey pressed while watching (its virtual-key code), until `take_hotkey`.
+static HOTKEY_HIT: AtomicU32 = AtomicU32::new(0);
 const STALLED_MS: u64 = 1500;
 
 fn now_ms() -> u64 {
@@ -59,6 +69,8 @@ fn taking() -> bool {
 
 const INSTALL: u32 = WM_APP + 1;
 const REMOVE: u32 = WM_APP + 2;
+/// The keyboard hook alone, for watching the hotkeys.
+const INSTALL_KEYS: u32 = WM_APP + 4;
 /// Posted to the host's thread when input arrives, to wake its wait at once.
 const WAKE: u32 = WM_APP + 3;
 /// The host's thread, and whether a wake is already posted (one at a time: a mouse
@@ -97,6 +109,33 @@ pub fn capture(on: bool) {
     }
 }
 
+/// While the overlay is closed: take the opening hotkeys `vks` (with Shift) from the
+/// game. Empty: stop watching.
+pub fn watch_hotkeys(vks: &[u32]) {
+    heartbeat();
+    for (i, h) in HOTKEYS.iter().enumerate() {
+        h.store(vks.contains(&(i as u32)), Ordering::Relaxed);
+    }
+    let on = !vks.is_empty();
+    if WATCHING.swap(on, Ordering::Relaxed) == on {
+        return;
+    }
+    let t = THREAD.load(Ordering::Relaxed);
+    if t != 0 {
+        unsafe { PostThreadMessageW(t, if on { INSTALL_KEYS } else { REMOVE }, 0, 0) };
+    }
+}
+
+/// The opening hotkey pressed while watching, once.
+pub fn take_hotkey() -> Option<u32> {
+    Some(HOTKEY_HIT.swap(0, Ordering::Relaxed)).filter(|&vk| vk != 0)
+}
+
+/// Whether the hotkeys are being watched for right now (and the host isn't stalled).
+fn watching() -> bool {
+    WATCHING.load(Ordering::Relaxed) && !ON.load(Ordering::Relaxed) && now_ms().saturating_sub(HEARTBEAT.load(Ordering::Relaxed)) < STALLED_MS
+}
+
 /// Input taken since the last call, oldest first.
 pub fn take() -> Vec<Input> {
     WOKEN.store(false, Ordering::Relaxed);
@@ -114,6 +153,11 @@ fn push(i: Input) {
         q.push_back(i);
     }
     drop(q);
+    wake();
+}
+
+/// Wakes the host's wait (once until it takes what came).
+fn wake() {
     if !WOKEN.swap(true, Ordering::Relaxed) {
         let host = HOST.load(Ordering::Relaxed);
         if host != 0 {
@@ -143,15 +187,28 @@ fn run(tx: std::sync::mpsc::Sender<u32>) {
                 kb = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard), module, 0) };
                 mouse = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), module, 0) };
             }
+            // The overlay opened while the hotkeys were watched: the mouse too.
+            INSTALL if mouse.is_null() => {
+                let mut p = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+                unsafe { GetCursorPos(&mut p) };
+                ANCHOR_X.store(p.x, Ordering::Relaxed);
+                ANCHOR_Y.store(p.y, Ordering::Relaxed);
+                mouse = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), module, 0) };
+            }
+            INSTALL_KEYS if kb.is_null() => {
+                kb = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard), module, 0) };
+            }
             REMOVE => {
-                if !kb.is_null() {
+                // The keyboard hook stays while either still needs it.
+                let keys_wanted = ON.load(Ordering::Relaxed) || WATCHING.load(Ordering::Relaxed);
+                if !kb.is_null() && !keys_wanted {
                     unsafe { UnhookWindowsHookEx(kb) };
+                    kb = std::ptr::null_mut();
                 }
-                if !mouse.is_null() {
+                if !mouse.is_null() && !ON.load(Ordering::Relaxed) {
                     unsafe { UnhookWindowsHookEx(mouse) };
+                    mouse = std::ptr::null_mut();
                 }
-                kb = std::ptr::null_mut();
-                mouse = std::ptr::null_mut();
             }
             _ => unsafe {
                 TranslateMessage(&msg);
@@ -172,6 +229,22 @@ const VK_GAMEPAD_FIRST: u32 = 0xC3;
 const VK_GAMEPAD_LAST: u32 = 0xDA;
 
 unsafe extern "system" fn keyboard(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
+    if code == HC_ACTION as i32 && watching() {
+        let k = unsafe { &*(l as *const KBDLLHOOKSTRUCT) };
+        let down = matches!(w as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
+        let vk = k.vkCode & 0xFF;
+        let shift = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x10) } as u16 & 0x8000 != 0;
+        if down && shift && HOTKEYS[vk as usize].load(Ordering::Relaxed) {
+            TAKEN[vk as usize].store(true, Ordering::Relaxed);
+            HOTKEY_HIT.store(vk, Ordering::Relaxed);
+            wake();
+            return 1;
+        }
+        // The release of a key taken (here, or while the overlay was open).
+        if !down && TAKEN[vk as usize].swap(false, Ordering::Relaxed) {
+            return 1;
+        }
+    }
     if code == HC_ACTION as i32 && taking() {
         let k = unsafe { &*(l as *const KBDLLHOOKSTRUCT) };
         let down = matches!(w as u32, WM_KEYDOWN | WM_SYSKEYDOWN);

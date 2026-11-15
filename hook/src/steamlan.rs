@@ -27,7 +27,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CString, c_char};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use peerparty_core::{Event, PeerId};
@@ -59,7 +59,9 @@ const CHANGE_GAME_PLAYED: i32 = 0x10;
 const CHANGE_RICH_PRESENCE: i32 = 0x1000;
 
 static ON: AtomicBool = AtomicBool::new(false);
-static REAL: LazyLock<Mutex<HashMap<String, usize>>> = LazyLock::new(Mutex::default);
+/// Written when steam_api loads, read on every swapped call: a read lock, so calls from
+/// several game threads never wait on each other.
+static REAL: LazyLock<RwLock<HashMap<String, usize>>> = LazyLock::new(RwLock::default);
 static MY_PRESENCE: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
 /// What each LAN player is shown as, and whether we clash (steamids.rs).
 static BOOK: LazyLock<Mutex<crate::steamids::Book>> = LazyLock::new(Mutex::default);
@@ -127,7 +129,7 @@ struct LobbyInvite {
 
 pub fn attach(base: usize, module_name: &str, exports: &[Export]) {
     {
-        let mut real = REAL.lock().unwrap();
+        let mut real = REAL.write().unwrap();
         for e in exports {
             if e.name.starts_with("SteamAPI_ISteamFriends_")
                 || STEAM_INPUT_READS.contains(&e.name.as_str())
@@ -556,11 +558,30 @@ fn lan_friends() -> Vec<(PeerId, String)> {
 }
 
 
+/// The game's Steam app id: `SteamAppId` (the launcher sets it), else `SteamGameId`'s low
+/// 24 bits (Steam sets both for a game it starts), else a `steam_appid.txt` in the
+/// working folder or beside the exe (where steam_api itself looks). Found once.
 pub fn app_id() -> u32 {
-    std::env::var("SteamAppId")
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0)
+    static ID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *ID.get_or_init(|| {
+        let env = |k: &str| std::env::var(k).ok().and_then(|s| s.trim().parse::<u64>().ok());
+        if let Some(id) = env("SteamAppId").filter(|&id| id != 0) {
+            return id as u32;
+        }
+        if let Some(id) = env("SteamGameId").map(|g| (g & 0xFF_FFFF) as u32).filter(|&id| id != 0) {
+            return id;
+        }
+        let mut dirs = Vec::new();
+        dirs.extend(std::env::current_dir().ok());
+        dirs.extend(std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf())));
+        dirs.iter().find_map(|d| appid_in(&std::fs::read_to_string(d.join("steam_appid.txt")).ok()?)).unwrap_or(0)
+    })
+}
+
+/// The id in a steam_appid.txt's text: its first number.
+fn appid_in(text: &str) -> Option<u32> {
+    let digits: String = text.trim_start_matches('\u{feff}').trim().chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok().filter(|&id| id != 0)
 }
 
 /// A C string that stays valid (Steam's own strings stay valid until the next call).
@@ -572,21 +593,50 @@ pub fn c_str(s: &str) -> *const c_char {
 }
 
 fn real(name: &str) -> Option<usize> {
-    REAL.lock().unwrap().get(name).copied()
+    REAL.read().unwrap().get(name).copied()
 }
 
 /// Calls the real flat function. `this` may be a stand-in (steamobj.rs); the real
 /// function gets the real object, or its virtual call would come straight back here.
+/// A steam_api without the flat API (older SDKs export only the accessors) gets the
+/// real object's C++ method of the same name instead, when its version has that method
+/// with the newest signature. Not for a method that returns a class (a CSteamID): the
+/// C++ method returns it through a hidden pointer (`real_friend_by_index`).
 macro_rules! real_call {
-    ($name:literal, fn($($t:ty),*) -> $r:ty, $default:expr, $this:expr $(, $arg:expr)*) => {
+    ($name:literal, fn(usize $(, $t:ty)*) -> $r:ty, $default:expr, $this:expr $(, $arg:expr)*) => {
         match real($name) {
             Some(f) => {
-                let f: unsafe extern "C" fn($($t),*) -> $r = unsafe { std::mem::transmute(f) };
+                let f: unsafe extern "C" fn(usize $(, $t)*) -> $r = unsafe { std::mem::transmute(f) };
                 unsafe { f(unwrap($this) $(, $arg)*) }
             }
-            None => $default,
+            None => call_real!($this, method_of($name), fn($($t),*) -> $r, $default $(, $arg)*),
         }
     };
+}
+
+/// "SteamAPI_ISteamFriends_GetFriendCount" -> "GetFriendCount".
+fn method_of(flat: &str) -> &str {
+    flat.rsplit('_').next().unwrap_or(flat)
+}
+
+/// The real ISteamFriends's friend `index`: the flat function where there is one, else
+/// the C++ method, which returns the CSteamID through a hidden pointer after `this`.
+fn real_friend_by_index(this: usize, index: i32, flags: i32) -> u64 {
+    if let Some(f) = real("SteamAPI_ISteamFriends_GetFriendByIndex") {
+        let f: unsafe extern "C" fn(usize, i32, i32) -> u64 = unsafe { std::mem::transmute(f) };
+        return unsafe { f(unwrap(this), index, flags) };
+    }
+    let mut out = 0u64;
+    let _ = call_real!(
+        this,
+        "GetFriendByIndex",
+        fn(*mut u64, i32, i32) -> *mut u64,
+        std::ptr::null_mut(),
+        &mut out,
+        index,
+        flags
+    );
+    out
 }
 
 /// LAN friends who aren't already Steam friends (who'd be listed twice).
@@ -614,18 +664,7 @@ fn real_friends(this: usize) -> Vec<u64> {
             return ids.clone();
         }
     }
-    let ids: Vec<u64> = (0..n)
-        .map(|i| {
-            real_call!(
-                "SteamAPI_ISteamFriends_GetFriendByIndex",
-                fn(usize, i32, i32) -> u64,
-                0,
-                this,
-                i,
-                FRIEND_FLAG_IMMEDIATE
-            )
-        })
-        .collect();
+    let ids: Vec<u64> = (0..n).map(|i| real_friend_by_index(this, i, FRIEND_FLAG_IMMEDIATE)).collect();
     *cache = Some((this, Instant::now(), ids.clone()));
     ids
 }
@@ -656,6 +695,54 @@ pub fn auth_ticket_issued(ticket: u32) -> u32 {
     log!("steam-lan auth ticket {ticket:#x}: nothing else answers it, answering GetAuthSessionTicketResponse_t");
     crate::steam::inject(GET_AUTH_SESSION_TICKET_RESPONSE, bytes(&TicketResponse { ticket, result: RESULT_OK }));
     ticket
+}
+
+/// Presence that says this copy's auth tickets carry PeerParty's proof (no real Steam
+/// client signs them): a ticket for this player without one isn't this player's.
+pub const KEY_TICKETS: &str = "peerparty:tickets";
+
+/// A ticket steam_api just wrote (`ticket`, `*len` bytes, room for `max`): with no real
+/// Steam client to sign it, PeerParty's proof goes on the end (`Lan::auth_ticket`), so
+/// the PC it goes to can tell whose it is.
+///
+/// # Safety
+/// `ticket` holds `max` bytes and `len` points at the length written.
+pub unsafe fn add_ticket_proof(ticket: *mut u8, max: i32, len: *mut u32) {
+    if real_steam_client() || ticket.is_null() || len.is_null() {
+        return;
+    }
+    let Some(proof) = net::lan().and_then(|l| l.auth_ticket()) else { return };
+    let n = unsafe { *len } as usize;
+    if n + proof.len() > max.max(0) as usize {
+        return;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(proof.as_ptr(), ticket.add(n), proof.len());
+        *len = (n + proof.len()) as u32;
+    }
+}
+
+/// BeginAuthSession for a LAN player's SteamID `user` (`peer`): 0 (OK) or 1
+/// (k_EBeginAuthSessionResultInvalidTicket). A ticket with PeerParty's proof must be
+/// that player's; one without is that player's only if their copy doesn't put proofs
+/// on its tickets (it has a real Steam client, whose tickets can't be checked here).
+pub fn auth_verdict(ticket: *const u8, len: i32, user: u64, peer: PeerId) -> i32 {
+    let Some(lan) = net::lan() else { return 0 };
+    let bytes = if ticket.is_null() || len <= 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(ticket, len as usize) } };
+    let proves = lan.check_auth_ticket(bytes, peer);
+    let wants_proof = lan.presence(peer).iter().any(|(k, v)| k == KEY_TICKETS && v == "1");
+    match proves {
+        Some(true) => 0,
+        Some(false) => {
+            log!("steam-lan auth: a ticket for {user} isn't that player's (signed by someone else): refused");
+            1
+        }
+        None if wants_proof => {
+            log!("steam-lan auth: a ticket for {user} without that player's proof: refused");
+            1
+        }
+        None => 0,
+    }
 }
 
 /// The web API flavour (`GetTicketForWebApiResponse_t`), which newer games and EOS
@@ -707,6 +794,9 @@ unsafe extern "C" fn get_auth_session_ticket(
         len,
         identity
     );
+    if h != 0 {
+        unsafe { add_ticket_proof(ticket, max, len) };
+    }
     auth_ticket_issued(h)
 }
 
@@ -737,14 +827,7 @@ unsafe extern "C" fn get_friend_by_index(this: usize, index: i32, flags: i32) ->
     )
     .max(0);
     if index < n_real {
-        return real_call!(
-            "SteamAPI_ISteamFriends_GetFriendByIndex",
-            fn(usize, i32, i32) -> u64,
-            0,
-            this,
-            index,
-            flags
-        );
+        return real_friend_by_index(this, index, flags);
     }
     if flags & FRIEND_FLAG_IMMEDIATE == 0 {
         return 0;
@@ -950,6 +1033,9 @@ pub fn publish_presence() {
     if let Some(lobby) = crate::steammm::current_lobby_id() {
         kv.push((KEY_STEAM_LOBBY.into(), lobby.to_string()));
     }
+    if !real_steam_client() {
+        kv.push((KEY_TICKETS.into(), "1".into()));
+    }
     net::set_presence("steam", kv);
 }
 
@@ -997,7 +1083,8 @@ unsafe extern "C" fn clear_rich_presence(this: usize) {
 fn digital(name: &str, this: usize, input: u64, action: u64) -> u16 {
     let Some(f) = real(name) else { return 0 };
     let f: unsafe extern "C" fn(usize, u64, u64) -> u16 = unsafe { std::mem::transmute(f) };
-    let r = unsafe { f(this, input, action) };
+    // The real object: a stand-in's methods would gate the read a second time.
+    let r = unsafe { f(unwrap(this), input, action) };
     if crate::overlay::pads_held_back() { r & 0xFF00 } else { r }
 }
 
@@ -1007,11 +1094,55 @@ fn digital(name: &str, this: usize, input: u64, action: u64) -> u16 {
 fn analog(name: &str, out: *mut u8, this: usize, input: u64, action: u64) -> *mut u8 {
     let Some(f) = real(name) else { return out };
     let f: unsafe extern "C" fn(*mut u8, usize, u64, u64) -> *mut u8 = unsafe { std::mem::transmute(f) };
-    let r = unsafe { f(out, this, input, action) };
+    let r = unsafe { f(out, unwrap(this), input, action) };
     if crate::overlay::pads_held_back() && !r.is_null() {
         unsafe { std::ptr::write_bytes(r.add(4), 0, 8) };
     }
     r
+}
+
+/// ISteamInput's and ISteamController's C++ action reads, held at rest while the
+/// overlay shows, as the flat ones are (`digital`, `analog`). A C++ method returns a
+/// struct through a hidden pointer after `this`, whatever its size.
+pub fn input() -> Vec<(&'static str, usize)> {
+    vec![
+        ("GetDigitalActionData", v_input_digital as *const () as usize),
+        ("GetAnalogActionData", v_input_analog as *const () as usize),
+    ]
+}
+
+vmethod! {
+    fn v_input_digital(this: usize, out: *mut u8, input: u64, action: u64) -> *mut u8 {
+        let r = call_real!(this, "GetDigitalActionData", fn(*mut u8, u64, u64) -> *mut u8, std::ptr::null_mut(), out, input, action);
+        let r = if r.is_null() && !out.is_null() {
+            // No such method: nothing pressed, not active.
+            unsafe { std::ptr::write_bytes(out, 0, 2) };
+            out
+        } else {
+            r
+        };
+        // bState, then bActive (kept).
+        if crate::overlay::pads_held_back() && !r.is_null() {
+            unsafe { *r = 0 };
+        }
+        r
+    }
+}
+
+vmethod! {
+    fn v_input_analog(this: usize, out: *mut u8, input: u64, action: u64) -> *mut u8 {
+        let r = call_real!(this, "GetAnalogActionData", fn(*mut u8, u64, u64) -> *mut u8, std::ptr::null_mut(), out, input, action);
+        let r = if r.is_null() && !out.is_null() {
+            unsafe { std::ptr::write_bytes(out, 0, 16) };
+            out
+        } else {
+            r
+        };
+        if crate::overlay::pads_held_back() && !r.is_null() {
+            unsafe { std::ptr::write_bytes(r.add(4), 0, 8) };
+        }
+        r
+    }
 }
 
 unsafe extern "C" fn input_digital(this: usize, input: u64, action: u64) -> u16 {
@@ -1418,6 +1549,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reads_the_id_in_a_steam_appid_txt() {
+        assert_eq!(appid_in("480\n"), Some(480));
+        assert_eq!(appid_in("\u{feff} 1245620 \r\n"), Some(1245620));
+        assert_eq!(appid_in("0"), None);
+        assert_eq!(appid_in("abc"), None);
+    }
+
+    #[test]
     fn only_individual_accounts_count_as_a_real_steam_id() {
         assert!(plausible_steam_id(0x0110_0001_0BED_6549));
         assert!(plausible_steam_id(lan_steam_id(PeerId([7; 16]))));
@@ -1441,7 +1580,7 @@ mod tests {
             out
         }
         {
-            let mut r = REAL.lock().unwrap();
+            let mut r = REAL.write().unwrap();
             r.insert("SteamAPI_ISteamInput_GetDigitalActionData".into(), fake_digital as *const () as usize);
             r.insert("SteamAPI_ISteamInput_GetAnalogActionData".into(), fake_analog as *const () as usize);
         }

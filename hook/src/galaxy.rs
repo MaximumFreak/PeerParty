@@ -33,7 +33,7 @@
 //! a pointer to a copy on x64 (on x86 the 8 bytes go on the stack) and returns one
 //! through a hidden pointer after `this`.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::{CString, c_char};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
@@ -179,6 +179,9 @@ impl Iface {
 struct Layout {
     names: &'static [&'static str],
     certain: usize,
+    /// The DLL's own slot count (its RTTI), when it has more than `names`: a stand-in's
+    /// vtable has that many, the ones past `names` forwarding to the real object.
+    slots: usize,
 }
 
 static LAYOUTS: LazyLock<Mutex<HashMap<Iface, Option<Layout>>>> = LazyLock::new(Mutex::default);
@@ -232,8 +235,12 @@ fn row_for(version: (u32, u32, u32)) -> Option<usize> {
 }
 
 fn row() -> Option<usize> {
+    // No Galaxy DLL found yet: nothing to read, and nothing to remember.
+    let base = MODULE.load(Ordering::Relaxed);
+    if base == 0 {
+        return None;
+    }
     *ROW.get_or_init(|| {
-        let base = MODULE.load(Ordering::Relaxed);
         let version = file_version(base)?;
         let row = row_for(version);
         let (a, b, c) = version;
@@ -312,7 +319,7 @@ fn rtti_slots(base: usize, class: &str) -> Option<usize> {
     None
 }
 
-fn layout(iface: Iface) -> Option<(&'static [&'static str], usize)> {
+fn layout(iface: Iface) -> Option<(&'static [&'static str], usize, usize)> {
     let mut layouts = LAYOUTS.lock().unwrap();
     let got = layouts.entry(iface).or_insert_with(|| {
         let r = row()?;
@@ -324,8 +331,8 @@ fn layout(iface: Iface) -> Option<(&'static [&'static str], usize)> {
         let names = iface.table()[index as usize];
         let base = MODULE.load(Ordering::Relaxed);
         match rtti_slots(base, iface.class()) {
-            Some(n) if n == names.len() => Some(Layout { certain: n, names }),
-            None => Some(Layout { certain: names.len(), names }),
+            Some(n) if n == names.len() => Some(Layout { certain: n, names, slots: n }),
+            None => Some(Layout { certain: names.len(), names, slots: names.len() }),
             Some(n) => {
                 if let Some(near) = nearby_layout(r, at, iface.table(), n) {
                     log!(
@@ -333,7 +340,7 @@ fn layout(iface: Iface) -> Option<(&'static [&'static str], usize)> {
                         iface.class(),
                         names.len()
                     );
-                    return Some(Layout { certain: n, names: near });
+                    return Some(Layout { certain: n, names: near, slots: n });
                 }
                 // IUser's first methods (SignedIn, GetGalaxyID) are the same in every version.
                 let certain = if iface == Iface::User { 3 } else { 0 };
@@ -343,11 +350,11 @@ fn layout(iface: Iface) -> Option<(&'static [&'static str], usize)> {
                     names.len(),
                     if certain > 0 { "only its first methods are answered" } else { "left alone" }
                 );
-                (certain > 0).then_some(Layout { certain, names })
+                (certain > 0).then_some(Layout { certain, names, slots: n.max(names.len()) })
             }
         }
     });
-    got.as_ref().map(|l| (l.names, l.certain))
+    got.as_ref().map(|l| (l.names, l.certain, l.slots))
 }
 
 /// A DLL between two SDKs whose headers PeerParty has (1.152.10, between 1.152.9 and
@@ -370,7 +377,7 @@ fn nearby_layout(row: usize, at: usize, table: &'static [&'static [&'static str]
 }
 
 fn slot_of(iface: Iface, name: &str) -> Option<usize> {
-    let (names, certain) = layout(iface)?;
+    let (names, certain, _) = layout(iface)?;
     names.iter().position(|n| *n == name).filter(|i| *i < certain)
 }
 
@@ -383,7 +390,10 @@ struct Proxy {
     real: usize,
 }
 
-static PROXIES: LazyLock<Mutex<HashMap<usize, usize>>> = LazyLock::new(Mutex::default);
+/// Stand-ins by the real object and the interface it was asked for as: an address the
+/// DLL reuses for another interface's object (after a shutdown) gets a stand-in of its
+/// own, never one with the other interface's methods.
+static PROXIES: LazyLock<Mutex<HashMap<(usize, Iface), usize>>> = LazyLock::new(Mutex::default);
 static REALS: LazyLock<Mutex<HashMap<usize, (usize, Iface)>>> = LazyLock::new(Mutex::default);
 
 fn overrides(iface: Iface) -> Vec<(&'static str, usize)> {
@@ -411,10 +421,10 @@ fn wrap(real: usize, iface: Iface) -> usize {
     if REALS.lock().unwrap().contains_key(&real) {
         return real;
     }
-    if let Some(p) = PROXIES.lock().unwrap().get(&real) {
+    if let Some(p) = PROXIES.lock().unwrap().get(&(real, iface)) {
         return *p;
     }
-    let Some((names, certain)) = layout(iface) else { return real };
+    let Some((names, certain, slots)) = layout(iface) else { return real };
     let mine = overrides(iface);
     let mut ours = 0;
     let mut vtable = Vec::with_capacity(names.len());
@@ -432,9 +442,16 @@ fn wrap(real: usize, iface: Iface) -> usize {
         };
         vtable.push(f);
     }
+    // A newer DLL's methods past the header's: passed on as they are.
+    for i in names.len()..slots {
+        match crate::steamobj::forward_stub(i) {
+            Some(s) => vtable.push(s),
+            None => return real,
+        }
+    }
     let vtable = Box::leak(vtable.into_boxed_slice()).as_ptr();
     let proxy = Box::leak(Box::new(Proxy { vtable, real })) as *const Proxy as usize;
-    PROXIES.lock().unwrap().insert(real, proxy);
+    PROXIES.lock().unwrap().insert((real, iface), proxy);
     REALS.lock().unwrap().insert(proxy, (real, iface));
     log!("galaxy {}: peerparty answers {ours} of its {} methods", iface.class(), names.len() - 1);
     proxy
@@ -465,18 +482,36 @@ macro_rules! real {
 }
 
 /// Calls virtual method `slot` of a game object (thiscall on x86).
+/// Calls a listener's method, unless the game has unregistered that listener since
+/// (it may be freed by now: listener calls are queued and made later).
 macro_rules! virt {
     ($obj:expr, $slot:expr, fn($($t:ty),*) $(, $arg:expr)*) => {{
         let obj: usize = $obj;
-        unsafe {
-            let f = *(*(obj as *const *const usize)).add($slot);
-            #[cfg(target_arch = "x86")]
-            let f: unsafe extern "thiscall" fn(usize $(, $t)*) = std::mem::transmute(f);
-            #[cfg(not(target_arch = "x86"))]
-            let f: unsafe extern "C" fn(usize $(, $t)*) = std::mem::transmute(f);
-            f(obj $(, $arg)*)
+        if !$crate::galaxy::listener_gone(obj) {
+            unsafe {
+                let f = *(*(obj as *const *const usize)).add($slot);
+                #[cfg(target_arch = "x86")]
+                let f: unsafe extern "thiscall" fn(usize $(, $t)*) = std::mem::transmute(f);
+                #[cfg(not(target_arch = "x86"))]
+                let f: unsafe extern "C" fn(usize $(, $t)*) = std::mem::transmute(f);
+                f(obj $(, $arg)*)
+            }
         }
     }};
+}
+
+/// Listeners the game unregistered and hasn't registered or handed to a call since.
+/// Its own lock: listener calls check it with the state unlocked or locked.
+static GONE: std::sync::LazyLock<Mutex<HashSet<usize>>> = std::sync::LazyLock::new(Default::default);
+
+pub(crate) fn listener_gone(l: usize) -> bool {
+    GONE.lock().unwrap().contains(&l)
+}
+
+fn listener_live(l: usize) {
+    if l != 0 {
+        GONE.lock().unwrap().remove(&l);
+    }
 }
 
 mod ext;
@@ -491,16 +526,25 @@ enum Filter {
     Near(String, i64),
 }
 
+struct Search {
+    listener: usize,
+    allow_full: bool,
+    filters: Vec<Filter>,
+    count: Option<usize>,
+}
+
 #[derive(Default)]
 struct State {
     /// Global listeners by ListenerType.
     listeners: HashMap<u32, Vec<usize>>,
     /// Calls to make on the game's thread, from ProcessData.
     queue: VecDeque<Box<dyn FnOnce() + Send>>,
+    /// Filters and count for the next RequestLobbyList.
     filters: Vec<Filter>,
     count: Option<usize>,
-    /// The lobby list search in flight: (core search, listener, allow full).
-    search: Option<(u64, usize, bool)>,
+    /// Lobby list searches in flight, by core search: each answers its own listener
+    /// with the filters it was asked with.
+    searches: HashMap<u64, Search>,
     results: Vec<u64>,
     known: HashMap<u64, Lobby>,
     joins: HashMap<String, usize>,
@@ -510,8 +554,14 @@ struct State {
     messages: crate::lobbychat::Log<(u64, Vec<u8>)>,
     /// Lobby messages from players not (yet) known to be members.
     inbox: crate::lobbychat::Inbox,
-    /// Packets by channel, taken from the LAN.
+    /// Packets by channel, taken from the LAN, and their bytes in all: bounded like the
+    /// LAN's own inbox (`P2P_HELD_*`), as a game may never read a channel.
     packets: HashMap<u8, VecDeque<(u64, Vec<u8>)>>,
+    packet_bytes: usize,
+    /// Packets taken from the LAN whose OnP2PPacketAvailable hasn't gone out yet:
+    /// (channel, size). A read on one channel takes every channel's packets, and the
+    /// others are still announced.
+    unannounced: Vec<(u8, u32)>,
     rich: BTreeMap<String, String>,
     /// This player's user data (kept for the run; LAN players have none).
     user_data: BTreeMap<String, String>,
@@ -565,6 +615,8 @@ fn later(f: impl FnOnce() + Send + 'static) {
 
 /// The listener given with a call plus the global ones of its type, each once.
 fn targets(kind: &str, specific: usize) -> Vec<usize> {
+    // A listener handed to a call is live, even at an address an unregistered one had.
+    listener_live(specific);
     targets_locked(&S.lock().unwrap(), kind, specific)
 }
 
@@ -686,6 +738,7 @@ fn registrar() -> Vec<(&'static str, usize)> {
 vmethod! {
     fn register(this: usize, kind: u32, listener: usize) {
         if listener != 0 {
+            listener_live(listener);
             let mut st = S.lock().unwrap();
             let v = st.listeners.entry(kind).or_default();
             if !v.contains(&listener) {
@@ -698,8 +751,16 @@ vmethod! {
 
 vmethod! {
     fn unregister(this: usize, kind: u32, listener: usize) {
-        if let Some(v) = S.lock().unwrap().listeners.get_mut(&kind) {
-            v.retain(|l| *l != listener);
+        // Global or specific (a call's listener being cancelled): either way no
+        // queued call reaches it now, unless it is still registered for another type.
+        {
+            let mut st = S.lock().unwrap();
+            if let Some(v) = st.listeners.get_mut(&kind) {
+                v.retain(|l| *l != listener);
+            }
+            if listener != 0 && !st.listeners.values().any(|v| v.contains(&listener)) {
+                GONE.lock().unwrap().insert(listener);
+            }
         }
         real!(this, "Unregister", fn(u32, usize) -> (), (), kind, listener);
     }
@@ -733,9 +794,37 @@ fn user() -> Vec<(&'static str, usize)> {
         ("GetUserDataCount", get_user_data_count as *const () as usize),
         ("GetUserDataByIndex", get_user_data_by_index as *const () as usize),
         ("DeleteUserData", delete_user_data as *const () as usize),
+        // Older SDKs: no listener, and before 1.73 no user (this player's own data).
+        ("RequestUserData~0", request_user_data_0 as *const () as usize),
+        ("RequestUserData~1", request_user_data_1 as *const () as usize),
+        ("SetUserData~2", set_user_data_2 as *const () as usize),
+        ("DeleteUserData~1", delete_user_data_1 as *const () as usize),
+        ("GetUserData~1", get_user_data_1 as *const () as usize),
+        ("GetUserDataCopy~3", get_user_data_copy_3 as *const () as usize),
+        ("GetUserDataCount~0", get_user_data_count_0 as *const () as usize),
+        ("GetUserDataByIndex~5", get_user_data_by_index_5 as *const () as usize),
     ];
     v.dedup();
     v
+}
+
+// IUser's older shapes: the same calls without a listener (results go to the global
+// listeners, as those SDKs had only those) or without a user (this player).
+vmethod! { fn request_user_data_0(this: usize) { unsafe { request_user_data(this, by_value(&my_id()), 0) } } }
+vmethod! { fn request_user_data_1(this: usize, user: Gid) { unsafe { request_user_data(this, user, 0) } } }
+vmethod! { fn set_user_data_2(this: usize, key: *const c_char, value: *const c_char) { unsafe { set_user_data(this, key, value, 0) } } }
+vmethod! { fn delete_user_data_1(this: usize, key: *const c_char) { unsafe { delete_user_data(this, key, 0) } } }
+vmethod! { fn get_user_data_1(this: usize, key: *const c_char) -> *const c_char { unsafe { get_user_data(this, key, by_value(&0)) } } }
+vmethod! {
+    fn get_user_data_copy_3(this: usize, key: *const c_char, buf: *mut c_char, len: u32) {
+        unsafe { get_user_data_copy(this, key, buf, len, by_value(&0)) }
+    }
+}
+vmethod! { fn get_user_data_count_0(this: usize) -> u32 { unsafe { get_user_data_count(this, by_value(&0)) } } }
+vmethod! {
+    fn get_user_data_by_index_5(this: usize, index: u32, key: *mut c_char, klen: u32, value: *mut c_char, vlen: u32) -> bool {
+        unsafe { get_user_data_by_index(this, index, key, klen, value, vlen, by_value(&0)) }
+    }
 }
 
 fn signed_in_now(listener: usize) {
@@ -942,9 +1031,31 @@ vmethod! { fn set_rich_presence_2(this: usize, key: *const c_char, value: *const
 vmethod! { fn delete_rich_presence_1(this: usize, key: *const c_char) -> bool { unsafe { delete_rich_presence(this, key, 0) }; true } }
 vmethod! { fn clear_rich_presence_0(this: usize) -> bool { unsafe { clear_rich_presence(this, 0) }; true } }
 vmethod! { fn request_friend_list_0(this: usize) { unsafe { request_friend_list(this, 0) } } }
-vmethod! { fn send_invitation_2(this: usize, user: Gid, connect: *const c_char) { unsafe { send_invitation(this, user, connect, 0) } } }
-vmethod! { fn request_user_information_1(this: usize, user: Gid) { unsafe { request_user_information(this, user, 0, 0) } } }
-vmethod! { fn request_user_information_2(this: usize, user: Gid, criteria: u32) { unsafe { request_user_information(this, user, criteria, 0) } } }
+// A player who isn't on the LAN is Galaxy's: its own method, in this SDK's shape.
+vmethod! {
+    fn send_invitation_2(this: usize, user: Gid, connect: *const c_char) {
+        if peer_of(gid(user)).is_none() {
+            return real!(this, "SendInvitation~2", fn(Gid, *const c_char) -> (), (), user, connect);
+        }
+        unsafe { send_invitation(this, user, connect, 0) }
+    }
+}
+vmethod! {
+    fn request_user_information_1(this: usize, user: Gid) {
+        if peer_of(gid(user)).is_none() {
+            return real!(this, "RequestUserInformation~1", fn(Gid) -> (), (), user);
+        }
+        unsafe { request_user_information(this, user, 0, 0) }
+    }
+}
+vmethod! {
+    fn request_user_information_2(this: usize, user: Gid, criteria: u32) {
+        if peer_of(gid(user)).is_none() {
+            return real!(this, "RequestUserInformation~2", fn(Gid, u32) -> (), (), user, criteria);
+        }
+        unsafe { request_user_information(this, user, criteria, 0) }
+    }
+}
 vmethod! { fn request_rich_presence_1(this: usize, user: Gid) { unsafe { request_rich_presence(this, user, 0) } } }
 vmethod! { fn sign_in_steam(_this: usize, _ticket: usize, _size: u32, _name: usize, listener: usize) { signed_in_now(listener) } }
 vmethod! { fn sign_in_galaxy(_this: usize, _online: bool, _timeout: u32, listener: usize) { signed_in_now(listener) } }
@@ -1000,10 +1111,18 @@ vmethod! {
             return real!(this, "RequestUserInformation", fn(Gid, u32, usize) -> (), (), user, criteria, listener);
         }
         ours();
-        let to = targets(USER_INFORMATION_RETRIEVE, listener);
+        // SDKs before 1.126 have no retrieve listener: their games hear of a player's
+        // details through the persona listeners.
+        let (to, persona) = match listener_type(USER_INFORMATION_RETRIEVE) {
+            Some(_) => (targets(USER_INFORMATION_RETRIEVE, listener), Vec::new()),
+            None => (Vec::new(), targets(PERSONA_DATA_CHANGED, 0)),
+        };
         later(move || {
             for l in to {
                 virt!(l, 1, fn(Gid), by_value(&id));
+            }
+            for l in persona {
+                virt!(l, 1, fn(Gid, u32), by_value(&id), PERSONA_CHANGE_NAME);
             }
         });
     }
@@ -1158,7 +1277,11 @@ vmethod! {
         ours();
         let id = gid(user);
         let id = if id == 0 { my_id() } else { id };
-        let to = targets(RICH_PRESENCE_RETRIEVE, listener);
+        // Before 1.126 there is no retrieve listener: the rich presence listeners hear it.
+        let to = match listener_type(RICH_PRESENCE_RETRIEVE) {
+            Some(_) => targets(RICH_PRESENCE_RETRIEVE, listener),
+            None => targets(RICH_PRESENCE, 0),
+        };
         later(move || {
             for l in to {
                 virt!(l, 1, fn(Gid), by_value(&id));
@@ -1217,7 +1340,8 @@ vmethod! {
     /// The overlay's invite dialog: every LAN friend is invited.
     fn show_overlay_invite_dialog(_this: usize, connect: *const c_char) {
         ours();
-        // PeerParty's overlay opens on its invite page; without one everyone is invited.
+        // PeerParty's overlay opens on its invite page; without one every LAN friend is
+        // invited (not room or public players), as with Steam's dialog.
         let c = s(connect);
         if !crate::overlay::invite_dialog(&c, None) {
             crate::invite::send(None, &c);
@@ -1421,7 +1545,11 @@ vmethod! {
         let mut q = Query::new(NS);
         q.max_results = 500;
         let search = lan.search(q);
-        S.lock().unwrap().search = Some((search, listener, allow_full));
+        listener_live(listener);
+        let mut st = S.lock().unwrap();
+        let filters = std::mem::take(&mut st.filters);
+        let count = st.count.take();
+        st.searches.insert(search, Search { listener, allow_full, filters, count });
         log!("galaxy RequestLobbyList");
     }
 }
@@ -1842,16 +1970,45 @@ fn networking() -> Vec<(&'static str, usize)> {
     ]
 }
 
-/// Moves packets that have arrived into our per-channel queues; returns the new ones.
-fn take_packets() -> Vec<(u8, u32)> {
-    let Some(lan) = lan() else { return Vec::new() };
-    let mut fresh = Vec::new();
+/// What the per-channel queues hold at most, all channels together: past it a
+/// channel's oldest packets go (the LAN's inbox has the same limits).
+const P2P_HELD_PACKETS: usize = 65_536;
+const P2P_HELD_BYTES: usize = 64 << 20;
+
+/// Moves packets that have arrived into our per-channel queues, to be announced.
+fn take_packets() {
+    let Some(lan) = lan() else { return };
     while let Some(p) = lan.receive_where(None, |s| s == P2P) {
         let from = galaxy_id(p.peer);
-        fresh.push((p.channel, p.data.len() as u32));
-        S.lock().unwrap().packets.entry(p.channel).or_default().push_back((from, p.data));
+        let (channel, len) = (p.channel, p.data.len() as u32);
+        let mut st = S.lock().unwrap();
+        let st = &mut *st;
+        let dropped = hold_packet(&mut st.packets, &mut st.packet_bytes, channel, from, p.data);
+        if dropped > 0 {
+            crate::log::throttled("galaxy p2p held full", 2, |n| {
+                log!("galaxy: {P2P_HELD_PACKETS} packets / {} MiB unread; channel {channel}'s oldest dropped (n={n})", P2P_HELD_BYTES >> 20)
+            });
+        }
+        st.unannounced.push((channel, len));
     }
-    fresh
+}
+
+/// Queues a packet on its channel; returns how many of that channel's oldest went to
+/// keep within `P2P_HELD_*`.
+fn hold_packet(packets: &mut HashMap<u8, VecDeque<(u64, Vec<u8>)>>, bytes: &mut usize, channel: u8, from: u64, data: Vec<u8>) -> usize {
+    let held: usize = packets.values().map(VecDeque::len).sum();
+    let q = packets.entry(channel).or_default();
+    let mut dropped = 0;
+    let (mut held, len) = (held, data.len());
+    while !q.is_empty() && (held + 1 > P2P_HELD_PACKETS || *bytes + len > P2P_HELD_BYTES) {
+        let (_, old) = q.pop_front().unwrap();
+        *bytes -= old.len();
+        held -= 1;
+        dropped += 1;
+    }
+    *bytes += len;
+    q.push_back((from, data));
+    dropped
 }
 
 vmethod! {
@@ -1874,8 +2031,14 @@ vmethod! {
 fn front(channel: u8, take: bool) -> Option<(u64, Vec<u8>)> {
     take_packets();
     let mut st = S.lock().unwrap();
+    let st = &mut *st;
     let q = st.packets.get_mut(&channel)?;
-    if take { q.pop_front() } else { q.front().cloned() }
+    if !take {
+        return q.front().cloned();
+    }
+    let p = q.pop_front()?;
+    st.packet_bytes -= p.1.len();
+    Some(p)
 }
 
 fn hand_out(p: Option<(u64, Vec<u8>)>, dest: *mut u8, cap: u32, size: *mut u32, from: *mut u64) -> bool {
@@ -2089,33 +2252,14 @@ fn search_done(search: u64, results: &[Lobby]) {
         }));
         return;
     }
-    let Some((s_id, listener, allow_full)) = st.search else { return };
-    if s_id != search {
-        return;
-    }
-    st.search = None;
-    let mut hits: Vec<Lobby> = results
-        .iter()
-        .filter(|l| l.namespace == NS && lobby_of(&l.id).is_some())
-        .filter(|l| allow_full || l.open_slots() > 0)
-        .filter(|l| text(l, KEY_JOINABLE).is_none_or(|v| v != "0"))
-        .filter(|l| st.filters.iter().all(|f| passes(l, f)))
-        .cloned()
-        .collect();
-    for f in &st.filters {
-        if let Filter::Near(k, target) = f {
-            hits.sort_by_key(|l| text(l, k).and_then(|t| t.trim().parse::<i64>().ok()).map_or(i64::MAX, |v| (v - target).abs()));
-        }
-    }
-    hits.truncate(st.count.unwrap_or(100));
+    let Some(Search { listener, allow_full, filters, count }) = st.searches.remove(&search) else { return };
+    let hits = list_hits(results, allow_full, &filters, count);
     st.results = hits.iter().filter_map(|l| lobby_of(&l.id)).collect();
     for l in hits {
         if let Some(id) = lobby_of(&l.id) {
             st.known.insert(id, l);
         }
     }
-    st.filters.clear();
-    st.count = None;
     let n = st.results.len() as u32;
     log!("galaxy lobby list: {n} lobbies");
     let to = targets_locked(&st, LOBBY_LIST, listener);
@@ -2125,6 +2269,35 @@ fn search_done(search: u64, results: &[Lobby]) {
             virt!(l, 1, fn(u32, u32), n, 0);
         }
     }));
+}
+
+/// A lobby list request's answer: the lobbies its filters pass, nearest first (the
+/// first near filter deciding first), at most its count.
+fn list_hits(results: &[Lobby], allow_full: bool, filters: &[Filter], count: Option<usize>) -> Vec<Lobby> {
+    let mut hits: Vec<Lobby> = results
+        .iter()
+        .filter(|l| l.namespace == NS && lobby_of(&l.id).is_some())
+        .filter(|l| allow_full || l.open_slots() > 0)
+        .filter(|l| text(l, KEY_JOINABLE).is_none_or(|v| v != "0"))
+        .filter(|l| filters.iter().all(|f| passes(l, f)))
+        .cloned()
+        .collect();
+    let near: Vec<(&String, i64)> = filters
+        .iter()
+        .filter_map(|f| match f {
+            Filter::Near(k, target) => Some((k, *target)),
+            _ => None,
+        })
+        .collect();
+    if !near.is_empty() {
+        hits.sort_by_cached_key(|l| {
+            near.iter()
+                .map(|(k, target)| text(l, k).and_then(|t| t.trim().parse::<i64>().ok()).map_or(u64::MAX, |v| v.abs_diff(*target)))
+                .collect::<Vec<u64>>()
+        });
+    }
+    hits.truncate(count.unwrap_or(100));
+    hits
 }
 
 fn targets_locked(st: &State, kind: &str, specific: usize) -> Vec<usize> {
@@ -2170,7 +2343,8 @@ fn pump() {
         }
     }
     ext::pump();
-    let fresh = take_packets();
+    take_packets();
+    let fresh = std::mem::take(&mut S.lock().unwrap().unannounced);
     if !fresh.is_empty() {
         let to = targets(NETWORKING, 0);
         later(move || {
@@ -2342,6 +2516,21 @@ where
 mod tests {
     use super::*;
 
+    #[test]
+    fn unread_packets_are_held_within_the_lans_limits() {
+        let (mut q, mut bytes) = (HashMap::new(), 0usize);
+        let big = P2P_HELD_BYTES / 4;
+        for _ in 0..4 {
+            assert_eq!(hold_packet(&mut q, &mut bytes, 1, 7, vec![0; big]), 0);
+        }
+        assert_eq!(bytes, P2P_HELD_BYTES);
+        assert_eq!(hold_packet(&mut q, &mut bytes, 1, 7, vec![1; 10]), 1, "the oldest goes");
+        assert_eq!(bytes, P2P_HELD_BYTES - big + 10);
+        assert_eq!(q[&1].len(), 4);
+        // Another channel's packet still gets in while that one is full of others'.
+        assert_eq!(hold_packet(&mut q, &mut bytes, 2, 7, vec![2; 10]), 0);
+    }
+
     /// A player's GalaxyID comes from its peer id, whatever it publishes.
     #[test]
     fn a_published_galaxy_id_is_not_taken() {
@@ -2417,7 +2606,9 @@ mod tests {
             let names = iface.table()[galaxyvt::VERSIONS[r].1[at] as usize];
             let mine = overrides(iface);
             for (n, _) in &mine {
-                assert!(names.contains(n), "{} {n}", iface.class());
+                // An older SDK's shape (`name~args`) is in that SDK's layout.
+                let known = if n.contains('~') { iface.table().iter().any(|row| row.contains(n)) } else { names.contains(n) };
+                assert!(known, "{} {n}", iface.class());
             }
             // Every slot of the newest SDK is PeerParty's, except IApps' local ones and
             // IUser's / IFriends' calls about non-LAN players.
@@ -2437,7 +2628,7 @@ mod tests {
         use windows_sys::Win32::System::LibraryLoader::LoadLibraryExW;
         let path = if cfg!(target_arch = "x86") { String::new() } else { std::env::var("PPTEST_GALAXY_DLL").unwrap_or_default() };
         if path.is_empty() || !std::path::Path::new(&path).is_file() {
-            return;
+            return crate::skip("PPTEST_GALAXY_DLL names no Galaxy64.dll 1.152.11");
         }
         let wide: Vec<u16> = std::ffi::OsStr::new(&path).encode_wide().chain(Some(0)).collect();
         let base = unsafe { LoadLibraryExW(wide.as_ptr(), std::ptr::null_mut(), 0x1) } as usize;
@@ -2501,7 +2692,7 @@ mod tests {
         // PPTEST_GALAXY_1152_6_DLL: a copy of a game's 64-bit Galaxy64.dll 1.152.6.
         let path = if cfg!(target_arch = "x86") { String::new() } else { std::env::var("PPTEST_GALAXY_1152_6_DLL").unwrap_or_default() };
         if path.is_empty() || !std::path::Path::new(&path).is_file() {
-            return;
+            return crate::skip("PPTEST_GALAXY_1152_6_DLL names no Galaxy64.dll 1.152.6");
         }
         let wide: Vec<u16> = std::ffi::OsStr::new(&path).encode_wide().chain(Some(0)).collect();
         let base = unsafe { LoadLibraryExW(wide.as_ptr(), std::ptr::null_mut(), DONT_RESOLVE) } as usize;

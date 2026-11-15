@@ -200,6 +200,14 @@ const TIMEOUT_MS: i64 = 10_000;
 const OBJECT_WORDS: usize = 1 << 16;
 const ROOM_OBJECTS: usize = 8192;
 const ROOM_WORDS: usize = 1 << 21;
+/// A notify packet's fragments are numbered in 7 bits: one needing more isn't sent
+/// (its numbers would wrap), and a client's is put together from no more than this.
+const FRAGMENTS_MAX: usize = 127;
+/// Reliable messages a client may send ahead of the one it still owes.
+const AHEAD_MAX: u64 = 1024;
+/// Messages waiting to go to one client: past this, unreliable ones go first, then
+/// the newest is dropped (a client this far behind has stopped reading).
+const OUT_MAX: usize = 4096;
 
 struct Object {
     words: Vec<i32>,
@@ -374,12 +382,20 @@ impl Conn {
     fn raw_player(&self) -> i32 {
         self.player as i32 + 1
     }
-    fn queue(&mut self, mut m: Message) {
+    /// False when the message was dropped: the queue is full of reliable ones.
+    fn queue(&mut self, mut m: Message) -> bool {
+        if self.out.len() >= OUT_MAX {
+            self.out.retain(|q| q.flags & msg::UNRELIABLE == 0);
+            if self.out.len() >= OUT_MAX {
+                return false;
+            }
+        }
         if m.flags & msg::UNRELIABLE == 0 {
             self.out_seq += 1;
             m.seq = self.out_seq;
         }
         self.out.push_back(m);
+        true
     }
 }
 
@@ -615,7 +631,7 @@ impl Server {
             if index == 1 {
                 c.fragments = Some((h.seq, 1, data.to_vec()));
             } else if let Some((seq, last, buf)) = c.fragments.as_mut() {
-                if *seq == h.seq && *last + 1 == index {
+                if *seq == h.seq && *last + 1 == index && buf.len() + data.len() <= FRAGMENTS_MAX * packet::MTU {
                     *last = index;
                     buf.extend_from_slice(&data[packet::HEADER..]);
                 } else {
@@ -716,7 +732,7 @@ impl Server {
         }
         let aoi = r.u8()?;
         for _ in 0..aoi {
-            r.bits(32 * 5)?;
+            r.skip(32 * 5)?;
         }
         let raw = self.conns[&actor].raw_player();
         // Destroys.
@@ -820,7 +836,7 @@ impl Server {
             self.route(actor, m, master, out);
             return;
         }
-        if m.seq <= c.in_seq {
+        if m.seq <= c.in_seq || m.seq > c.in_seq + AHEAD_MAX {
             return;
         }
         c.in_waiting.insert(m.seq, m);
@@ -846,17 +862,29 @@ impl Server {
         }
         if m.flags & msg::TARGET_PLAYER != 0 {
             let target = m.target;
-            if let Some(c) = self.conns.values_mut().find(|c| c.raw_player() == target) {
+            let mut full = Vec::new();
+            if let Some((a, c)) = self.conns.iter_mut().find(|(_, c)| c.raw_player() == target) {
                 let mut f = m;
                 f.target = 0;
-                c.queue(f);
+                if !c.queue(f) {
+                    full.push(*a);
+                }
             }
+            self.log_full(full);
             return;
         }
+        let mut full = Vec::new();
         for (a, c) in self.conns.iter_mut() {
-            if *a != actor {
-                c.queue(m.clone());
+            if *a != actor && !c.queue(m.clone()) {
+                full.push(*a);
             }
+        }
+        self.log_full(full);
+    }
+
+    fn log_full(&mut self, actors: Vec<i32>) {
+        for a in actors {
+            self.log.push(format!("photon: Fusion Shared: {OUT_MAX} messages wait for actor {a}; a message to it was dropped"));
         }
     }
 
@@ -1064,7 +1092,11 @@ impl Server {
         }
         let mut bytes = h.bytes().to_vec();
         bytes.extend_from_slice(&w.data);
-        for p in fragments(&bytes) {
+        let parts = fragments(&bytes);
+        if parts.is_empty() {
+            self.log.push(format!("photon: Fusion Shared packet for actor {actor} too big to send ({} bytes)", bytes.len()));
+        }
+        for p in parts {
             out.push((actor, p));
         }
     }
@@ -1094,7 +1126,8 @@ fn accepted(local: u64, remote: u64, counter: u32) -> Vec<u8> {
     b
 }
 
-/// A notify packet as sent: whole, or in MTU-sized fragments.
+/// A notify packet as sent: whole, or in MTU-sized fragments; none if it would take
+/// more than `FRAGMENTS_MAX`.
 fn fragments(p: &[u8]) -> Vec<Vec<u8>> {
     if p.len() <= packet::MTU {
         return vec![p.to_vec()];
@@ -1102,6 +1135,9 @@ fn fragments(p: &[u8]) -> Vec<Vec<u8>> {
     let body = &p[packet::HEADER..];
     let chunks: Vec<&[u8]> = body.chunks(packet::MTU - packet::HEADER).collect();
     let n = chunks.len();
+    if n > FRAGMENTS_MAX {
+        return Vec::new();
+    }
     chunks
         .into_iter()
         .enumerate()
@@ -1117,6 +1153,16 @@ fn fragments(p: &[u8]) -> Vec<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_packet_too_big_for_seven_bit_fragment_numbers_is_not_sent() {
+        let per = packet::MTU - packet::HEADER;
+        let fits = vec![0u8; packet::HEADER + per * FRAGMENTS_MAX];
+        let parts = fragments(&fits);
+        assert_eq!(parts.len(), FRAGMENTS_MAX);
+        assert_eq!(parts.last().unwrap()[1], FRAGMENTS_MAX as u8 | 0x80);
+        assert!(fragments(&vec![0u8; fits.len() + 1]).is_empty());
+    }
 
     /// A Fusion client as far as the tests need: the handshake, notify headers, and its
     /// side of the state and message encoding.
@@ -1177,6 +1223,15 @@ mod tests {
         /// Sends a notify packet: owned objects (all words, created when `create`),
         /// destroys and messages.
         fn send(&mut self, s: &mut Server, now: i64, objects: &[(u32, Vec<i32>, bool)], destroys: &[u32], msgs: Vec<Message>) -> Out {
+            let mut out = Out::new();
+            for f in self.packets(objects, destroys, msgs) {
+                out.extend(s.packet(self.actor, &f, now, 1));
+            }
+            out
+        }
+
+        /// The packets (fragments) `send` sends.
+        fn packets(&mut self, objects: &[(u32, Vec<i32>, bool)], destroys: &[u32], msgs: Vec<Message>) -> Vec<Vec<u8>> {
             let mut w = BitWriter::default();
             w.bool(true);
             w.u32(1);
@@ -1227,11 +1282,7 @@ mod tests {
             let h = Notify { kind: packet::NOTIFY_DATA, fragment: 0, seq: self.seq, ack: self.recv, mask: self.mask };
             let mut b = h.bytes().to_vec();
             b.extend_from_slice(&w.data);
-            let mut out = Out::new();
-            for f in fragments(&b) {
-                out.extend(s.packet(self.actor, &f, now, 1));
-            }
-            out
+            fragments(&b)
         }
 
         /// Reads what the server sent this client, as far as the tests look.
@@ -1395,6 +1446,37 @@ mod tests {
         let more = sized(OBJECT_WORDS);
         a.send(&mut s, 30, &more, &[], vec![]);
         assert_eq!(s.objects.len(), had + fit, "and none after");
+    }
+
+    /// Relayed packets that are mutated or noise, from connected players and strangers
+    /// (see photon/tests.rs): the server neither panics nor holds more than its limits.
+    #[test]
+    fn fuzz_relayed_packets() {
+        use crate::photon::tests::{rounds, Rng};
+        let mut s = Server::new(60, 4);
+        let (mut a, mut b) = (Client::new(1), Client::new(2));
+        a.connect(&mut s, 0);
+        b.connect(&mut s, 0);
+        let base = a.counter << 19;
+        let mut seeds = a.packets(&[(base | 1, vec![5; 64], true), (base | 2, vec![-3; 600], true)], &[], vec![]);
+        seeds.extend(b.packets(&[], &[base | 1], vec![]));
+        seeds.extend(a.packets(&[(base | 1, vec![7; 64], false)], &[], vec![]));
+        let mut connect = vec![0u8; 152];
+        connect[0] = packet::COMMAND;
+        connect[1] = packet::CONNECT;
+        seeds.push(connect);
+        let mut rng = Rng(0x5eed_0005);
+        for i in 0..rounds() {
+            let now = 10 + i as i64;
+            let p = rng.mutate(&seeds[i % seeds.len()]);
+            // Players 1 and 2, and actor 3, which never connected.
+            let _ = s.packet(1 + (i % 3) as i32, &p, now, 1);
+            if i % 16 == 0 {
+                let _ = s.tick(now);
+            }
+        }
+        let words: usize = s.objects.values().map(|o| o.words.len()).sum();
+        assert!(words <= ROOM_WORDS, "{words} words held");
     }
 
     #[test]

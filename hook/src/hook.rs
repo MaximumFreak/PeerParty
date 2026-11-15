@@ -8,9 +8,6 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Mutex;
 
 use retour::RawDetour;
-use windows_sys::Win32::System::Memory::{
-    MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc,
-};
 
 use crate::log;
 use crate::pe::Export;
@@ -106,9 +103,29 @@ static ARENA: Mutex<Arena> = Mutex::new(Arena { chunks: Vec::new() });
 pub static LAST_ARGS: Mutex<[usize; 7]> = Mutex::new([0; 7]);
 
 struct Arena {
-    /// (base, capacity, used) for each executable slab. Old slabs stay mapped:
-    /// stubs in them keep running.
-    chunks: Vec<(usize, usize, usize)>,
+    /// (where it's written, where it runs, capacity, used) for each slab (`wx_block`).
+    /// Old slabs stay mapped: stubs in them keep running.
+    chunks: Vec<(usize, usize, usize, usize)>,
+}
+
+/// Memory for code made at run time, mapped twice: written through a read-write view,
+/// run from a read-execute one (the same pages), so no page is ever writable and
+/// executable at once. (write, run) addresses; the code must not depend on where it
+/// is, which every stub and thunk here doesn't (absolute targets, `[rip+0]`).
+pub(crate) fn wx_block(size: usize) -> Option<(usize, usize)> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_EXECUTE, FILE_MAP_READ, FILE_MAP_WRITE, MapViewOfFile, PAGE_EXECUTE_READWRITE};
+    unsafe {
+        let section = CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_EXECUTE_READWRITE, (size as u64 >> 32) as u32, size as u32, std::ptr::null());
+        if section.is_null() {
+            return None;
+        }
+        let write = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, size).Value as usize;
+        let run = MapViewOfFile(section, FILE_MAP_READ | FILE_MAP_EXECUTE, 0, 0, size).Value as usize;
+        // The views keep the section.
+        CloseHandle(section);
+        (write != 0 && run != 0).then_some((write, run))
+    }
 }
 
 pub struct Summary {
@@ -154,7 +171,7 @@ fn install_locked(exports: &[Export], skip: &HashSet<usize>) -> Summary {
         let names = &groups[&addr];
         let label = primary(names);
         let name_ptr = leak_cstr(&label);
-        let (stub, tramp_off) = match place_stub(name_ptr) {
+        let (stub, stub_w, tramp_off) = match place_stub(name_ptr) {
             Some(v) => v,
             None => {
                 note_fail(&mut summary, format!("{label}: stub alloc failed"));
@@ -180,7 +197,7 @@ fn install_locked(exports: &[Export], skip: &HashSet<usize>) -> Summary {
             note_fail(&mut summary, format!("{label}: no trampoline"));
             continue;
         }
-        unsafe { stub.add(tramp_off).cast::<usize>().write_unaligned(tramp) };
+        unsafe { stub_w.add(tramp_off).cast::<usize>().write_unaligned(tramp) };
         if let Err(e) = unsafe { detour.enable() } {
             note_fail(&mut summary, format!("{label}: enable {e}"));
             continue;
@@ -217,34 +234,26 @@ fn leak_cstr(name: &str) -> *const u8 {
     ptr
 }
 
-fn place_stub(name: *const u8) -> Option<(*mut u8, usize)> {
+/// A stub for export `name`: (where it runs, where it's written, the trampoline
+/// address's offset in it).
+fn place_stub(name: *const u8) -> Option<(*mut u8, *mut u8, usize)> {
     let (bytes, tramp_off) = stub_bytes(name as usize, on_enter as *const () as usize);
     let mut arena = ARENA.lock().unwrap_or_else(|e| e.into_inner());
     let need = (bytes.len() + 15) & !15;
     let last_ok = arena
         .chunks
         .last()
-        .is_some_and(|(_, cap, used)| cap - used >= need);
+        .is_some_and(|(_, _, cap, used)| cap - used >= need);
     if !last_ok {
         let cap = need.max(0x1_0000);
-        let ptr = unsafe {
-            VirtualAlloc(
-                std::ptr::null(),
-                cap,
-                MEM_COMMIT | MEM_RESERVE,
-                PAGE_EXECUTE_READWRITE,
-            )
-        };
-        if ptr.is_null() {
-            return None;
-        }
-        arena.chunks.push((ptr as usize, cap, 0));
+        let (write, run) = wx_block(cap)?;
+        arena.chunks.push((write, run, cap, 0));
     }
-    let (base, _, used) = arena.chunks.last_mut()?;
-    let dest = (*base + *used) as *mut u8;
-    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dest, bytes.len()) };
+    let (write, run, _, used) = arena.chunks.last_mut()?;
+    let (w, r) = ((*write + *used) as *mut u8, (*run + *used) as *mut u8);
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), w, bytes.len()) };
     *used += need;
-    Some((dest, tramp_off))
+    Some((r, w, tramp_off))
 }
 
 /// Builds the stub. `tramp_off` is the offset of the pointer-sized absolute trampoline
@@ -514,6 +523,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn relocates_rip_operand_with_trailing_immediate() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc};
         let code = unsafe {
             VirtualAlloc(
                 std::ptr::null(),

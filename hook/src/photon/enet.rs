@@ -43,6 +43,9 @@ const CMD_HEADER: usize = 12;
 const MAX_CMDS: usize = 99;
 const CRC_TYPE: u8 = 204;
 const MAX_ASSEMBLY: usize = 500 * 1024;
+/// The biggest message taken over any transport: what fragments may add up to here, so
+/// TCP and WebSocket clients get the same limit as UDP ones.
+pub const MAX_MESSAGE: usize = MAX_ASSEMBLY;
 const WINDOW: u32 = 8192;
 /// What one peer may have waiting to be delivered: commands that came ahead of a gap,
 /// fragments of unfinished messages, messages not yet taken. Without it that is a window
@@ -192,7 +195,8 @@ pub fn parse(data: &[u8]) -> Result<(Header, Vec<Cmd>), &'static str> {
             return Err("truncated command header");
         }
         let len = be32(data, off + 4) as usize;
-        if len < CMD_HEADER || off + len > data.len() {
+        // Not `off + len`: on 32-bit a length near 4 GiB would wrap past the check.
+        if len < CMD_HEADER || len > data.len() - off {
             return Err("bad command length");
         }
         let mut c = Cmd {
@@ -596,13 +600,19 @@ impl Peer {
         let reliable = c.reliable();
         let unseq = c.unsequenced();
         if !reliable && unseq {
-            // Unsequenced groups: a 128-wide window of seen group numbers.
+            // Unsequenced groups: a 128-wide window of seen group numbers. Compared as
+            // distances, so the numbers can wrap: up to half the number space ahead is
+            // newer, the rest behind is old.
             let g = c.group;
             let idx = g % 128;
-            if g >= self.in_group + 128 {
+            let ahead = g.wrapping_sub(self.in_group);
+            if ahead >= 0x8000_0000 {
+                return false;
+            }
+            if ahead >= 128 {
                 self.in_group = g - idx;
                 self.group_window = [0; 4];
-            } else if g < self.in_group || self.group_window[(idx / 32) as usize] & (1 << (idx % 32)) != 0 {
+            } else if self.group_window[(idx / 32) as usize] & (1 << (idx % 32)) != 0 {
                 return false;
             }
             self.group_window[(idx / 32) as usize] |= 1 << (idx % 32);
@@ -1008,6 +1018,34 @@ mod tests {
         let (h, cmds) = parse(&d).unwrap();
         server.handle(&h, cmds, 11);
         assert_eq!(server.dispatch(), None);
+    }
+
+    /// Unsequenced group numbers can wrap: the window follows them past u32::MAX, a
+    /// group seen once is dropped the second time, an old one is dropped.
+    #[test]
+    fn unsequenced_groups_wrap() {
+        let (_, mut server) = pair();
+        let mut t = 20;
+        let mut send = |server: &mut Peer, g: u32| {
+            let mut c = Cmd::new(ct::UNSEQUENCED, 0, 0);
+            c.flags |= FLAG_UNSEQUENCED;
+            c.group = g;
+            c.payload = g.to_le_bytes().to_vec();
+            let d = build(&Header { peer_id: 7, crc: false, sent_time: 0, challenge: 0x1234_5678 }, &[c]);
+            let (h, cmds) = parse(&d).unwrap();
+            t += 1;
+            server.handle(&h, cmds, t);
+            std::iter::from_fn(|| server.dispatch()).count()
+        };
+        // Up to the top in jumps of less than half the number space.
+        assert_eq!(send(&mut server, 0x7000_0000), 1);
+        assert_eq!(send(&mut server, 0xE000_0000), 1);
+        assert_eq!(send(&mut server, 0xA000_0000), 0, "behind is old");
+        assert_eq!(send(&mut server, u32::MAX - 1), 1);
+        assert_eq!(send(&mut server, u32::MAX - 1), 0, "a duplicate");
+        assert_eq!(send(&mut server, 3), 1, "past the wrap");
+        assert_eq!(send(&mut server, u32::MAX - 300), 0, "an old one");
+        assert_eq!(send(&mut server, 4), 1);
     }
 
     #[test]

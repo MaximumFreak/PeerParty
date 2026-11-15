@@ -107,8 +107,9 @@ impl<'a> BitReader<'a> {
     pub fn seek(&mut self, pos: usize) {
         self.pos = pos;
     }
+    /// The next `n` bits (at most 64), lowest first.
     pub fn bits(&mut self, n: usize) -> Option<u64> {
-        if self.left() < n {
+        if n > 64 || self.left() < n {
             return None;
         }
         let mut v = 0u64;
@@ -120,6 +121,14 @@ impl<'a> BitReader<'a> {
         }
         self.pos += n;
         Some(v)
+    }
+    /// Passes over `n` bits, as many as they are.
+    pub fn skip(&mut self, n: usize) -> Option<()> {
+        if self.left() < n {
+            return None;
+        }
+        self.pos += n;
+        Some(())
     }
     pub fn u8(&mut self) -> Option<u8> {
         self.bits(8).map(|v| v as u8)
@@ -386,6 +395,10 @@ pub struct Plugin {
     /// Shared mode: PeerParty's Fusion server, from the first relayed packet on.
     shared: Option<super::shared::Server>,
     shared_mode: bool,
+    /// The host's actor once it left: the session ended with it (Fusion without host
+    /// migration), so no other peer may claim to be its host; the same actor coming
+    /// back (a rejoin within PlayerTTL) may.
+    host_left: Option<i32>,
 }
 
 /// What the plugin sends: (actor, message bytes), and lines for the log.
@@ -434,6 +447,11 @@ impl Plugin {
                     return;
                 }
                 let server = peer_mode == PEER_SERVER;
+                if server && self.host.is_none() && self.host_left.is_some_and(|h| h != sender) {
+                    log.push(format!("photon: Fusion room's host (actor {}) left; refusing actor {sender} as a new host", self.host_left.unwrap()));
+                    out.push((sender, encode(&Message::new(v, Body::Disconnect { reason: SERVER_ALREADY_IN_ROOM }))));
+                    return;
+                }
                 if server && self.host.is_some_and(|h| h != sender) {
                     log.push(format!("photon: Fusion room already has a host (actor {}); refusing actor {sender}", self.host.unwrap()));
                     out.push((sender, encode(&Message::new(v, Body::Disconnect { reason: SERVER_ALREADY_IN_ROOM }))));
@@ -444,6 +462,7 @@ impl Plugin {
                 if server {
                     asks |= join_requests::NETWORK_CONFIG;
                     self.host = Some(sender);
+                    self.host_left = None;
                 }
                 self.peers.insert(
                     sender,
@@ -551,6 +570,7 @@ impl Plugin {
         if self.host == Some(actor) {
             self.host = None;
             self.config = None;
+            self.host_left = Some(actor);
         }
     }
 }
@@ -663,5 +683,12 @@ mod tests {
         p.handle(1, &join(PEER_SERVER, CLIENT_SERVER), || [1; 8], &mut log);
         let out = p.handle(2, &join(PEER_SERVER, CLIENT_SERVER), || [2; 8], &mut log);
         assert!(matches!(bodies(&out, 2)[..], [Body::Disconnect { reason: SERVER_ALREADY_IN_ROOM }]));
+        // The host leaves: the session ended with it, nobody else takes it over; the
+        // same actor rejoining does.
+        p.left(1);
+        let out = p.handle(3, &join(PEER_SERVER, CLIENT_SERVER), || [3; 8], &mut log);
+        assert!(matches!(bodies(&out, 3)[..], [Body::Disconnect { reason: SERVER_ALREADY_IN_ROOM }]));
+        let out = p.handle(1, &join(PEER_SERVER, CLIENT_SERVER), || [1; 8], &mut log);
+        assert!(!bodies(&out, 1).iter().any(|b| matches!(b, Body::Disconnect { .. })), "the host's own rejoin");
     }
 }

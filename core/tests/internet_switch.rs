@@ -16,8 +16,23 @@ fn noisy(s: &str) {
 
 fn base_port(offset: u16) -> u16 {
     // Clear of the other test files' ranges (20000.., 30000.., 40000.., 47600.., 50000..64000).
-    // 10000..: 16 ports for each of 600 process ids.
-    10000 + (std::process::id() % 600) as u16 * 16 + offset
+    // 10000..: 16 ports for each of 600 process ids, starting at this process's block
+    // and moving on past one with a port that won't bind: Windows keeps ranges of ports
+    // out of use (`netsh int ipv4 show excludedportrange protocol=tcp`), and binding one
+    // fails with 10013.
+    static BASE: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    let base = *BASE.get_or_init(|| {
+        let first = (std::process::id() % 600) as u16;
+        (0..600u16)
+            .map(|i| 10000 + (first + i) % 600 * 16)
+            .find(|&b| {
+                (b..b + 16).all(|p| {
+                    std::net::TcpListener::bind(("127.0.0.1", p)).is_ok() && std::net::UdpSocket::bind(("127.0.0.1", p)).is_ok()
+                })
+            })
+            .expect("a block of 16 ports that bind")
+    });
+    base + offset
 }
 
 fn room_cfg(room: &RoomCode, port: u16, peers: Vec<String>) -> inet::Config {

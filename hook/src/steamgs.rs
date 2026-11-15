@@ -284,7 +284,8 @@ pub fn host_of(id: u64) -> Option<PeerId> {
     found
 }
 
-/// The game server a LAN player hosts, from its presence.
+/// The game server a LAN player hosts, from its presence. Only the id that player's
+/// own servers get counts (`new_server_id`), so no one can pass as another's server.
 pub fn server_id_of(peer: PeerId) -> Option<u64> {
     let lan = lan()?;
     if peer == lan.me() {
@@ -294,6 +295,7 @@ pub fn server_id_of(peer: PeerId) -> Option<u64> {
         .iter()
         .find(|(k, _)| k == KEY_GS)
         .and_then(|(_, v)| v.parse().ok())
+        .filter(|id| hosted_by(*id, peer))
 }
 
 /// Whether a SteamID is a game server on the LAN.
@@ -347,10 +349,19 @@ fn call_pipe(slot: &AtomicUsize) -> i32 {
     unsafe { f() }
 }
 
-fn new_server_id(anonymous: bool) -> u64 {
-    let account = u32::from_le_bytes(PeerId::random().0[..4].try_into().unwrap()) | 1;
+/// The game server SteamID `host`'s servers go by: worked out from its player id, so
+/// it stays the same across restarts and every player can check who hosts it
+/// (`hosted_by`). Its account id comes from other bytes than the player's LAN SteamID
+/// (`steamids::lan_steam_id`); the account type tells the two apart anyway.
+fn new_server_id(host: PeerId, anonymous: bool) -> u64 {
+    let account = u32::from_le_bytes(host.0[4..8].try_into().unwrap()) | 1;
     let kind = if anonymous { 4u64 } else { 3 };
     (1u64 << 56) | (kind << 52) | (1u64 << 32) | account as u64
+}
+
+/// Whether `id` is the game server SteamID `host` would have, anonymous or not.
+fn hosted_by(id: u64, host: PeerId) -> bool {
+    id == new_server_id(host, false) || id == new_server_id(host, true)
 }
 
 fn log_on(anonymous: bool) {
@@ -359,7 +370,8 @@ fn log_on(anonymous: bool) {
         let st = &mut *st;
         let server = st.server.get_or_insert_with(Server::default);
         if server.id == 0 {
-            server.id = new_server_id(anonymous);
+            let me = lan().map_or_else(PeerId::random, |l| l.me());
+            server.id = new_server_id(me, anonymous);
         }
         server.logged_on = true;
         st.dirty = true;
@@ -627,7 +639,8 @@ fn address_of(l: &Lobby) -> u32 {
 fn item_of(l: &Lobby) -> ServerItem {
     let players = players_of(l);
     let bots: i32 = num(l, "bots");
-    let sid: u64 = num(l, "sid");
+    // A listing can only name its owner's server (`hosted_by`).
+    let sid = Some(num::<u64>(l, "sid")).filter(|sid| hosted_by(*sid, l.owner)).unwrap_or_else(|| new_server_id(l.owner, false));
     let mut item = ServerItem {
         connection_port: num(l, "port"),
         query_port: num(l, "qport"),
@@ -699,29 +712,59 @@ fn tag_list(v: &str) -> Vec<String> {
     v.split(',').map(|t| t.trim().to_ascii_lowercase()).filter(|t| !t.is_empty()).collect()
 }
 
-/// Whether a server passes a request's filters. "or", "nand" and "nor" groups are
-/// skipped rather than half-evaluated, so they never hide a server.
+/// Whether a server passes a request's filters: each in turn, all of them; "and",
+/// "or", "nand" and "nor" take the next N filters (groups within groups too), as Steam's
+/// master server reads them.
 fn passes(l: &Lobby, filters: &[(String, String)]) -> bool {
     let item = item_of(l);
-    let mut skip = 0usize;
-    for (k, v) in filters {
-        if skip > 0 {
-            skip -= 1;
-            continue;
+    let mut at = 0;
+    while at < filters.len() {
+        if !one_filter(l, &item, filters, &mut at, 0) {
+            return false;
         }
-        let key = k.to_ascii_lowercase();
-        let ok = match key.as_str() {
-            "and" => true,
-            "or" | "nand" | "nor" => {
-                skip = v.trim().parse().unwrap_or(0);
-                true
+    }
+    true
+}
+
+/// The filter at `*at` (with a group's members), moving `*at` past what it took.
+fn one_filter(l: &Lobby, item: &ServerItem, filters: &[(String, String)], at: &mut usize, depth: u32) -> bool {
+    let Some((k, v)) = filters.get(*at) else { return true };
+    *at += 1;
+    let key = k.to_ascii_lowercase();
+    if let "and" | "or" | "nand" | "nor" = key.as_str() {
+        let n: usize = v.trim().parse().unwrap_or(0);
+        // A group past its depth or the list's end can't be evaluated: it hides nothing.
+        if depth > 16 {
+            *at = filters.len();
+            return true;
+        }
+        let mut results = Vec::with_capacity(n.min(64));
+        for _ in 0..n {
+            if *at >= filters.len() {
+                break;
             }
+            results.push(one_filter(l, item, filters, at, depth + 1));
+        }
+        return match key.as_str() {
+            "and" => results.iter().all(|r| *r),
+            "or" => results.is_empty() || results.iter().any(|r| *r),
+            "nand" => !results.iter().all(|r| *r),
+            _ => !results.iter().any(|r| *r),
+        };
+    }
+    {
+        let ok = match key.as_str() {
             "gamedir" => text(l, "gamedir").eq_ignore_ascii_case(v),
             "map" => text(l, "map").eq_ignore_ascii_case(v),
             "dedicated" => text(l, "dedicated") == "1",
-            "notfull" => item.max_players == 0 || item.players < item.max_players,
-            "hasplayers" => item.players > 0,
+            // Steam's "full" and "empty": servers that aren't.
+            "notfull" | "full" => item.max_players == 0 || item.players < item.max_players,
+            "hasplayers" | "empty" => item.players > 0,
             "noplayers" => item.players == 0,
+            "gameaddr" => {
+                let ip = std::net::Ipv4Addr::from(item.ip).to_string();
+                v.split_once(':').map_or(v.trim() == ip, |(a, p)| a == ip && p.parse() == Ok(item.connection_port))
+            }
             "password" => (text(l, "password") == "1") == (v.trim() == "1"),
             "name_match" => wildcard(v, &text(l, "name")),
             "version_match" => wildcard(v, &text(l, "version")),
@@ -745,11 +788,8 @@ fn passes(l: &Lobby, filters: &[(String, String)]) -> bool {
             // to LAN servers.
             _ => true,
         };
-        if !ok {
-            return false;
-        }
+        ok
     }
-    true
 }
 
 // ---- ISteamGameServer ----
@@ -762,6 +802,7 @@ pub fn server() -> Vec<(&'static str, usize)> {
         ("SetDedicatedServer", set_dedicated as *const () as usize),
         ("LogOn", log_on_token as *const () as usize),
         ("LogOn~0", log_on_old as *const () as usize),
+        ("LogOn~2", log_on_account as *const () as usize),
         ("LogOnAnonymous", log_on_anonymous as *const () as usize),
         ("LogOff", log_off_method as *const () as usize),
         ("BLoggedOn", logged_on as *const () as usize),
@@ -888,6 +929,8 @@ vmethod! {
 
 vmethod! { fn log_on_token(_this: usize, _token: *const c_char) { log_on(false) } }
 vmethod! { fn log_on_old(_this: usize) { log_on(false) } }
+// SteamGameServer011: an account name and a password.
+vmethod! { fn log_on_account(_this: usize, _account: *const c_char, _password: *const c_char) { log_on(false) } }
 vmethod! { fn log_on_anonymous(_this: usize) { log_on(true) } }
 vmethod! { fn log_off_method(_this: usize) { log_off() } }
 
@@ -913,8 +956,12 @@ vmethod! {
 
 vmethod! {
     fn begin_auth_session(this: usize, ticket: *const u8, len: i32, user: u64) -> i32 {
-        if peer_of(user).is_none() {
+        let Some(peer) = peer_of(user) else {
             return call_real!(this, "BeginAuthSession", fn(*const u8, i32, u64) -> i32, 1, ticket, len, user);
+        };
+        let verdict = crate::steamlan::auth_verdict(ticket, len, user, peer);
+        if verdict != 0 {
+            return verdict;
         }
         add_player(user);
         log!("steam-lan game server: LAN player {user} authenticated");
@@ -1052,7 +1099,15 @@ vmethod! {
 /// The LAN player at a client address the game gives (host byte order).
 fn player_at(ip: u32) -> Option<u64> {
     let lan = lan()?;
-    let addr = std::net::IpAddr::V4(std::net::Ipv4Addr::from(ip));
+    let v4 = std::net::Ipv4Addr::from(ip);
+    let addr = std::net::IpAddr::V4(v4);
+    // A stand-in address (one per player: what the server sees of a player that comes
+    // through the forwarder) names its player alone.
+    if peerparty_core::fwd::is_stand_in(v4)
+        && let Some(p) = crate::ipfwd::forwarded_peer(std::net::SocketAddr::new(addr, 0))
+    {
+        return Some(steam_id(p));
+    }
     let known: Vec<u64> = S.lock().unwrap().server.as_ref().map(|s| s.players.keys().copied().collect()).unwrap_or_default();
     let mut at: Vec<u64> = lan
         .peers()
@@ -1060,7 +1115,8 @@ fn player_at(ip: u32) -> Option<u64> {
         .filter(|(p, _)| lan.peer_has_ip(*p, addr) || (addr.is_loopback() && lan.peer_ip(*p).is_some_and(|a| a.is_loopback())))
         .map(|(p, _)| steam_id(p))
         .collect();
-    // Two players behind one address: the one not on the server yet.
+    // Two players behind one real address (one PC, or one NAT): the one not on the
+    // server yet. The old auth gives nothing else to tell them apart.
     at.sort_by_key(|id| known.contains(id));
     at.into_iter().next()
 }
@@ -1384,6 +1440,8 @@ vmethod! {
 vmethod! {
     fn cancel_server_query(_this: usize, query: i32) {
         S.lock().unwrap().queries.remove(&query);
+        // Cancelled from inside one of its own answers: the rest of them don't go.
+        DELIVERING.lock().unwrap().retain(|q| *q != query);
     }
 }
 
@@ -1414,8 +1472,38 @@ enum Call {
     RulesDone(usize, bool),
 }
 
-fn run(calls: Vec<Call>) {
-    for c in calls {
+/// Server queries whose answers are being called right now (`run`), by id: one the game
+/// cancels from inside an answer is taken out, and gets no more.
+static DELIVERING: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+
+/// What must still hold for a call to go: the list request still there with that
+/// response object (not released or cancelled meanwhile), or the query not cancelled.
+enum Guard {
+    List(usize, usize),
+    Query(i32),
+}
+
+impl Guard {
+    fn holds(&self) -> bool {
+        match *self {
+            Guard::List(h, resp) => S.lock().unwrap().lists.get(&h).is_some_and(|l| l.response == resp),
+            Guard::Query(id) => DELIVERING.lock().unwrap().contains(&id),
+        }
+    }
+}
+
+/// Calls the game's response objects in turn. Each answer can release or cancel what
+/// the next ones are for (and free their object): each is checked just before it goes.
+fn run(calls: Vec<(Guard, Call)>) {
+    for (guard, c) in calls {
+        if !guard.holds() {
+            continue;
+        }
+        let query = match guard {
+            Guard::Query(id) => Some(id),
+            Guard::List(..) => None,
+        };
+        let last = matches!(c, Call::Ping(..) | Call::PlayersDone(..) | Call::RulesDone(..));
         match c {
             Call::Responded(resp, h, i) => virt!(resp, 0, fn(usize, i32), h, i),
             Call::Complete(resp, h, r) => virt!(resp, 2, fn(usize, i32), h, r),
@@ -1435,6 +1523,10 @@ fn run(calls: Vec<Call>) {
             Call::RulesDone(resp, true) => virt!(resp, 2, fn()),
             Call::RulesDone(resp, false) => virt!(resp, 1, fn()),
         }
+        // A query's last answer: it's done.
+        if let Some(id) = query.filter(|_| last) {
+            DELIVERING.lock().unwrap().retain(|q| *q != id);
+        }
     }
 }
 
@@ -1451,8 +1543,10 @@ pub fn on_event(ev: &Event) {
     {
         let mut st = S.lock().unwrap();
         for l in results {
+            // Only the id the lobby's owner would have: a listing can't take over
+            // another player's server.
             let sid: u64 = num(l, "sid");
-            if sid != 0 {
+            if sid != 0 && hosted_by(sid, l.owner) {
                 st.hosts.insert(sid, l.owner);
             }
         }
@@ -1473,33 +1567,35 @@ pub fn on_event(ev: &Event) {
                 continue;
             }
             for i in 0..list.items.len() {
-                calls.push(Call::Responded(list.response, *h, i as i32));
+                calls.push((Guard::List(*h, list.response), Call::Responded(list.response, *h, i as i32)));
             }
             // eServerResponded, or eNoServersListedOnMasterServer.
             let r = if list.items.is_empty() { 2 } else { 0 };
-            calls.push(Call::Complete(list.response, *h, r));
+            calls.push((Guard::List(*h, list.response), Call::Complete(list.response, *h, r)));
         }
         let done: Vec<i32> = st.queries.iter().filter(|(_, q)| q.search == *search).map(|(id, _)| *id).collect();
         for id in done {
             let q = st.queries.remove(&id).unwrap();
+            DELIVERING.lock().unwrap().push(id);
             let found = results.iter().find(|l| l.namespace == NS && matches_address(l, q.ip, q.port));
+            let g = || Guard::Query(id);
             match q.kind {
-                QueryKind::Ping => calls.push(Call::Ping(q.response, found.map(|l| Box::new(item_of(l))))),
+                QueryKind::Ping => calls.push((g(), Call::Ping(q.response, found.map(|l| Box::new(item_of(l)))))),
                 QueryKind::Players => {
                     if let Some(l) = found {
                         for (_, score, name) in players_of(l) {
-                            calls.push(Call::Player(q.response, name, score as i32));
+                            calls.push((g(), Call::Player(q.response, name, score as i32)));
                         }
                     }
-                    calls.push(Call::PlayersDone(q.response, found.is_some()));
+                    calls.push((g(), Call::PlayersDone(q.response, found.is_some())));
                 }
                 QueryKind::Rules => {
                     if let Some(l) = found {
                         for a in l.attrs.iter().filter(|a| a.key.starts_with("r:")) {
-                            calls.push(Call::Rule(q.response, a.key[2..].to_string(), a.value.text()));
+                            calls.push((g(), Call::Rule(q.response, a.key[2..].to_string(), a.value.text())));
                         }
                     }
-                    calls.push(Call::RulesDone(q.response, found.is_some()));
+                    calls.push((g(), Call::RulesDone(q.response, found.is_some())));
                 }
             }
         }
@@ -1517,7 +1613,7 @@ pub fn finish_empty() {
             if let Some(l) = st.lists.get_mut(&h) {
                 l.refreshing = false;
                 if l.response != 0 {
-                    calls.push(Call::Complete(l.response, h, 2));
+                    calls.push((Guard::List(h, l.response), Call::Complete(l.response, h, 2)));
                 }
             }
         }
@@ -1587,8 +1683,10 @@ mod tests {
 
     #[test]
     fn items_carry_steams_layout_and_values() {
-        let l = advert(&[
-            ("sid", "90071992547409921"),
+        let owner = PeerId([7; 16]);
+        let sid = new_server_id(owner, false).to_string();
+        let mut l = advert(&[
+            ("sid", &sid),
             ("ip", "3232235777"),
             ("port", "27015"),
             ("qport", "27016"),
@@ -1601,6 +1699,7 @@ mod tests {
             ("version", "1.0.2.3"),
             ("tags", "coop,hard"),
         ]);
+        l.owner = owner;
         let item = item_of(&l);
         assert_eq!(item.connection_port, 27015);
         assert_eq!(item.query_port, 27016);
@@ -1608,7 +1707,12 @@ mod tests {
         assert_eq!(item.max_players, 8);
         assert_eq!(item.version, 1023);
         assert_eq!(&item.map[..7], b"de_lan\0");
-        assert_eq!(u64::from_le_bytes(item.steam_id), 90071992547409921);
+        assert_eq!(u64::from_le_bytes(item.steam_id), new_server_id(owner, false));
+        // A listing naming someone else's server gets its owner's id instead.
+        let mut other = l.clone();
+        other.attrs.retain(|a| a.key != "sid");
+        other.attrs.push(attr("sid", new_server_id(PeerId([8; 16]), false)));
+        assert_eq!(u64::from_le_bytes(item_of(&other).steam_id), new_server_id(owner, false));
         let bytes = unsafe { std::slice::from_raw_parts(&item as *const ServerItem as *const u8, 380) };
         assert_eq!(&bytes[172..181], b"LAN game\0", "name at Steam's offset");
         assert_eq!(&bytes[0..2], &27015u16.to_le_bytes(), "connection port first");
@@ -1634,17 +1738,27 @@ mod tests {
         assert!(passes(&l, &f(&[("hasplayers", ""), ("name_match", "*server")])));
         assert!(!passes(&l, &f(&[("noplayers", "")])));
         assert!(!passes(&l, &f(&[("dedicated", "1")])));
-        // An "or" group is skipped, not half-applied.
-        assert!(passes(&l, &f(&[("or", "2"), ("map", "Desert"), ("map", "Snow"), ("gamedir", "mygame")])));
+        // Groups take the next N filters, as the master server reads them.
+        assert!(!passes(&l, &f(&[("or", "2"), ("map", "Desert"), ("map", "Snow"), ("gamedir", "mygame")])));
+        assert!(passes(&l, &f(&[("or", "2"), ("map", "Desert"), ("map", "forest"), ("gamedir", "mygame")])));
+        assert!(passes(&l, &f(&[("nor", "1"), ("map", "Desert")])));
+        assert!(!passes(&l, &f(&[("nand", "2"), ("map", "forest"), ("gamedir", "mygame")])));
+        assert!(passes(&l, &f(&[("and", "2"), ("or", "2"), ("map", "x"), ("map", "forest"), ("gamedir", "mygame")])), "a group in a group");
+        assert!(passes(&l, &f(&[("full", "1"), ("empty", "1")])), "Steam's own keys");
     }
 
     #[test]
     fn server_ids_are_game_servers() {
-        let anon = new_server_id(true);
+        let host = PeerId([7; 16]);
+        let anon = new_server_id(host, true);
         assert_eq!(anon >> 56, 1, "public universe");
         assert_eq!((anon >> 52) & 0xf, 4, "anonymous game server");
         assert_ne!(anon as u32, 0, "account id");
-        assert_eq!((new_server_id(false) >> 52) & 0xf, 3, "game server");
+        assert_eq!((new_server_id(host, false) >> 52) & 0xf, 3, "game server");
+        assert_eq!(new_server_id(host, false), new_server_id(PeerId([7; 16]), false), "the same every run");
+        assert!(hosted_by(anon, host) && hosted_by(new_server_id(host, false), host));
+        assert!(!hosted_by(anon, PeerId([8; 16])), "another player's");
+        assert_ne!(new_server_id(host, false), crate::steamids::lan_steam_id(host));
         assert_eq!(size_of::<ClientApprove>(), 16);
         assert_eq!(size_of::<KeyValue>(), 512);
     }

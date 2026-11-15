@@ -51,6 +51,18 @@ mod watch;
 mod xboxlive;
 mod xgameui;
 
+/// A test that needs something this PC may not have (an SDK DLL from an installed game,
+/// named by a PPTEST_* variable) and returns without it says so on stderr; with
+/// `PPTEST_REQUIRE=1` (a run that should have everything) it fails instead, so a missing
+/// file can't pass for a test that ran.
+#[cfg(test)]
+pub(crate) fn skip(why: &str) {
+    if std::env::var("PPTEST_REQUIRE").is_ok_and(|v| v == "1") {
+        panic!("required but skipped: {why}");
+    }
+    eprintln!("skipped: {why}");
+}
+
 use std::panic::AssertUnwindSafe;
 
 use windows_sys::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
@@ -66,6 +78,22 @@ pub extern "system" fn DllMain(
         // loader lock, before the entry point. Keep going even if init panics
         // so a bug here doesn't fail the load with an empty error.
         let _ = std::panic::catch_unwind(AssertUnwindSafe(|| watch::init(module)));
+        loaded();
     }
     1
+}
+
+/// Tells the launcher the hook is in (its event, made before the game ran:
+/// launcher/src/main.rs `watch_hook_load`). Nothing when it didn't make one.
+fn loaded() {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{EVENT_MODIFY_STATE, GetCurrentProcessId, OpenEventW, SetEvent};
+    let name: Vec<u16> = format!("Local\\peerparty-loaded-{}", unsafe { GetCurrentProcessId() }).encode_utf16().chain(Some(0)).collect();
+    let e = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr()) };
+    if !e.is_null() {
+        unsafe {
+            SetEvent(e);
+            CloseHandle(e);
+        }
+    }
 }

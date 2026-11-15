@@ -6,7 +6,10 @@
 //!   the game's modules (the exe, Mono, GameAssembly, the .NET runtime...): their
 //!   `GetProcAddress` slot points here, and kernelbase itself isn't touched, for
 //!   compatibility: some games won't start once kernelbase's code has been patched.
-//!   Asking
+//!   A slot another module already redirected (a mod loader such as Unity Doorstop,
+//!   which BepInEx and MelonLoader use, does it to UnityPlayer.dll from its DllMain)
+//!   keeps that redirect behind PeerParty's, so the mod loader still sees every lookup
+//!   PeerParty doesn't answer itself. Asking
 //!   for `GetProcAddress` itself gets this one too. Windows' own modules and packed
 //!   modules are left alone. `PEERPARTY_SWAP=inline` hooks kernelbase's
 //!   `GetProcAddress` / `GetProcAddressForCaller` instead, which also catches code
@@ -84,6 +87,7 @@ pub fn patch_get_proc_imports() {
         }
         let imports = unsafe { crate::pe::imports(base as *const u8) };
         let mut n = 0;
+        let mut chained = Vec::new();
         let mut unbound = false;
         for imp in imports.iter().filter(|i| i.name == "GetProcAddress" && loader_dll(&i.dll)) {
             let now = unsafe { imp.slot.read() };
@@ -92,8 +96,28 @@ pub fn patch_get_proc_imports() {
                 unbound = true;
                 continue;
             }
-            let ours = detour_get_proc as *const () as usize;
-            if now != ours && unsafe { crate::pe::write_slot(imp.slot, ours) } {
+            if is_ours(now) {
+                continue;
+            }
+            // Another module already redirected this slot (a mod loader such as Unity
+            // Doorstop does this from its DllMain, before the hook loads, to see the
+            // runtime's init lookups): its function stays in the chain, called for
+            // whatever PeerParty doesn't answer itself.
+            let ours = if is_loader_module(module_of(now)) {
+                detour_get_proc as *const () as usize
+            } else {
+                match chain(now) {
+                    Some(f) => {
+                        chained.push(module_name(module_of(now)));
+                        f
+                    }
+                    None => {
+                        log!("swap {full}: GetProcAddress already redirected and no chain slot left; left as it is");
+                        continue;
+                    }
+                }
+            };
+            if unsafe { crate::pe::write_slot(imp.slot, ours) } {
                 n += 1;
             }
         }
@@ -104,12 +128,68 @@ pub fn patch_get_proc_imports() {
         if n > 0 {
             log!("swap {full}: GetProcAddress comes to peerparty");
         }
+        for by in chained {
+            log!("swap {full}: GetProcAddress was already redirected to {by}; peerparty passes it what it doesn't answer");
+        }
     }
 }
 
 fn loader_dll(dll: &str) -> bool {
     let d = dll.to_ascii_lowercase();
     d == "kernel32.dll" || d == "kernelbase.dll" || d.starts_with("api-ms-win-core-libraryloader-")
+}
+
+/// The base of the module that holds `addr` (0 when none does).
+fn module_of(addr: usize) -> usize {
+    use windows_sys::Win32::System::LibraryLoader::{
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleHandleExW,
+    };
+    let mut m = std::ptr::null_mut();
+    let flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
+    if unsafe { GetModuleHandleExW(flags, addr as *const u16, &mut m) } == 0 {
+        return 0;
+    }
+    m as usize
+}
+
+fn module_name(base: usize) -> String {
+    crate::watch::modules_full()
+        .into_iter()
+        .find(|(b, _)| *b == base)
+        .map(|(_, f)| f)
+        .unwrap_or_else(|| format!("{base:#x}"))
+}
+
+/// GetProcAddress redirects found in place (`chain`), each with a detour of its own
+/// that hands on to it: CHAINS of them at most.
+const CHAINS: usize = 16;
+static CHAIN_NEXT: [AtomicUsize; CHAINS] = [const { AtomicUsize::new(0) }; CHAINS];
+static CHAIN_LOCK: Mutex<()> = Mutex::new(());
+
+macro_rules! chained_detours {
+    ($($n:literal)*) => { [$(chained_get_proc::<$n> as GetProcAddressFn),*] };
+}
+static CHAINED: [GetProcAddressFn; CHAINS] = chained_detours!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15);
+
+/// The detour that answers what PeerParty answers and hands everything else to `next`
+/// (another module's GetProcAddress redirect). The same `next` shares one detour.
+fn chain(next: usize) -> Option<usize> {
+    let _g = CHAIN_LOCK.lock().unwrap();
+    let mut free = None;
+    for (i, slot) in CHAIN_NEXT.iter().enumerate() {
+        match slot.load(Ordering::Acquire) {
+            n if n == next => return Some(CHAINED[i] as usize),
+            0 if free.is_none() => free = Some(i),
+            _ => {}
+        }
+    }
+    let i = free?;
+    CHAIN_NEXT[i].store(next, Ordering::Release);
+    Some(CHAINED[i] as usize)
+}
+
+fn is_ours(f: usize) -> bool {
+    f == detour_get_proc as *const () as usize || CHAINED.iter().any(|c| *c as usize == f)
 }
 
 fn is_loader_module(module: usize) -> bool {
@@ -208,6 +288,16 @@ fn substitute(module: usize, name: *const u8) -> Option<usize> {
 }
 
 unsafe extern "system" fn detour_get_proc(module: usize, name: *const u8) -> usize {
+    unsafe { get_proc(module, name, 0) }
+}
+
+unsafe extern "system" fn chained_get_proc<const N: usize>(module: usize, name: *const u8) -> usize {
+    unsafe { get_proc(module, name, CHAIN_NEXT[N].load(Ordering::Acquire)) }
+}
+
+/// GetProcAddress as the game sees it: PeerParty's swaps, else `next` (another
+/// module's redirect this slot held before; 0 for none), else the real one.
+unsafe fn get_proc(module: usize, name: *const u8, next: usize) -> usize {
     crate::watch::looked_up(module);
     crate::vivox::looked_up(module);
     if let Some(f) = substitute(module, name) {
@@ -215,6 +305,10 @@ unsafe extern "system" fn detour_get_proc(module: usize, name: *const u8) -> usi
     }
     if let Some(hook) = GET_PROC.get() {
         return unsafe { hook.call(module, name) };
+    }
+    if next != 0 {
+        let next: GetProcAddressFn = unsafe { std::mem::transmute(next) };
+        return unsafe { next(module, name) };
     }
     // Import-table mode: someone asking for GetProcAddress itself gets this one.
     if (name as usize) > 0xffff
@@ -295,6 +389,33 @@ pub fn patch_imports() {
             if n > 0 {
                 log!("swap patched {n} imports of {sdk} in module {module:#x}");
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    unsafe extern "system" fn mod_loader_a(_: usize, _: *const u8) -> usize {
+        0xa11
+    }
+    unsafe extern "system" fn mod_loader_b(_: usize, _: *const u8) -> usize {
+        0xb22
+    }
+
+    #[test]
+    fn a_redirect_found_in_a_slot_still_gets_the_lookups_peerparty_doesnt_answer() {
+        let a = chain(mod_loader_a as *const () as usize).unwrap();
+        let b = chain(mod_loader_b as *const () as usize).unwrap();
+        assert_ne!(a, b);
+        // The same redirect found in another module's slot shares its detour.
+        assert_eq!(chain(mod_loader_a as *const () as usize), Some(a));
+        assert!(is_ours(a) && is_ours(b) && is_ours(detour_get_proc as *const () as usize));
+        let name = c"il2cpp_init";
+        for (f, want) in [(a, 0xa11), (b, 0xb22)] {
+            let f: GetProcAddressFn = unsafe { std::mem::transmute(f) };
+            assert_eq!(unsafe { f(0x1234_0000, name.as_ptr().cast()) }, want);
         }
     }
 }

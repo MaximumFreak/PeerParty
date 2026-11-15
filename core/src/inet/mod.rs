@@ -75,6 +75,12 @@ const F_DGRAM: u8 = 3;
 const F_PING: u8 = 4;
 const F_PONG: u8 = 5;
 const F_CLOSE: u8 = 6;
+/// After F_CLOSE: the sender is leaving for good (it quit, switched internet play off,
+/// or blocked us), not just ending this session. Its mesh peer then leaves at once
+/// instead of being waited for (`Host::tunnel_down`).
+const CLOSE_LEAVING: u8 = 1;
+/// What `frames` ends a session with for such a goodbye.
+const LEAVING: &str = "\0leaving";
 /// Our IPv6 addresses (`[n]`, then n × 16-byte address and port, little-endian), sent
 /// inside the session in a packet of its own (older peers skip a frame they don't know
 /// and the rest of its packet). The peer then tries them: direct IPv6 needs no NAT.
@@ -167,6 +173,8 @@ const COOKIE_BURST: f32 = 64.0;
 const COOKIE_RATE: f32 = 32.0;
 /// How long a blocked player's address is ignored.
 const BLOCKED_FOR: Duration = Duration::from_secs(600);
+/// How many blocks remember the address they dropped (`Shared::recent_blocks`).
+const RECENT_BLOCKS: usize = 64;
 /// After a block, how long keys we've never seen are refused from that player's internet
 /// address (one coming back with a new key). Known keys and friends still get in.
 const NEW_KEY_COOLDOWN: Duration = Duration::from_secs(1800);
@@ -326,7 +334,9 @@ pub trait Host: Send + Sync + 'static {
     /// A tunnel is about to carry the mesh connection whose far end (as our mesh sees
     /// it) is `mesh`, a loopback address. Called before any of the peer's bytes pass.
     fn tunnel_up(&self, mesh: SocketAddr, t: Tunnel);
-    fn tunnel_down(&self, mesh: SocketAddr);
+    /// The tunnel under that mesh connection ended; `leaving`: its peer left for good
+    /// (said so, or we dropped it), so it isn't waited for.
+    fn tunnel_down(&self, mesh: SocketAddr, leaving: bool);
     fn log(&self, line: &str);
 }
 
@@ -560,7 +570,8 @@ struct Session {
 /// What a tick or a packet leaves to do once the sessions are unlocked.
 enum Act {
     Bridge(SocketAddr, u64, PeerId),
-    Gone(Option<Bridge>),
+    /// A session's bridge goes; whether its peer said it's leaving for good.
+    Gone(Option<Bridge>, bool),
     Log(String),
     /// A session ended: whether it had ever connected.
     Ended(SocketAddr, bool),
@@ -766,9 +777,10 @@ impl Session {
         self.send_plain(cx, &plain, now);
     }
 
-    fn send_close(&mut self, cx: &Ctx, now: Instant) {
+    fn send_close(&mut self, cx: &Ctx, now: Instant, leaving: bool) {
+        let frame: &[u8] = if leaving { &[F_CLOSE, CLOSE_LEAVING] } else { &[F_CLOSE] };
         for _ in 0..3 {
-            self.send_plain(cx, &[F_CLOSE], now);
+            self.send_plain(cx, frame, now);
         }
     }
 
@@ -897,6 +909,9 @@ struct Shared {
     blocked_addrs: Mutex<HashMap<SocketAddr, Instant>>,
     /// Internet addresses of blocked players: no new keys from them for a while (a leaf lock).
     cooldown: Mutex<HashMap<IpAddr, Instant>>,
+    /// The addresses players were dropped from when blocked (newest last, at most
+    /// RECENT_BLOCKS), so an unblock forgives them too (a leaf lock).
+    recent_blocks: Mutex<Vec<(String, SocketAddr)>>,
     /// The port the router forwards to us, and what the last try said (leaf locks).
     mapping: Mutex<Option<portmap::Mapping>>,
     map_note: Mutex<Option<String>>,
@@ -935,7 +950,7 @@ impl Shared {
     fn new_keys_cooling(&self, ip: IpAddr, now: Instant) -> bool {
         let mut c = self.cooldown.lock().unwrap();
         c.retain(|_, until| *until > now);
-        c.contains_key(&ip)
+        c.contains_key(&public::limit_key(ip))
     }
 
     fn is_blocked_addr(&self, a: SocketAddr, now: Instant) -> bool {
@@ -952,7 +967,7 @@ impl Shared {
         drop(b);
         let mut c = self.cooldown.lock().unwrap();
         if c.len() < 4096 {
-            c.insert(a.ip(), now + NEW_KEY_COOLDOWN);
+            c.insert(public::limit_key(a.ip()), now + NEW_KEY_COOLDOWN);
         }
     }
 
@@ -1199,6 +1214,7 @@ impl Inet {
             max_sessions,
             blocked_addrs: Mutex::new(HashMap::new()),
             cooldown: Mutex::new(HashMap::new()),
+            recent_blocks: Mutex::new(Vec::new()),
             mapping: Mutex::new(None),
             map_note: Mutex::new(None),
             stop_mapping: AtomicBool::new(false),
@@ -1293,6 +1309,28 @@ impl Inet {
         Ok(added)
     }
 
+    /// Takes a player off the block list, and forgives the addresses it was dropped
+    /// from (so it can come back at once). Whether it was on the list.
+    pub fn unblock(&self, fp: &str) -> io::Result<bool> {
+        let Some(p) = &self.sh.pubs else {
+            return Err(io::Error::other("not in public sessions"));
+        };
+        let removed = p.blocked.remove(fp)?;
+        let norm = public::normalize_fingerprint(fp).unwrap_or_default();
+        let addrs: Vec<SocketAddr> = {
+            let mut r = self.sh.recent_blocks.lock().unwrap();
+            let addrs = r.iter().filter(|(f, _)| *f == norm).map(|(_, a)| *a).collect();
+            r.retain(|(f, _)| *f != norm);
+            addrs
+        };
+        for a in addrs {
+            self.sh.blocked_addrs.lock().unwrap().remove(&a);
+            self.sh.cooldown.lock().unwrap().remove(&public::limit_key(a.ip()));
+            self.sh.disc.lock().unwrap().banned.remove(&a);
+        }
+        Ok(removed)
+    }
+
     /// Adds a player to the friends list (friends-only public sessions). Whether it's new.
     pub fn befriend(&self, fp: &str, note: &str) -> io::Result<bool> {
         let Some(p) = &self.sh.pubs else {
@@ -1327,14 +1365,14 @@ impl Inet {
             let mut s = self.sh.sessions.lock().unwrap();
             let cx = self.sh.cx();
             for v in s.values_mut().filter(|v| v.confirmed) {
-                v.send_close(&cx, now);
+                v.send_close(&cx, now, true);
             }
             s.drain().map(|(_, v)| v).collect()
         };
         for v in gone {
             if let Some(b) = &v.bridge {
                 b.shut();
-                self.sh.host.tunnel_down(b.mesh);
+                self.sh.host.tunnel_down(b.mesh, true);
             }
         }
         let d = self.sh.disc.lock().unwrap();
@@ -1495,7 +1533,7 @@ fn on_packet(sh: &Arc<Shared>, ss: &mut HashMap<SocketAddr, Session>, from: Sock
                     // The peer started over (it lost our session): so do we.
                     let old = ss.remove(&from).unwrap();
                     acts.push(Act::Log(format!("{} reconnected", tag())));
-                    acts.push(Act::Gone(old.bridge));
+                    acts.push(Act::Gone(old.bridge, false));
                     ss.insert(from, Session::new(from, sh.epoch(), now, true));
                 }
                 let s = ss.get_mut(&from).unwrap();
@@ -1637,7 +1675,7 @@ fn on_packet(sh: &Arc<Shared>, ss: &mut HashMap<SocketAddr, Session>, from: Sock
                     info.name,
                     quiet.as_secs()
                 )));
-                acts.push(Act::Gone(gone.bridge));
+                acts.push(Act::Gone(gone.bridge, false));
                 acts.push(Act::Ended(old, true));
             }
             let s = ss.get_mut(&from).unwrap();
@@ -1694,10 +1732,11 @@ fn on_packet(sh: &Arc<Shared>, ss: &mut HashMap<SocketAddr, Session>, from: Sock
             }
             if let Err(e) = frames(s, &cx, &plain, now) {
                 let old = ss.remove(&key).unwrap();
-                if !e.is_empty() {
+                let leaving = e == LEAVING;
+                if !e.is_empty() && !leaving {
                     acts.push(Act::Log(format!("{}: {e}", redact::addr(key))));
                 }
-                acts.push(Act::Gone(old.bridge));
+                acts.push(Act::Gone(old.bridge, leaving));
                 acts.push(Act::Ended(key, true));
             }
         }
@@ -1783,7 +1822,7 @@ fn frames(s: &mut Session, cx: &Ctx, mut p: &[u8], now: Instant) -> Result<(), S
                     }
                 }
             }
-            F_CLOSE => return Err(String::new()),
+            F_CLOSE => return Err(if p.first() == Some(&CLOSE_LEAVING) { LEAVING.into() } else { String::new() }),
             _ => return Ok(()), // a newer frame: skip the rest
         }
     }
@@ -1846,7 +1885,7 @@ fn tick_sessions(sh: &Arc<Shared>, ss: &mut HashMap<SocketAddr, Session>, now: I
             continue;
         }
         if s.bridge.as_ref().is_some_and(|b| b.closed.load(Ordering::Relaxed)) {
-            s.send_close(&cx, now);
+            s.send_close(&cx, now, false);
             remove.push((s.addr, true, format!("{}: the mesh connection closed", redact::addr(s.addr))));
             continue;
         }
@@ -1855,7 +1894,7 @@ fn tick_sessions(sh: &Arc<Shared>, ss: &mut HashMap<SocketAddr, Session>, now: I
             // it (a goodbye straight away could drop the tail still in flight).
             let since = *s.finishing.get_or_insert(now);
             if s.stream.idle() || now.duration_since(since) >= FINISH_FOR {
-                s.send_close(&cx, now);
+                s.send_close(&cx, now, false);
                 remove.push((s.addr, true, format!("{}: the mesh connection finished", redact::addr(s.addr))));
                 continue;
             }
@@ -1905,7 +1944,7 @@ fn tick_sessions(sh: &Arc<Shared>, ss: &mut HashMap<SocketAddr, Session>, now: I
         if !why.is_empty() {
             acts.push(Act::Log(why));
         }
-        acts.push(Act::Gone(s.bridge));
+        acts.push(Act::Gone(s.bridge, false));
         acts.push(Act::Ended(addr, was_up));
     }
     acts
@@ -1915,12 +1954,12 @@ fn run(sh: &Arc<Shared>, acts: Vec<Act>) {
     for a in acts {
         match a {
             Act::Bridge(addr, epoch, id) => start_bridge(sh.clone(), addr, epoch, id),
-            Act::Gone(bridge) => {
+            Act::Gone(bridge, leaving) => {
                 if let Some(b) = bridge {
                     // Not cut: the writer still hands our mesh what already came from
                     // the peer, then closes (dropping the bridge ends its queue).
                     b.closed.store(true, Ordering::Relaxed);
-                    sh.host.tunnel_down(b.mesh);
+                    sh.host.tunnel_down(b.mesh, leaving);
                 }
             }
             Act::Log(s) => sh.log(&s),
@@ -2025,7 +2064,7 @@ fn attach(sh: &Arc<Shared>, addr: SocketAddr, epoch: u64, tcp: TcpStream) -> io:
         let Some(s) = ss.get_mut(&addr).filter(|s| s.epoch == epoch) else {
             drop(ss);
             let _ = tcp.shutdown(std::net::Shutdown::Both);
-            sh.host.tunnel_down(mesh);
+            sh.host.tunnel_down(mesh, false);
             return Ok(());
         };
         s.bridge = Some(Bridge {
@@ -2271,10 +2310,17 @@ fn kick_blocked(sh: &Arc<Shared>) {
             ss.values().filter(|s| s.fp.as_deref().is_some_and(|f| p.blocked.is_blocked(f))).map(|s| s.addr).collect();
         for a in gone {
             let mut s = ss.remove(&a).unwrap();
-            s.send_close(&cx, now);
+            s.send_close(&cx, now, true);
             sh.block_addr(a, now);
+            if let Some(fp) = s.fp.as_deref().and_then(public::normalize_fingerprint) {
+                let mut r = sh.recent_blocks.lock().unwrap();
+                if r.len() >= RECENT_BLOCKS {
+                    r.remove(0);
+                }
+                r.push((fp, a));
+            }
             acts.push(Act::Log(format!("{} ({}) is on the block list: dropped", redact::addr(a), s.fp.as_deref().unwrap_or("?"))));
-            acts.push(Act::Gone(s.bridge.take()));
+            acts.push(Act::Gone(s.bridge.take(), true));
             acts.push(Act::Ban(a));
         }
     }
@@ -2790,9 +2836,11 @@ pub mod testing {
             Msg::Proof { sig: [5; 64] },
             Msg::Search { search: 1, query: Query::new("eos.lobby") },
             Msg::SearchReply { search: 1, lobbies: vec![lobby.clone(); 100] },
-            Msg::Join { lobby: victim.into() },
-            Msg::JoinReply { lobby: victim.into(), result: JoinResult::Ok },
-            Msg::State { lobby: lobby.clone() },
+            Msg::Join { lobby: victim.into(), secret: String::new() },
+            Msg::OwnerCheck { lobby: victim.into(), owner: me },
+            Msg::OwnerHere { lobby: victim.into() },
+            Msg::JoinReply { lobby: victim.into(), result: JoinResult::Ok, claim: Default::default() },
+            Msg::State { lobby: lobby.clone(), secret: [0; 32] },
             Msg::Leave { lobby: victim.into() },
             Msg::MemberAttrs { lobby: victim.into(), attrs: vec![Attr { key: big.clone(), value: Value::Str(big.clone()), public: true }] },
             Msg::Closed { lobby: victim.into() },

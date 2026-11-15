@@ -329,6 +329,12 @@ fn session_id(name: &str) -> Option<String> {
     H.lock().unwrap().sessions.get(name).map(|s| s.id.clone())
 }
 
+/// PeerParty's own attributes, in any case (EOS attribute keys ignore case, so a game's
+/// "PEERPARTY:..." would otherwise pass as one of ours, or ours as the game's).
+fn is_hidden(key: &str) -> bool {
+    key.len() >= HIDDEN.len() && key.as_bytes()[..HIDDEN.len()].eq_ignore_ascii_case(HIDDEN.as_bytes())
+}
+
 fn hidden(l: &Lobby, key: &str) -> Option<String> {
     l.attrs.iter().find(|a| a.key == key).map(|a| a.value.text())
 }
@@ -531,7 +537,7 @@ unsafe extern "system" fn mod_add_attribute(h: usize, o: *const abi::AddAttribut
             read_attr((*o).Attribute, if advertise { abi::VISIBILITY_PUBLIC } else { 1 })
         })
         .flatten()
-        .filter(|a| !a.key.starts_with(HIDDEN))
+        .filter(|a| !is_hidden(&a.key))
     else {
         return INVALID_PARAMETERS;
     };
@@ -622,7 +628,12 @@ unsafe extern "system" fn destroy_session(_h: usize, o: *const abi::PtrOptions, 
     };
     let r = lan().map_or(Err(LobbyError::NotFound), |l| l.leave(&s.id));
     trace("EOS_Sessions_DestroySession", || format!("{name} {} -> {r:?}", s.id));
-    done(cb, cd, SUCCESS);
+    // Our record of it is gone either way; a session already gone elsewhere is
+    // destroyed as far as the game is concerned.
+    done(cb, cd, match r {
+        Ok(()) | Err(LobbyError::NotFound) => SUCCESS,
+        Err(e) => lobby_error(e),
+    });
 }
 
 unsafe extern "system" fn join_session(_h: usize, o: *const JoinOptions, cd: usize, cb: usize) {
@@ -1071,8 +1082,11 @@ unsafe extern "system" fn search_set_max(h: usize, o: *const abi::U32Options) ->
 
 unsafe extern "system" fn search_find(h: usize, _o: usize, cd: usize, cb: usize) {
     let query = H.lock().unwrap().searches.get(&h).map(|s| s.query.clone());
-    let (Some(query), Some(lan)) = (query, lan()) else {
+    let Some(query) = query else {
         return done(cb, cd, INVALID_PARAMETERS);
+    };
+    let Some(lan) = lan() else {
+        return done(cb, cd, NO_CONNECTION);
     };
     // A search for one session or player that finds nothing is NotFound.
     let specific = query.lobby_id.is_some() || query.member.is_some();
@@ -1184,7 +1198,7 @@ unsafe extern "system" fn details_copy_info(h: usize, _o: usize, out: *mut usize
 }
 
 fn visible(l: &Lobby) -> Vec<Attr> {
-    l.attrs.iter().filter(|a| !a.key.starts_with(HIDDEN)).cloned().collect()
+    l.attrs.iter().filter(|a| !is_hidden(&a.key)).cloned().collect()
 }
 
 /// An `EOS_SessionDetails_Attribute`, freed by `EOS_SessionDetails_Attribute_Release`.
@@ -1422,7 +1436,7 @@ pub fn on_event(_lan: &Lan, ev: &Event) {
                     SUCCESS
                 }
                 JoinResult::Full => SESSION_TOO_MANY_PLAYERS,
-                JoinResult::NotAllowed => SESSION_NOT_ALLOWED,
+                JoinResult::NotAllowed | JoinResult::WrongSecret => SESSION_NOT_ALLOWED,
                 JoinResult::NotFound | JoinResult::TimedOut => SESSION_INVALID,
             };
             // As with lobbies: a LAN join beats any game's "joining" screen otherwise.

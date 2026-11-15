@@ -9,6 +9,9 @@ doesn't implement the function itself:
   peerparty-minted handle.
 - async: completes on the next tick with EOS_NoConnection. The callback info starts
   with ResultCode and ClientData; the generator checks that.
+- async_after_ptr / async_after_u32: the same, for callback infos with one field
+  between ResultCode and ClientData (a user id, or a 32-bit SnapshotId): Mods and
+  ProgressionSnapshot.
 - add_notify: hands out a notification id and never fires.
 - copy: returns EOS_NotFound and nulls the out pointer.
 - zero: returns 0 (counts, handles, booleans, enums).
@@ -61,7 +64,8 @@ def parse(headers):
             callbacks[m.group(1)] = m.group(2).strip()
         for m in re.finditer(r"EOS_STRUCT\((\w+),\s*\((.*?)\)\);", text, re.S):
             fields = [f.strip() for f in m.group(2).split(";") if f.strip()]
-            structs[m.group(1)] = [f.split()[-1].strip("*") for f in fields]
+            # (type, name) per field.
+            structs[m.group(1)] = [(ptype(f), f.replace("*", " ").split()[-1]) for f in fields]
     return funcs, callbacks, structs, u64
 
 
@@ -100,9 +104,18 @@ def classify(name, ret, params, callbacks, structs):
     if ret == "void" and len(params) == 4 and len(callback_params) == 1 and bare(types[3]) in callbacks:
         info_arg = callbacks[bare(types[3])]
         info = re.sub(r"const|\*", " ", info_arg).split()[0]
-        fields = structs.get(info, [])
-        if fields[:2] == ["ResultCode", "ClientData"]:
-            return "async"
+        names = [n for _, n in structs.get(info, [])]
+        if names[:1] == ["ResultCode"] and "ClientData" in names:
+            at = names.index("ClientData")
+            if at == 1:
+                return "async"
+            if at == 2:
+                between = structs[info][1][0]
+                if "*" in between or bare(between) in ("EOS_EpicAccountId", "EOS_ProductUserId") or bare(between).startswith("EOS_H"):
+                    return "async_after_ptr"
+                if bare(between) in ("uint32_t", "int32_t") or bare(between).startswith("EOS_E"):
+                    return "async_after_u32"
+            sys.exit("%s: ClientData where the stand-ins don't put it (%s)" % (name, names))
         return "void"  # a notification-style callback taken by a void call
     if "_AddNotify" in name and ret == "EOS_NotificationId":
         return "add_notify"
@@ -130,6 +143,8 @@ def main():
         variant = {
             "pass": "Pass",
             "async": "Async",
+            "async_after_ptr": "AsyncAfterPtr",
+            "async_after_u32": "AsyncAfterU32",
             "add_notify": "AddNotify",
             "result": "Result",
             "void": "Void",

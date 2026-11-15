@@ -162,6 +162,7 @@ fn write_file(path: Option<PathBuf>, data: &[u8]) -> bool {
     if let Some(d) = p.parent() {
         let _ = std::fs::create_dir_all(d);
     }
+    crate::ipc::local_store("GOG Galaxy", &p);
     crate::saves::write_whole(&p, data).is_ok()
 }
 
@@ -191,6 +192,8 @@ struct Ext {
     unread: HashMap<u64, u32>,
     /// The messages GetChatRoomMessageByIndex reads: the last retrieved or received.
     current: Vec<(u64, u64, u32, String)>,
+    /// The room those messages are in.
+    current_room: u64,
     visit: String,
 }
 
@@ -265,6 +268,18 @@ fn is_me(user: Gid) -> bool {
 pub fn stats() -> Vec<(&'static str, usize)> {
     vec![
         ("RequestUserStatsAndAchievements", request_stats as *const () as usize),
+        ("RequestUserStatsAndAchievements~1", request_stats_1 as *const () as usize),
+        ("StoreStatsAndAchievements~0", store_stats_0 as *const () as usize),
+        ("ResetStatsAndAchievements~0", reset_stats_0 as *const () as usize),
+        ("RequestLeaderboards~0", request_leaderboards_0 as *const () as usize),
+        ("RequestLeaderboardEntriesGlobal~3", entries_global_3 as *const () as usize),
+        ("RequestLeaderboardEntriesAroundUser~4", entries_around_4 as *const () as usize),
+        ("RequestLeaderboardEntriesForUsers~3", entries_for_users_3 as *const () as usize),
+        ("SetLeaderboardScore~3", set_score_3 as *const () as usize),
+        ("SetLeaderboardScoreWithDetails~5", set_score_details_5 as *const () as usize),
+        ("FindLeaderboard~1", find_leaderboard_1 as *const () as usize),
+        ("FindOrCreateLeaderboard~4", find_or_create_leaderboard_4 as *const () as usize),
+        ("RequestUserTimePlayed~1", request_time_played_1 as *const () as usize),
         ("GetStatInt", get_stat_int as *const () as usize),
         ("GetStatFloat", get_stat_float as *const () as usize),
         ("SetStatInt", set_stat_int as *const () as usize),
@@ -550,11 +565,20 @@ vmethod! { fn time_played(_this: usize, _user: Gid) -> u32 { ours(); 0 } }
 // ---- IUtils ----
 
 pub fn utils() -> Vec<(&'static str, usize)> {
+    // GetNotification's id was a uint32_t before 1.95 and a uint64_t NotificationID after.
+    let notification_5 = if super::sdk() < (1, 95, 0) {
+        get_notification_5_u32 as *const () as usize
+    } else {
+        get_notification_5 as *const () as usize
+    };
     vec![
         ("GetImageSize", image_size as *const () as usize),
         ("GetImageRGBA", image_rgba as *const () as usize),
+        // `unsigned char*` before 1.114.9: the same call.
+        ("GetImageRGBA~3", image_rgba as *const () as usize),
         ("RegisterForNotification", nothing_for_name as *const () as usize),
         ("GetNotification", get_notification as *const () as usize),
+        ("GetNotification~5", notification_5),
         ("ShowOverlayWithWebPage", show_web_page as *const () as usize),
         ("IsOverlayVisible", overlay_visible as *const () as usize),
         ("GetOverlayState", overlay_state as *const () as usize),
@@ -603,13 +627,54 @@ vmethod! {
     fn show_web_page(_this: usize, url: *const c_char) {
         ours();
         let u = s(url);
-        if u.starts_with("https://") || u.starts_with("http://") {
+        if web_url(&u) {
             log!("galaxy: the game opened {u}, in the player's browser");
-            let _ = std::process::Command::new("explorer.exe").arg(&u).spawn();
+            open_in_browser(u);
         } else {
             log!("galaxy: the game asked the overlay for {u:?}, not a web page; ignored");
         }
     }
+}
+
+/// An http(s) address with nothing a shell could read as more than one: no spaces,
+/// quotes or control characters.
+fn web_url(u: &str) -> bool {
+    let lower = u.to_ascii_lowercase();
+    (lower.starts_with("https://") || lower.starts_with("http://"))
+        && u.len() > "http://".len()
+        && !u.chars().any(|c| c.is_whitespace() || c.is_control() || c == '"' || c == '\'' || c == '`')
+}
+
+/// Opens a web address with the default browser through the shell's URL handler (not a
+/// program given the address on its command line), on a thread of its own so the
+/// game's thread isn't held while it starts.
+fn open_in_browser(url: String) {
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn ShellExecuteW(hwnd: usize, op: *const u16, file: *const u16, params: *const u16, dir: *const u16, show: i32) -> isize;
+    }
+    #[link(name = "ole32")]
+    unsafe extern "system" {
+        fn CoInitializeEx(reserved: *const core::ffi::c_void, flags: u32) -> i32;
+        fn CoUninitialize();
+    }
+    const COINIT_APARTMENTTHREADED: u32 = 0x2;
+    const COINIT_DISABLE_OLE1DDE: u32 = 0x4;
+    const SW_SHOWNORMAL: i32 = 1;
+    let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    let _ = std::thread::Builder::new().name("peerparty-url".into()).spawn(move || {
+        let (op, file) = (wide("open"), wide(&url));
+        unsafe {
+            let hr = CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+            let r = ShellExecuteW(0, op.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL);
+            if r <= 32 {
+                log!("galaxy: the browser didn't open {url} (error {r})");
+            }
+            if hr >= 0 {
+                CoUninitialize();
+            }
+        }
+    });
 }
 
 vmethod! { fn overlay_visible(_this: usize) -> bool { ours(); crate::overlay::visible() } }
@@ -652,6 +717,8 @@ pub fn storage() -> Vec<(&'static str, usize)> {
         ("GetFileNameCopyByIndex", file_name_copy_at as *const () as usize),
         ("FileShare", file_share as *const () as usize),
         ("DownloadSharedFile", download_shared as *const () as usize),
+        ("FileShare~1", file_share_1 as *const () as usize),
+        ("DownloadSharedFile~1", download_shared_1 as *const () as usize),
         ("GetSharedFileName", shared_name as *const () as usize),
         ("GetSharedFileNameCopy", shared_name_copy as *const () as usize),
         ("GetSharedFileSize", shared_size as *const () as usize),
@@ -765,6 +832,12 @@ pub fn cloud_storage() -> Vec<(&'static str, usize)> {
         ("GetFileMetadata", cloud_metadata as *const () as usize),
         ("PutFile~8@4", cloud_put_buffer as *const () as usize),
         ("PutFile~9@5", cloud_put_func as *const () as usize),
+        // 1.148.6 (metadata keys and values) and 1.148.14 (savegame type and time): one
+        // argument fewer.
+        ("PutFile~7@4", cloud_put_buffer_7 as *const () as usize),
+        ("PutFile~8@5", cloud_put_func_8 as *const () as usize),
+        // 1.148.x: no expected hash.
+        ("DeleteFile~3@2", cloud_delete_3 as *const () as usize),
         ("CalculateHash~4", hash_buffer as *const () as usize),
         ("CalculateHash~5", hash_func as *const () as usize),
         ("DeleteFile", cloud_delete as *const () as usize),
@@ -812,8 +885,14 @@ vmethod! { fn cloud_hash_at(_this: usize, index: u32) -> *const c_char { ours();
 fn get_succeeded(container: &str, name: &str, size: u32, listener: usize) {
     let (c, n) = (owned(container), owned(name));
     let id = owned("");
+    // Before 1.148.14 the success has four arguments (no savegame id).
+    let short = super::sdk() < (1, 148, 14);
     notify(CLOUD_STORAGE_GET_FILE, listener, move |l| {
-        virt!(l, 1, fn(*const c_char, *const c_char, u32, u32, *const c_char), c.as_ptr(), n.as_ptr(), size, 0, id.as_ptr())
+        if short {
+            virt!(l, 1, fn(*const c_char, *const c_char, u32, u32), c.as_ptr(), n.as_ptr(), size, 0)
+        } else {
+            virt!(l, 1, fn(*const c_char, *const c_char, u32, u32, *const c_char), c.as_ptr(), n.as_ptr(), size, 0, id.as_ptr())
+        }
     });
 }
 
@@ -1015,6 +1094,11 @@ pub fn chat() -> Vec<(&'static str, usize)> {
         ("RequestChatRoomMessages", chat_messages as *const () as usize),
         ("SendChatRoomMessage", chat_send as *const () as usize),
         ("GetChatRoomMessageByIndex", chat_message_at as *const () as usize),
+        ("RequestChatRoomWithUser~1", chat_room_with_1 as *const () as usize),
+        ("RequestChatRoomMessages~3", chat_messages_3 as *const () as usize),
+        ("SendChatRoomMessage~2", chat_send_2 as *const () as usize),
+        ("GetChatRoomMessageByIndex~7", chat_message_at_room as *const () as usize),
+        ("GetChatRoomMessageByIndex~6", chat_message_at_6 as *const () as usize),
         ("GetChatRoomMemberCount", chat_member_count as *const () as usize),
         ("GetChatRoomMemberUserIDByIndex", chat_member_at as *const () as usize),
         ("GetChatRoomUnreadMessageCount", chat_unread as *const () as usize),
@@ -1059,6 +1143,7 @@ vmethod! {
             let upto = if before == 0 { all.len() } else { all.iter().position(|m| m.0 == before).unwrap_or(all.len()) };
             let from = upto.saturating_sub(if limit == 0 { upto } else { limit as usize });
             x.current = all[from..upto].to_vec();
+            x.current_room = room;
             (x.current.len() as u32, longest(&x.current))
         };
         notify(CHAT_ROOM_MESSAGES_RETRIEVE, listener, move |l| virt!(l, 1, fn(u64, u32, u32), room, count, long));
@@ -1158,6 +1243,7 @@ pub fn pump() {
             x.history.entry(room).or_default().push(m.clone());
             *x.unread.entry(room).or_default() += 1;
             x.current = vec![m];
+            x.current_room = room;
             longest(&x.current)
         };
         notify(CHAT_ROOM_MESSAGES, 0, move |l| virt!(l, 1, fn(u64, u32, u32), room, 1, long));
@@ -1170,6 +1256,8 @@ pub fn custom_networking() -> Vec<(&'static str, usize)> {
     vec![
         ("OpenConnection", open_connection as *const () as usize),
         ("CloseConnection", close_connection as *const () as usize),
+        ("OpenConnection~1", open_connection_1 as *const () as usize),
+        ("CloseConnection~1", close_connection_1 as *const () as usize),
         ("SendData", send_data as *const () as usize),
         ("GetAvailableDataSize", available_data as *const () as usize),
         ("PeekData", read_data as *const () as usize),
@@ -1206,6 +1294,8 @@ pub fn user() -> Vec<(&'static str, usize)> {
     vec![
         ("SignOut", sign_out as *const () as usize),
         ("RequestEncryptedAppTicket", request_ticket as *const () as usize),
+        ("RequestEncryptedAppTicket~2", request_ticket_2 as *const () as usize),
+        ("ReportInvalidAccessToken~1", report_invalid_token_1 as *const () as usize),
         ("GetEncryptedAppTicket", get_ticket as *const () as usize),
         ("CreateOpenIDConnection", create_openid as *const () as usize),
         ("LoginWithOpenIDConnect", login_openid as *const () as usize),
@@ -1314,6 +1404,15 @@ pub fn friends() -> Vec<(&'static str, usize)> {
     vec![
         ("GetDefaultAvatarCriteria", default_avatar_criteria as *const () as usize),
         ("SetDefaultAvatarCriteria", set_default_avatar_criteria as *const () as usize),
+        // A uint32_t before the AvatarCriteria enum: the same call.
+        ("SetDefaultAvatarCriteria~1", set_default_avatar_criteria as *const () as usize),
+        ("GetFriendAvatarImageRGBA~4", avatar_rgba_4 as *const () as usize),
+        ("SendFriendInvitation~1", send_friend_invitation_1 as *const () as usize),
+        ("RequestFriendInvitationList~0", request_invitation_list_0 as *const () as usize),
+        ("RequestSentFriendInvitationList~0", request_sent_invitation_list_0 as *const () as usize),
+        ("RespondToFriendInvitation~2", respond_to_invitation_2 as *const () as usize),
+        ("DeleteFriend~1", delete_friend_1 as *const () as usize),
+        ("FindUser~1", find_user_1 as *const () as usize),
         ("GetFriendAvatarUrl", avatar_url as *const () as usize),
         ("GetFriendAvatarUrlCopy", avatar_url_copy as *const () as usize),
         ("GetFriendAvatarImageRGBA", avatar_rgba as *const () as usize),
@@ -1442,6 +1541,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_plain_web_addresses_open_a_browser() {
+        assert!(web_url("https://www.gog.com/game/x?a=1&b=2"));
+        assert!(web_url("HTTP://example.com"));
+        assert!(!web_url("file:///C:/Windows/System32/calc.exe"));
+        assert!(!web_url("https://a.com\" /select,C:/x"));
+        assert!(!web_url("https://a.com x"));
+        assert!(!web_url("http://"));
+    }
+
+    #[test]
     fn chat_rooms_are_the_same_on_both_sides() {
         assert_eq!(room_of(5, 9), room_of(9, 5));
         assert_ne!(room_of(5, 9), room_of(5, 10));
@@ -1484,5 +1593,160 @@ mod tests {
         assert_eq!(safe("a\\b:c").as_deref(), Some("a_b_c"));
         assert_eq!(safe(".."), None);
         assert_eq!(safe(""), None);
+    }
+}
+
+// ---- older SDKs' shapes ----
+//
+// Before per-call listeners (1.125 to 1.139, by interface) these calls had no listener
+// argument, and some had fewer others: the same call, its result going to the global
+// listeners, which were all those SDKs had.
+
+vmethod! { fn request_stats_1(this: usize, user: Gid) { unsafe { request_stats(this, user, 0) } } }
+vmethod! { fn store_stats_0(this: usize) { unsafe { store_stats(this, 0) } } }
+vmethod! { fn reset_stats_0(this: usize) { unsafe { reset_stats(this, 0) } } }
+vmethod! { fn request_leaderboards_0(this: usize) { unsafe { request_leaderboards(this, 0) } } }
+vmethod! {
+    fn entries_global_3(this: usize, name: *const c_char, start: u32, end: u32) {
+        unsafe { entries_global(this, name, start, end, 0) }
+    }
+}
+vmethod! {
+    fn entries_around_4(this: usize, name: *const c_char, before: u32, after: u32, user: Gid) {
+        unsafe { entries_around(this, name, before, after, user, 0) }
+    }
+}
+vmethod! {
+    fn entries_for_users_3(this: usize, name: *const c_char, users: *const u64, count: u32) {
+        unsafe { entries_for_users(this, name, users, count, 0) }
+    }
+}
+vmethod! { fn set_score_3(this: usize, name: *const c_char, score: i32, force: bool) { unsafe { set_score(this, name, score, force, 0) } } }
+vmethod! {
+    fn set_score_details_5(this: usize, name: *const c_char, score: i32, details: *const u8, size: u32, force: bool) {
+        unsafe { set_score_details(this, name, score, details, size, force, 0) }
+    }
+}
+vmethod! { fn find_leaderboard_1(this: usize, name: *const c_char) { unsafe { find_leaderboard(this, name, 0) } } }
+vmethod! {
+    /// The sort method and display type went by reference in 1.70 and by value from
+    /// 1.72: pointer-sized either way, and not read.
+    fn find_or_create_leaderboard_4(this: usize, name: *const c_char, display: *const c_char, _sort: usize, _kind: usize) {
+        unsafe { find_or_create_leaderboard(this, name, display, std::ptr::null(), std::ptr::null(), 0) }
+    }
+}
+vmethod! { fn request_time_played_1(this: usize, user: Gid) { unsafe { request_time_played(this, user, 0) } } }
+
+vmethod! {
+    /// 1.95 to 1.128: no "consumable" flag.
+    fn get_notification_5(this: usize, id: u64, kind: *mut c_char, klen: u32, content: *mut u8, size: u32) -> u32 {
+        unsafe { get_notification(this, id, std::ptr::null_mut(), kind, klen, content, size) }
+    }
+}
+vmethod! {
+    /// Before 1.95: a uint32_t id too.
+    fn get_notification_5_u32(this: usize, id: u32, kind: *mut c_char, klen: u32, content: *mut u8, size: u32) -> u32 {
+        unsafe { get_notification(this, id as u64, std::ptr::null_mut(), kind, klen, content, size) }
+    }
+}
+
+vmethod! { fn file_share_1(this: usize, name: *const c_char) { unsafe { file_share(this, name, 0) } } }
+vmethod! { fn download_shared_1(this: usize, id: u64) { unsafe { download_shared(this, id, 0) } } }
+
+vmethod! { fn chat_room_with_1(this: usize, user: Gid) { unsafe { chat_room_with(this, user, 0) } } }
+vmethod! {
+    fn chat_messages_3(this: usize, room: u64, limit: u32, before: u64) {
+        unsafe { chat_messages(this, room, limit, before, 0) }
+    }
+}
+vmethod! { fn chat_send_2(this: usize, room: u64, msg: *const c_char) -> u32 { unsafe { chat_send(this, room, msg, 0) } } }
+vmethod! {
+    /// 1.104.3: the room first, no message type.
+    fn chat_message_at_room(
+        this: usize,
+        index: u32,
+        room: *mut u64,
+        id: *mut u64,
+        sender: *mut u64,
+        time: *mut u32,
+        buf: *mut c_char,
+        len: u32,
+    ) -> u32 {
+        if !room.is_null() {
+            unsafe { *room = X.lock().unwrap().current_room };
+        }
+        unsafe { chat_message_at(this, index, id, std::ptr::null_mut(), sender, time, buf, len) }
+    }
+}
+vmethod! {
+    /// 1.104.4 to 1.109: no message type.
+    fn chat_message_at_6(this: usize, index: u32, id: *mut u64, sender: *mut u64, time: *mut u32, buf: *mut c_char, len: u32) -> u32 {
+        unsafe { chat_message_at(this, index, id, std::ptr::null_mut(), sender, time, buf, len) }
+    }
+}
+
+vmethod! { fn open_connection_1(this: usize, connect: *const c_char) { unsafe { open_connection(this, connect, 0) } } }
+vmethod! { fn close_connection_1(this: usize, id: u64) { unsafe { close_connection(this, id, 0) } } }
+
+vmethod! { fn request_ticket_2(this: usize, data: *const u8, size: u32) { unsafe { request_ticket(this, data, size, 0) } } }
+vmethod! {
+    fn report_invalid_token_1(this: usize, token: *const c_char) -> bool {
+        unsafe { report_invalid_token(this, token, std::ptr::null()) }
+    }
+}
+
+vmethod! {
+    /// `unsigned char*` before 1.114.9. A player who isn't on the LAN is Galaxy's, in
+    /// this SDK's shape.
+    fn avatar_rgba_4(this: usize, user: Gid, kind: u32, buf: *mut u8, len: u32) {
+        if peer_of(gid(user)).is_none() {
+            return real!(this, "GetFriendAvatarImageRGBA~4", fn(Gid, u32, *mut u8, u32) -> (), (), user, kind, buf, len);
+        }
+        unsafe { avatar_rgba(this, user, kind, buf, len) }
+    }
+}
+vmethod! { fn send_friend_invitation_1(this: usize, user: Gid) { unsafe { send_friend_invitation(this, user, 0) } } }
+vmethod! { fn request_invitation_list_0(this: usize) { unsafe { request_invitation_list(this, 0) } } }
+vmethod! { fn request_sent_invitation_list_0(this: usize) { unsafe { request_sent_invitation_list(this, 0) } } }
+vmethod! {
+    fn respond_to_invitation_2(this: usize, user: Gid, accept: bool) {
+        unsafe { respond_to_invitation(this, user, accept, 0) }
+    }
+}
+vmethod! { fn delete_friend_1(this: usize, user: Gid) { unsafe { delete_friend(this, user, 0) } } }
+vmethod! { fn find_user_1(this: usize, spec: *const c_char) { unsafe { find_user(this, spec, 0) } } }
+
+vmethod! {
+    fn cloud_put_buffer_7(
+        this: usize,
+        container: *const c_char,
+        name: *const c_char,
+        buf: *const u8,
+        len: u32,
+        listener: usize,
+        _a: usize,
+        _b: usize,
+    ) {
+        unsafe { cloud_put_buffer(this, container, name, buf, len, listener, 0, 0, std::ptr::null()) }
+    }
+}
+vmethod! {
+    fn cloud_put_func_8(
+        this: usize,
+        container: *const c_char,
+        name: *const c_char,
+        param: usize,
+        read: usize,
+        rewind_f: usize,
+        listener: usize,
+        _a: usize,
+        _b: usize,
+    ) {
+        unsafe { cloud_put_func(this, container, name, param, read, rewind_f, listener, 0, 0, std::ptr::null()) }
+    }
+}
+vmethod! {
+    fn cloud_delete_3(this: usize, container: *const c_char, name: *const c_char, listener: usize) {
+        unsafe { cloud_delete(this, container, name, listener, std::ptr::null()) }
     }
 }

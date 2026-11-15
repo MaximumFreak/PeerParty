@@ -29,7 +29,7 @@ mod gl;
 mod vkshaders;
 mod vulkan;
 
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 use std::sync::{Mutex, Once};
 
 use crate::log;
@@ -37,8 +37,25 @@ use crate::log;
 pub const HEADER: usize = 256;
 const MAGIC: u32 = u32::from_le_bytes(*b"LBOV");
 
-/// The mapped frame block (base address), 0 until `attach`.
-static VIEW: AtomicUsize = AtomicUsize::new(0);
+/// The mapped frame block, null until `attach`: its base and size together, so a reader
+/// never pairs one block's base with another's size. A block the launcher replaces (a
+/// bigger frame) stays mapped and its `View` stays allocated: a present may still be
+/// reading it, and it happens a few times a run at most.
+static VIEW: AtomicPtr<View> = AtomicPtr::new(std::ptr::null_mut());
+/// The block's name, to tell a new block from the one already mapped.
+static VIEW_NAME: Mutex<String> = Mutex::new(String::new());
+
+struct View {
+    base: usize,
+    /// Its size in bytes as mapped (what Windows says, never the header's word).
+    size: usize,
+}
+
+/// The block mapped now: (base, size), or (0, 0).
+fn view() -> (usize, usize) {
+    let v = VIEW.load(Ordering::Acquire);
+    if v.is_null() { (0, 0) } else { unsafe { ((*v).base, (*v).size) } }
+}
 /// Which API drew a frame last ("" until one has).
 static API: Mutex<&'static str> = Mutex::new("");
 static INSTALL: Once = Once::new();
@@ -73,12 +90,18 @@ pub fn attach(name: &str) {
     if crate::net::skip("present") {
         return;
     }
-    if VIEW.load(Ordering::Acquire) == 0 {
-        match open(name) {
-            Some(v) => VIEW.store(v, Ordering::Release),
-            None => {
-                log!("present: couldn't open the overlay's frame {name}");
-                return;
+    {
+        let mut known = VIEW_NAME.lock().unwrap();
+        if *known != name {
+            match open(name) {
+                Some((base, size)) => {
+                    VIEW.store(Box::into_raw(Box::new(View { base, size })), Ordering::Release);
+                    *known = name.to_string();
+                }
+                None => {
+                    log!("present: couldn't open the overlay's frame {name}");
+                    return;
+                }
             }
         }
     }
@@ -100,20 +123,30 @@ pub fn attach(name: &str) {
     });
 }
 
-fn open(name: &str) -> Option<usize> {
-    use windows_sys::Win32::System::Memory::{FILE_MAP_READ, MapViewOfFile, OpenFileMappingW};
+/// Maps a frame block: its base and its size as mapped, so a frame can't be read past
+/// the block's end whatever its header says.
+fn open(name: &str) -> Option<(usize, usize)> {
+    use windows_sys::Win32::System::Memory::{FILE_MAP_READ, MEMORY_BASIC_INFORMATION, MapViewOfFile, OpenFileMappingW, VirtualQuery};
     let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
     let map = unsafe { OpenFileMappingW(FILE_MAP_READ, 0, wide.as_ptr()) };
     if map.is_null() {
         return None;
     }
     let view = unsafe { MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0) };
+    // The view keeps the section alive.
+    unsafe { windows_sys::Win32::Foundation::CloseHandle(map) };
     let base = view.Value as usize;
-    if base == 0 || unsafe { (base as *const u32).read() } != MAGIC {
+    if base == 0 {
         return None;
     }
-    log!("present: overlay frame {name} mapped");
-    Some(base)
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let got = unsafe { VirtualQuery(base as *const _, &mut info, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) };
+    let size = if got == 0 { 0 } else { info.RegionSize };
+    if size < HEADER || unsafe { (base as *const u32).read() } != MAGIC {
+        return None;
+    }
+    log!("present: overlay frame {name} mapped ({size} bytes)");
+    Some((base, size))
 }
 
 fn word(base: usize, off: usize) -> u32 {
@@ -126,22 +159,25 @@ pub struct Frame {
     pub w: u32,
     pub h: u32,
     pub px: *const u32,
+    /// The block it is in.
+    base: usize,
 }
 
 /// The current frame if the overlay (or a notification) is showing, else None. `None`
 /// too while the launcher is halfway through writing one (the caller keeps showing the
 /// last frame it uploaded).
 pub fn frame() -> Option<Frame> {
-    let base = VIEW.load(Ordering::Acquire);
+    let (base, size) = view();
     if base == 0 || word(base, 8) == 0 {
         return None;
     }
     let seq = word(base, 4);
     let (w, h) = (word(base, 20), word(base, 24));
-    if w == 0 || h == 0 || u64::from(w) * u64::from(h) > u64::from(word(base, 28)) {
+    let room = ((size - HEADER) / 4) as u64;
+    if w == 0 || h == 0 || u64::from(w) * u64::from(h) > room {
         return None;
     }
-    Some(Frame { seq, w, h, px: (base + HEADER) as *const u32 })
+    Some(Frame { seq, w, h, base, px: (base + HEADER) as *const u32 })
 }
 
 impl Frame {
@@ -150,20 +186,37 @@ impl Frame {
         self.seq & 1 == 1
     }
 
-    /// Copies the frame into `dst` (rows `pitch` bytes apart), checking afterwards that
-    /// it wasn't rewritten meanwhile. False when it was (keep the old upload).
+    /// The frame's pixels, copied out of the block and checked afterwards that the
+    /// launcher didn't rewrite them meanwhile: None when it did (keep the old upload).
+    /// The copy is what goes to the graphics API, so a frame half rewritten while it was
+    /// read is never shown, not even for one frame.
+    pub fn stable(&self) -> Option<std::sync::MutexGuard<'static, Vec<u32>>> {
+        static COPY: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+        if self.writing() {
+            return None;
+        }
+        let n = self.w as usize * self.h as usize;
+        let mut copy = COPY.lock().unwrap_or_else(|e| e.into_inner());
+        copy.clear();
+        copy.reserve(n);
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.px, copy.as_mut_ptr(), n);
+            copy.set_len(n);
+        }
+        (word(self.base, 4) == self.seq).then_some(copy)
+    }
+
+    /// Copies the frame into `dst` (rows `pitch` bytes apart) if it was read whole
+    /// (`stable`). False when it wasn't, and `dst` is left as it was.
     ///
     /// # Safety
     /// `dst` must hold `h` rows of `pitch` bytes, `pitch >= w * 4`.
     pub unsafe fn copy_to(&self, dst: *mut u8, pitch: usize) -> bool {
-        if self.writing() {
-            return false;
-        }
+        let Some(px) = self.stable() else { return false };
         let row = self.w as usize * 4;
         for y in 0..self.h as usize {
-            unsafe { std::ptr::copy_nonoverlapping((self.px as *const u8).add(y * row), dst.add(y * pitch), row) };
+            unsafe { std::ptr::copy_nonoverlapping((px.as_ptr() as *const u8).add(y * row), dst.add(y * pitch), row) };
         }
-        let base = VIEW.load(Ordering::Acquire);
-        word(base, 4) == self.seq
+        true
     }
 }
