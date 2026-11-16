@@ -1,0 +1,76 @@
+name: A game doesn't work
+description: Multiplayer doesn't work, or PeerParty misbehaves, in a game
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Every game started through PeerParty writes a log of what PeerParty did in it, and a report can't be looked into without it.
+
+        **Getting the log:** in the launcher, open **Settings** and press **Open logs**, or paste `%TEMP%\peerparty\logs` into File Explorer's address bar. There is one file per run, named after the game's exe and the time it started (for example `game-20261109-183005-4242.log`). Attach the newest one for the game, **from each PC that played**.
+  - type: input
+    id: version
+    attributes:
+      label: PeerParty version
+      description: Shown in the launcher's Settings.
+      placeholder: "0.4.0"
+    validations:
+      required: true
+  - type: input
+    id: game
+    attributes:
+      label: Game
+      description: The game's name, and its version if you know it.
+    validations:
+      required: true
+  - type: dropdown
+    id: store
+    attributes:
+      label: Store
+      options:
+        - Steam
+        - Epic Games Store
+        - GOG
+        - Xbox app / Microsoft Store
+        - Other (say which below)
+    validations:
+      required: true
+  - type: dropdown
+    id: network
+    attributes:
+      label: How you played
+      options:
+        - LAN (same network)
+        - Internet (room code or friends)
+        - Public sessions
+        - Only one PC so far
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens
+      description: How many PCs played, what you tried (host, join, invite), what you expected, and what happened instead.
+      placeholder: |
+        1. Two PCs on the same network, both started the game through PeerParty
+        2. PC 1 hosted a lobby
+        3. PC 2 doesn't see it in the server list
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: In the launcher, **Settings → Open logs** (or `%TEMP%\peerparty\logs`). Drag the newest log for the game from each PC into this box. Please attach the files rather than pasting them.
+      placeholder: Drop the .log files here
+    validations:
+      required: true
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Before you send
+      options:
+        - label: The game's online play isn't protected by anti-cheat (PeerParty stops a game in which EasyAntiCheat, BattlEye or EOS Anti-Cheat starts).
+          required: true
+        - label: This isn't a request to get round a store's ownership, licence or anti-cheat checks. Those are closed.
+          required: true
