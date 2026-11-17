@@ -270,6 +270,7 @@ struct Funcs {
     wait_fences: unsafe extern "system" fn(usize, u32, *const u64, u32, u64) -> i32,
     reset_fences: unsafe extern "system" fn(usize, u32, *const u64) -> i32,
     create_buffer: unsafe extern "system" fn(usize, *const BufferInfo, usize, *mut u64) -> i32,
+    destroy_buffer: unsafe extern "system" fn(usize, u64, usize),
     buffer_reqs: unsafe extern "system" fn(usize, u64, *mut [u64; 3]),
     alloc_mem: unsafe extern "system" fn(usize, *const MemAlloc, usize, *mut u64) -> i32,
     free_mem: unsafe extern "system" fn(usize, u64, usize),
@@ -734,6 +735,7 @@ fn funcs_with(get: impl Fn(&CStr) -> Pfn, m: windows_sys::Win32::Foundation::HMO
         wait_fences: f!(c"vkWaitForFences"),
         reset_fences: f!(c"vkResetFences"),
         create_buffer: f!(c"vkCreateBuffer"),
+        destroy_buffer: f!(c"vkDestroyBuffer"),
         buffer_reqs: f!(c"vkGetBufferMemoryRequirements"),
         alloc_mem: f!(c"vkAllocateMemory"),
         free_mem: f!(c"vkFreeMemory"),
@@ -1189,7 +1191,14 @@ impl Gfx {
         if self.staging.is_none_or(|s| s.3 < need) {
             wait();
             let Some((buf, mem, ptr)) = host_buffer(fx, dev, self.phys, need, 0x1) else { return false }; // TRANSFER_SRC
-            self.staging = Some((buf, mem, ptr, need));
+            // The smaller one goes (the wait above let the GPU finish with it), not left
+            // behind on every growth.
+            if let Some((old_buf, old_mem, _, _)) = self.staging.replace((buf, mem, ptr, need)) {
+                unsafe {
+                    (fx.destroy_buffer)(dev, old_buf, 0);
+                    (fx.free_mem)(dev, old_mem, 0);
+                }
+            }
             self.staged = None;
         }
         if self.staged != Some(f.seq) && !f.writing() {

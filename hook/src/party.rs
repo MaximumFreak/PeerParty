@@ -2264,6 +2264,10 @@ unsafe extern "system" fn party_network_connection_type(_: usize, _: usize, out:
 }
 
 unsafe extern "system" fn party_network_statistics(_: usize, count: u32, _types: usize, values: *mut u64) -> u32 {
+    // `put` skips only a null pointer, not the ones past it.
+    if values.is_null() && count > 0 {
+        return E_BAD_ARG;
+    }
     for i in 0..count as usize {
         unsafe { put(values.add(i), 0) };
     }
@@ -2424,6 +2428,10 @@ unsafe extern "system" fn party_endpoint_statistics(
     _types: usize,
     values: *mut u64,
 ) -> u32 {
+    // `put` skips only a null pointer, not the ones past it.
+    if values.is_null() && count > 0 {
+        return E_BAD_ARG;
+    }
     for i in 0..count as usize {
         unsafe { put(values.add(i), 0) };
     }

@@ -227,7 +227,13 @@ pub fn attach(args: &[String]) -> Result<u32, String> {
     let process = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
     let thread = unsafe { OpenThread(THREAD_ALL_ACCESS, 0, tid) };
     if process.is_null() || thread.is_null() {
-        return Err(format!("couldn't open process {pid}: {}", std::io::Error::last_os_error()));
+        let e = std::io::Error::last_os_error();
+        for h in [process, thread] {
+            if !h.is_null() {
+                unsafe { windows_sys::Win32::Foundation::CloseHandle(h) };
+            }
+        }
+        return Err(format!("couldn't open process {pid}: {e}"));
     }
     let (mut machine, mut native) = (0u16, 0u16);
     unsafe { IsWow64Process2(process, &mut machine, &mut native) };

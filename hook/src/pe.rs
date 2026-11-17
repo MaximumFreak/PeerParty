@@ -97,7 +97,7 @@ pub unsafe fn exports(base: *const u8) -> Result<ExportTable, &'static str> {
                 skipped += 1;
                 continue;
             }
-            let name = read_name(base.add(name_rva as usize));
+            let name = read_name(base, name_rva as usize, image_size);
             let ord = u16_at(ords, i * 2)? as u32;
             if ord >= n_funcs {
                 skipped += 1;
@@ -205,7 +205,7 @@ pub unsafe fn imports(base: *const u8) -> Vec<Import> {
             if oft == 0 || !inside(name_rva as usize, 1) || !inside(oft as usize, entry) || !inside(ft as usize, entry) {
                 continue;
             }
-            let dll = read_name(base.add(name_rva as usize));
+            let dll = read_name(base, name_rva as usize, size);
             for i in 0..65536usize {
                 if !inside(oft as usize + i * entry, entry) || !inside(ft as usize + i * entry, entry) {
                     break;
@@ -225,7 +225,7 @@ pub unsafe fn imports(base: *const u8) -> Vec<Import> {
                 }
                 out.push(Import {
                     dll: dll.clone(),
-                    name: read_name(base.add((v as u32) as usize + 2)),
+                    name: read_name(base, (v as u32) as usize + 2, size),
                     slot: base.add(ft as usize + i * entry) as *mut usize,
                     unbound: v as usize,
                 });
@@ -249,11 +249,13 @@ pub unsafe fn write_slot(slot: *mut usize, value: usize) -> bool {
     }
 }
 
-unsafe fn read_name(p: *const u8) -> String {
+/// The name at `rva`, read no further than the image's `size` (a name left without
+/// its NUL in a table still being mapped must not walk into the page after it).
+unsafe fn read_name(base: *const u8, rva: usize, size: usize) -> String {
     unsafe {
         let mut out = Vec::new();
-        for i in 0..512 {
-            let b = p.add(i).read();
+        for i in 0..512.min(size.saturating_sub(rva)) {
+            let b = base.add(rva + i).read();
             if b == 0 {
                 break;
             }

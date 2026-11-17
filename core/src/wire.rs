@@ -721,9 +721,15 @@ impl Msg {
             24 => Msg::OwnerHere { lobby: r.str()? },
             25 => {
                 let n = r.u64()?;
-                // Exactly one message that counts: never a number around a number.
-                let msg = Msg::decode(&b[r.p..])?;
-                if matches!(msg, Msg::Numbered { .. }) || !crate::link::counted(&msg) {
+                // Exactly one message that counts: never a number around a number. That is
+                // checked before decoding what is inside, so a frame of numbers nested a
+                // million deep is turned away at once instead of recursing off the stack.
+                let inner = &b[r.p..];
+                if inner.first() == Some(&25) {
+                    return None;
+                }
+                let msg = Msg::decode(inner)?;
+                if !crate::link::counted(&msg) {
                     return None;
                 }
                 return Some(Msg::Numbered { n, msg: Box::new(msg) });
@@ -892,6 +898,10 @@ mod tests {
         for not in [Msg::Ack { recv: 1 }, Msg::Bye, Msg::Numbered { n: 1, msg: Box::new(leave) }] {
             assert!(Msg::decode(&wrap(&not)).is_none(), "{not:?}");
         }
+        // Numbers nested as deep as a stranger's largest frame allows are refused, not
+        // decoded one level at a time until the stack runs out.
+        let deep = Msg::numbered_head(1).repeat(2 * 1024 * 1024 / 9);
+        assert!(Msg::decode(&deep).is_none());
     }
 
     #[test]

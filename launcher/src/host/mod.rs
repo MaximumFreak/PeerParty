@@ -193,10 +193,12 @@ struct Host {
     /// Opening hotkeys held at the last tick, seen whether or not they could open the
     /// overlay, so a press that couldn't says why in the game's log.
     diag_keys: [bool; 4],
+    /// Some controller's Home / Guide was down at the last tick, the same for Home.
+    diag_home: bool,
     /// A hotkey left to a store's overlay has been mentioned (once a run).
     key_left_told: bool,
-    /// The controllers last named in the game's log.
-    pads_logged: Vec<String>,
+    /// The controllers last named in the game's log (none named yet: `None`).
+    pads_logged: Option<Vec<String>>,
     /// Ticks that panicked (each is caught; the first few go to the game's log).
     panics: u32,
     /// The fonts are loaded into both contexts (the first time anything is drawn: a
@@ -272,8 +274,9 @@ pub fn run(process: HANDLE, pid: u32, pipe: pipe::Pipe, exe: &Path, prefs: Prefs
         other_version: 0,
         fixing: None,
         diag_keys: [false; 4],
+        diag_home: true,
         key_left_told: false,
-        pads_logged: Vec::new(),
+        pads_logged: None,
         panics: 0,
         fonts: false,
     };
@@ -287,7 +290,9 @@ pub fn run(process: HANDLE, pid: u32, pipe: pipe::Pipe, exe: &Path, prefs: Prefs
         } else if host.in_front() {
             33
         } else {
-            200
+            // Often enough to see a Home / Guide press that can't open the overlay
+            // (`why_not_open`).
+            50
         };
         let r = unsafe {
             MsgWaitForMultipleObjects(1, &process, 0, timeout, QS_ALLINPUT)
@@ -429,6 +434,18 @@ fn down(vk: i32) -> bool {
     unsafe { GetAsyncKeyState(vk) as u16 & 0x8000 != 0 }
 }
 
+/// Whether Home / Guide opens the overlay: on, and not taken by inviting everyone.
+pub(super) fn guide_opens(prefs: &Prefs) -> bool {
+    prefs.hotkeys.guide && !matches!(prefs.invite_buttons.as_str(), "guide" | "both")
+}
+
+/// The recorded chord, unless it's View + Menu while that also invites everyone.
+pub(super) fn chord_opens(prefs: &Prefs) -> bool {
+    let c = prefs.hotkeys.chord;
+    let view_menu = pad::BACK | pad::START;
+    c.count_ones() >= 2 && !(c == view_menu && matches!(prefs.invite_buttons.as_str(), "combo" | "both"))
+}
+
 impl Host {
     fn in_front(&self) -> bool {
         let mut pid = 0u32;
@@ -488,14 +505,11 @@ impl Host {
 
 
     fn guide_opens(&self) -> bool {
-        self.prefs.hotkeys.guide && !matches!(self.prefs.invite_buttons.as_str(), "guide" | "both")
+        guide_opens(&self.prefs)
     }
 
-    /// The recorded chord, unless it's View + Menu while that also invites everyone.
     fn chord_opens(&self) -> bool {
-        let c = self.prefs.hotkeys.chord;
-        let view_menu = pad::BACK | pad::START;
-        c.count_ones() >= 2 && !(c == view_menu && matches!(self.prefs.invite_buttons.as_str(), "combo" | "both"))
+        chord_opens(&self.prefs)
     }
 
     fn game_rect(&mut self) -> Option<RECT> {
@@ -682,9 +696,10 @@ impl Host {
         }
     }
 
-    /// An opening hotkey pressed while the overlay can't open: the game's log says why
-    /// (another window in front, Game Bar over the game), so a player's "it didn't open"
-    /// has an answer.
+    /// An opening hotkey or Home / Guide pressed while the overlay can't open: the game's
+    /// log says why (another window in front, a console window such as a mod loader's
+    /// among them, or Game Bar over the game), so a player's "it didn't open" has an
+    /// answer.
     fn why_not_open(&mut self, front: bool, gamebar: bool) {
         let shift = down(VK_SHIFT);
         let mut pressed = None;
@@ -695,6 +710,14 @@ impl Host {
             }
             self.diag_keys[i] = d;
         }
+        // Controllers are read here too, so the log names them whether or not the game
+        // is ever in front. Home with Game Bar over the game is Game Bar's (it closes it).
+        let home = self.pads.poll() & pad::HOME != 0;
+        self.log_pads();
+        if home && !self.diag_home && !front && self.guide_opens() {
+            pressed = pressed.or(Some("Home / Guide"));
+        }
+        self.diag_home = home;
         let Some(key) = pressed else { return };
         let why = if !self.prefs.overlay {
             "the overlay is turned off for this game".to_string()
@@ -702,11 +725,13 @@ impl Host {
             "Game Bar looks open over the game (it has the keyboard and controller meanwhile)".to_string()
         } else if !front {
             let mut pid = 0u32;
-            unsafe { GetWindowThreadProcessId(GetForegroundWindow(), &mut pid) };
+            let fg = unsafe { GetForegroundWindow() };
+            unsafe { GetWindowThreadProcessId(fg, &mut pid) };
             let name = firewall::process_exe(pid)
                 .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
                 .unwrap_or_else(|| format!("process {pid}"));
-            format!("the game isn't the window in front ({name} is; the game is process {})", self.pid)
+            let console = if is_console(fg) { ", a console window, like the one a mod loader opens: click the game to bring it to the front" } else { "" };
+            format!("the game isn't the window in front ({name} is{console}; the game is process {})", self.pid)
         } else {
             return;
         };
@@ -715,18 +740,24 @@ impl Host {
 
     /// The controllers the overlay reads, into the game's log whenever they change, so a
     /// button that doesn't open it shows whether its controller is read at all.
+    /// "none" too, once the first scan is done: a log without the line can't tell no
+    /// controller from controllers never read.
     fn log_pads(&mut self) {
+        if !self.pads.scanned() {
+            return;
+        }
         let found = self.pads.found();
-        if found != self.pads_logged {
+        if self.pads_logged.as_ref() != Some(&found) {
             let list = if found.is_empty() { "none".to_string() } else { found.join(", ") };
             self.pipe.send(json!({"t": "note", "text": format!("overlay: controllers read: {list}")}));
-            self.pads_logged = found;
+            self.pads_logged = Some(found);
         }
     }
 
     /// Opening hotkeys and buttons, while the overlay is closed and the game in front.
     fn check_open(&mut self) {
         self.diag_keys = [true; 4];
+        self.diag_home = true;
         let shift = down(VK_SHIFT);
         let keys = self.hotkeys();
         let mut open = None;
@@ -1311,6 +1342,14 @@ fn exclusive_fullscreen() -> bool {
     let mut state = 0;
     let hr = unsafe { windows_sys::Win32::UI::Shell::SHQueryUserNotificationState(&mut state) };
     hr >= 0 && state == 3 // QUNS_RUNNING_D3D_FULL_SCREEN
+}
+
+/// A console's window: the classic console host's, or Windows Terminal's (where Windows 11
+/// opens a program's console by default, a mod loader's log window among them).
+fn is_console(h: HWND) -> bool {
+    let mut class = [0u16; 64];
+    let n = unsafe { GetClassNameW(h, class.as_mut_ptr(), class.len() as i32) }.max(0) as usize;
+    matches!(String::from_utf16_lossy(&class[..n]).as_str(), "ConsoleWindowClass" | "CASCADIA_HOSTING_WINDOW_CLASS")
 }
 
 /// The game's main window: its biggest visible top-level window.

@@ -488,6 +488,10 @@ fn make_follow_event(pid: u32) -> Option<usize> {
     let event = unsafe { windows_sys::Win32::System::Threading::CreateEventW(std::ptr::null(), 1, 0, follow_event(pid).as_ptr()) };
     if event.is_null() {
         log!("child: no hand-over event for pid {pid}: {}", std::io::Error::last_os_error());
+        // Nothing will hand over to this child, so nothing would ever take its grant
+        // back: left listed, a starter would look pending for the whole run.
+        GRANTS.lock().unwrap().retain(|&(p, _)| p != pid);
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(grant) };
         return None;
     }
     Some(event as usize)

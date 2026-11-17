@@ -2621,8 +2621,12 @@ pub(crate) fn rest_join_arranged(arrangement: &str, c: RestCreate) -> Result<Str
         return Ok(id);
     }
     let deadline = Instant::now() + if creator.is_some() { ARRANGED_WAIT } else { ARRANGED_HEAD_START };
+    let member = |lan: &Lan| lan.lobby(&id).is_some_and(|l| l.members.iter().any(|m| m.id == lan.me()));
     loop {
-        if lan.join_by_id(NS, &id).is_ok() && wait_joined(lan, &id, Duration::from_secs(1)).is_ok() {
+        // A join still in flight from the last try is held as `AlreadyIn`: keep waiting
+        // on it rather than skipping the wait until the deadline.
+        let asked = matches!(lan.join_by_id(NS, &id), Ok(()) | Err(peerparty_core::LobbyError::AlreadyIn));
+        if asked && wait_joined(lan, &id, Duration::from_secs(1)).is_ok() {
             let _ = lan.update(&id, None, &mine, &[]);
             return Ok(id);
         }
@@ -2631,9 +2635,16 @@ pub(crate) fn rest_join_arranged(arrangement: &str, c: RestCreate) -> Result<Str
         }
         std::thread::sleep(Duration::from_millis(250));
     }
+    if member(lan) {
+        let _ = lan.update(&id, None, &mine, &[]);
+        return Ok(id);
+    }
     if creator.is_some() {
         return Err("LobbyNotFound");
     }
+    // A join nobody has answered yet still holds the id; drop it, or creating the
+    // lobby would find it "already in" and this copy would host nothing.
+    let _ = lan.leave(&id);
     create()?;
     Ok(id)
 }

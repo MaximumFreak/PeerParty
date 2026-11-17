@@ -420,8 +420,17 @@ fn eval(e: &Expr, col: &dyn Fn(&str) -> V) -> V {
             if a == V::Null {
                 return V::Null;
             }
-            let found = items.iter().any(|i| a.order(&eval(i, col)) == Ordering::Equal && eval(i, col) != V::Null);
-            bool_v(Some(found != *negated))
+            // As in SQLite: no match with a NULL in the list is NULL, not false, so
+            // `3 NOT IN (5, NULL)` passes no room.
+            let mut null = false;
+            for i in items {
+                match eval(i, col) {
+                    V::Null => null = true,
+                    v if a.order(&v) == Ordering::Equal => return bool_v(Some(!*negated)),
+                    _ => {}
+                }
+            }
+            if null { V::Null } else { bool_v(Some(*negated)) }
         }
         Expr::Between(a, lo, hi, negated) => {
             let (a, lo, hi) = (eval(a, col), eval(lo, col), eval(hi, col));
@@ -549,6 +558,9 @@ mod tests {
             ("C1 LIKE 'M_p2'", true),
             ("C2 IN (1, 2, 3)", true),
             ("C2 NOT IN (1, 2, 3)", false),
+            ("C2 NOT IN (5, C5)", false),
+            ("C2 IN (3, C5)", true),
+            ("C2 NOT IN (3, C5)", false),
             ("C5 = 1", false),
             ("C5 IS NULL", true),
             ("C0 IS NOT NULL AND C0 % 2 = 0", true),

@@ -1092,7 +1092,13 @@ fn digital(name: &str, this: usize, input: u64, action: u64) -> u16 {
 /// bigger than a register, so returned through a hidden pointer (first, before `this`).
 /// While the overlay shows, x and y read 0 (mode and active kept).
 fn analog(name: &str, out: *mut u8, this: usize, input: u64, action: u64) -> *mut u8 {
-    let Some(f) = real(name) else { return out };
+    let Some(f) = real(name) else {
+        // No real one to ask: at rest, as the C++ path answers (`v_input_analog`).
+        if !out.is_null() {
+            unsafe { std::ptr::write_bytes(out, 0, 16) };
+        }
+        return out;
+    };
     let f: unsafe extern "C" fn(*mut u8, usize, u64, u64) -> *mut u8 = unsafe { std::mem::transmute(f) };
     let r = unsafe { f(out, unwrap(this), input, action) };
     if crate::overlay::pads_held_back() && !r.is_null() {

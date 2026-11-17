@@ -980,8 +980,13 @@ fn bulk(id: &str, body: &Json) -> Reply {
             return last;
         }
     }
+    // A refused player update is the answer, as a refused lobby update is: not a 200
+    // with the change missing.
     for (player, upd) in pairs(body.get("playerUpdates")) {
         last = update_player(id, player, upd);
+        if last.0 / 100 != 2 {
+            return last;
+        }
     }
     for p in body.get("playersToRemove").as_arr() {
         if let Some(p) = p.as_str().map(str::to_string).or_else(|| p.get("id").as_str().map(str::to_string)) {

@@ -141,11 +141,18 @@ struct Opus {
 const OPUS_RATES: [u32; 5] = [8_000, 12_000, 16_000, 24_000, 48_000];
 
 fn opus_takes(f: &Frame) -> Option<usize> {
-    if !OPUS_RATES.contains(&f.rate) || !(1..=2).contains(&f.channels) || f.samples.len() % f.channels as usize != 0 {
+    if !(1..=2).contains(&f.channels) || f.samples.len() % f.channels as usize != 0 {
         return None;
     }
-    let n = f.samples.len() / f.channels as usize;
-    let per_ms = f.rate as usize / 1000;
+    opus_length(f.rate, f.samples.len() / f.channels as usize)
+}
+
+/// `n` samples a channel, when Opus has a frame that long at `rate`.
+fn opus_length(rate: u32, n: usize) -> Option<usize> {
+    if !OPUS_RATES.contains(&rate) {
+        return None;
+    }
+    let per_ms = rate as usize / 1000;
     [per_ms * 5 / 2, per_ms * 5, per_ms * 10, per_ms * 20, per_ms * 40, per_ms * 60].contains(&n).then_some(n)
 }
 
@@ -194,7 +201,8 @@ impl Opus {
         let rate = u32::from_le_bytes(b[1..5].try_into().ok()?);
         let channels = b[5] as u32;
         let n = u16::from_le_bytes([b[6], b[7]]) as usize;
-        if !(1..=2).contains(&channels) || opus_takes(&Frame { rate, channels, samples: vec![0; n * channels as usize] }).is_none() {
+        // Checked from the header alone: a stranger's 8 bytes don't get a buffer made.
+        if !(1..=2).contains(&channels) || opus_length(rate, n).is_none() {
             return None;
         }
         let shape = (rate, channels);
@@ -732,6 +740,11 @@ pub fn pump(lan: &Lan) {
                                 let gain = r.volume_out * r.peer_volume.get(&p.peer).copied().unwrap_or(1.0);
                                 let [left, right] = pan_gains(r.peer_pan.get(&p.peer).copied().unwrap_or(0.0));
                                 devices::play(room, p.peer, &f, [gain * left, gain * right]);
+                            }
+                            // Audio is the biggest event: a game that has stopped taking
+                            // them loses the oldest, as with data.
+                            if r.events.len() >= EVENTS_MAX {
+                                r.events.pop_front();
                             }
                             r.events.push_back(RoomEvent::Audio(p.peer, f));
                         }

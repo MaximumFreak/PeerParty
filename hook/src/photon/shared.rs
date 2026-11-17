@@ -760,7 +760,9 @@ impl Server {
             let mut words = Vec::new();
             let mut at = word::FIRST_DELTA;
             while r.bool()? {
-                at += r.varlen(4)? as usize;
+                // A step that wraps would land back in the header words (or panic): the
+                // packet is malformed.
+                at = at.checked_add(usize::try_from(r.varlen(4)?).ok()?)?;
                 words.push((at, unzigzag(r.varlen(6)?) as i32));
             }
             if id == INTERNAL_STATE {

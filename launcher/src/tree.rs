@@ -101,7 +101,9 @@ impl Tree {
                 );
                 ended.starter = Some((ended.pid, ended.exe.clone(), ended.code));
             }
-            let handles: Vec<HANDLE> = left.iter().map(|l| l.2).collect();
+            // At most 64 at once (MAXIMUM_WAIT_OBJECTS): more makes every wait fail, and
+            // which one ended would never be seen. The rest are watched on later looks.
+            let handles: Vec<HANDLE> = left.iter().take(64).map(|l| l.2).collect();
             // A program started meanwhile shows up on the next look.
             let r = unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, 2000) };
             if r != WAIT_FAILED && (r as usize) < WAIT_OBJECT_0 as usize + handles.len() {

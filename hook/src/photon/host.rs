@@ -72,6 +72,14 @@ struct Adapter {
     drop_init_response: bool,
 }
 
+/// The reader thread holds its own handle to the stream: shutting it down is what ends
+/// that thread when the server stops, not only when the client goes.
+impl Drop for Adapter {
+    fn drop(&mut self) {
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
+}
+
 impl Adapter {
     fn new(peer: Peer, stream: TcpStream, ws: bool, drop_init_response: bool) -> Adapter {
         Adapter { peer, stream, queued: Vec::new(), ws, drop_init_response }

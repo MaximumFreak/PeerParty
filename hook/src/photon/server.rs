@@ -451,6 +451,23 @@ impl Game {
         })
     }
 
+    /// What `custom` would hold once `apply(update)` ran, without changing anything.
+    fn custom_after(&self, update: &Table) -> Table {
+        let delete_null = self.flags & flag::DELETE_NULL_PROPS != 0;
+        let mut custom = self.custom.clone();
+        for (k, v) in update {
+            if !is_custom(k) {
+                continue;
+            }
+            if v.is_null() && delete_null {
+                table_remove(&mut custom, k);
+            } else {
+                table_set(&mut custom, k.clone(), v.clone());
+            }
+        }
+        custom
+    }
+
     /// Luxon `Game::insert_game_props`. Returns (lobby list changed, became invisible).
     fn apply(&mut self, update: &Table) -> (bool, bool) {
         let delete_null = self.flags & flag::DELETE_NULL_PROPS != 0;
@@ -494,9 +511,7 @@ impl Game {
                     self.lobby_props = l.clone();
                     list = true;
                 }
-                (Value::Byte(prop::PLAYER_COUNT | prop::REMOVED), _) => {}
-                (Value::Byte(prop::MAX_PLAYERS | prop::IS_VISIBLE | prop::IS_OPEN | prop::LOBBY_PROPERTIES), _) => {}
-                (Value::Null, _) => {}
+                (k, _) if !is_custom(k) => {}
                 (k, v) => {
                     if let Value::Str(s) = k {
                         list |= self.lobby_props.contains(s);
@@ -1860,12 +1875,12 @@ impl Server {
             if !update_fits(&update) {
                 return self.gs_fail(id, code, err::INVALID_PARAMETERS, "Too many properties");
             }
-            let before = g.custom.clone();
-            let (changed, hidden) = g.apply(&update);
-            if !props_fit(&g.custom) {
-                g.custom = before;
+            // Sized before anything is applied: a refused update must not leave the room's
+            // own settings (max players, open, master...) changed behind the error.
+            if !props_fit(&g.custom_after(&update)) {
                 return self.gs_fail(id, code, err::INVALID_PARAMETERS, "Too many properties");
             }
+            let (changed, hidden) = g.apply(&update);
             list = changed || hidden;
         }
         let to_all = g.flags & flag::BROADCAST_PROPS_TO_ALL != 0 || expected.is_some();
@@ -2096,6 +2111,26 @@ impl Server {
             }
         }
     }
+}
+
+/// A game property key that lands in `Game::custom`, not one of the room's own settings
+/// (`Game::apply` takes those, or ignores them when their value has the wrong type).
+fn is_custom(k: &Value) -> bool {
+    !matches!(
+        k,
+        Value::Null
+            | Value::Byte(
+                prop::MAX_PLAYERS
+                    | prop::IS_VISIBLE
+                    | prop::IS_OPEN
+                    | prop::PLAYER_TTL
+                    | prop::EMPTY_ROOM_TTL
+                    | prop::MASTER_CLIENT_ID
+                    | prop::LOBBY_PROPERTIES
+                    | prop::PLAYER_COUNT
+                    | prop::REMOVED
+            )
+    )
 }
 
 /// Room options the creating client sends (LoadBalancingPeer `RoomOptionsToOpParameters`).

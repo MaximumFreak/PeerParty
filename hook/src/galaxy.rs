@@ -451,8 +451,15 @@ fn wrap(real: usize, iface: Iface) -> usize {
     }
     let vtable = Box::leak(vtable.into_boxed_slice()).as_ptr();
     let proxy = Box::leak(Box::new(Proxy { vtable, real })) as *const Proxy as usize;
-    PROXIES.lock().unwrap().insert((real, iface), proxy);
-    REALS.lock().unwrap().insert(proxy, (real, iface));
+    {
+        // One stand-in per object, even when two threads wrap it at once.
+        let mut proxies = PROXIES.lock().unwrap();
+        if let Some(p) = proxies.get(&(real, iface)) {
+            return *p;
+        }
+        proxies.insert((real, iface), proxy);
+        REALS.lock().unwrap().insert(proxy, (real, iface));
+    }
     log!("galaxy {}: peerparty answers {ours} of its {} methods", iface.class(), names.len() - 1);
     proxy
 }
@@ -1908,7 +1915,8 @@ vmethod! {
         ours();
         let id = gid(lobby);
         let (Some(lan), Some(l)) = (lan(), view(id)) else { return false };
-        if l.member(lan.me()).is_none() {
+        // Longer than the others take (MESSAGE_MAX), it would reach only the sender.
+        if l.member(lan.me()).is_none() || size as usize > MESSAGE_MAX {
             return false;
         }
         let body = if data.is_null() || size == 0 { Vec::new() } else { unsafe { std::slice::from_raw_parts(data, size as usize) }.to_vec() };

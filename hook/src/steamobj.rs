@@ -240,8 +240,16 @@ pub fn wrap_as(real: usize, version: &str, server: bool) -> usize {
         version,
         server,
     })) as *const Proxy as usize;
-    PROXIES.lock().unwrap().insert(real, proxy);
-    REALS.write().unwrap().insert(proxy, real);
+    {
+        // Another thread may have wrapped the same object meanwhile: the game must get
+        // one stand-in per object, so the first one in stays (this one goes unused).
+        let mut proxies = PROXIES.lock().unwrap();
+        if let Some(p) = proxies.get(&real) {
+            return *p;
+        }
+        proxies.insert(real, proxy);
+        REALS.write().unwrap().insert(proxy, real);
+    }
     if !server {
         SEEN.lock()
             .unwrap()

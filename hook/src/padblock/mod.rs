@@ -201,6 +201,10 @@ where
                 let _ = slots.hooks[i].set(h);
                 if let Err(e) = crate::hook::frozen(addr, || unsafe { slots.hooks[i].get().unwrap().enable() }) {
                     log!("padblock {label}: {e}");
+                    // The slot keeps this detour (a OnceLock), so it can't be handed out
+                    // again: the next address would get this one's detour re-enabled in
+                    // place of its own, and never be held back itself.
+                    addrs[i] = usize::MAX;
                     return 0;
                 }
                 addrs[i] = addr;

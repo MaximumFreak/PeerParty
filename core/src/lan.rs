@@ -62,9 +62,11 @@ const MOVE_HOLD_MAX: usize = 65_536;
 /// messages pile up to gigabytes while its old connection drains).
 const MOVE_HOLD_BYTES: usize = 64 << 20;
 
-/// About what a message takes held in memory: its channel data, else a little.
+/// About what a message takes held in memory: its channel data, else a little. A
+/// numbered message weighs what it carries.
 fn weight(m: &Msg) -> usize {
     match m {
+        Msg::Numbered { msg, .. } => weight(msg),
         Msg::ChanData { socket, data, .. } => data.len() + socket.len() + 64,
         Msg::Presence { kv } => kv.iter().map(|(k, v)| k.len() + v.len() + 48).sum::<usize>() + 64,
         _ => 256,
@@ -474,6 +476,11 @@ struct Peer {
     /// `early` is being delivered (`Inner::deliver_early`): what comes meanwhile, on
     /// another connection, queues behind it rather than overtaking it.
     draining: bool,
+    /// How many times a drain was cut short by the connection dropping (`Inner::lost`):
+    /// a message `deliver_early` took off the queue before that is dropped, not
+    /// delivered after what it overtook was discarded (a resume sends it again; no
+    /// resume and it belongs to a session that's over).
+    drain_cut: u64,
     /// What `held` and `prior` (`held_bytes`) and `early` (`early_bytes`) hold, about
     /// (`weight`), against MOVE_HOLD_BYTES.
     held_bytes: usize,
@@ -538,6 +545,7 @@ impl Peer {
             said: None,
             early: VecDeque::new(),
             draining: false,
+            drain_cut: 0,
             held_bytes: 0,
             early_bytes: 0,
             bye: false,
@@ -1058,6 +1066,7 @@ impl Inner {
         p.early.clear();
         p.early_bytes = 0;
         p.draining = false;
+        p.drain_cut += 1;
         for x in p.prior.iter_mut() {
             x.done = true;
         }
@@ -1172,7 +1181,7 @@ impl Inner {
     /// another connection can't overtake an older one held here.
     fn deliver_early(&self, peer: PeerId) {
         loop {
-            let (c, m) = {
+            let (c, m, cut) = {
                 let mut s = self.state.lock().unwrap();
                 let Some(p) = s.peers.get_mut(&peer) else { return };
                 // Lost and back again meanwhile: the next decision delivers what's left.
@@ -1185,9 +1194,9 @@ impl Inner {
                     return;
                 };
                 p.early_bytes = p.early_bytes.saturating_sub(weight(&m));
-                (c, m)
+                (c, m, p.drain_cut)
             };
-            self.receive(&c, m, true, true);
+            self.receive(&c, m, true, Some(cut));
         }
     }
 
@@ -1409,6 +1418,13 @@ impl Lan {
     /// it; the first one's game key wins. `server`: this process is a dedicated server,
     /// which takes a server identity slot (`Identity::claim_server`), not a player's.
     pub fn global(game: &str, server: bool, log: fn(&str)) -> io::Result<Lan> {
+        if let Some(lan) = GLOBAL.get() {
+            return Ok(lan.clone());
+        }
+        // One starts at a time: two first callers at once would each bind the ports and
+        // claim an identity slot, and the one not kept would hold them for good.
+        static STARTING: Mutex<()> = Mutex::new(());
+        let _starting = STARTING.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(lan) = GLOBAL.get() {
             return Ok(lan.clone());
         }
@@ -3594,9 +3610,10 @@ fn replaces_stale(old: &Conn, new: &Conn) -> bool {
 }
 
 impl Inner {
-    /// A message from a peer's connection (`Sink::message`), or (`draining`) one
-    /// `deliver_early` takes off the peer's early queue.
-    fn receive(&self, conn: &Arc<Conn>, msg: Msg, ordered: bool, draining: bool) {
+    /// A message from a peer's connection (`Sink::message`), or (`drain`, the peer's
+    /// `drain_cut` when it was taken) one `deliver_early` takes off its early queue.
+    fn receive(&self, conn: &Arc<Conn>, msg: Msg, ordered: bool, drain: Option<u64>) {
+        let draining = drain.is_some();
         // A number belongs to the ordered stream; a datagram with one is a lie.
         if !ordered && matches!(msg, Msg::Numbered { .. }) {
             return;
@@ -3609,6 +3626,10 @@ impl Inner {
             let Some(p) = s.peers.get_mut(&conn.peer) else {
                 return;
             };
+            // Taken off the early queue, then the connection dropped before it was delivered.
+            if drain.is_some_and(|cut| cut != p.drain_cut) {
+                return;
+            }
             if Arc::ptr_eq(&p.conn, conn) || p.prior.iter().any(|x| Arc::ptr_eq(&x.conn, conn)) || conn.retired() {
                 match &msg {
                     &Msg::Session { mine, yours, sent, recv, first } => {
@@ -3883,7 +3904,7 @@ impl Sink for Inner {
     }
 
     fn message(&self, conn: &Arc<Conn>, msg: Msg, ordered: bool) {
-        self.receive(conn, msg, ordered, false);
+        self.receive(conn, msg, ordered, None);
     }
 
     fn disconnected(&self, conn: &Arc<Conn>) {
@@ -3964,6 +3985,14 @@ mod tests {
 
     fn state(l: &Lobby) -> Msg {
         Msg::State { lobby: l.clone(), secret: SECRET }
+    }
+
+    #[test]
+    fn numbered_messages_weigh_what_they_carry() {
+        let data = Msg::ChanData { socket: "s".into(), channel: 0, reliable: true, data: vec![0; 1 << 20] };
+        let alone = weight(&data);
+        assert!(alone > 1 << 20);
+        assert_eq!(weight(&Msg::Numbered { n: 1, msg: Box::new(data) }), alone);
     }
 
     #[test]

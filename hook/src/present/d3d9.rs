@@ -180,7 +180,9 @@ fn texture(device: usize, w: u32, h: u32) -> Option<usize> {
     }
     let t = g.as_mut()?;
     let f = frame()?;
-    if t.seq != Some(f.seq) && !f.writing() {
+    // Read again, the frame may have changed size since `draw` sized the texture:
+    // copied into this one, it would write past the locked surface.
+    if t.seq != Some(f.seq) && !f.writing() && (f.w, f.h) == t.size {
         let mut lr = LockedRect { pitch: 0, bits: std::ptr::null_mut() };
         // IDirect3DTexture9::LockRect / UnlockRect are slots 19 / 20; D3DLOCK_DISCARD.
         if vcall!(t.tex, 19, fn(u32, *mut LockedRect, usize, u32) -> i32, 0, &mut lr, 0, 0x2000) >= 0 {

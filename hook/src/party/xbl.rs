@@ -259,7 +259,13 @@ unsafe extern "system" fn create_local(_h: usize, xuid: u64, async_id: usize, ou
 unsafe extern "system" fn create_remote(_h: usize, xuid: u64, out: *mut usize) -> PartyError {
     let h = with(|s| {
         if let Some(u) = s.users.iter().find(|u| u.xuid == xuid && !u.local) {
-            return user_ptr(u);
+            // One destroyed earlier is kept alive but forgotten: made again, it is listed
+            // again (and hears permission changes) like a new one.
+            let h = user_ptr(u);
+            if !s.handles.contains(&h) {
+                s.handles.push(h);
+            }
+            return h;
         }
         let u = Box::new(ChatUser { xuid, local: false, context: 0 });
         let h = user_ptr(&u);

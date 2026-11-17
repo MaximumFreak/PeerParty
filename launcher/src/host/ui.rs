@@ -548,7 +548,9 @@ const KEY_NAMES: [&str; 4] = ["Shift+Tab", "Shift+F3", "Shift+F1", "Shift+F2"];
 /// host's rule (`usable_hotkeys`), with Home / Guide or a chord as the other ways in.
 fn usable_keys(prefs: &Prefs, foreign: &[String]) -> [bool; 4] {
     let hk = &prefs.hotkeys;
-    let other = hk.guide || hk.chord.count_ones() >= 2;
+    // As the host decides it: Home / Guide or a chord that invites everyone instead
+    // doesn't open the overlay.
+    let other = super::guide_opens(prefs) || super::chord_opens(prefs);
     super::usable_hotkeys([hk.shift_tab, hk.shift_f3, hk.shift_f1, hk.shift_f2], foreign, other)
 }
 
@@ -952,13 +954,12 @@ impl Overlay {
                 rows
             }
             Page::Settings => {
-                let hk = &prefs.hotkeys;
                 // The keys that open it in this game: one a store overlay loaded here
                 // opens on too is left to that overlay (host's `usable_hotkeys`).
                 let usable = usable_keys(prefs, &st.foreign);
                 let keys: Vec<&str> = KEY_NAMES.iter().zip(usable).filter(|k| k.1).map(|k| *k.0).collect();
                 let mut open_with = keys.join(", ");
-                if hk.guide {
+                if super::guide_opens(prefs) {
                     if !open_with.is_empty() {
                         open_with.push_str(", ");
                     }

@@ -454,7 +454,8 @@ fn complete(raw: &[u8]) -> bool {
     let Some(end) = find(raw, b"\r\n\r\n") else { return false };
     let head = String::from_utf8_lossy(&raw[..end]);
     if let Some(n) = header(&head, "content-length").and_then(|v| v.parse::<usize>().ok()) {
-        return raw.len() >= end + 4 + n;
+        // The router's number: one near usize::MAX must mean "not yet", not wrap to done.
+        return raw.len().saturating_sub(end + 4) >= n;
     }
     raw.ends_with(b"\r\n0\r\n\r\n")
 }

@@ -4,8 +4,8 @@
 friends or anyone playing the same game, without the online services their multiplayer
 was built on. Whatever a game uses (Steamworks, Epic Online Services, PlayFab, GOG
 Galaxy, Photon or Unity Gaming Services), its lobbies, invites, friends, voice and
-connections run between the copies themselves. It's one Windows program, written in
-Rust, that starts the game with a small hook inside it. No game files change.
+connections run between the copies themselves. It's one Windows program that starts
+the game with a small hook inside it. No game files change.
 
 <table>
   <tr>

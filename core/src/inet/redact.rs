@@ -94,6 +94,8 @@ pub fn has_address(s: &str) -> bool {
         i += 1;
     }
     s.split(|c: char| c.is_whitespace() || c == '[' || c == ']' || c == '(' || c == ')')
+        // A "%zone" suffix ("fe80::1%12") doesn't parse, but the address before it does.
+        .map(|w| w.split('%').next().unwrap_or(w))
         .any(|w| w.matches(':').count() >= 2 && w.parse::<std::net::Ipv6Addr>().is_ok())
 }
 
@@ -383,7 +385,7 @@ mod tests {
 
     #[test]
     fn finds_addresses_in_names() {
-        for s in ["1.2.3.4", "me@10.0.0.1:5", "x 192.168.001.002 y", "1-2-3-4", "::1 here", "[2001:db8::1]:80", "1_2_3_4"] {
+        for s in ["1.2.3.4", "me@10.0.0.1:5", "x 192.168.001.002 y", "1-2-3-4", "::1 here", "[2001:db8::1]:80", "1_2_3_4", "fe80::1%12", "[fe80::1%eth0]:80"] {
             assert!(has_address(s), "{s}");
         }
         for s in ["Robin", "Player 2", "v1.2.3", "Team 10", "12:30", "a:b:c", "1.2.3"] {

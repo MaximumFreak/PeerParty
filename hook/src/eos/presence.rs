@@ -356,7 +356,8 @@ unsafe fn records(o: *const RecordsOptions) -> Option<Vec<(String, Option<String
     if o.RecordsCount < 0 || (o.RecordsCount > 0 && o.Records.is_null()) {
         return None;
     }
-    let rs = unsafe { std::slice::from_raw_parts(o.Records, o.RecordsCount as usize) };
+    // No records may come as a null pointer, which a slice can't be made from.
+    let rs = if o.RecordsCount == 0 { &[] } else { unsafe { std::slice::from_raw_parts(o.Records, o.RecordsCount as usize) } };
     Some(
         rs.iter()
             .filter_map(|r| {
@@ -394,7 +395,7 @@ unsafe extern "system" fn mod_delete_data(h: usize, o: *const RecordsOptions) ->
         ApiVersion: i32,
         Key: *const c_char,
     }
-    let ids = unsafe { std::slice::from_raw_parts(o.Records as *const RecordId, o.RecordsCount as usize) };
+    let ids = if o.RecordsCount == 0 { &[] } else { unsafe { std::slice::from_raw_parts(o.Records as *const RecordId, o.RecordsCount as usize) } };
     let keys: Vec<String> = ids.iter().filter_map(|r| unsafe { text(r.Key) }).collect();
     with_edit(h, |m| {
         for k in keys {

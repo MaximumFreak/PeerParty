@@ -149,7 +149,9 @@ fn parse_response(got: &[u8]) -> Option<(u16, String, bool)> {
             if size == 0 {
                 return Some((status, String::from_utf8_lossy(&body).into(), true));
             }
-            if rest.len() < at + size + 2 {
+            // The size is the server's: one past anything read so far is "not yet" (the
+            // read stops at MAX_ANSWER), never a sum that wraps.
+            if rest.len().saturating_sub(at) < size.saturating_add(2) {
                 return Some((status, String::from_utf8_lossy(&body).into(), false));
             }
             body.extend_from_slice(&rest[at..at + size]);

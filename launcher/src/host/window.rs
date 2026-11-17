@@ -86,10 +86,6 @@ impl Layered {
         if self.size == (w, h) && !self.bits.is_null() {
             return true;
         }
-        if !self.bitmap.is_null() {
-            unsafe { DeleteObject(self.bitmap) };
-            self.bitmap = std::ptr::null_mut();
-        }
         let mut bi: BITMAPINFO = unsafe { std::mem::zeroed() };
         bi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
         bi.bmiHeader.biWidth = w as i32;
@@ -100,9 +96,17 @@ impl Layered {
         let mut bits = std::ptr::null_mut();
         let bmp = unsafe { CreateDIBSection(self.dc, &bi, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0) };
         if bmp.is_null() || bits.is_null() {
+            if !bmp.is_null() {
+                unsafe { DeleteObject(bmp) };
+            }
             return false;
         }
+        // The old bitmap is selected into the DC, and a selected bitmap can't be deleted:
+        // select the new one first, which lets the old one go.
         unsafe { SelectObject(self.dc, bmp) };
+        if !self.bitmap.is_null() {
+            unsafe { DeleteObject(self.bitmap) };
+        }
         self.bitmap = bmp;
         self.bits = bits.cast();
         self.size = (w, h);
@@ -178,10 +182,11 @@ impl Drop for Layered {
     fn drop(&mut self) {
         unsafe {
             DestroyWindow(self.hwnd);
+            // The DC first, so the bitmap is no longer selected into anything.
+            DeleteDC(self.dc);
             if !self.bitmap.is_null() {
                 DeleteObject(self.bitmap);
             }
-            DeleteDC(self.dc);
         }
     }
 }

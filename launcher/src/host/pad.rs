@@ -109,6 +109,8 @@ pub struct Pads {
     connected: [bool; 4],
     hid: Arc<Mutex<Vec<Hid>>>,
     last_scan: Option<Instant>,
+    /// The first HID scan has finished (until then `found` may be missing HID pads).
+    scanned: Arc<AtomicBool>,
     pub style: Style,
     last_buttons: u32,
     /// Home was down at the last poll, or hasn't been seen up yet, per XInput slot.
@@ -129,6 +131,7 @@ impl Pads {
             connected: [false; 4],
             hid: Arc::new(Mutex::new(Vec::new())),
             last_scan: None,
+            scanned: Arc::new(AtomicBool::new(false)),
             style: Style::Xbox,
             last_buttons: 0,
             x_home: [true; 4],
@@ -152,8 +155,11 @@ impl Pads {
         self.home_pressed = false;
         if self.last_scan.is_none_or(|t| t.elapsed() > Duration::from_secs(3)) {
             self.last_scan = Some(Instant::now());
-            let hid = self.hid.clone();
-            std::thread::spawn(move || scan_hid(&hid));
+            let (hid, scanned) = (self.hid.clone(), self.scanned.clone());
+            std::thread::spawn(move || {
+                scan_hid(&hid);
+                scanned.store(true, Ordering::Relaxed);
+            });
         }
         if let Some(get) = self.xinput {
             for pad in 0..4u32 {
@@ -208,6 +214,11 @@ impl Pads {
 
 impl Pads {
     /// Each controller read, with its buttons now (`peerparty --pads`).
+    /// Whether the first HID scan is done, so `found` names every controller there is.
+    pub fn scanned(&self) -> bool {
+        self.scanned.load(Ordering::Relaxed)
+    }
+
     /// The controllers the last poll read, by name ("XInput slot 0", "HID 054c:0ce6"),
     /// for the game's log.
     pub fn found(&self) -> Vec<String> {
