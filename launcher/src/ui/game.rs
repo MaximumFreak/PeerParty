@@ -350,18 +350,20 @@ impl App {
         }
         widgets::section(ui, t!("game.adv_layers"));
         ui.add(egui::Label::new(egui::RichText::new(t!("game.adv_layers_sub")).size(12.0).color(TEXT3)).wrap());
+        // Each switch is on while its layer is (the default): off puts it on the game's
+        // skip list (`PEERPARTY_SKIP`).
         for (layer, what) in layers() {
-            let mut off = o.skip.iter().any(|s| s == layer);
+            let mut on = !o.skip.iter().any(|s| s == layer);
             let changed = ui
                 .horizontal(|ui| {
-                    let c = widgets::switch(ui, &mut off).changed();
+                    let c = widgets::switch(ui, &mut on).changed();
                     ui.add(egui::Label::new(egui::RichText::new(what).size(13.0).color(TEXT2)).wrap());
                     c
                 })
                 .inner;
             if changed {
                 o.skip.retain(|s| s != layer);
-                if off {
+                if !on {
                     o.skip.push(layer.to_string());
                 }
             }

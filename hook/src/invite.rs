@@ -272,29 +272,50 @@ pub fn why_not() -> Option<String> {
 /// PeerParty can't hand an invite to (Xbox's invites and PlayFab Party only, say) is
 /// told so, instead of being asked to host first.
 fn why_not_with(fronts: &[net::Front]) -> String {
-    why_not_for(fronts, &crate::modes::official_in_use(), crate::photon::local_room(), current_lobby().is_some())
+    why_not_for(fronts, &crate::modes::official_in_use(), &net::services_off(), crate::photon::local_room(), current_lobby().is_some())
 }
+
+/// Starts the "can't invite" note when the services the game plays through are turned
+/// off for it in PeerParty: their layers' names (`PEERPARTY_SKIP`'s) follow, joined by
+/// ", ", and the overlay says them in the player's language.
+pub const LAYERS_OFF: &str = "Turned off for this game in PeerParty: ";
+
+/// Starts the note for services left on their official servers: their names follow,
+/// joined by " and ", then `OFFICIAL_END`.
+pub const OFFICIAL_START: &str = "This game's online play goes through ";
+pub const OFFICIAL_END: &str = "'s own servers, which PeerParty can't invite through: use the game's own invites or room codes, or set it to PeerParty's own in this game's page in PeerParty (Advanced, Online services)";
+
+/// Starts the note for a game whose services PeerParty can't hand an invite through:
+/// their names follow, joined by " or ".
+pub const UNSUPPORTED_START: &str = "Not supported for this game yet: PeerParty can't hand it an invite through ";
+
+/// The layers whose services carry lobbies and invites: one of them turned off is why
+/// there's nothing to invite to (voice and sign-in layers aren't).
+const LOBBY_LAYERS: &[&str] = &["steam", "eos", "pfmp", "galaxy", "party", "photon", "ugs", "playfab"];
 
 /// `why_not_with`, given the services left on their official servers this run: a game
 /// that hosts its rooms there (Photon's cloud, say) has nothing PeerParty can invite to,
 /// however many rooms it made, so it's told to use the game's own codes. A game hosting
 /// a Photon room on PeerParty's own servers (`photon_room`) is hosting: Photon has no
-/// invites, so it's told how the others join it instead of to host first. A game in a
-/// lobby PeerParty knows (`in_lobby`) but with no way to hand it over is told how
-/// PeerParty learns one (`LEARN_FIRST`).
-fn why_not_for(fronts: &[net::Front], official: &[&str], photon_room: Option<String>, in_lobby: bool) -> String {
+/// invites, so it's told how the others join it instead of to host first. A game whose
+/// services were turned off for it (`off`, PEERPARTY_SKIP) and that plays through none
+/// PeerParty answers is told which, not to host first: its lobbies never reach
+/// PeerParty. A game in a lobby PeerParty knows (`in_lobby`) but with no way to hand it
+/// over is told how PeerParty learns one (`LEARN_FIRST`).
+fn why_not_for(fronts: &[net::Front], official: &[&str], off: &[&str], photon_room: Option<String>, in_lobby: bool) -> String {
     if !official.is_empty() {
-        return format!(
-            "This game's online play goes through {}'s own servers, which peerparty can't invite through: use the game's own invites or room codes instead",
-            official.join(" and ")
-        );
+        return format!("{OFFICIAL_START}{}{OFFICIAL_END}", official.join(" and "));
     }
     if let Some(room) = photon_room {
         return format!("{PHOTON_NO_INVITES} (room {room})");
     }
+    let off: Vec<&str> = off.iter().copied().filter(|l| LOBBY_LAYERS.contains(l)).collect();
+    if !off.is_empty() && !fronts.iter().any(|f| CARRIERS.contains(f)) {
+        return format!("{LAYERS_OFF}{}", off.join(", "));
+    }
     if !fronts.is_empty() && !fronts.iter().any(|f| CARRIERS.contains(f)) {
         let names: Vec<&str> = fronts.iter().map(|f| f.label()).collect();
-        return format!("Not supported for this game yet: peerparty can't hand it an invite through {}", names.join(" or "));
+        return format!("{UNSUPPORTED_START}{}", names.join(" or "));
     }
     if in_lobby {
         return LEARN_FIRST.into();
@@ -843,23 +864,37 @@ mod tests {
     fn says_why_there_is_nothing_to_invite_to() {
         use crate::net::Front;
         // PlayFab Party only, whose invites PeerParty can't carry.
-        let party = why_not_for(&[Front::Party], &[], None, false);
-        assert!(party.starts_with("Not supported for this game yet"), "{party}");
+        let party = why_not_for(&[Front::Party], &[], &[], None, false);
+        assert!(party.starts_with(UNSUPPORTED_START), "{party}");
         assert!(party.contains("PlayFab Party"), "{party}");
         // A game with a lobby service just hasn't hosted yet, nor has one that hasn't
         // started any online service.
-        assert_eq!(why_not_for(&[Front::Party, Front::Eos], &[], None, false), "Host or join a game first");
-        assert_eq!(why_not_for(&[], &[], None, false), "Host or join a game first");
+        assert_eq!(why_not_for(&[Front::Party, Front::Eos], &[], &[], None, false), "Host or join a game first");
+        assert_eq!(why_not_for(&[], &[], &[], None, false), "Host or join a game first");
         // In a lobby (a Unity lobby, say) PeerParty can't hand over until the game has
         // shown it an invite of its own.
-        assert_eq!(why_not_for(&[Front::Steam, Front::Ugs], &[], None, true), LEARN_FIRST);
+        assert_eq!(why_not_for(&[Front::Steam, Front::Ugs], &[], &[], None, true), LEARN_FIRST);
         // Rooms on Photon's own cloud (a Steam game whose multiplayer is Photon's):
         // no room the player makes is one PeerParty can invite to.
-        let photon = why_not_for(&[Front::Steam], &["Photon"], None, false);
+        let photon = why_not_for(&[Front::Steam], &["Photon"], &[], None, false);
         assert!(photon.contains("Photon's own servers") && photon.contains("room codes"), "{photon}");
+        assert!(photon.starts_with(OFFICIAL_START) && photon.ends_with(OFFICIAL_END), "{photon}");
         // A room on PeerParty's own Photon servers: the game has hosted, and its players
         // join from its own menu (Photon has no invites), not "host first".
-        let room = why_not_for(&[Front::Steam], &[], Some("EUCSH".into()), false);
+        let room = why_not_for(&[Front::Steam], &[], &[], Some("EUCSH".into()), false);
         assert_eq!(room, format!("{PHOTON_NO_INVITES} (room EUCSH)"));
+    }
+
+    /// A Steam game whose Steam layer the player turned off makes its lobbies where
+    /// PeerParty never sees them: it's told the layer is off, not to host first.
+    #[test]
+    fn a_turned_off_service_is_named() {
+        use crate::net::Front;
+        assert_eq!(why_not_for(&[], &[], &["steam"], None, false), format!("{LAYERS_OFF}steam"));
+        assert_eq!(why_not_for(&[Front::Party], &[], &["eos", "galaxy"], None, false), format!("{LAYERS_OFF}eos, galaxy"));
+        // Voice off doesn't stop invites.
+        assert_eq!(why_not_for(&[], &[], &["vivox"], None, false), "Host or join a game first");
+        // Another service PeerParty answers carries the invite: hosting there is what's missing.
+        assert_eq!(why_not_for(&[Front::Eos], &[], &["steam"], None, false), "Host or join a game first");
     }
 }

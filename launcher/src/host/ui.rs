@@ -21,6 +21,7 @@ use super::pad::Style;
 use crate::t;
 use crate::ui::fx;
 use crate::ui::icons::{self, Glyph, Icon};
+use crate::ui::settings::{layer_name, layer_off_effect};
 use crate::ui::store::Prefs;
 use crate::ui::theme::{self, ACCENT, ACCENT_HI, GOOD, TEXT, TEXT2};
 
@@ -65,6 +66,9 @@ pub struct GameState {
     /// one, and whether any of them is newer.
     pub other_version: u64,
     pub newer_version: bool,
+    /// PeerParty layers turned off for this game that it needs (`PEERPARTY_SKIP` names):
+    /// each gets a row saying what that costs.
+    pub layers_off: Vec<String>,
 }
 
 /// Windows Firewall keeps other players out of the game (or hasn't been told to let
@@ -247,6 +251,7 @@ impl GameState {
             invite_note: s(v, "invite_note"),
             sdks: arr(v, "sdks").iter().filter_map(|x| x.as_str().map(String::from)).collect(),
             foreign: arr(v, "foreign").iter().filter_map(|x| x.as_str().map(String::from)).collect(),
+            layers_off: arr(v, "layers_off").iter().filter_map(|x| x.as_str().map(String::from)).collect(),
             internet: internet_list
                 .iter()
                 .map(|n| {
@@ -586,6 +591,24 @@ pub fn invite_text(name: &str, kind: &str) -> String {
     }
 }
 
+/// The hook's invite.rs note openings (its LAYERS_OFF, OFFICIAL_START / OFFICIAL_END,
+/// UNSUPPORTED_START): what follows them is filled into the translation.
+const HOOK_LAYERS_OFF: &str = "Turned off for this game in PeerParty: ";
+const HOOK_OFFICIAL_START: &str = "This game's online play goes through ";
+const HOOK_OFFICIAL_END: &str = "'s own servers, which PeerParty can't invite through: use the game's own invites or room codes, or set it to PeerParty's own in this game's page in PeerParty (Advanced, Online services)";
+const HOOK_UNSUPPORTED_START: &str = "Not supported for this game yet: PeerParty can't hand it an invite through ";
+
+/// A turned-off layer's overlay row: its name, then what that costs and where it's
+/// turned back on (the game's page, or `PEERPARTY_SKIP` for a layer the page doesn't list).
+pub fn layer_off_text(layer: &str) -> (String, String) {
+    let title = t!("overlay.layer_off", name = layer_name(layer));
+    let detail = match layer_off_effect(layer) {
+        Some(effect) => format!("{effect} {}", t!("overlay.layer_off_where")),
+        None => t!("overlay.layer_off_env").to_string(),
+    };
+    (title, detail)
+}
+
 /// The hook's own notes, translated where the words are known.
 pub fn hook_text(s: &str) -> String {
     match s {
@@ -604,6 +627,18 @@ pub fn hook_text(s: &str) -> String {
             let room = s.rsplit("(room ").next().unwrap_or_default().trim_end_matches(')');
             t!("hook.photon_room", room = room)
         }
+        // The hook's invite.rs LAYERS_OFF, with the turned-off layers after it.
+        _ if s.starts_with(HOOK_LAYERS_OFF) => {
+            let names: Vec<String> = s[HOOK_LAYERS_OFF.len()..].split(", ").filter(|l| !l.is_empty()).map(layer_name).collect();
+            t!("hook.layers_off", names = names.join(", "))
+        }
+        // The hook's invite.rs OFFICIAL_START, the services, OFFICIAL_END.
+        _ if s.starts_with(HOOK_OFFICIAL_START) && s.ends_with(HOOK_OFFICIAL_END) && s.len() > HOOK_OFFICIAL_START.len() + HOOK_OFFICIAL_END.len() => {
+            let names = &s[HOOK_OFFICIAL_START.len()..s.len() - HOOK_OFFICIAL_END.len()];
+            t!("hook.official", names = names, mode = t!("mode.lan"))
+        }
+        // The hook's invite.rs UNSUPPORTED_START, with the services after it.
+        _ if s.starts_with(HOOK_UNSUPPORTED_START) => t!("hook.unsupported", names = &s[HOOK_UNSUPPORTED_START.len()..]),
         _ => match s.strip_prefix("To ").and_then(|r| r.split(' ').next()).and_then(|n| n.parse::<u64>().ok()) {
             Some(n) if s.ends_with("player") || s.ends_with("players") => t!("hook.to_players", n = n),
             _ => s.to_string(),
@@ -711,6 +746,10 @@ impl Overlay {
         if self.state.other_version > 0 {
             rows.push(Row::info(other_version_title(&self.state), other_version_detail(&self.state)).icon(Icon::Warning, Tone::Warn));
         }
+        rows.extend(self.state.layers_off.iter().map(|l| {
+            let (title, detail) = layer_off_text(l);
+            Row { id: format!("layer off {l}"), ..Row::info(title, detail).icon(Icon::Warning, Tone::Warn) }
+        }));
         rows
     }
 
@@ -2015,6 +2054,42 @@ mod tests {
             let rgba: Vec<u8> = c.px.iter().flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, *p as u8, 255]).collect();
             image::RgbaImage::from_raw(c.w as u32, c.h as u32, rgba).unwrap().save(std::path::Path::new(&d).join("overlay-no-invites.png")).unwrap();
         }
+    }
+
+    /// A game whose Steam layer the player turned off: Home says so at the top, with what
+    /// that costs and where it's turned back on, and the invite row names the layer
+    /// instead of asking to host first. The hook's other invite notes are translated too.
+    #[test]
+    fn a_turned_off_layer_is_named_with_what_it_costs() {
+        crate::i18n::set("en");
+        let st = GameState::from_json(&serde_json::json!({"t": "state", "layers_off": ["padblock", "steam", "calls"]}));
+        assert_eq!(st.layers_off, ["padblock", "steam", "calls"]);
+        let mut o = Overlay::new("Game".into());
+        o.state = sample_state();
+        o.state.can_invite = false;
+        o.state.layers_off = st.layers_off;
+        // The hook's invite.rs LAYERS_OFF note.
+        o.state.invite_note = "Turned off for this game in PeerParty: steam".into();
+        o.open(Page::Home, false);
+        let rows = o.rows(&Prefs::default());
+        let steam = rows.iter().find(|r| r.title == t!("overlay.layer_off", name = t!("layer.steam"))).expect("a row for the Steam layer");
+        assert!(steam.detail.starts_with(t!("off.steam")) && steam.detail.ends_with(t!("overlay.layer_off_where")), "{}", steam.detail);
+        assert!(rows.iter().any(|r| r.title == t!("overlay.layer_off", name = t!("layer.padblock"))));
+        // A layer the game page doesn't list: named as written, turned back on where it was turned off.
+        let calls = rows.iter().find(|r| r.title == t!("overlay.layer_off", name = "calls")).unwrap();
+        assert_eq!(calls.detail, t!("overlay.layer_off_env"));
+        let invite = rows.iter().find(|r| r.title == t!("overlay.invite_all")).unwrap();
+        assert_eq!(invite.detail, t!("hook.layers_off", names = t!("layer.steam")));
+        assert!(invite.detail.contains("Steam lobbies") && !invite.detail.contains("Host or join"), "{}", invite.detail);
+        assert_eq!(
+            hook_text("Turned off for this game in PeerParty: eos, galaxy"),
+            t!("hook.layers_off", names = format!("{}, {}", t!("layer.eos"), t!("layer.galaxy")))
+        );
+        // The hook's invite.rs OFFICIAL_START + services + OFFICIAL_END, and UNSUPPORTED_START.
+        let official = "This game's online play goes through Steam and Photon's own servers, which PeerParty can't invite through: use the game's own invites or room codes, or set it to PeerParty's own in this game's page in PeerParty (Advanced, Online services)";
+        assert_eq!(hook_text(official), t!("hook.official", names = "Steam and Photon", mode = t!("mode.lan")));
+        let unsupported = "Not supported for this game yet: PeerParty can't hand it an invite through PlayFab Party";
+        assert_eq!(hook_text(unsupported), t!("hook.unsupported", names = "PlayFab Party"));
     }
 
     /// A Photon room: Home says which room we're in and who is there (not "no lobby"),

@@ -228,6 +228,39 @@ pub fn skip(layer: &str) -> bool {
     .any(|s| s == layer)
 }
 
+/// Turned-off layers this game turned out to need, in the order noticed (`needed_but_off`).
+static OFF_NEEDED: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+
+/// Layers that touch every game: whenever one is off, the overlay says so.
+const GENERAL_LAYERS: &[&str] = &["invite", "padblock", "present", "swap", "dns", "ipfwd"];
+
+/// The game uses what `layer` covers (it loaded that service's SDK, or looked up its
+/// servers): if the player turned the layer off, it's noted for the overlay, which says
+/// what that costs and where to turn it back on. Nothing when the layer is on.
+pub fn needed_but_off(layer: &'static str) {
+    if !skip(layer) {
+        return;
+    }
+    let mut v = OFF_NEEDED.lock().unwrap();
+    if !v.contains(&layer) {
+        v.push(layer);
+        log!("{layer}: the game uses it, but it's turned off for this game (PEERPARTY_SKIP), so peerparty leaves it alone");
+    }
+}
+
+/// The turned-off layers that matter in this run, for the overlay: the general ones
+/// whenever they're off, a service's only once the game used that service.
+pub fn off_layers() -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = GENERAL_LAYERS.iter().copied().filter(|l| skip(l)).collect();
+    v.extend(OFF_NEEDED.lock().unwrap().iter().copied());
+    v
+}
+
+/// The service layers among `off_layers` (what invites and lobbies travel through).
+pub fn services_off() -> Vec<&'static str> {
+    OFF_NEEDED.lock().unwrap().clone()
+}
+
 /// The engine, started on first use (only in a game started through PeerParty).
 /// The game is exiting: deletes the router port mappings internet play made (their
 /// leases would end them anyway). Starts nothing that isn't running.

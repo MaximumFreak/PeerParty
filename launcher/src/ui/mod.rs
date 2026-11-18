@@ -26,7 +26,7 @@ mod mainexe;
 mod padgate;
 mod pads;
 pub mod scan;
-mod settings;
+pub mod settings;
 pub mod store;
 pub mod theme;
 mod together;

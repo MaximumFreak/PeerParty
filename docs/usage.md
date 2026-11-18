@@ -245,9 +245,14 @@ both.
   `padblock` (holding controllers back while the overlay shows), `present` (drawing the
   overlay inside the game), `ipfwd` (typed-IP forwarding to internet players, and the
   path to another PC's Photon servers; without it they're reached directly, which that
-  PC's firewall must allow), and
+  PC's firewall must allow), `vivox` (voice chat), `xboxlive` (the Xbox Live friends
+  list), `xgameui` (Xbox invite screens in Microsoft Store games), and
   `calls` (the call logging in SDK modules). The launcher
-  window's game panel has these as checkboxes (Advanced).
+  window's game panel lists all but `calls` under Advanced, Parts of PeerParty, each
+  switched on unless turned off for that game. When a turned-off layer is one the game
+  needs (it loaded that service's SDK or looked up its servers; the general layers
+  always), the overlay's Home page says so, with what it costs and where to turn it
+  back on, and Invite names it instead of asking to host first.
 - `PEERPARTY_GAME=name`: the game key players meet under, normally the exe's name
   less a dedicated server's "server" word, with any build tail kept
   (`mygame_server` meets `mygame`, `MyGameServer-Win64-Shipping` meets

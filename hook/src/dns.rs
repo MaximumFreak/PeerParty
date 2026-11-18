@@ -236,6 +236,19 @@ fn redirect(host: &str) -> Option<String> {
     if BYPASS.with(|b| b.get()) {
         return None;
     }
+    // A service the player turned off for this game: the overlay says what that costs.
+    if crate::net::enabled() {
+        let h = host.trim_end_matches('.').to_ascii_lowercase();
+        if crate::photon::is_photon_host(&h) {
+            crate::net::needed_but_off("photon");
+        } else if h.ends_with(crate::playfab::tls::HOST_SUFFIX) || h == "playfabapi.com" {
+            crate::net::needed_but_off("playfab");
+        } else if crate::ugs::is_host(&h) {
+            crate::net::needed_but_off("ugs");
+        } else if crate::xboxlive::service_of(&h).is_some() {
+            crate::net::needed_but_off("xboxlive");
+        }
+    }
     crate::playfab::redirect(host)
         .or_else(|| crate::ugs::redirect(host))
         .or_else(|| crate::xboxlive::redirect(host))

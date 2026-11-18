@@ -40,7 +40,7 @@ impl Tab {
 }
 
 /// PeerParty layers a game can turn off (`PEERPARTY_SKIP`), with what each does.
-pub fn layers() -> [(&'static str, &'static str); 13] {
+pub fn layers() -> [(&'static str, &'static str); 17] {
     [
         ("steam", t!("layer.steam")),
         ("eos", t!("layer.eos")),
@@ -50,12 +50,47 @@ pub fn layers() -> [(&'static str, &'static str); 13] {
         ("galaxy", t!("layer.galaxy")),
         ("photon", t!("layer.photon")),
         ("ugs", t!("layer.ugs")),
+        ("vivox", t!("layer.vivox")),
+        ("xboxlive", t!("layer.xboxlive")),
+        ("xgameui", t!("layer.xgameui")),
         ("invite", t!("layer.invite")),
         ("padblock", t!("layer.padblock")),
         ("present", t!("layer.present")),
+        ("ipfwd", t!("layer.ipfwd")),
         ("swap", t!("layer.swap")),
         ("dns", t!("layer.dns")),
     ]
+}
+
+/// A layer's name as the game page lists it; a name it doesn't list (one only
+/// `PEERPARTY_SKIP` can turn off) as written.
+pub fn layer_name(layer: &str) -> String {
+    layers().iter().find(|(l, _)| *l == layer).map_or_else(|| layer.to_string(), |(_, name)| name.to_string())
+}
+
+/// What a turned-off layer costs while it's off, for the overlay (None for a layer the
+/// game page doesn't list).
+pub fn layer_off_effect(layer: &str) -> Option<&'static str> {
+    Some(match layer {
+        "steam" => t!("off.steam"),
+        "eos" => t!("off.eos"),
+        "party" => t!("off.party"),
+        "pfmp" => t!("off.pfmp"),
+        "playfab" => t!("off.playfab"),
+        "galaxy" => t!("off.galaxy"),
+        "photon" => t!("off.photon"),
+        "ugs" => t!("off.ugs"),
+        "vivox" => t!("off.vivox"),
+        "xboxlive" => t!("off.xboxlive"),
+        "xgameui" => t!("off.xgameui"),
+        "invite" => t!("off.invite"),
+        "padblock" => t!("off.padblock"),
+        "present" => t!("off.present"),
+        "ipfwd" => t!("off.ipfwd"),
+        "swap" => t!("off.swap"),
+        "dns" => t!("off.dns"),
+        _ => return None,
+    })
 }
 
 /// The modes a service can be in, in the order the labels list them.

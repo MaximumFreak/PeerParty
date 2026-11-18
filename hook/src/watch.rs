@@ -198,6 +198,22 @@ fn consider(m: Mod) {
         } else {
             crate::steam::Typed { skip: Default::default(), hooked: 0 }
         };
+        if crate::net::enabled() {
+            // A service the player turned off: the overlay says what that costs.
+            let layer = match kind {
+                sdk::Sdk::SteamApi => Some("steam"),
+                sdk::Sdk::Eos => Some("eos"),
+                sdk::Sdk::Party | sdk::Sdk::PartyXbl => Some("party"),
+                sdk::Sdk::PlayFabCore => Some("playfab"),
+                sdk::Sdk::PlayFabMultiplayer => Some("pfmp"),
+                sdk::Sdk::Galaxy => Some("galaxy"),
+                sdk::Sdk::Vivox => Some("vivox"),
+                sdk::Sdk::SteamClient => None,
+            };
+            if let Some(layer) = layer {
+                crate::net::needed_but_off(layer);
+            }
+        }
         if kind == sdk::Sdk::Eos && crate::net::enabled() {
             // In every mode: a game PeerParty started stays PeerParty's.
             typed.skip.extend(crate::eos::answer_restart_check(&table.code));
@@ -273,6 +289,9 @@ fn consider(m: Mod) {
     {
         crate::padblock::module_loaded(&m.name);
     } else if m.name.eq_ignore_ascii_case("xgameruntime.dll") {
+        if crate::net::enabled() && !crate::child::is_helper() {
+            crate::net::needed_but_off("xgameui");
+        }
         if crate::net::enabled() && !crate::net::skip("xgameui") && !crate::child::is_helper() {
             let n = crate::xgameui::attach(&table.code);
             log!("xgameui {} hooked {n}", m.full);

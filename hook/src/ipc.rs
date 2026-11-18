@@ -412,6 +412,9 @@ fn state() -> String {
     fields.push(("codes", Json::Bool(crate::photon::in_use())));
     fields.push(("can_invite", Json::Bool(crate::invite::can_invite())));
     fields.push(("invite_note", Json::str(crate::invite::why_not().unwrap_or_default())));
+    // Layers the player turned off that this game needs: the overlay says what each costs.
+    let off: Vec<Json> = crate::net::off_layers().into_iter().map(Json::str).collect();
+    fields.push(("layers_off", Json::Arr(off)));
     let foreign: Vec<Json> = foreign_overlays().into_iter().map(Json::str).collect();
     fields.push(("foreign", Json::Arr(foreign)));
     fields.push(("present", Json::str(crate::present::api())));
