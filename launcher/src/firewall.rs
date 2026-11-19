@@ -211,6 +211,12 @@ pub fn assess(rules: &[Rule], exe: &Path, p: Profiles) -> Verdict {
     }
 }
 
+/// Windows calls a network in use public (and the firewall is on for it).
+pub fn on_public_network() -> bool {
+    let p = profiles();
+    p.current & p.enabled & PUBLIC != 0
+}
+
 /// Every firewall rule: the local store's, then Group Policy's.
 pub fn rules() -> Vec<Rule> {
     let mut out = Vec::new();
@@ -532,11 +538,18 @@ fn shell_open(file: &str, params: &str) -> bool {
 /// what to tell the player, and whether it was fixed.
 pub fn fix_or_open(peerparty: &Path, exe: &Path, public: bool) -> (String, bool) {
     let name = exe.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    // The network in use is always covered: on one Windows calls public, a fix for
+    // private networks only leaves the game shut out of the very network it's on (and
+    // Windows asks again when it goes online).
+    let public = public || on_public_network();
     let why = match fix_elevated(peerparty, exe, public) {
         Outcome::Fixed => {
             let v = assess(&rules(), exe, profiles());
-            if !v.blocked() {
+            if !v.blocked() && v.allowed {
                 return (crate::t!("firewall.fixed", exe = name), true);
+            }
+            if !v.blocked() {
+                return (crate::t!("firewall.still_blocked", exe = name, why = crate::t!("firewall.left_not_allowed")), false);
             }
             let left = if v.block_all {
                 crate::t!("firewall.left_block_all")

@@ -27,13 +27,15 @@ through PeerParty. It finds what's installed on any PC:
   `.gamebox.json`'s `main`, else a Unity game's exe, else the largest, skipping
   redistributables, tools, and old-renderer builds beside a newer one.
 - **Recent**: every game peerparty.exe starts (from the window, a .bat or a Steam
-  launch option) is noted in `%LOCALAPPDATA%\peerparty\recent.tsv`.
+  launch option) is noted in `%LOCALAPPDATA%\peerparty\recent.tsv`, except a test run
+  (`PEERPARTY_LOOPBACK=1`).
 - **Add > Add a game…** picks any .exe.
 
 The sidebar has three places:
 
 - **Library**: the games, as covers or a list, with filters (All, Recent, each store,
-  Games folder, Added, Hidden) and a search (Ctrl+F). A game's panel has Play, the
+  Games folder, Added, Hidden) and a search (Ctrl+F) that looks through All whichever
+  filter is picked (from Hidden, through the hidden games). A game's panel has Play, the
   number of players on this PC (at 2: **Second instance starts after**), **Copy Player
   1's saves to Player N** (shown at 2 players, or at 1 once an instance runs and Play
   has become **Start another instance**, and not while an instance counts down; for

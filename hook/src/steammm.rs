@@ -144,6 +144,8 @@ struct State {
     chat_inbox: crate::lobbychat::Inbox,
     /// The game server each lobby last announced, to spot a new one.
     servers: HashMap<u64, String>,
+    /// When RequestLobbyData last answered for a lobby we're in (`request_lobby_data`).
+    data_answered: HashMap<u64, std::time::Instant>,
 }
 
 static S: LazyLock<Mutex<State>> = LazyLock::new(Mutex::default);
@@ -640,6 +642,19 @@ vmethod! {
         let (k, v) = (s(key), s(value));
         crate::steamlan::dump("set-member-data", None, format!("{k}={v}").as_bytes());
         let Some(lan) = lan() else { return };
+        // The same value again changes nothing, and Steam says nothing about it: a game
+        // that sets its member data on every LobbyDataUpdate_t would otherwise answer
+        // its own update forever.
+        let same = lan
+            .lobby(&core_id(lobby))
+            .and_then(|l| l.member(lan.me()).and_then(|m| m.attrs.iter().find(|a| a.key == k).map(|a| a.value.text() == v)))
+            .unwrap_or(false);
+        crate::log::throttled("steam-lan SetLobbyMemberData", 4, |n| {
+            log!("steam-lan SetLobbyMemberData n={n} {k}{}", if same { " (unchanged: no update)" } else { "" })
+        });
+        if same {
+            return;
+        }
         let a = Attr { key: k, value: Value::Str(v), public: false };
         if lan.update(&core_id(lobby), None, &[a], &[]).is_ok() {
             data_update(lobby, crate::steamlan::my_steam_id(), true);
@@ -717,7 +732,22 @@ vmethod! {
     fn request_lobby_data(_this: usize, lobby: u64) -> bool {
         let Some(lan) = lan() else { return false };
         if lan.lobby(&core_id(lobby)).is_some() {
-            data_update(lobby, lobby, true);
+            // A lobby we're in is always up to date: answered, but at most once a second,
+            // so a game that asks again on every LobbyDataUpdate_t isn't answered in a loop.
+            let answer = {
+                let mut st = S.lock().unwrap();
+                let due = st.data_answered.get(&lobby).is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1));
+                if due {
+                    st.data_answered.insert(lobby, std::time::Instant::now());
+                }
+                due
+            };
+            crate::log::throttled("steam-lan RequestLobbyData joined", 4, |n| {
+                log!("steam-lan RequestLobbyData n={n} for a lobby we're in{}", if answer { "" } else { " (answered within the last second: not again)" })
+            });
+            if answer {
+                data_update(lobby, lobby, true);
+            }
             return true;
         }
         let mut q = Query::new(NS);

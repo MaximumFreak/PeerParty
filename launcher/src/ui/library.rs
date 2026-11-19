@@ -115,13 +115,14 @@ impl App {
                     Category::Source(s) => super::source_name(s),
                 };
                 let n = self.count(c);
-                let r = widgets::chip(ui, label, Some(n), self.category == c);
+                let lit = self.shown() == c;
+                let r = widgets::chip(ui, label, Some(n), lit);
                 self.top_bar_ids.insert(r.id);
-                if self.category == c {
+                if lit {
                     first_focus(&r, &mut self.focus_first);
                 }
                 if r.clicked() {
-                    self.category = c;
+                    self.pick_category(c);
                 }
             }
         });
@@ -366,7 +367,7 @@ impl App {
                 (t!("library.scanning").to_string(), String::new())
             } else if !self.search.is_empty() {
                 (t!("library.no_match", text = self.search), t!("library.no_match_sub").to_string())
-            } else if self.category == Category::Recent {
+            } else if self.shown() == Category::Recent {
                 (t!("library.no_recent").to_string(), t!("library.no_recent_sub").to_string())
             } else {
                 (t!("library.empty").to_string(), t!("library.empty_sub").to_string())
@@ -375,7 +376,7 @@ impl App {
             if !sub.is_empty() {
                 ui.label(egui::RichText::new(sub).color(TEXT2));
             }
-            if !self.scanning && self.search.is_empty() && self.category != Category::Recent {
+            if !self.scanning && self.search.is_empty() && self.shown() != Category::Recent {
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     let w = 2.0 * 160.0 + 8.0;

@@ -199,6 +199,11 @@ struct Host {
     key_left_told: bool,
     /// The controllers last named in the game's log (none named yet: `None`).
     pads_logged: Option<Vec<String>>,
+    /// Who has had the front since the game lost it: (since when, that process), for the
+    /// log (`track_focus`). None while the game is in front, or before it ever was.
+    focus_away: Option<(Instant, u32)>,
+    /// The game has been the window in front at least once.
+    focus_seen: bool,
     /// Ticks that panicked (each is caught; the first few go to the game's log).
     panics: u32,
     /// The fonts are loaded into both contexts (the first time anything is drawn: a
@@ -277,6 +282,8 @@ pub fn run(process: HANDLE, pid: u32, pipe: pipe::Pipe, exe: &Path, prefs: Prefs
         diag_home: true,
         key_left_told: false,
         pads_logged: None,
+        focus_away: None,
+        focus_seen: false,
         panics: 0,
         fonts: false,
     };
@@ -538,6 +545,7 @@ impl Host {
         }
         self.firewall_tick();
         let front = self.in_front();
+        self.track_focus(front);
         let rect = if front { self.game_rect() } else { None };
         let gamebar = front && self.gamebar.open(rect);
         let mut polled = false;
@@ -736,6 +744,39 @@ impl Host {
             return;
         };
         self.pipe.send(json!({"t": "note", "text": format!("overlay: {key} pressed but the overlay can't open: {why}")}));
+    }
+
+    /// Into the game's log whenever the game stops being the window in front, with what
+    /// took it (a Windows prompt, another program), and when it's back: a game that seems
+    /// frozen or deaf to input may just not have the keyboard and controller.
+    fn track_focus(&mut self, front: bool) {
+        if front {
+            if let Some((since, _)) = self.focus_away.take() {
+                self.pipe.send(json!({"t": "note", "text": format!("focus: the game is the window in front again, after {:.1} s", since.elapsed().as_secs_f32())}));
+            }
+            self.focus_seen = true;
+            return;
+        }
+        if !self.focus_seen {
+            return;
+        }
+        let mut pid = 0u32;
+        let fg = unsafe { GetForegroundWindow() };
+        unsafe { GetWindowThreadProcessId(fg, &mut pid) };
+        if self.focus_away.is_some_and(|(_, p)| p == pid) {
+            return;
+        }
+        let since = self.focus_away.map_or_else(Instant::now, |(t, _)| t);
+        self.focus_away = Some((since, pid));
+        let who = if fg.is_null() {
+            "no window (a Windows prompt, such as the administrator one, has the screen)".to_string()
+        } else if pid == std::process::id() {
+            "PeerParty's own window".to_string()
+        } else {
+            let name = firewall::process_exe(pid).and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_else(|| format!("process {pid}"));
+            if is_console(fg) { format!("{name}, a console window") } else { name }
+        };
+        self.pipe.send(json!({"t": "note", "text": format!("focus: the game isn't the window in front: {who} is (many games ignore the keyboard and controller meanwhile)")}));
     }
 
     /// The controllers the overlay reads, into the game's log whenever they change, so a

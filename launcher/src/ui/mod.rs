@@ -448,20 +448,36 @@ impl App {
         cats
     }
 
-    /// What the grid shows: the category, narrowed by the search.
+    /// The filter the grid is showing: a search looks through All, whichever filter was
+    /// picked (in Hidden it looks through the hidden games, which All leaves out).
+    fn shown(&self) -> Category {
+        if self.search.trim().is_empty() || self.category == Category::Hidden { self.category } else { Category::All }
+    }
+
+    /// Picks a filter. A search goes on in All and Hidden; any other filter clears it,
+    /// since while it's there the grid would show All instead.
+    fn pick_category(&mut self, c: Category) {
+        if !matches!(c, Category::All | Category::Hidden) {
+            self.search.clear();
+        }
+        self.category = c;
+    }
+
+    /// What the grid shows: the filter, or All narrowed by the search.
     fn visible(&self) -> Vec<usize> {
         let needle = self.search.trim().to_lowercase();
+        let shown = self.shown();
         let mut v: Vec<usize> = self
             .entries
             .iter()
             .enumerate()
             .filter(|(_, g)| {
                 let key = store::key_of(&g.exe);
-                self.in_category(g, &key, self.category) && (needle.is_empty() || g.name.to_lowercase().contains(&needle) || key.contains(&needle))
+                self.in_category(g, &key, shown) && (needle.is_empty() || g.name.to_lowercase().contains(&needle) || key.contains(&needle))
             })
             .map(|(i, _)| i)
             .collect();
-        if self.category == Category::Recent {
+        if shown == Category::Recent {
             v.sort_by_key(|i| std::cmp::Reverse(self.recent.get(&store::key_of(&self.entries[*i].exe)).copied()));
         }
         v
@@ -915,8 +931,8 @@ impl App {
             match self.view {
                 View::Library => {
                     let cats = self.categories();
-                    let i = cats.iter().position(|c| *c == self.category).unwrap_or(0) as i32;
-                    self.category = cats[(i + d).rem_euclid(cats.len() as i32) as usize];
+                    let i = cats.iter().position(|c| *c == self.shown()).unwrap_or(0) as i32;
+                    self.pick_category(cats[(i + d).rem_euclid(cats.len() as i32) as usize]);
                 }
                 View::Settings => {
                     self.settings_tab = self.settings_tab.step(d);
@@ -1659,6 +1675,38 @@ mod tests {
         .into_iter()
         .map(|(n, s)| game(n, s))
         .collect()
+    }
+
+    /// A search looks through All whatever filter is picked (Hidden searches the hidden
+    /// games), and picking another filter clears it.
+    #[test]
+    fn a_search_looks_through_all() {
+        let ctx = egui::Context::default();
+        let mut app = App::with(ctx, Settings { onboarded: true, ..Settings::default() }, false);
+        app.scanned = sample();
+        app.rebuild();
+        let names = |a: &App| a.visible().into_iter().map(|i| a.entries[i].name.clone()).collect::<Vec<_>>();
+        let tide = store::key_of(&app.entries.iter().find(|g| g.name == "Tidewatch").unwrap().exe);
+        app.recent = HashMap::from([(tide.clone(), 1)]);
+        app.category = Category::Recent;
+        assert_eq!(names(&app), ["Tidewatch"]);
+        app.search = "lantern".into();
+        assert_eq!(app.shown(), Category::All);
+        assert_eq!(names(&app), ["Lantern Keep"], "found outside Recent");
+        app.category = Category::Source(Source::Epic);
+        assert_eq!(names(&app), ["Lantern Keep"], "found outside Epic");
+        app.pick_category(Category::All);
+        assert_eq!(app.search, "lantern", "All keeps the search");
+        app.pick_category(Category::Recent);
+        assert!(app.search.is_empty(), "another filter clears it");
+        assert_eq!(names(&app), ["Tidewatch"]);
+        // Hidden: the search stays among the hidden games.
+        app.settings.hidden.push(tide);
+        app.pick_category(Category::Hidden);
+        app.search = "tide".into();
+        assert_eq!(names(&app), ["Tidewatch"]);
+        app.search = "lantern".into();
+        assert!(names(&app).is_empty());
     }
 
     #[test]

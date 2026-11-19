@@ -819,23 +819,47 @@ fn find_log(dir: &Path, pid: u32) -> Option<PathBuf> {
 }
 
 /// Notes the game in `%LOCALAPPDATA%\peerparty\recent.tsv` (time, exe), the launcher
-/// window's Recent list. The file keeps the last 200 launches.
+/// window's Recent list. A test run (`PEERPARTY_LOOPBACK=1`) isn't noted.
+///
+/// Copies start at the same moment (two players on this PC, the tests), so the line is
+/// appended in one write and the file is only ever replaced whole (a new file renamed
+/// over it), never emptied and refilled: a launch that read it mid-rewrite used to write
+/// back only its own line, and the rest of the list was gone.
 fn remember(exe: &Path) {
+    if peerparty_core::loopback_only() {
+        return;
+    }
     let Some(dir) = env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("peerparty")) else {
         return;
     };
-    let file = dir.join("recent.tsv");
+    let _ = fs::create_dir_all(&dir);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let old = fs::read_to_string(&file).unwrap_or_default();
-    let mut lines: Vec<&str> = old.lines().filter(|l| !l.is_empty()).collect();
-    let line = format!("{now}\t{}", exe.display());
-    lines.push(&line);
-    let keep = &lines[lines.len().saturating_sub(200)..];
-    let _ = fs::create_dir_all(&dir);
-    let _ = fs::write(&file, keep.join("\n") + "\n");
+    note_recent(&dir.join("recent.tsv"), &format!("{now}\t{}", exe.display()), RECENT_KEEP);
+}
+
+/// How many launches recent.tsv keeps (trimmed back to that once it has twice as many).
+const RECENT_KEEP: usize = 200;
+
+/// Appends `line` to `file` in one write, then, once the file has `2 * keep` lines, cuts
+/// it to its last `keep` through a new file renamed over it: a reader sees the old file
+/// or the new one, whole.
+fn note_recent(file: &Path, line: &str, keep: usize) {
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(file) {
+        use std::io::Write;
+        let _ = f.write_all(format!("{line}\n").as_bytes());
+    }
+    let Ok(text) = fs::read_to_string(file) else { return };
+    let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+    if lines.len() < keep * 2 {
+        return;
+    }
+    let tmp = file.with_extension(format!("tsv.{}.tmp", std::process::id()));
+    if fs::write(&tmp, lines[lines.len() - keep..].join("\n") + "\n").is_err() || fs::rename(&tmp, file).is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
 }
 
 unsafe fn start_injected(
@@ -1088,6 +1112,36 @@ fn wide(s: &OsStr) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Launches at the same moment each keep their line and the ones before them (a
+    /// rewrite used to drop the list when another launch read it half written), and the
+    /// file is trimmed to its newest lines.
+    #[test]
+    fn recent_launches_at_once_all_stay() {
+        let dir = env::temp_dir().join(format!("peerparty-recent-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("recent.tsv");
+        fs::write(&file, "1\tC:\\older.exe\n").unwrap();
+        std::thread::scope(|s| {
+            for t in 0..8 {
+                let file = &file;
+                s.spawn(move || {
+                    for i in 0..20 {
+                        note_recent(file, &format!("2\tC:\\game-{t}-{i}.exe"), 1000);
+                    }
+                });
+            }
+        });
+        let text = fs::read_to_string(&file).unwrap();
+        assert_eq!(text.lines().count(), 161, "every launch noted, none lost");
+        assert!(text.starts_with("1\tC:\\older.exe\n"), "the earlier launches are still there");
+        note_recent(&file, "3\tC:\\newest.exe", 80);
+        let text = fs::read_to_string(&file).unwrap();
+        assert_eq!(text.lines().count(), 80);
+        assert!(text.ends_with("3\tC:\\newest.exe\n"));
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     /// The launcher's names for the invite events are the hook's.
     #[test]

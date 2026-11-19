@@ -521,7 +521,9 @@ fn dispatched() {
 
 unsafe extern "C" fn detour_run_frame(pipe: i32) {
     if in_run_callbacks() {
-        log::throttled("steam dispatch nested", 1, |_| {
+        // Once: log::throttled would go on at every power of two.
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
             log!("steam: steam_api's SteamAPI_RunCallbacks runs its own ManualDispatch; the game's dispatch stays the classic one, and PeerParty's callbacks go out after SteamAPI_RunCallbacks")
         });
         if let Some(hook) = RUN_FRAME.get() {
@@ -540,9 +542,8 @@ unsafe extern "C" fn detour_run_frame(pipe: i32) {
 }
 
 unsafe extern "C" fn detour_run_callbacks() {
-    log::throttled("steam dispatch classic", 1, |_| {
-        log!("steam: the game dispatches Steam callbacks with SteamAPI_RunCallbacks")
-    });
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| log!("steam: the game dispatches Steam callbacks with SteamAPI_RunCallbacks"));
     if let Some(hook) = RUN_CALLBACKS.get() {
         IN_RUN_CALLBACKS.with(|c| c.set(true));
         unsafe { hook.call() };
