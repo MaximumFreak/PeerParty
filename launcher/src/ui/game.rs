@@ -121,6 +121,27 @@ impl App {
                             widgets::note(ui, Icon::Warning, theme::WARN, t!("game.copy_saves_warn"));
                         }
                     }
+                    // Only where a second copy on this PC is in play (two players here, or
+                    // Play adding one): most players never start two, and never see it.
+                    if o.players >= 2 || !running.is_empty() {
+                        let main = match self.settings.prefs.name.trim() {
+                            "" => crate::platform::user_name(),
+                            n => n.to_string(),
+                        };
+                        let hint = format!("{main} (2)");
+                        let mut name = self.settings.prefs.other_name.clone();
+                        // The name over its field: a text field doesn't fit beside it.
+                        ui.add_space(4.0);
+                        ui.add(egui::Label::new(egui::RichText::new(t!("game.other_name")).size(13.5).color(TEXT)).wrap());
+                        ui.add_space(-2.0);
+                        ui.add(egui::Label::new(egui::RichText::new(t!("game.other_name_sub")).size(12.0).color(TEXT3)).wrap());
+                        ui.add_space(2.0);
+                        widgets::text_field(ui, &mut name, &hint, ui.available_width().min(260.0), 32);
+                        if name != self.settings.prefs.other_name {
+                            self.settings.prefs.other_name = name;
+                            self.save_settings();
+                        }
+                    }
                 } else {
                     widgets::note(ui, Icon::Info, TEXT3, t!("game.xbox_one_copy"));
                 }

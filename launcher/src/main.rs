@@ -512,6 +512,9 @@ fn run() -> Result<u32, String> {
         if !prefs.name.trim().is_empty() {
             default("PEERPARTY_NAME", prefs.name.trim());
         }
+        if !prefs.other_name.trim().is_empty() {
+            default("PEERPARTY_OTHER_NAME", prefs.other_name.trim());
+        }
         default("PEERPARTY_INVITES", if prefs.auto_accept { "auto" } else { "ask" });
         default("PEERPARTY_INVITE_BUTTONS", &prefs.invite_buttons);
         default("PEERPARTY_DRAW", &prefs.draw);
@@ -621,6 +624,8 @@ fn run() -> Result<u32, String> {
         log_dir.display()
     );
 
+    let closer = tree.as_ref().map_or_else(|| tree::Closer::process(pi.hProcess), |t| t.closer(pi.hProcess));
+    listen_for_close(closer);
     let watch = tree.map(|t| t.watch(pi.hProcess, pi.dwProcessId, exe.clone()));
     let done = watch.as_ref().map_or(pi.hProcess, |w| w.0);
     if let Some(pipe) = pipe {
@@ -692,6 +697,7 @@ fn apply_set(p: &mut ui::store::Prefs, k: &str, v: &str) {
     let on = matches!(v.to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes" | "auto");
     match k {
         "name" => p.name = v.to_string(),
+        "other_name" => p.other_name = v.to_string(),
         "auto_accept" | "invites" => p.auto_accept = on,
         "overlay" => p.overlay = on,
         "voice" => p.voice = on,
@@ -896,6 +902,29 @@ unsafe fn start_injected(
         }
         Ok(pi)
     }
+}
+
+/// The event PeerParty's window sets to close the game this peerparty.exe (process
+/// `pid`) started: Close all on its Now playing card.
+pub(crate) fn close_event(pid: u32) -> Vec<u16> {
+    wide(OsStr::new(&format!("Local\\peerparty-close-{pid}")))
+}
+
+/// Waits on a thread of its own for the window's Close all, then closes the game. The
+/// wait for the game to end goes on as usual and reports how it ended.
+fn listen_for_close(closer: tree::Closer) {
+    use windows_sys::Win32::System::Threading::CreateEventW;
+    let event = unsafe { CreateEventW(ptr::null(), 1, 0, close_event(std::process::id()).as_ptr()) };
+    if event.is_null() {
+        return;
+    }
+    let event = event as usize;
+    std::thread::spawn(move || unsafe {
+        if WaitForSingleObject(event as _, INFINITE) == 0 {
+            closer.close();
+        }
+        CloseHandle(event as _);
+    });
 }
 
 /// The event the hook sets once it has loaded in process `pid` (hook/src/lib.rs).

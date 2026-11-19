@@ -40,8 +40,12 @@ The sidebar has three places:
   the next instance only: it turns itself
   off once used, when no instance is left at 1 player, and every time the launcher
   starts, and warns that a save the new instance already has is replaced, with a
-  backup kept). While the second instance waits, Play reads **Start instance 2 now**
-  and the Now playing card has Start now and Cancel. Then **Who can join you** (people on your network, with a
+  backup kept), and **Player 2's name** (shown at 2 players, or once an instance runs;
+  the name the second instance on this PC goes by, `PEERPARTY_OTHER_NAME`). While the
+  second instance waits, Play reads **Start instance 2 now** and the Now playing card has
+  Start now and Cancel. The Now playing card's **Close all** (after a yes) closes every
+  game the window started, each instance: their windows are asked to close, and what
+  still runs a few seconds later is ended. Then **Who can join you** (people on your network, with a
   Windows Firewall check and Fix; your room; public sessions), **This game's own
   settings** (invites, overlay, voice and saves for this game alone) and **Advanced**
   (multiplayer through PeerParty on or off, online services, PeerParty layers to turn
@@ -133,7 +137,7 @@ peerparty --net-test
 
 The launcher window's settings (`%LOCALAPPDATA%\peerparty\ui.json`: global ones and
 each game's own) apply however the game is started: from the window, a shortcut or
-Steam. `--set` changes one for a single run: `name=Alex`, `auto_accept=on`, `overlay=off`,
+Steam. `--set` changes one for a single run: `name=Alex`, `other_name=Sam`, `auto_accept=on`, `overlay=off`,
 `invite_buttons=guide|combo|both`, `toasts=off`, `voice=off`, `draw=window|ingame`,
 `mode.<service>=lan|official|auto`, `room=CODE` (empty: off), `public=on`, `internet=off`,
 `language=de` (empty: the system's), `effects=off`. A variable already set in the environment wins over
@@ -166,6 +170,10 @@ both.
 - `PEERPARTY_NAME`: the name other players see, in every service (Steam's persona name,
   EOS and GOG display names, PlayFab, Unity). Set from the launcher's Settings ("Your
   name"); empty means the Windows user name, and a second copy on one PC adds " (2)".
+- `PEERPARTY_OTHER_NAME`: the name a second copy of a game on this PC goes by instead
+  of "name (2)" (the third onwards: "that name (3)"). Set from a game's page ("Player 2's
+  name", shown only at two players or with an instance running); the first copy keeps
+  `PEERPARTY_NAME`.
 - Programs the game starts: PeerParty works out the game's install folder (its Steam
   library folder, Epic's install list, the folder under one of the window's game folders,
   Unreal's layout, or the program's own folder above ones named like `bin` or `Win64`;

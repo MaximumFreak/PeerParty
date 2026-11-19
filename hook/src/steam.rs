@@ -86,6 +86,48 @@ struct Pending {
     server: bool,
     /// Dispatches it has waited through for its CCallResult to be registered.
     waited: u32,
+    /// When it was queued, for `watch_undelivered`.
+    at: std::time::Instant,
+}
+
+/// How long a callback may wait before the log says nothing is taking it.
+const UNDELIVERED_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Watches the queue from the first callback on: one that has waited past
+/// `UNDELIVERED_AFTER` is logged with how the game dispatches (or doesn't), since a game
+/// waiting on PeerParty's answer otherwise just sits there ("Creating session...").
+fn watch_undelivered() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new().name("peerparty steam watch".into()).spawn(|| {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                // The game's own (a game server's has its own dispatch, which may never run).
+                let oldest = {
+                    let q = INJECT.lock().unwrap();
+                    q.iter().find(|p| !p.server).map(|p| (p.id, p.call, p.at.elapsed(), q.len()))
+                };
+                let Some((id, call, age, n)) = oldest else { continue };
+                if age < UNDELIVERED_AFTER {
+                    continue;
+                }
+                let how = match (*DISPATCH_SEEN.lock().unwrap(), MANUAL.load(Ordering::Relaxed)) {
+                    (None, _) => "the game hasn't run SteamAPI_RunCallbacks or asked for a callback since PeerParty hooked steam_api".to_string(),
+                    (Some(t), true) => format!("the game dispatches manually; it last asked {}s ago", t.elapsed().as_secs()),
+                    (Some(t), false) => format!("the game's SteamAPI_RunCallbacks last ran {}s ago", t.elapsed().as_secs()),
+                };
+                let what = match call {
+                    0 => format!("callback {id}"),
+                    _ if MANUAL.load(Ordering::Relaxed) => format!("call result {id} ({call:#x})"),
+                    _ if RESULT_OBJS.lock().unwrap().contains_key(&call) => format!("call result {id} ({call:#x}, its CCallResult registered)"),
+                    _ => format!("call result {id} ({call:#x}, no CCallResult registered for it with SteamAPI_RegisterCallResult)"),
+                };
+                log::throttled("steam-lan undelivered", 1, |k| {
+                    log!("steam-lan: {n} callback(s) wait undelivered, the oldest {what} for {}s: {how} (n={k})", age.as_secs())
+                });
+            }
+        });
+    });
 }
 
 /// Callbacks and call results PeerParty wants the game to see, oldest first.
@@ -181,7 +223,12 @@ fn push(call: u64, id: i32, data: Vec<u8>, server: bool) {
         data,
         server,
         waited: 0,
+        at: std::time::Instant::now(),
     });
+    drop(q);
+    if !cfg!(test) {
+        watch_undelivered();
+    }
 }
 
 /// Whether the game will receive callback `id` from us.
@@ -454,8 +501,38 @@ unsafe extern "C" fn detour_free_last(pipe: i32) {
     }
 }
 
+thread_local! {
+    /// This thread is inside the game's SteamAPI_RunCallbacks: a steam_api that builds
+    /// it on its own ManualDispatch exports calls them from there, and that's steam_api's
+    /// dispatch, not the game's.
+    static IN_RUN_CALLBACKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn in_run_callbacks() -> bool {
+    IN_RUN_CALLBACKS.with(|c| c.get())
+}
+
+/// How the game takes Steam's callbacks, for the log and the undelivered-callback watch.
+static DISPATCH_SEEN: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+fn dispatched() {
+    *DISPATCH_SEEN.lock().unwrap() = Some(std::time::Instant::now());
+}
+
 unsafe extern "C" fn detour_run_frame(pipe: i32) {
-    MANUAL.store(true, Ordering::Relaxed);
+    if in_run_callbacks() {
+        log::throttled("steam dispatch nested", 1, |_| {
+            log!("steam: steam_api's SteamAPI_RunCallbacks runs its own ManualDispatch; the game's dispatch stays the classic one, and PeerParty's callbacks go out after SteamAPI_RunCallbacks")
+        });
+        if let Some(hook) = RUN_FRAME.get() {
+            unsafe { hook.call(pipe) };
+        }
+        return;
+    }
+    if !MANUAL.swap(true, Ordering::Relaxed) {
+        log!("steam: the game dispatches Steam callbacks itself (SteamAPI_ManualDispatch_RunFrame): PeerParty's go out through GetNextCallback");
+    }
+    dispatched();
     if let Some(hook) = RUN_FRAME.get() {
         unsafe { hook.call(pipe) };
     }
@@ -463,11 +540,17 @@ unsafe extern "C" fn detour_run_frame(pipe: i32) {
 }
 
 unsafe extern "C" fn detour_run_callbacks() {
+    log::throttled("steam dispatch classic", 1, |_| {
+        log!("steam: the game dispatches Steam callbacks with SteamAPI_RunCallbacks")
+    });
     if let Some(hook) = RUN_CALLBACKS.get() {
+        IN_RUN_CALLBACKS.with(|c| c.set(true));
         unsafe { hook.call() };
+        IN_RUN_CALLBACKS.with(|c| c.set(false));
     }
     let _ = std::panic::catch_unwind(crate::steamlan::pump);
     if !MANUAL.load(Ordering::Relaxed) {
+        dispatched();
         deliver_registered(false);
     }
 }
@@ -692,8 +775,11 @@ unsafe extern "C" fn detour_next(pipe: i32, msg: *mut CallbackMsg) -> bool {
     };
     // Ours go first, one at a time: each is freed by the game's next FreeLastCallback.
     // A call result goes out as SteamAPICallCompleted_t; the game then fetches it with
-    // GetAPICallResult.
-    if !msg.is_null() {
+    // GetAPICallResult. Not to steam_api's own dispatch inside SteamAPI_RunCallbacks: it
+    // has no listener for PeerParty's calls (they're registered with PeerParty), and
+    // classic delivery follows it.
+    if !msg.is_null() && !in_run_callbacks() {
+        dispatched();
         let mut out = OUTSTANDING.lock().unwrap();
         if !out.contains_key(&pipe) {
             // The game server's pipe gets its callbacks; every other pipe the rest.
@@ -950,5 +1036,16 @@ mod tests {
         assert_eq!(&buf[..4], &[1, 2, 3, 4]);
         // Taken: no longer complete.
         assert!(!polled(call));
+    }
+
+    #[test]
+    fn steam_apis_own_manual_dispatch_inside_run_callbacks_keeps_the_game_classic() {
+        // A steam_api whose SteamAPI_RunCallbacks calls its own ManualDispatch_RunFrame:
+        // the game still dispatches classically, so PeerParty's callbacks must still go
+        // out after SteamAPI_RunCallbacks (no test sets MANUAL; it's the hook's global).
+        IN_RUN_CALLBACKS.with(|c| c.set(true));
+        unsafe { detour_run_frame(1) };
+        IN_RUN_CALLBACKS.with(|c| c.set(false));
+        assert!(!MANUAL.load(Ordering::Relaxed));
     }
 }

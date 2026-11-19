@@ -12,7 +12,8 @@
 #      same Photon DLLs and the same test sources skips `dotnet build`.
 #   4. the two-copy SDK tests (tests/sdk/run_pair.ps1): EOS RTC, EOS lobby voice, EOS custom
 #      invites, PlayFab Party chat, PlayFabCore sign-in, PlayFab's web API, Unity Gaming
-#      Services, Vivox voice (Unity's VivoxNative.dll), GOG Galaxy, Steam licence checks (with the Steam client running), a starter handing over to the game, and
+#      Services, Vivox voice (Unity's VivoxNative.dll), GOG Galaxy, Steam licence checks (with the Steam client running), an older SDK's steam_api (old accessors,
+#      classic dispatch), a starter handing over to the game, and
 #      typed-IP games on async sockets (two copies in a room)
 #
 # SDK pairs and Photon run four at a time. Each pair gets its own PEERPARTY_GAME, so they
@@ -259,7 +260,9 @@ function Finish-SuiteJob($job) {
     $exits = @($out | Select-String '^---- (\w) \(exit (.*)\)$' | ForEach-Object { $_.Matches[0].Groups[2].Value })
     $skip = $out | Select-String '^SKIP (.*)' | Select-Object -First 1
     if ($skip -and -not ($out | Select-String '^(PASS|FAIL) ')) { Note $job.Name 'skipped' $skip.Matches[0].Groups[1].Value }
-    elseif ($exits.Count -eq $roles.Count -and -not ($exits | Where-Object { $_ -ne 'ok' })) { Note $job.Name 'pass' }
+    # Counted, not tested for truth: a role that wrote no result is an empty string, which
+    # PowerShell takes for false.
+    elseif ($exits.Count -eq $roles.Count -and @($exits | Where-Object { $_ -ne 'ok' }).Count -eq 0) { Note $job.Name 'pass' }
     else {
         $fails = @($out | Select-String '^FAIL ' | Select-Object -First 2 | ForEach-Object Line)
         $bits = @()
@@ -388,6 +391,11 @@ try {
         # (steamown.rs, saves.rs), once per callback dispatch.
         @{ Name = 'steam_own_id'; Py = 'steam_own_id_test.py'; Var = 'PPTEST_STEAM_OWN_DLL'; Files = @('steam_api64.dll'); File = $true; Env = @('SteamAppId=480', 'PEERPARTY_MODE_STEAMID=lan'); Steam = $true; Roles = @('A'); Probe = $true; ProbeOf = 'steam_own' },
         @{ Name = 'steam_own_id_classic'; Dlls = 'steam_own_id'; Py = 'steam_own_id_test.py'; Var = 'PPTEST_STEAM_OWN_DLL'; Files = @('steam_api64.dll'); File = $true; Env = @('SteamAppId=480', 'PEERPARTY_MODE_STEAMID=lan', 'PPTEST_DISPATCH=classic'); Steam = $true; Roles = @('A'); Probe = $true; ProbeOf = 'steam_own' },
+        # A game from before the flat API: SteamMatchmaking() and classic dispatch, through a
+        # steam_api64.dll from an older SDK (with any files it reads kept beside it). Its
+        # lobby's LobbyCreated_t must reach the game. No Steam client needed when the DLL
+        # doesn't ask for one.
+        @{ Name = 'steam_legacy'; Py = 'steam_legacy_test.py'; Var = 'PPTEST_STEAM_LEGACY_DLL'; Files = @('steam_api64.dll'); File = $true; Env = @('SteamAppId=480'); Roles = @('A') },
         # A starter that starts the game, with a room code set: the game, not the starter,
         # is this PC's first player. Only loads the DLL: no Steam client needed.
         @{ Name = 'starter'; Dlls = 'steam_own_id'; Py = 'starter_test.py'; Var = 'PPTEST_STARTER_DLL'; Files = @('steam_api64.dll'); File = $true; Env = @('PEERPARTY_ROOM=starter-test-room', 'PEERPARTY_INET_DHT=0', 'PEERPARTY_INET_STUN=0', 'PEERPARTY_INET_PORTMAP=0'); Roles = @('A') },

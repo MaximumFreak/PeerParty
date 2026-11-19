@@ -21,7 +21,10 @@
   other's participants, positions, Windows' devices listed and one chosen, leaving); GOG Galaxy (stats,
   storage, cloud saves, telemetry, tokens, chat); Steam licence checks, which must reach
   Steam itself and read "can't verify" for a LAN player (needs the Steam client running,
-  and shows the account as playing the app used).
+  and shows the account as playing the app used); and a game from before the flat API
+  (`steam_legacy`): `SteamMatchmaking()`'s object wrapped whatever the DLL names (its
+  class's RTTI says the version), a lobby created through it, and LobbyCreated_t and
+  LobbyEnter_t reaching the game through classic `SteamAPI_RunCallbacks` dispatch.
 - Typed-IP games on async sockets (`tests/sdk/ipfwd_test.py`, no DLL): two copies in a
   fresh room over loopback, with LAN discovery off so each sees the other only at its
   stand-in address. Each answer's overlapped receive is collected seven ways (completion
@@ -52,6 +55,7 @@ folder holding several):
 | `PPTEST_PHOTON_DIR` | A folder with `Photon3Unity3D.dll`, `PhotonRealtime.dll` and, if the game has it, `PhotonChat.dll` |
 | `PPTEST_VIVOX_DIR` | A folder with a Unity game's 64-bit `VivoxNative.dll` and `vivoxsdk.dll` (its `Plugins\x86_64`) |
 | `PPTEST_STEAM_DLL`, `PPTEST_STEAM_APPID` | A `steam_api64.dll` or 32-bit `steam_api.dll` (any SDK with the flat API), and the app id of a game the signed-in Steam account owns |
+| `PPTEST_STEAM_LEGACY_DLL` | A `steam_api64.dll` from an older SDK, one that exports `SteamMatchmaking()` (with any files it reads kept beside it) |
 | `PPTEST_SDK_DLLS`, `PPTEST_SDK_DLLS_X86` | `;`-separated SDK DLLs the cargo test maps and hooks without running (64-bit, 32-bit) |
 
 Without the variable, `run_all.ps1` uses copies kept in

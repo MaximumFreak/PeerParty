@@ -136,6 +136,8 @@ struct Session {
     player: u8,
     started: Instant,
     stderr: Arc<Mutex<String>>,
+    /// peerparty.exe's process id: Close all reaches it by `crate::close_event`.
+    pid: u32,
 }
 
 /// After a game is started, Play does nothing for it for this long (see `play`).
@@ -217,6 +219,8 @@ struct App {
     /// to Player N"). Never saved: off whenever the window starts, and off again once a start
     /// has used it, so a later Play can't replace a save by accident.
     copy_saves: HashSet<String>,
+    /// Close all on the Now playing card asked first: Close all again closes everything.
+    confirm_close: bool,
     snack: Option<Snack>,
     peerparty: PathBuf,
     focus_search: bool,
@@ -311,6 +315,7 @@ impl App {
             ended_rx,
             pending: Vec::new(),
             copy_saves: HashSet::new(),
+            confirm_close: false,
             snack: None,
             peerparty,
             focus_search: false,
@@ -541,6 +546,27 @@ impl App {
         }
     }
 
+    /// Close all on the Now playing card: every game PeerParty started from here, each
+    /// copy, asked to close (ended if it doesn't within a few seconds), and no waiting
+    /// copy starts after. The sessions go as each one's peerparty.exe ends.
+    fn close_all(&mut self) {
+        self.pending.clear();
+        let mut asked = 0;
+        for s in &self.sessions {
+            use windows_sys::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
+            unsafe {
+                let ev = OpenEventW(EVENT_MODIFY_STATE, 0, crate::close_event(s.pid).as_ptr());
+                if !ev.is_null() {
+                    if SetEvent(ev) != 0 {
+                        asked += 1;
+                    }
+                    windows_sys::Win32::Foundation::CloseHandle(ev);
+                }
+            }
+        }
+        self.say(t!("snack.closing_all", n = asked), asked > 0);
+    }
+
     /// Cancel on the Now playing card: the waiting copy won't start.
     fn cancel_pending(&mut self, key: &str) {
         if let Some(i) = self.pending.iter().position(|p| p.key == key) {
@@ -567,6 +593,7 @@ impl App {
         cmd.arg("--why").args(&args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
         match platform::quiet(&mut cmd).spawn() {
             Ok(mut child) => {
+                let pid = child.id();
                 let id = self.next_session;
                 self.next_session += 1;
                 let stderr = Arc::new(Mutex::new(String::new()));
@@ -584,7 +611,7 @@ impl App {
                     let _ = tx.send((id, code));
                     ctx.request_repaint();
                 });
-                self.sessions.push(Session { id, key: key.into(), name: name.into(), player, started: Instant::now(), stderr });
+                self.sessions.push(Session { id, key: key.into(), name: name.into(), player, started: Instant::now(), stderr, pid });
                 true
             }
             Err(e) => {
@@ -1027,6 +1054,10 @@ impl App {
         }
         // What's running, with what can be done for it.
         // Each game once (two games started in turn don't sit next to each other).
+        // Nothing running: no question left waiting for the next game.
+        if self.sessions.is_empty() {
+            self.confirm_close = false;
+        }
         let mut keys: Vec<String> = Vec::new();
         for s in &self.sessions {
             if !keys.contains(&s.key) {
@@ -1041,6 +1072,8 @@ impl App {
             }
             ui.add_space(8.0);
             let mut invite = false;
+            let mut close_all = false;
+            let mut confirm_close = self.confirm_close;
             let mut fix = None;
             let (mut start_now, mut cancel) = (None, None);
             widgets::card(ui, |ui| {
@@ -1088,9 +1121,35 @@ impl App {
                 {
                     invite = true;
                 }
+                // Closing loses unsaved progress: a yes first, here on the card.
+                if !self.sessions.is_empty() {
+                    if !confirm_close {
+                        if widgets::wide_button(ui, Some(Icon::Close), t!("nav.close_all"), widgets::Kind::Ghost, 28.0)
+                            .on_hover_text(t!("nav.close_all_tip"))
+                            .clicked()
+                        {
+                            confirm_close = true;
+                        }
+                    } else {
+                        ui.add(egui::Label::new(egui::RichText::new(t!("nav.close_all_confirm")).size(12.0).color(TEXT)).wrap());
+                        ui.horizontal(|ui| {
+                            if widgets::button(ui, None, t!("nav.close_all"), widgets::Kind::Danger).clicked() {
+                                close_all = true;
+                                confirm_close = false;
+                            }
+                            if widgets::icon_button(ui, Icon::Close, t!("common.cancel")).clicked() {
+                                confirm_close = false;
+                            }
+                        });
+                    }
+                }
             });
             if invite {
                 self.invite_everyone();
+            }
+            self.confirm_close = confirm_close;
+            if close_all {
+                self.close_all();
             }
             if let Some(key) = start_now {
                 self.start_pending_now(&key);
@@ -1854,7 +1913,7 @@ mod tests {
         crate::i18n::set("en");
         assert_eq!(t!("game.copy_saves", player = app.copy_saves_target("k")), "Copy Player 1's saves to Player 2");
         let at = Instant::now();
-        app.sessions.push(Session { id: 1, key: "k".into(), name: "x".into(), player: 1, started: at, stderr: Arc::default() });
+        app.sessions.push(Session { id: 1, key: "k".into(), name: "x".into(), player: 1, started: at, stderr: Arc::default(), pid: 0 });
         app.pending.push(PendingStart { at, key: "k".into(), name: "x".into(), args: vec![], player: 2 });
         // Copy 2 counting down: its saves are settled, so no switch (it would name copy 3).
         assert!(!app.copy_saves_offered("k", 2, true));
@@ -1862,7 +1921,7 @@ mod tests {
         assert!(app.copy_saves.is_empty(), "hidden, so off");
         app.pending.clear();
         assert!(app.copy_saves_offered("k", 2, true), "back once copy 2 has started");
-        app.sessions.push(Session { id: 2, key: "k".into(), name: "x".into(), player: 2, started: at, stderr: Arc::default() });
+        app.sessions.push(Session { id: 2, key: "k".into(), name: "x".into(), player: 2, started: at, stderr: Arc::default(), pid: 0 });
         assert_eq!(t!("game.copy_saves", player = app.copy_saves_target("k")), "Copy Player 1's saves to Player 3");
     }
 
@@ -1916,7 +1975,7 @@ mod tests {
             ("game-waiting", &|a: &mut App| {
                 let key = store::key_of(&a.entries[3].exe);
                 let name = a.entries[3].name.clone();
-                a.sessions.push(Session { id: 9_999, key: key.clone(), name: name.clone(), player: 1, started: Instant::now(), stderr: Arc::default() });
+                a.sessions.push(Session { id: 9_999, key: key.clone(), name: name.clone(), player: 1, started: Instant::now(), stderr: Arc::default(), pid: 0 });
                 a.pending.push(PendingStart { at: Instant::now() + Duration::from_secs(9), key, name, args: vec![], player: 2 });
             }),
             // One player, a copy running: Start another instance, and the save switch for it.

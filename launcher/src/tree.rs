@@ -13,14 +13,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JobObjectBasicProcessIdList,
-    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, GetExitCodeProcess, INFINITE, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-    QueryFullProcessImageNameW, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
+    CreateEventW, GetCurrentProcess, GetExitCodeProcess, INFINITE, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW, SetEvent, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
 };
 
 /// Programs that outlive a crash on purpose: not the game.
@@ -124,18 +124,131 @@ impl Tree {
 
     /// The ids of the job's running programs.
     fn members(&self) -> Vec<u32> {
-        // JOBOBJECT_BASIC_PROCESS_ID_LIST: two u32 counts, then the ids (ULONG_PTRs).
-        const MAX: usize = 1024;
-        let w = std::mem::size_of::<usize>();
-        let mut buf = vec![0usize; 8 / w + MAX];
-        let ok = unsafe { QueryInformationJobObject(self.job, JobObjectBasicProcessIdList, buf.as_mut_ptr().cast(), (buf.len() * w) as u32, std::ptr::null_mut()) };
-        if ok == 0 {
-            return Vec::new();
-        }
-        let bytes: &[u8] = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast(), buf.len() * w) };
-        let listed = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
-        buf[8 / w..8 / w + listed.min(MAX)].iter().map(|&p| p as u32).collect()
+        members(self.job)
     }
+
+    /// What closes the whole game later (the window's Close all), with handles of its own:
+    /// `watch` takes the tree. `first` is the program PeerParty started.
+    pub fn closer(&self, first: HANDLE) -> Closer {
+        Closer { job: duplicate(self.job), first: duplicate(first) }
+    }
+}
+
+/// Closes a game PeerParty started: its windows are asked to close, as their close
+/// button would; whatever still runs after `CLOSE_WAIT` is ended, every program in the
+/// job (a game stuck on a loading screen doesn't answer).
+pub struct Closer {
+    job: HANDLE,
+    first: HANDLE,
+}
+
+// Its handles are only used by the one thread that closes.
+unsafe impl Send for Closer {}
+
+const CLOSE_WAIT: Duration = Duration::from_secs(6);
+
+impl Closer {
+    /// For a game PeerParty couldn't put in a job: only the program it started.
+    pub fn process(first: HANDLE) -> Closer {
+        Closer { job: std::ptr::null_mut(), first: duplicate(first) }
+    }
+
+    pub fn close(&self) {
+        let pids: Vec<u32> = if self.job.is_null() { Vec::new() } else { members(self.job) };
+        let asked = ask_windows_to_close(&pids, self.first);
+        eprintln!("peerparty: closing the game (Close all in PeerParty's window): {asked} window(s) asked to close");
+        let until = std::time::Instant::now() + CLOSE_WAIT;
+        while std::time::Instant::now() < until {
+            let left = if self.job.is_null() { 0 } else { members(self.job).len() };
+            let first_runs = !self.first.is_null() && unsafe { WaitForSingleObject(self.first, 0) } != WAIT_OBJECT_0;
+            if left == 0 && !first_runs {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        eprintln!("peerparty: the game still ran {}s after being asked to close: ended", CLOSE_WAIT.as_secs());
+        unsafe {
+            if !self.job.is_null() {
+                TerminateJobObject(self.job, 1);
+            }
+            if !self.first.is_null() {
+                TerminateProcess(self.first, 1);
+            }
+        }
+    }
+}
+
+impl Drop for Closer {
+    fn drop(&mut self) {
+        unsafe {
+            for h in [self.job, self.first] {
+                if !h.is_null() {
+                    CloseHandle(h);
+                }
+            }
+        }
+    }
+}
+
+fn duplicate(h: HANDLE) -> HANDLE {
+    let mut out = std::ptr::null_mut();
+    unsafe {
+        let me = GetCurrentProcess();
+        if h.is_null() || DuplicateHandle(me, h, me, &mut out, 0, 0, DUPLICATE_SAME_ACCESS) == 0 {
+            return std::ptr::null_mut();
+        }
+    }
+    out
+}
+
+/// Posts WM_CLOSE to the visible top-level windows of `pids` (and of `first`'s
+/// program); returns how many.
+fn ask_windows_to_close(pids: &[u32], first: HANDLE) -> usize {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId, IsWindowVisible, PostMessageW, WM_CLOSE};
+    let mut want: Vec<u32> = pids.to_vec();
+    if !first.is_null() {
+        let pid = unsafe { windows_sys::Win32::System::Threading::GetProcessId(first) };
+        if pid != 0 && !want.contains(&pid) {
+            want.push(pid);
+        }
+    }
+    struct Ctx {
+        want: Vec<u32>,
+        asked: usize,
+    }
+    unsafe extern "system" fn each(hwnd: HWND, lp: LPARAM) -> i32 {
+        unsafe {
+            let ctx = &mut *(lp as *mut Ctx);
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            if ctx.want.contains(&pid) && IsWindowVisible(hwnd) != 0 && PostMessageW(hwnd, WM_CLOSE, 0 as WPARAM, 0) != 0 {
+                ctx.asked += 1;
+            }
+        }
+        1
+    }
+    let mut ctx = Ctx { want, asked: 0 };
+    unsafe { EnumWindows(Some(each), &mut ctx as *mut Ctx as LPARAM) };
+    ctx.asked
+}
+
+/// The ids of a job's running programs.
+fn members(job: HANDLE) -> Vec<u32> {
+    // JOBOBJECT_BASIC_PROCESS_ID_LIST: two u32 counts, then the ids (ULONG_PTRs).
+    const MAX: usize = 1024;
+    let w = std::mem::size_of::<usize>();
+    let mut buf = vec![0usize; 8 / w + MAX];
+    let ok = unsafe { QueryInformationJobObject(job, JobObjectBasicProcessIdList, buf.as_mut_ptr().cast(), (buf.len() * w) as u32, std::ptr::null_mut()) };
+    if ok == 0 {
+        return Vec::new();
+    }
+    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast(), buf.len() * w) };
+    let listed = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    buf[8 / w..8 / w + listed.min(MAX)].iter().map(|&p| p as u32).collect()
+}
+
+impl Tree {
 
     /// A running program of the job worth waiting for: inside the game's folder, not a
     /// crash reporter.
@@ -182,4 +295,29 @@ unsafe fn image(h: HANDLE) -> Option<PathBuf> {
         return None;
     }
     Some(PathBuf::from(String::from_utf16_lossy(&buf[..len as usize])))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::windows::io::AsRawHandle;
+
+    /// Close all ends a game that has no window to ask (one stuck loading, or a console
+    /// program here), every program in its job, once the wait is over.
+    #[test]
+    fn close_ends_what_doesnt_answer() {
+        let tree = Tree::new(None).expect("a job");
+        let mut cmd = std::process::Command::new("ping");
+        cmd.args(["-n", "60", "127.0.0.1"]).stdout(std::process::Stdio::null());
+        let mut child = crate::platform::quiet(&mut cmd).spawn().expect("ping starts");
+        let h = child.as_raw_handle() as HANDLE;
+        assert!(tree.add(h));
+        let closer = tree.closer(h);
+        let started = std::time::Instant::now();
+        closer.close();
+        let status = child.wait().expect("ended");
+        assert!(!status.success(), "ended, not finished");
+        assert!(started.elapsed() < Duration::from_secs(20));
+        assert!(members(closer.job).is_empty());
+    }
 }

@@ -94,6 +94,10 @@ pub struct Prefs {
     /// The name other players see, in every service (Steam's persona name, EOS and GOG
     /// display names, PlayFab, Unity). Empty: the Windows user name.
     pub name: String,
+    /// The name a second copy of a game on this PC goes by (`PEERPARTY_OTHER_NAME`; the
+    /// third onwards numbered). Empty: `name` with "(2)". Shown only on a game page set
+    /// to two players, or with a copy running.
+    pub other_name: String,
     /// Invites from other players are accepted without asking. Off: the overlay asks.
     pub auto_accept: bool,
     /// Controller buttons that invite every other player: "", "guide", "combo" or "both".
@@ -146,6 +150,7 @@ impl Default for Prefs {
     fn default() -> Self {
         Prefs {
             name: String::new(),
+            other_name: String::new(),
             auto_accept: false,
             invite_buttons: String::new(),
             overlay: true,

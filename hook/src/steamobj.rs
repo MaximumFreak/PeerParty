@@ -1114,13 +1114,20 @@ unsafe fn data_sections(base: usize) -> Vec<&'static [u8]> {
 /// The version an old accessor's object `real` is: the one steam_api names, else the
 /// one its vtable matches (once, logged).
 fn legacy_version(l: &Legacy, real: usize) -> Option<&str> {
-    if let Some(v) = &l.named {
-        return Some(v);
-    }
     if real == 0 {
-        return None;
+        return l.named.as_deref();
     }
     *l.seen.get_or_init(|| {
+        // The object's own class says it best: a steam_api that holds several versions'
+        // names, or none, still builds each version as a class of its own.
+        let rtti = version_from_rtti(real, l.family);
+        if let Ok(v) = rtti {
+            log!("steam-lan {}: its object's class is {v}'s, so it's taken as {v}", l.export);
+            return Some(v);
+        }
+        if let Some(v) = l.named.as_deref().and_then(layout).map(|(v, _)| v) {
+            return Some(v);
+        }
         let flat = FLAT_ALL.get();
         let v = flat.and_then(|flat| {
             version_from_vtable(l.family, flat, |i| unsafe {
@@ -1129,12 +1136,151 @@ fn legacy_version(l: &Legacy, real: usize) -> Option<&str> {
                 crate::read::readable(p, size_of::<usize>()).then(|| *(p as *const usize))
             })
         });
-        match v {
-            Some(v) => log!("steam-lan {}: its object's methods are steam_api's own in {v}'s order, so it's taken as {v}", l.export),
-            None => log!("steam-lan {}: can't tell which {} version its object is, so it's left as is", l.export, l.family),
+        if let Some(v) = v {
+            log!("steam-lan {}: its object's methods are steam_api's own in {v}'s order, so it's taken as {v}", l.export);
+            return Some(v);
         }
-        v
+        let why = rtti.err().unwrap_or_default();
+        log!("steam-lan {}: can't tell which {} version its object is ({why}), so it's left as is", l.export, l.family);
+        None
     })
+}
+
+/// The family a class name's stem stands for: "SteamMatchmaking" (from
+/// "SteamMatchmaking9", "ISteamMatchmaking009", "CSteamMatchmaking009").
+fn family_of_class(stem: &str) -> Option<&'static str> {
+    let stem = stem.strip_prefix('I').or_else(|| stem.strip_prefix('C')).filter(|s| s.starts_with("Steam")).unwrap_or(stem);
+    Some(match stem.to_ascii_lowercase().as_str() {
+        "steamclient" => "SteamClient",
+        "steamuser" => "SteamUser",
+        "steamfriends" => "SteamFriends",
+        "steammatchmaking" => "SteamMatchMaking",
+        "steammatchmakingservers" => "SteamMatchMakingServers",
+        "steamnetworking" => "SteamNetworking",
+        "steamgameserver" => "SteamGameServer",
+        "steamutils" => "SteamUtils",
+        "steamuserstats" => "STEAMUSERSTATS_INTERFACE_VERSION",
+        "steamapps" => "STEAMAPPS_INTERFACE_VERSION",
+        "steamugc" => "STEAMUGC_INTERFACE_VERSION",
+        "steamcontroller" => "SteamController",
+        _ => return None,
+    })
+}
+
+/// The interface version a decorated MSVC class name (".?AVSteamMatchmaking9@@") stands
+/// for, when it names one of PeerParty's layouts.
+fn version_of_class(decorated: &str) -> Option<&'static str> {
+    let name = decorated.strip_prefix(".?AV").or_else(|| decorated.strip_prefix(".?AU"))?;
+    let name = name.split('@').next()?;
+    let digits_at = name.find(|c: char| c.is_ascii_digit())?;
+    let (stem, digits) = name.split_at(digits_at);
+    if digits.is_empty() || digits.len() > 3 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let family = family_of_class(stem)?;
+    layout(&format!("{family}{digits:0>3}")).map(|(v, _)| v)
+}
+
+/// The version of `family` an MSVC-built object says it is: its class's name, or a base
+/// class's, from the RTTI beside its vtable ("SteamMatchmaking9" is SteamMatchMaking009).
+/// Taken only when exactly one version of `family` is named, and, where the vtable's end
+/// can be seen (the next vtable's RTTI), when its length is that version's.
+fn version_from_rtti(real: usize, family: &str) -> Result<&'static str, String> {
+    let names = unsafe { rtti::class_names(real) }.ok_or("no MSVC RTTI behind its vtable")?;
+    let mut found: Vec<&'static str> = names.iter().filter_map(|n| version_of_class(n)).filter(|v| self::family(v) == family).collect();
+    found.sort_unstable();
+    found.dedup();
+    let v = match found.as_slice() {
+        [v] => *v,
+        [] => return Err(format!("its class ({}) names no {family} version", names.first().map_or("?", |n| n.as_str()))),
+        many => return Err(format!("its classes name {}", many.join(", "))),
+    };
+    let want = layout(v).map_or(0, |(_, n)| n.len());
+    match unsafe { rtti::vtable_len(real) } {
+        Some(n) if n != want => Err(format!("its class is {v}'s, but its vtable has {n} methods, not {want}")),
+        _ => Ok(v),
+    }
+}
+
+/// MSVC's run-time type information, read with every pointer checked: the Complete
+/// Object Locator in the slot before a vtable leads to the class's name and its bases'.
+mod rtti {
+    use crate::read::{cstr, readable};
+
+    const P: usize = size_of::<usize>();
+
+    unsafe fn word(p: usize) -> Option<usize> {
+        readable(p, P).then(|| unsafe { *(p as *const usize) })
+    }
+
+    unsafe fn u32_at(p: usize) -> Option<u32> {
+        readable(p, 4).then(|| unsafe { *(p as *const u32) })
+    }
+
+    /// x64 locators hold image-relative offsets (signature 1, with the locator's own
+    /// offset to find the image); x86 ones hold pointers (signature 0).
+    unsafe fn at(p: usize, field: usize, image: usize) -> Option<usize> {
+        let v = unsafe { u32_at(p + field) }? as usize;
+        Some(if cfg!(target_pointer_width = "64") { image + v } else { v })
+    }
+
+    /// The image a locator at `col` belongs to, when `col` is one.
+    unsafe fn locator(col: usize) -> Option<usize> {
+        let sig = unsafe { u32_at(col) }?;
+        if cfg!(target_pointer_width = "64") {
+            let own = unsafe { u32_at(col + 20) }? as usize;
+            let image = col.checked_sub(own)?;
+            (sig == 1 && readable(image, 2) && unsafe { *(image as *const u16) } == 0x5A4D).then_some(image)
+        } else {
+            (sig == 0).then_some(0)
+        }
+    }
+
+    unsafe fn type_name(td: usize) -> Option<String> {
+        let name = cstr(td + 2 * P)?;
+        name.starts_with(".?A").then_some(name)
+    }
+
+    /// The decorated names of the object's class and its bases (".?AVSteamUser16@@").
+    pub unsafe fn class_names(obj: usize) -> Option<Vec<String>> {
+        unsafe {
+            let vt = word(obj)?;
+            let col = word(vt.checked_sub(P)?)?;
+            let image = locator(col)?;
+            let mut out = vec![type_name(at(col, 12, image)?)?];
+            let hierarchy = at(col, 16, image)?;
+            let n = u32_at(hierarchy + 8)?.min(64) as usize;
+            let bases = at(hierarchy, 12, image)?;
+            for i in 0..n {
+                let entry = at(bases, 4 * i, image)?;
+                if let Some(name) = at(entry, 0, image).and_then(|td| type_name(td)) {
+                    if !out.contains(&name) {
+                        out.push(name);
+                    }
+                }
+            }
+            Some(out)
+        }
+    }
+
+    /// How many methods the object's vtable has: up to the next vtable's locator. None
+    /// when that can't be seen (no locator within reach), and on x86, whose locators
+    /// (signature 0, no offset to themselves) can't be told from other data.
+    pub unsafe fn vtable_len(obj: usize) -> Option<usize> {
+        if cfg!(target_pointer_width = "32") {
+            return None;
+        }
+        unsafe {
+            let vt = word(obj)?;
+            for i in 0..256 {
+                let e = word(vt + i * P)?;
+                if readable(e, 24) && locator(e).is_some() {
+                    return Some(i);
+                }
+            }
+            None
+        }
+    }
 }
 
 /// steam_api's flat-function prefix for a version family's methods.
@@ -1257,6 +1403,21 @@ mod tests {
         // taken, so the changed method is forwarded rather than served.
         assert_eq!(layout(got).unwrap().1.len(), layout("SteamUser019").unwrap().1.len());
         assert!(got <= "SteamUser019");
+    }
+
+    #[test]
+    fn a_class_name_says_its_version() {
+        assert_eq!(version_of_class(".?AVSteamMatchmaking9@@"), Some("SteamMatchMaking009"));
+        assert_eq!(version_of_class(".?AVISteamFriends015@@"), Some("SteamFriends015"));
+        assert_eq!(version_of_class(".?AVSteamUserStats11@@"), Some("STEAMUSERSTATS_INTERFACE_VERSION011"));
+        assert_eq!(version_of_class(".?AVSteamApps5@@"), Some("STEAMAPPS_INTERFACE_VERSION005"));
+        assert_eq!(version_of_class(".?AVCSteamUser16@ns@@"), Some("SteamUser016"));
+        // Steam's own classes carry no version; a version PeerParty has no layout for
+        // isn't one; other classes aren't Steam's.
+        assert_eq!(version_of_class(".?AVCSteamMatchmaking@@"), None);
+        assert_eq!(version_of_class(".?AVSteamUser99@@"), None);
+        assert_eq!(version_of_class(".?AVPlayer2@@"), None);
+        assert_eq!(version_of_class("SteamUser16"), None);
     }
 
     #[test]

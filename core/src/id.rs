@@ -171,7 +171,7 @@ impl Identity {
                 if !server {
                     retire_old_id(dir, slot, id);
                 }
-                let name = if slot == 0 { base } else { format!("{base} ({})", slot + 1) };
+                let name = copy_name(&base, slot, if server { None } else { other_name() });
                 return Identity {
                     id,
                     name,
@@ -187,6 +187,29 @@ impl Identity {
         me
     }
 
+}
+
+/// The name the second and later player copies on this PC go by (the launcher's
+/// "Second player's name", `PEERPARTY_OTHER_NAME`), when one is set.
+fn other_name() -> Option<String> {
+    std::env::var("PEERPARTY_OTHER_NAME")
+        .ok()
+        .map(|n| n.trim().chars().take(32).collect::<String>())
+        .filter(|n| !n.is_empty())
+}
+
+/// The name of the copy in `slot` on this PC: the first is `base`; later ones are
+/// `other` when one is set (the third onwards numbered, "Sam (3)"), else "base (2)".
+fn copy_name(base: &str, slot: u32, other: Option<String>) -> String {
+    match (slot, other) {
+        (0, _) => base.to_string(),
+        (1, Some(o)) => o,
+        (n, Some(o)) => format!("{o} ({})", n + 1),
+        (n, None) => format!("{base} ({})", n + 1),
+    }
+}
+
+impl Identity {
     /// The ids of every identity slot on this PC (players' and servers'), from their
     /// key files in `dir`: a peer with one of these is another copy on this PC.
     pub fn ids_on_this_pc(dir: &Path) -> Vec<PeerId> {
@@ -357,6 +380,16 @@ fn retire_old_id(dir: &Path, slot: u32, now: PeerId) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The second player's name goes to copy 2 only; copy 1 keeps the player's name, and
+    /// with none set, copy 2 is "name (2)" as before.
+    #[test]
+    fn the_second_players_name_is_for_later_copies_only() {
+        assert_eq!(copy_name("Kim", 0, Some("Sam".into())), "Kim");
+        assert_eq!(copy_name("Kim", 1, Some("Sam".into())), "Sam");
+        assert_eq!(copy_name("Kim", 2, Some("Sam".into())), "Sam (3)");
+        assert_eq!(copy_name("Kim", 1, None), "Kim (2)");
+    }
 
     /// Slots are held per game: the player is the same in two games at once, and a
     /// second copy of one game is another player.
