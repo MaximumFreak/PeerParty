@@ -410,7 +410,39 @@ unsafe extern "C" fn on_enter(
                 log!("call {text} n={n} {extra}");
             }
         });
+        if let Some(method) = bypassed(&text, a1) {
+            log::gap("steam", &format!("{method} ran on steam_api's own object, not PeerParty's stand-in: the game got that object some way PeerParty doesn't wrap, so this never reaches the LAN"));
+        }
     }));
+}
+
+/// The Steam multiplayer methods whose flat function, called on an object that isn't
+/// one of PeerParty's stand-ins, means the game plays on steam_api's own objects:
+/// a lobby made or an invite sent that way never reaches PeerParty. A flat function
+/// that came to PeerParty through the by-name swap isn't traced, and one called on a
+/// stand-in goes on to PeerParty's method, so neither is counted.
+const MULTIPLAYER: &[&str] = &[
+    "SteamAPI_ISteamMatchmaking_CreateLobby",
+    "SteamAPI_ISteamMatchmaking_JoinLobby",
+    "SteamAPI_ISteamMatchmaking_RequestLobbyList",
+    "SteamAPI_ISteamMatchmaking_InviteUserToLobby",
+    "SteamAPI_ISteamFriends_ActivateGameOverlayInviteDialog",
+    "SteamAPI_ISteamNetworking_SendP2PPacket",
+    "SteamAPI_ISteamNetworkingSockets_ConnectP2P",
+    "SteamAPI_ISteamNetworkingMessages_SendMessageToUser",
+];
+
+/// `name`'s method ("ISteamMatchmaking CreateLobby") when it's one of `MULTIPLAYER` and
+/// `this` isn't a stand-in, while PeerParty's Steam layer is on.
+fn bypassed(name: &str, this: usize) -> Option<String> {
+    if !MULTIPLAYER.contains(&name) || this == 0 || !crate::net::enabled() || crate::net::skip("steam") {
+        return None;
+    }
+    if crate::steamobj::is_stand_in(this) {
+        return None;
+    }
+    let (iface, method) = name.strip_prefix("SteamAPI_")?.split_once('_')?;
+    Some(format!("{iface} {method}"))
 }
 
 fn wants_detail(name: &str) -> bool {

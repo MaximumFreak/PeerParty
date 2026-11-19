@@ -334,8 +334,12 @@ pub fn everyone() -> usize {
 pub fn to(target: Option<PeerId>) -> usize {
     let (connect, lobby) = crate::overlay::dialog_target().unwrap_or_else(|| (my_connect(), here()));
     if connect.is_empty() && lobby.is_none() {
-        let why = why_not_with(&net::fronts());
+        let fronts = net::fronts();
+        let why = why_not_with(&fronts);
         log!("invite: nothing to invite to: {why}");
+        if fronts.contains(&net::Front::Steam) {
+            log!("invite: {}", crate::steamobj::invite_diagnosis());
+        }
         crate::ipc::note("Can't invite", &why);
         beep(false);
         return 0;

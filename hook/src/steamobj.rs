@@ -264,6 +264,37 @@ pub fn wrap_as(real: usize, version: &str, server: bool) -> usize {
     proxy
 }
 
+/// Whether `p` is one of PeerParty's stand-ins.
+pub fn is_stand_in(p: usize) -> bool {
+    REALS.read().unwrap().contains_key(&p)
+}
+
+/// The interface versions PeerParty has handed out stand-ins for, sorted, for the log
+/// when there's nothing to invite to.
+pub fn stand_ins() -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = REALS
+        .read()
+        .unwrap()
+        .keys()
+        .map(|p| unsafe { (*(*p as *const Proxy)).version })
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// What the log says about Steam when there's nothing to invite to: the stand-ins the
+/// game was handed, and whether matchmaking (where lobbies are made) is among them.
+pub fn invite_diagnosis() -> String {
+    let have = stand_ins();
+    let lobbies = have.iter().any(|v| family(v) == "SteamMatchMaking");
+    format!(
+        "steam stand-ins handed out: {}{}",
+        if have.is_empty() { "none".to_string() } else { have.join(", ") },
+        if lobbies { "" } else { " (none for matchmaking: a lobby the game makes doesn't reach PeerParty)" }
+    )
+}
+
 /// The real object behind a stand-in (anything else comes back as is).
 pub fn unwrap(p: usize) -> usize {
     REALS.read().unwrap().get(&p).copied().unwrap_or(p)
@@ -357,9 +388,26 @@ type LegacyFn = unsafe extern "C" fn() -> usize;
 static CREATE: OnceLock<GenericDetour<CreateFn>> = OnceLock::new();
 static FIND_USER: OnceLock<GenericDetour<UserFn>> = OnceLock::new();
 static FIND_SERVER: OnceLock<GenericDetour<UserFn>> = OnceLock::new();
-/// The old accessors: export, its inline hook (when one could go in), the export's
-/// address, the version it hands out, whether it's the server's.
-static LEGACY: OnceLock<Vec<(&'static str, Option<GenericDetour<LegacyFn>>, usize, String, bool)>> = OnceLock::new();
+/// An old accessor (`SteamMatchmaking()` and the rest): they take no version, so it's
+/// the one steam_api names for its family, or else the one its object turns out to be.
+struct Legacy {
+    export: &'static str,
+    /// Its inline hook, when one could go in.
+    hook: Option<GenericDetour<LegacyFn>>,
+    addr: usize,
+    /// "SteamMatchMaking", as versions are named.
+    family: &'static str,
+    /// The version steam_api names, if it names one.
+    named: Option<String>,
+    /// Otherwise the version its object's vtable matches, worked out on the first call.
+    seen: OnceLock<Option<&'static str>>,
+    server: bool,
+}
+
+static LEGACY: OnceLock<Vec<Legacy>> = OnceLock::new();
+/// steam_api's flat methods of every interface, by name: a steam_api that names no
+/// interface versions can still be told apart by them (`version_from_vtable`).
+static FLAT_ALL: OnceLock<HashMap<String, usize>> = OnceLock::new();
 /// The `SteamInternal_*` accessors' own addresses, for calls that reach the detours
 /// through the by-name swap when the inline hook couldn't go in (an export too short to
 /// patch).
@@ -410,16 +458,17 @@ unsafe extern "C" fn detour_find_server(user: i32, version: *const c_char) -> us
 macro_rules! legacy {
     ($fn:ident, $export:literal) => {
         unsafe extern "C" fn $fn() -> usize {
-            let Some((_, h, addr, version, server)) =
-                LEGACY.get().and_then(|l| l.iter().find(|(n, ..)| *n == $export))
-            else {
+            let Some(l) = LEGACY.get().and_then(|l| l.iter().find(|l| l.export == $export)) else {
                 return 0;
             };
-            let real = match h {
+            let real = match &l.hook {
                 Some(h) => unsafe { h.call() },
-                None => unsafe { std::mem::transmute::<usize, LegacyFn>(*addr)() },
+                None => unsafe { std::mem::transmute::<usize, LegacyFn>(l.addr)() },
             };
-            wrap_as(real, version, *server)
+            match legacy_version(l, real) {
+                Some(version) => wrap_as(real, version, l.server),
+                None => real,
+            }
         }
     };
 }
@@ -860,7 +909,7 @@ fn accessor_swap(name: &str) -> Option<usize> {
     if let Some(f) = internal {
         return self::internal(name).map(|_| f);
     }
-    if let Some((_, _, _, _, _)) = LEGACY.get().and_then(|l| l.iter().find(|(n, ..)| *n == name)) {
+    if LEGACY.get().is_some_and(|l| l.iter().any(|l| l.export == name)) {
         return LEGACY_FNS.iter().find(|(n, _)| *n == name).map(|(_, f)| *f as usize);
     }
     let (found, base) = FLAT.get()?;
@@ -948,8 +997,17 @@ pub fn attach(base: usize, exports: &[Export]) -> Vec<usize> {
             patched.push(a);
         }
     }
+    let _ = FLAT_ALL.set(
+        exports
+            .iter()
+            .filter(|e| e.name.starts_with("SteamAPI_ISteam"))
+            .map(|e| (e.name.clone(), e.addr as usize))
+            .collect(),
+    );
     // The old accessors take no version: it's the one this steam_api.dll was built
-    // with, the only one of its family named in the image.
+    // with, the only one of its family named in the image. A steam_api that names none
+    // (one that keeps its version names some other way) still gets the hook: its
+    // object's version is told from its vtable on the first call.
     let image = unsafe { data_sections(base) };
     let mut legacy = Vec::new();
     for (export, fam, f, server) in [
@@ -968,9 +1026,8 @@ pub fn attach(base: usize, exports: &[Export]) -> Vec<usize> {
         ("SteamUGC", "STEAMUGC_INTERFACE_VERSION", legacy_ugc as LegacyFn, false),
         ("SteamController", "SteamController", legacy_controller as LegacyFn, false),
     ] {
-        let (Some(a), Some(version)) = (find(export), image.iter().filter_map(|s| newest_named(s, fam)).max()) else {
-            continue;
-        };
+        let Some(a) = find(export) else { continue };
+        let named = image.iter().filter_map(|s| newest_named(s, fam)).max();
         let target: LegacyFn = unsafe { std::mem::transmute(a) };
         let hooked = with_lock(|| unsafe {
             let h = GenericDetour::new(target, f).ok()?;
@@ -981,7 +1038,28 @@ pub fn attach(base: usize, exports: &[Export]) -> Vec<usize> {
             patched.push(a);
         }
         // Not hooked (too short to patch): the by-name swap still reaches it.
-        legacy.push((export, hooked, a, version, server));
+        legacy.push(Legacy {
+            export,
+            hook: hooked,
+            addr: a,
+            family: fam,
+            named,
+            seen: OnceLock::new(),
+            server,
+        });
+    }
+    // Which old accessors there are and how each is reached: a game that fetches its
+    // interfaces through one PeerParty can't wrap plays on steam_api's own objects.
+    if !legacy.is_empty() {
+        let each: Vec<String> = legacy
+            .iter()
+            .map(|l| {
+                let version = l.named.clone().unwrap_or_else(|| "version told from its object".into());
+                let how = if l.hook.is_some() { "" } else { ", not hooked (too short): only by name" };
+                format!("{} ({version}{how})", l.export)
+            })
+            .collect();
+        log!("steam-lan old accessors: {}", each.join(", "));
     }
     let _ = LEGACY.set(legacy);
     log!("steam-lan interface exports hooked: {}", patched.len());
@@ -1033,6 +1111,82 @@ unsafe fn data_sections(base: usize) -> Vec<&'static [u8]> {
     }
 }
 
+/// The version an old accessor's object `real` is: the one steam_api names, else the
+/// one its vtable matches (once, logged).
+fn legacy_version(l: &Legacy, real: usize) -> Option<&str> {
+    if let Some(v) = &l.named {
+        return Some(v);
+    }
+    if real == 0 {
+        return None;
+    }
+    *l.seen.get_or_init(|| {
+        let flat = FLAT_ALL.get();
+        let v = flat.and_then(|flat| {
+            version_from_vtable(l.family, flat, |i| unsafe {
+                let vt = *(real as *const usize);
+                let p = vt + i * size_of::<usize>();
+                crate::read::readable(p, size_of::<usize>()).then(|| *(p as *const usize))
+            })
+        });
+        match v {
+            Some(v) => log!("steam-lan {}: its object's methods are steam_api's own in {v}'s order, so it's taken as {v}", l.export),
+            None => log!("steam-lan {}: can't tell which {} version its object is, so it's left as is", l.export, l.family),
+        }
+        v
+    })
+}
+
+/// steam_api's flat-function prefix for a version family's methods.
+fn flat_iface(family: &str) -> Option<&'static str> {
+    Some(match family {
+        "SteamClient" => "ISteamClient",
+        "SteamUser" => "ISteamUser",
+        "SteamFriends" => "ISteamFriends",
+        "SteamMatchMaking" => "ISteamMatchmaking",
+        "SteamMatchMakingServers" => "ISteamMatchmakingServers",
+        "SteamNetworking" => "ISteamNetworking",
+        "SteamGameServer" => "ISteamGameServer",
+        "SteamUtils" => "ISteamUtils",
+        "STEAMUSERSTATS_INTERFACE_VERSION" => "ISteamUserStats",
+        "STEAMAPPS_INTERFACE_VERSION" => "ISteamApps",
+        "STEAMUGC_INTERFACE_VERSION" => "ISteamUGC",
+        "SteamController" => "ISteamController",
+        _ => return None,
+    })
+}
+
+/// The version of `family` whose slot order an object's vtable follows, for a
+/// steam_api whose objects' vtables hold the very functions it exports flat (slot i is
+/// `SteamAPI_ISteamMatchmaking_CreateLobby` where the version has CreateLobby). `slot(i)`
+/// reads the object's slot i (None past readable memory). A version counts when most of
+/// the slots it has a flat function for hold that function; the best one wins, and of
+/// equals the oldest (whose changed signatures are forwarded, not served). None when
+/// none counts: a steam_api whose flat functions only call into its objects (Steam's)
+/// leaves the object as is.
+fn version_from_vtable(family: &str, flat: &HashMap<String, usize>, slot: impl Fn(usize) -> Option<usize>) -> Option<&'static str> {
+    let iface = flat_iface(family)?;
+    let mut best: Option<(i64, &'static str)> = None;
+    for (v, names) in TABLES.iter().filter(|(v, _)| self::family(v) == family) {
+        let (mut hit, mut miss) = (0i64, 0i64);
+        for (i, n) in names.iter().enumerate() {
+            let method = n.split('~').next().unwrap_or(n);
+            let Some(&f) = flat.get(&format!("SteamAPI_{iface}_{method}")) else {
+                continue;
+            };
+            if slot(i) == Some(f) {
+                hit += 1;
+            } else {
+                miss += 1;
+            }
+        }
+        if hit >= 3 && hit > miss && best.is_none_or(|(s, _)| hit - miss > s) {
+            best = Some((hit - miss, *v));
+        }
+    }
+    best.map(|(_, v)| v)
+}
+
 /// The highest "<family>NNN" string in `image`, e.g. "SteamFriends015". A match that
 /// isn't one (too near the end, more digits) is skipped, not the end of the search.
 fn newest_named(image: &[u8], family: &str) -> Option<String> {
@@ -1063,6 +1217,56 @@ fn memchr_all<'a>(hay: &'a [u8], needle: &'a [u8]) -> impl Iterator<Item = usize
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A steam_api whose flat functions are its objects' methods: each method name gets
+    /// an address, and a version's vtable holds those in its order.
+    fn flat_for(family_iface: &str, versions: &[&str]) -> HashMap<String, usize> {
+        let mut flat = HashMap::new();
+        for v in versions {
+            for n in layout(v).unwrap().1 {
+                let method = n.split('~').next().unwrap();
+                let next = 0x1000 + flat.len() * 16;
+                flat.entry(format!("SteamAPI_{family_iface}_{method}")).or_insert(next);
+            }
+        }
+        flat
+    }
+
+    fn vtable_of(version: &str, iface: &str, flat: &HashMap<String, usize>) -> Vec<usize> {
+        layout(version)
+            .unwrap()
+            .1
+            .iter()
+            .map(|n| flat[&format!("SteamAPI_{iface}_{}", n.split('~').next().unwrap())])
+            .collect()
+    }
+
+    #[test]
+    fn an_unnamed_version_is_told_from_the_vtable() {
+        let all: Vec<&str> = TABLES.iter().map(|(v, _)| *v).filter(|v| family(v) == "SteamMatchMaking").collect();
+        let flat = flat_for("ISteamMatchmaking", &all);
+        for v in ["SteamMatchMaking009", "SteamMatchMaking008", "SteamMatchMaking006"] {
+            let vt = vtable_of(v, "ISteamMatchmaking", &flat);
+            assert_eq!(version_from_vtable("SteamMatchMaking", &flat, |i| vt.get(i).copied()), Some(v), "{v}");
+        }
+        let users: Vec<&str> = TABLES.iter().map(|(v, _)| *v).filter(|v| family(v) == "SteamUser").collect();
+        let flat = flat_for("ISteamUser", &users);
+        let vt = vtable_of("SteamUser019", "ISteamUser", &flat);
+        let got = version_from_vtable("SteamUser", &flat, |i| vt.get(i).copied()).unwrap();
+        // Versions that differ only in a changed signature look alike; the oldest is
+        // taken, so the changed method is forwarded rather than served.
+        assert_eq!(layout(got).unwrap().1.len(), layout("SteamUser019").unwrap().1.len());
+        assert!(got <= "SteamUser019");
+    }
+
+    #[test]
+    fn a_vtable_of_other_functions_is_left_alone() {
+        let flat = flat_for("ISteamMatchmaking", &["SteamMatchMaking009"]);
+        // Steam's own objects: the flat functions only call into them.
+        assert_eq!(version_from_vtable("SteamMatchMaking", &flat, |i| Some(0x9000_0000 + i * 8)), None);
+        assert_eq!(version_from_vtable("SteamMatchMaking", &flat, |_| None), None);
+        assert_eq!(version_from_vtable("SteamUnknown", &flat, |_| None), None);
+    }
 
     #[test]
     fn layouts_have_the_lobby_and_p2p_methods_where_steam_puts_them() {
