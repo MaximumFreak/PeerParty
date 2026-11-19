@@ -144,7 +144,7 @@ fn family(version: &str) -> &str {
     version.trim_end_matches(|c: char| c.is_ascii_digit())
 }
 
-fn layout(version: &str) -> Option<(&'static str, &'static [&'static str])> {
+pub(crate) fn layout(version: &str) -> Option<(&'static str, &'static [&'static str])> {
     TABLES
         .iter()
         .find(|(v, _)| *v == version)

@@ -596,20 +596,27 @@ fn real(name: &str) -> Option<usize> {
     REAL.read().unwrap().get(name).copied()
 }
 
-/// Calls the real flat function. `this` may be a stand-in (steamobj.rs); the real
-/// function gets the real object, or its virtual call would come straight back here.
-/// A steam_api without the flat API (older SDKs export only the accessors) gets the
-/// real object's C++ method of the same name instead, when its version has that method
-/// with the newest signature. Not for a method that returns a class (a CSteamID): the
+/// Calls the real method. For a stand-in (steamobj.rs) whose interface version has the
+/// method with the newest signature, that's the real object's own C++ method of the
+/// same name: steam_api's flat function calls the slot of the version the flat API was
+/// built for, and a game fetching an older version through an old accessor holds an
+/// object whose slots differ (one build's flat RequestUserInformation landed on the
+/// older object's SetRichPresence, with the SteamID for its strings, and crashed).
+/// Otherwise the flat function, with the real object (a stand-in's virtual call would
+/// come straight back here). Not for a method that returns a class (a CSteamID): the
 /// C++ method returns it through a hidden pointer (`real_friend_by_index`).
 macro_rules! real_call {
     ($name:literal, fn(usize $(, $t:ty)*) -> $r:ty, $default:expr, $this:expr $(, $arg:expr)*) => {
-        match real($name) {
-            Some(f) => {
-                let f: unsafe extern "C" fn(usize $(, $t)*) -> $r = unsafe { std::mem::transmute(f) };
-                unsafe { f(unwrap($this) $(, $arg)*) }
+        if unsafe { crate::steamobj::real_method($this, method_of($name)) }.is_some() {
+            call_real!($this, method_of($name), fn($($t),*) -> $r, $default $(, $arg)*)
+        } else {
+            match real($name) {
+                Some(f) => {
+                    let f: unsafe extern "C" fn(usize $(, $t)*) -> $r = unsafe { std::mem::transmute(f) };
+                    unsafe { f(unwrap($this) $(, $arg)*) }
+                }
+                None => $default,
             }
-            None => call_real!($this, method_of($name), fn($($t),*) -> $r, $default $(, $arg)*),
         }
     };
 }
@@ -1604,6 +1611,66 @@ mod tests {
         crate::overlay::set_visible_for_test(false);
         assert_eq!(d, 0x0100, "released, still active");
         assert_eq!((a[0], &a[4..12], a[12]), (3, &[0u8; 8][..], 1), "stick centred, mode and active kept");
+    }
+
+    // A fake older ISteamFriends: its RequestUserInformation notes the SteamID it got;
+    // every other slot (SetRichPresence among them) notes that it was reached instead.
+    // All take RequestUserInformation's arguments, so a wrong slot can't unbalance an
+    // x86 thiscall's stack.
+    static GOT: AtomicU64 = AtomicU64::new(0);
+    static WRONG: AtomicBool = AtomicBool::new(false);
+    vmethod! { fn fake_request_user_information(_this: usize, id: u64, _name_only: bool) -> bool { GOT.store(id, Ordering::SeqCst); true } }
+    vmethod! { fn fake_other(_this: usize, _id: u64, _name_only: bool) -> bool { WRONG.store(true, Ordering::SeqCst); false } }
+
+    /// A steam_api whose flat functions call the slot of the version the flat API was
+    /// built for (SteamFriends015), as one 32-bit build's do whatever object they get.
+    unsafe extern "C" fn flat_for_015(obj: usize, id: u64, name_only: bool) -> bool {
+        let i = crate::steamobj::slot("SteamFriends015", "RequestUserInformation").unwrap();
+        let vt = unsafe { *(obj as *const *const usize) };
+        #[cfg(target_arch = "x86")]
+        let f: unsafe extern "thiscall" fn(usize, u64, bool) -> bool = unsafe { std::mem::transmute(*vt.add(i)) };
+        #[cfg(not(target_arch = "x86"))]
+        let f: unsafe extern "C" fn(usize, u64, bool) -> bool = unsafe { std::mem::transmute(*vt.add(i)) };
+        unsafe { f(obj, id, name_only) }
+    }
+
+    /// A game that fetched an older ISteamFriends through the old `SteamFriends()`
+    /// accessor holds an object whose slots aren't the flat API's: PeerParty's calls on
+    /// to the real object go to that version's own method, never through steam_api's
+    /// flat function (which landed on SetRichPresence with the SteamID for its strings,
+    /// and the game crashed opening its multiplayer menu).
+    #[test]
+    fn calls_on_to_an_older_interface_use_its_own_slots() {
+        unsafe { std::env::set_var("PEERPARTY_ACTIVE", "1") };
+        let v = "SteamFriends014";
+        let at = crate::steamobj::slot(v, "RequestUserInformation").unwrap();
+        // The case this guards: the flat API's slot is another method in this version.
+        let flat_slot = crate::steamobj::slot("SteamFriends015", "RequestUserInformation").unwrap();
+        assert_ne!(at, flat_slot);
+        assert_eq!(crate::steamobj::slot(v, "SetRichPresence"), Some(flat_slot));
+
+        let mut vt = vec![fake_other as *const () as usize; crate::steamobj::layout(v).unwrap().1.len()];
+        vt[at] = fake_request_user_information as *const () as usize;
+        let real = Box::leak(Box::new(vt.as_ptr() as usize)) as *const usize as usize;
+        let proxy = crate::steamobj::wrap(real, v);
+        assert_ne!(proxy, real, "ISteamFriends is a stand-in");
+        REAL.write()
+            .unwrap()
+            .insert("SteamAPI_ISteamFriends_RequestUserInformation".into(), flat_for_015 as *const () as usize);
+
+        let id = 0x0110_0001_0BED_6549;
+        let ok = real_call!(
+            "SteamAPI_ISteamFriends_RequestUserInformation",
+            fn(usize, u64, bool) -> bool,
+            false,
+            proxy,
+            id,
+            false
+        );
+        assert!(!WRONG.load(Ordering::SeqCst), "another method of the older version was called");
+        assert!(ok);
+        assert_eq!(GOT.load(Ordering::SeqCst), id, "the older version's own RequestUserInformation got the SteamID");
+        std::mem::forget(vt);
     }
 
     #[test]

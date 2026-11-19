@@ -59,6 +59,35 @@ fn main() {
     let profile_dir = profile_dir_of(&out).unwrap_or(profile);
     let x64_only = env::var("PEERPARTY_HOOKS").ok().as_deref() == Some("x64");
 
+    let built: Vec<(&str, &str)> = HOOKS.into_iter().filter(|(triple, _)| !(x64_only && triple.starts_with("i686"))).collect();
+    // Both architectures in one cargo run, so they compile side by side (one after the
+    // other, each hook's single-unit link-time optimization kept most cores idle).
+    let mut cmd = Command::new(&cargo);
+    no_window(&mut cmd);
+    cmd.current_dir(&root).args(["build", "-p", "peerparty_hook"]);
+    for (triple, _) in &built {
+        cmd.args(["--target", triple]);
+    }
+    cmd.arg("--target-dir")
+        .arg(&nested)
+        // Outer flags are for the launcher's target; the hook gets its own from
+        // .cargo/config.toml.
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("CARGO_TARGET_DIR");
+    // A release build's flags for the hook too (the static CRT, and the path remapping
+    // that keeps local paths out of the DLLs), when it passes them here.
+    if let Ok(flags) = env::var("PEERPARTY_HOOK_RUSTFLAGS") {
+        cmd.env("CARGO_ENCODED_RUSTFLAGS", flags);
+    }
+    if profile_dir != "debug" {
+        cmd.args(["--profile", &profile_dir]);
+    }
+    let status = cmd.status().expect("running cargo for the hook DLL");
+    assert!(
+        status.success(),
+        "building peerparty_hook failed (rustup target add {}?)",
+        built.iter().map(|(t, _)| *t).collect::<Vec<_>>().join(" / ")
+    );
     for (triple, key) in HOOKS {
         if x64_only && triple.starts_with("i686") {
             let stub = out.join("hook32-stub.dll");
@@ -66,29 +95,6 @@ fn main() {
             println!("cargo:rustc-env={key}={}", stub.display());
             continue;
         }
-        let mut cmd = Command::new(&cargo);
-        no_window(&mut cmd);
-        cmd.current_dir(&root)
-            .args(["build", "-p", "peerparty_hook", "--target", triple])
-            .arg("--target-dir")
-            .arg(&nested)
-            // Outer flags are for the launcher's target; the hook gets its own from
-            // .cargo/config.toml.
-            .env_remove("CARGO_ENCODED_RUSTFLAGS")
-            .env_remove("CARGO_TARGET_DIR");
-        // A release build's flags for the hook too (the static CRT, and the path
-        // remapping that keeps local paths out of the DLLs), when it passes them here.
-        if let Ok(flags) = env::var("PEERPARTY_HOOK_RUSTFLAGS") {
-            cmd.env("CARGO_ENCODED_RUSTFLAGS", flags);
-        }
-        if profile_dir != "debug" {
-            cmd.args(["--profile", &profile_dir]);
-        }
-        let status = cmd.status().expect("running cargo for the hook DLL");
-        assert!(
-            status.success(),
-            "building peerparty_hook for {triple} failed (rustup target add {triple}?)"
-        );
         let dll = nested.join(triple).join(&profile_dir).join("peerparty_hook.dll");
         assert!(dll.is_file(), "{} missing", dll.display());
         println!("cargo:rustc-env={key}={}", dll.display());
@@ -173,9 +179,12 @@ fn profile_dir_of(out: &Path) -> Option<String> {
 fn build_number(root: &Path, version: &str) -> (u32, String) {
     // Rerun when HEAD moves or a tag appears (a missing path would rerun every build).
     let git = root.join(".git");
-    // And when the working tree may have changed (`--dirty`): git's index, and the
-    // launcher's own sources (the hook's are watched already).
-    let mut watch: Vec<PathBuf> = ["HEAD", "refs/tags", "packed-refs", "index"].iter().map(|p| git.join(p)).collect();
+    // And when the working tree may have changed (`--dirty`): the launcher's own sources
+    // (the hook's are watched already). Not git's index: `git status`, a commit and the
+    // `git describe` below rewrite it whenever file times have moved, so the build after
+    // nearly any git command ran this script again and relinked the exe (a minute) with
+    // nothing changed.
+    let mut watch: Vec<PathBuf> = ["HEAD", "refs/tags", "packed-refs"].iter().map(|p| git.join(p)).collect();
     watch.push(root.join("launcher").join("src"));
     watch.push(root.join("launcher").join("locales"));
     if let Ok(head) = std::fs::read_to_string(git.join("HEAD")) {
@@ -191,7 +200,8 @@ fn build_number(root: &Path, version: &str) -> (u32, String) {
     no_window(&mut git);
     let out = git
         .current_dir(root)
-        .args(["describe", "--tags", "--long", "--dirty", "--match", &tag])
+        // Reads only: the index's refreshed file times aren't written back.
+        .args(["--no-optional-locks", "describe", "--tags", "--long", "--dirty", "--match", &tag])
         .output()
         .ok()
         .filter(|o| o.status.success());
