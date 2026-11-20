@@ -618,6 +618,16 @@ pub fn hook_text(s: &str) -> String {
         "No other player of this game is running, or they're all with you already"
         | "No other player of this game is running on your network, or they're all with you already" => t!("hook.nobody_detail").into(),
         "A player asked to join you" => t!("hook.asked_to_join").into(),
+        // The hook's invite.rs ALREADY_TOGETHER and CANT_JOIN, the answers to Join.
+        "Already playing together" => t!("hook.already_together").into(),
+        "Can't join" => t!("hook.cant_join").into(),
+        // Their details (invite.rs together_detail / nowhere_detail), with a name.
+        _ if s.starts_with("You're already in ") && s.ends_with("'s game") && s.len() > "You're already in 's game".len() => {
+            t!("hook.together_detail", name = &s["You're already in ".len()..s.len() - "'s game".len()])
+        }
+        _ if s.ends_with(" isn't in a game you can join yet") && s.len() > " isn't in a game you can join yet".len() => {
+            t!("hook.nowhere_detail", name = &s[..s.len() - " isn't in a game you can join yet".len()])
+        }
         "Achievement unlocked" => t!("hook.achievement").into(),
         "Host or join a game first" => t!("overlay.host_first").into(),
         // The hook's invite.rs LEARN_FIRST.
@@ -641,7 +651,11 @@ pub fn hook_text(s: &str) -> String {
         _ if s.starts_with(HOOK_UNSUPPORTED_START) => t!("hook.unsupported", names = &s[HOOK_UNSUPPORTED_START.len()..]),
         _ => match s.strip_prefix("To ").and_then(|r| r.split(' ').next()).and_then(|n| n.parse::<u64>().ok()) {
             Some(n) if s.ends_with("player") || s.ends_with("players") => t!("hook.to_players", n = n),
-            _ => s.to_string(),
+            // invite.rs sent_detail: the one player invited, by name.
+            _ => match s.strip_prefix("To ") {
+                Some(name) if !name.is_empty() => t!("hook.to_name", name = name),
+                _ => s.to_string(),
+            },
         },
     }
 }
@@ -2090,6 +2104,20 @@ mod tests {
         assert_eq!(hook_text(official), t!("hook.official", names = "Steam and Photon", mode = t!("mode.lan")));
         let unsupported = "Not supported for this game yet: PeerParty can't hand it an invite through PlayFab Party";
         assert_eq!(hook_text(unsupported), t!("hook.unsupported", names = "PlayFab Party"));
+    }
+
+    /// The hook's answers to Join and its invite note name the player (invite.rs
+    /// together_detail, nowhere_detail, sent_detail).
+    #[test]
+    fn notes_with_a_players_name_are_translated() {
+        // The language stays English: it's global, and other tests run alongside.
+        assert_eq!(hook_text("Already playing together"), t!("hook.already_together"));
+        assert_eq!(hook_text("Can't join"), t!("hook.cant_join"));
+        assert_eq!(hook_text("You're already in Lola's game"), t!("hook.together_detail", name = "Lola"));
+        assert_eq!(hook_text("Lola isn't in a game you can join yet"), t!("hook.nowhere_detail", name = "Lola"));
+        assert_eq!(hook_text("To Lola"), t!("hook.to_name", name = "Lola"));
+        assert_eq!(hook_text("To 3 players"), t!("hook.to_players", n = 3));
+        assert_eq!(hook_text("To 1 player"), t!("hook.to_players", n = 1));
     }
 
     /// A Photon room: Home says which room we're in and who is there (not "no lobby"),

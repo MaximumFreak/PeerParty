@@ -283,6 +283,7 @@ pub fn lan() -> Option<&'static Lan> {
                 PRESENCE.lock().unwrap().insert("server", vec![(SERVER_KEY.into(), "1".into())]);
             }
             crate::saves::learn_lan(&l);
+            crate::saves::learn_slot(&l);
             crate::saves::adopt_earlier_ids(&l);
             let build = build_id();
             log!("lan: this copy's game build is {build}");
@@ -387,6 +388,21 @@ pub fn version() -> String {
 /// Logs whether a peer runs the same PeerParty as us, so a log shows mismatched copies:
 /// when it first says, and the few times it says something else (a version doesn't
 /// change while a copy runs; a peer that keeps changing it gets no more lines).
+/// Whether `peer` runs this PeerParty version or newer (what it says in its presence;
+/// one that says none is older): messages older copies would take for something else go
+/// only to newer ones.
+pub fn peer_at_least(lan: &Lan, peer: peerparty_core::PeerId, at_least: (u32, u32, u32)) -> bool {
+    let theirs = lan.presence(peer).into_iter().find(|(k, _)| k == VERSION_KEY).map(|(_, v)| v);
+    theirs.as_deref().and_then(version_numbers).is_some_and(|v| v >= at_least)
+}
+
+/// The numbers a version string starts with ("0.4.7 (abc1234)" is 0, 4, 7).
+fn version_numbers(v: &str) -> Option<(u32, u32, u32)> {
+    let head = v.trim().split(|c: char| !(c.is_ascii_digit() || c == '.')).next()?;
+    let mut n = head.split('.').map(|p| p.parse::<u32>().ok());
+    Some((n.next()??, n.next()??, n.next().flatten().unwrap_or(0)))
+}
+
 fn check_version(lan: &Lan, peer: peerparty_core::PeerId) {
     static SEEN: Mutex<Vec<Said>> = Mutex::new(Vec::new());
     let theirs = lan.presence(peer).into_iter().find(|(k, _)| k == VERSION_KEY).map(|(_, v)| v);
@@ -555,6 +571,10 @@ fn tick_into(lan: &Lan, q: &mut HashMap<Front, VecDeque<Event>>) {
                 crate::invite::join_requested(*from);
                 continue;
             }
+            if connect == crate::invite::JOIN_TOGETHER || connect == crate::invite::JOIN_NOWHERE {
+                crate::invite::join_answered(*from, connect);
+                continue;
+            }
             if let Some(code) = connect.strip_prefix(crate::invite::CODE_PREFIX) {
                 crate::invite::code_arrived(*from, code);
                 continue;
@@ -653,7 +673,17 @@ fn wants(front: Front, ev: &Event, fronts: &[Front]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Said, ServerExe, VERSION_LINES, VERSION_PEERS, dedicated_for, key_for, note_version, says_version, server_exe};
+    use super::{Said, ServerExe, VERSION_LINES, VERSION_PEERS, dedicated_for, key_for, note_version, says_version, server_exe, version_numbers};
+
+    /// Versions as copies say them, with their commit after.
+    #[test]
+    fn version_numbers_are_read_from_the_start() {
+        assert_eq!(version_numbers("0.4.7 (abc1234)"), Some((0, 4, 7)));
+        assert_eq!(version_numbers("0.4.10"), Some((0, 4, 10)));
+        assert_eq!(version_numbers("1.2"), Some((1, 2, 0)));
+        assert!(version_numbers("0.4.6").unwrap() < (0, 4, 7));
+        assert_eq!(version_numbers("dev"), None);
+    }
 
     /// Two waiters on one queue: each takes its own answer and leaves the other's.
     #[test]

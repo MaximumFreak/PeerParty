@@ -458,6 +458,26 @@ has no game or SDK code in it.
   chat through `PartyXboxLive.dll`. Offline or signed out, the LAN's answers stand
   alone. `PEERPARTY_XBL_REAL=0` turns it off.
 
+### Demonware (`hook/src/demonware/`)
+
+- Activision's online service, statically linked into the game. Lookups of
+  `*.demonware.net` resolve to PeerParty's own address in a game started through it.
+- Sign-in (auth3, JSON over HTTPS) is answered by the local HTTPS service; the lobby
+  service (TCP 3074) does Demonware's handshake and encrypted calls, answers server time
+  and matchmaking, and logs every other call; Demonware's address check (UDP 3074)
+  reports the LAN address. Sessions a copy hosts reach the other copies through LAN
+  presence, so the game's matchmaking search and find-by-player see them.
+- The game's Steam encrypted app ticket is PeerParty's while Demonware is answered
+  locally, carrying the data the game put in it.
+- libcurl over SChannel validates certificates automatically, outside the crypt32 hook;
+  for Demonware's names only, such a client gets a manually validated twin of its
+  credential, which then trusts PeerParty's certificate like every other client does.
+- Players in one Demonware session count as together in the overlay even when the game
+  put them in different Steam lobbies (it makes one per player who joins).
+- `PEERPARTY_DEMONWARE=0` or `PEERPARTY_SKIP=demonware` turns it off. Written from the
+  wire format only: an open-source community client was read for protocol facts, and
+  none of its code is used.
+
 ## Trust for the local HTTPS service
 
 The local service (`hook/src/playfab/http.rs`, `tls.rs`) uses a self-signed certificate
@@ -632,7 +652,8 @@ hand, attaching `peerparty.exe` (that exact name) is enough.
   back empty or offline; sign-in is answered locally (LEGAL.md).
 - Game files are never changed; PeerParty's own files live under
   `%LOCALAPPDATA%\peerparty` (logs under `%TEMP%\peerparty\logs`). Elsewhere it writes only
-  save copies under a PeerParty identity (originals only read), firewall rules when the
+  save copies under a PeerParty identity (originals only read), a second copy's own save
+  folder beside the game's (`Saves.peerparty-2`, see usage.md), firewall rules when the
   player asks for the fix, its local certificate's key in the user's key store, and an
   Xbox app package's debug setting while it starts that game (cleared at once).
 - Certificates are trusted inside the game only; nothing system-wide is installed.

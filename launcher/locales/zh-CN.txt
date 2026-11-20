@@ -398,6 +398,11 @@ hook.official = 此游戏的联机通过 {names} 自己的服务器进行，Peer
 hook.unsupported = 暂不支持此游戏：PeerParty 无法通过 {names} 传递邀请
 hook.learn_invite = 请先从游戏的好友列表邀请一次。之后即可在这里使用邀请和加入
 hook.asked_to_join = 有玩家请求加入你
+hook.already_together = 你们已经在一起玩了
+hook.cant_join = 无法加入
+hook.together_detail = 你已经在 {name} 的游戏中
+hook.nowhere_detail = {name} 还没有在你可以加入的游戏中
+hook.to_name = 发给 {name}
 hook.achievement = 成就已解锁
 hook.to_players.other = 发给 {n} 位玩家
 

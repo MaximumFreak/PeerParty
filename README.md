@@ -3,7 +3,7 @@
 **PeerParty** lets PC games play together over the LAN, or over the internet with
 friends or anyone playing the same game, without the online services their multiplayer
 was built on. Whatever a game uses (Steamworks, Epic Online Services, PlayFab, GOG
-Galaxy, Photon or Unity Gaming Services), its lobbies, invites, friends, voice and
+Galaxy, Photon, Unity Gaming Services or Demonware), its lobbies, invites, friends, voice and
 connections run between the copies themselves. It's one Windows program that starts
 the game with a small hook inside it. No game files change.
 
@@ -44,7 +44,8 @@ itself still runs. PeerParty moves that part onto the players' own PCs:
   instead. Either way, players find each other through the public BitTorrent DHT and
   connect directly, through an encrypted tunnel.
 - **Several copies on one PC.** Two players on one PC each get their own instance, with
-  their own identity, and they meet as LAN players do.
+  their own identity and, for a game whose saves aren't kept per player, their own
+  saves, and they meet as LAN players do.
 - **An overlay in every game**: players, invites and settings, opened with the usual
   store hotkeys or a controller's Home button.
 
@@ -58,6 +59,7 @@ itself still runs. PeerParty moves that part onto the players' own PCs:
 | **GOG Galaxy** | Sign-in, user data, friends, rich presence, invites, lobbies, P2P, chat, stats and achievements, storage and cloud saves (every SDK from 1.57 on). |
 | **Photon** | Realtime / PUN rooms served by one of the players' copies (name, master and game servers over UDP, TCP and WebSocket), Photon Voice, Chat, Bolt, and Fusion's Host, Server, Client and Shared modes. |
 | **Unity Gaming Services** | Authentication, Lobby (with Wire events), Relay (plain and DTLS), Cloud Save and Remote Config; Vivox voice chat, positional (proximity) channels included. |
+| **Demonware** | Sign-in, the lobby service's server time and matchmaking (sessions hosted, updated, searched for and found by player), and Demonware's own address check, alongside the game's Steam lobbies and invites. |
 | **Xbox app games** | Started as packages with PeerParty inside; PlayFab Party's Xbox Live helper and the Xbox Live friends and presence calls are answered by PeerParty. |
 
 Anything PeerParty doesn't carry behaves as if that service were offline or had nothing

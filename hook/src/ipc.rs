@@ -464,7 +464,9 @@ fn state() -> String {
         .unwrap_or_default()
         .into_iter()
         .map(|(p, name)| {
-            let with_me = here.as_ref().is_some_and(|h| h.member(p).is_some());
+            // In our lobby, or with us in a session whose lobbies don't say so
+            // (demonware/mm.rs `together`).
+            let with_me = here.as_ref().is_some_and(|h| h.member(p).is_some()) || crate::invite::in_our_session(p);
             let presence = lan.map(|l| l.presence(p)).unwrap_or_default();
             let status = presence
                 .iter()

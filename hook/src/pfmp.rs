@@ -524,9 +524,16 @@ fn find_prop<'a>(props: &'a [(CString, CString)], key: &str) -> Option<&'a CStri
 /// PlayFab answering here it is the one the member's PeerParty id gives, not what the
 /// member says it is: no member can pass as another's entity (take its seat, have the
 /// owner act on it). With the real PlayFab, entities are the service's own.
+/// Whether every player's entity is the one their PeerParty id gives (this game's
+/// PlayFab is PeerParty's). In a unit test, members' entities are as they sent them,
+/// whatever service another test started in the same process.
+fn entities_are_ours() -> bool {
+    !cfg!(test) && crate::playfab::serving()
+}
+
 fn member_entity(m: &Member) -> Option<(String, String)> {
     let id = attr_text(&m.attrs, "pf")?;
-    if crate::playfab::serving() {
+    if entities_are_ours() {
         let real = api::entity_of(m.id);
         if id != real {
             crate::log::throttled(&format!("pfmp-lan entity {}", m.id), 1, |_| {

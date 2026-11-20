@@ -330,6 +330,11 @@ fn consider(m: Mod) {
         if !crate::net::skip("playfab") && crate::playfab::attach(&table.code) {
             log!("playfab {} certificate check noted (hooked only if the game's PlayFab is answered locally)", m.full);
         }
+    } else if m.name.eq_ignore_ascii_case("sspicli.dll") {
+        if crate::net::enabled() && !crate::net::skip("demonware") {
+            let n = crate::demonware::schannel::attach(&table.code);
+            log!("demonware {} hooked {n} (SChannel's certificate check, for Demonware hosts only)", m.full);
+        }
     } else if m.name.eq_ignore_ascii_case("xcurl.dll") {
         if crate::net::enabled() && !crate::net::skip("xboxlive") && crate::xboxlive::curl::bodies() {
             let n = crate::xboxlive::curl::attach(&table.code);

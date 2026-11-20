@@ -193,8 +193,59 @@ pub fn lobby_for(lobby: u64) -> Option<Lobby> {
 }
 
 /// The Steam lobby we're in, if any.
+/// The lobby the game most recently created or joined. A game can be in several at
+/// once (one makes a fresh lobby when a player joins, without leaving the last), and
+/// invites and the overlay's Join go to the newest.
+static LATEST: Mutex<Option<u64>> = Mutex::new(None);
+
+fn note_latest(lobby: u64) {
+    *LATEST.lock().unwrap() = Some(lobby);
+}
+
+/// k_ELobbyTypeInvisible: the one kind a player may be in besides a regular lobby.
+const TYPE_INVISIBLE: i64 = 3;
+
+fn lobby_type(l: &Lobby) -> i64 {
+    text(l, KEY_TYPE).and_then(|v| v.parse().ok()).unwrap_or(2)
+}
+
+/// Steam keeps a player in one regular lobby at a time (isteammatchmaking.h: "a user can
+/// be in only one regular lobby, and up to two invisible lobbies"): entering regular
+/// lobby `kept` leaves any other regular one. A game that makes a fresh lobby without
+/// leaving its last (one does each time a player joins) would otherwise leave this
+/// player in both, and players it left behind would still show as in its lobby.
+fn leave_other_regular(kept: u64) {
+    let Some(lan) = lan() else { return };
+    let mine: Vec<(u64, i64, String)> = lan
+        .my_lobbies(NS)
+        .iter()
+        .filter_map(|l| Some((steam_lobby(&l.id)?, lobby_type(l), l.id.clone())))
+        .collect();
+    let kinds: Vec<(u64, i64)> = mine.iter().map(|(id, kind, _)| (*id, *kind)).collect();
+    for id in regular_to_leave(&kinds, kept) {
+        let Some((_, _, core)) = mine.iter().find(|(i, ..)| *i == id) else { continue };
+        let r = lan.leave(core);
+        S.lock().unwrap().chat.forget(id);
+        log!("steam-lan entering lobby {kept} leaves lobby {id} (one regular lobby at a time, as on Steam): {r:?}");
+    }
+}
+
+/// The lobbies (id, type) to leave on entering `kept`: every other regular one, none
+/// when `kept` is invisible.
+fn regular_to_leave(mine: &[(u64, i64)], kept: u64) -> Vec<u64> {
+    if mine.iter().any(|(id, kind)| *id == kept && *kind == TYPE_INVISIBLE) {
+        return Vec::new();
+    }
+    mine.iter().filter(|(id, kind)| *id != kept && *kind != TYPE_INVISIBLE).map(|(id, _)| *id).collect()
+}
+
 pub fn current_lobby() -> Option<Lobby> {
-    lan()?.my_lobbies(NS).into_iter().next()
+    let mine = lan()?.my_lobbies(NS);
+    let latest = (*LATEST.lock().unwrap()).map(core_id);
+    match latest.and_then(|id| mine.iter().position(|l| l.id == id)) {
+        Some(i) => mine.into_iter().nth(i),
+        None => mine.into_iter().next(),
+    }
 }
 
 pub fn current_lobby_id() -> Option<u64> {
@@ -249,7 +300,7 @@ fn edit(lobby: u64, f: impl FnOnce(&mut Lobby)) -> bool {
     };
     f(&mut l);
     let joinable = text(&l, KEY_JOINABLE).is_none_or(|v| v != "0");
-    let kind = text(&l, KEY_TYPE).and_then(|v| v.parse().ok()).unwrap_or(2);
+    let kind = lobby_type(&l);
     l.permission = permission(kind, joinable);
     let ok = lan.update(&core, Some(&l), &[], &[]).is_ok();
     if ok {
@@ -446,6 +497,12 @@ vmethod! {
         set_hidden(&mut l, KEY_TYPE, kind.to_string());
         let created = lan.create_lobby(l).is_ok();
         log!("steam-lan CreateLobby type={kind} max={max_members} -> {id} ({created})");
+        if created {
+            note_latest(id);
+            if i64::from(kind) != TYPE_INVISIBLE {
+                leave_other_regular(id);
+            }
+        }
         let result = LobbyCreatedT {
             result: if created { 1 } else { 2 },
             lobby: if created { id } else { 0 },
@@ -504,6 +561,7 @@ vmethod! {
         match r {
             Ok(()) => {
                 S.lock().unwrap().joins.insert(core, call);
+                note_latest(lobby);
             }
             Err(_) => enter_result(lobby, call, ENTER_DOESNT_EXIST),
         }
@@ -543,6 +601,7 @@ vmethod! {
             .and_then(|l| l.members.get(index.max(0) as usize).map(|m| steam_id(m.id)))
             .unwrap_or(0);
         crate::steamlan::dump_answer(&format!("member #{index}"), || id.to_string());
+        crate::log::throttled(&format!("steam-lan member {lobby} {index} {id}"), 1, |_| log!("steam-lan GetLobbyMemberByIndex {lobby} #{index} -> {id}"));
         unsafe { *ret = id };
         ret
     }
@@ -554,7 +613,13 @@ vmethod! {
         let v = view(lobby)
             .and_then(|l| {
                 let v = l.attrs.iter().find(|a| a.key.eq_ignore_ascii_case(&k) && !a.key.starts_with(HIDDEN))?.value.text();
-                Some(crate::steamlan::ids_in_text(l.owner, v))
+                let mapped = crate::steamlan::ids_in_text(l.owner, v.clone());
+                if mapped != v {
+                    crate::log::throttled(&format!("steam-lan lobby data mapped {k}"), 3, |n| {
+                        log!("steam-lan GetLobbyData {k}: {v} is {mapped} here (SteamIDs as this copy knows them) n={n}")
+                    });
+                }
+                Some(mapped)
             })
             .unwrap_or_default();
         c_str(&v)
@@ -565,6 +630,9 @@ vmethod! {
     fn set_lobby_data(_this: usize, lobby: u64, key: *const c_char, value: *const c_char) -> bool {
         let (k, v) = (s(key), s(value));
         crate::steamlan::dump("set-lobby-data", None, format!("{k}={v}").as_bytes());
+        crate::log::throttled(&format!("steam-lan set lobby data {k}"), 3, |n| {
+            log!("steam-lan SetLobbyData {k}={} n={n}", v.chars().take(120).collect::<String>())
+        });
         if k.is_empty() || k.starts_with(HIDDEN) {
             return false;
         }
@@ -829,6 +897,7 @@ vmethod! {
     fn get_lobby_owner(_this: usize, ret: *mut u64, lobby: u64) -> *mut u64 {
         let id = view(lobby).map_or(0, |l| steam_id(l.owner));
         crate::steamlan::dump_answer("owner", || id.to_string());
+        crate::log::throttled(&format!("steam-lan owner {lobby} {id}"), 1, |_| log!("steam-lan GetLobbyOwner {lobby} -> {id}"));
         unsafe { *ret = id };
         ret
     }
@@ -848,6 +917,9 @@ vmethod! { fn set_linked_lobby(_this: usize, _lobby: u64, _dependent: u64) -> bo
 // ---- LAN events -> Steam callbacks ----
 
 fn chat_update(lobby: u64, changed: u64, making_change: u64, state: u32) {
+    crate::log::throttled(&format!("steam-lan chat update {lobby} {changed} {state}"), 2, |n| {
+        log!("steam-lan LobbyChatUpdate lobby {lobby}: {changed} (by {making_change}) state {state:#x} n={n}")
+    });
     crate::steam::inject(
         LOBBY_CHAT_UPDATE,
         bytes(&LobbyChatUpdateT {
@@ -918,6 +990,9 @@ pub fn on_event(ev: &Event) {
                 _ => ENTER_ERROR,
             };
             log!("steam-lan JoinLobby {lobby} done: {result:?}");
+            if matches!(result, JoinResult::Ok) {
+                leave_other_regular(lobby);
+            }
             enter_result(lobby, call, response);
         }
         Event::LobbyUpdated { lobby: core } => {
@@ -1025,6 +1100,16 @@ mod tests {
         let w = Wanted { max_results: Some(1), filters: vec![Filter::Num("region".into(), 2, 0)], ..Default::default() };
         let ids: Vec<String> = filtered(&all, &w).into_iter().map(|l| l.id).collect();
         assert_eq!(ids, ["c"]);
+    }
+
+    #[test]
+    fn entering_a_regular_lobby_leaves_the_other_regular_ones() {
+        // Private (0), friends-only (1), public (2) are regular; invisible (3) isn't.
+        let mine = [(10, 0), (11, 2), (12, TYPE_INVISIBLE), (13, 1)];
+        assert_eq!(regular_to_leave(&mine, 13), vec![10, 11]);
+        // Entering an invisible lobby leaves nothing.
+        assert!(regular_to_leave(&mine, 12).is_empty());
+        assert!(regular_to_leave(&[(13, 0)], 13).is_empty());
     }
 
     #[test]

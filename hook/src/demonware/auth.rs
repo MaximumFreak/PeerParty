@@ -1,0 +1,259 @@
+//! Demonware's JSON sign-in ("auth3"): `POST /auth/` on `<title>-pc-auth3.<env>.demonware.net`.
+//!
+//! The request carries `auth_task`, `iv_seed`, `title_id` and `extra_data`, a JSON text
+//! whose `token` is the base64 of the game's Steam encrypted app ticket. The game asked
+//! Steam for that ticket with 0x58 bytes of its own inside (a random 24-byte key, then
+//! the persona name); steamlan.rs answers it with `app_ticket`, which carries them in the
+//! clear.
+//!
+//! The answer (`code` 700, `auth_task` one more than the request's) carries a client ticket (bdAuthTicket, 128 bytes) and a
+//! server ticket (128 bytes) the game later hands the lobby service. The client ticket
+//! normally comes encrypted with the key from the app ticket; Demonware's client takes
+//! it as it is when it starts with the ticket's magic number, so it's sent in the clear.
+//! Its session key is PeerParty's: lobby.rs reads it back out of the server ticket.
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::json::Json;
+use crate::log;
+use crate::playfab::http::Request;
+
+
+static TITLE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The title id the game signed in with (0 before it has).
+pub fn title() -> u32 {
+    TITLE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// bdAuthTicket's magic number.
+pub const TICKET_MAGIC: u32 = 0xEFBD_ADDE;
+
+/// The start of an encrypted app ticket PeerParty made (steamlan.rs).
+pub const APP_TICKET_MAGIC: &[u8; 4] = b"PPDW";
+
+/// Marks a server ticket PeerParty made; the session key is the 24 bytes before it.
+pub const SERVER_TICKET_MARK: &[u8; 4] = b"PPST";
+
+/// The Steam encrypted app ticket PeerParty hands a game whose Demonware is answered
+/// here: its magic, the player's SteamID, then the data the game asked to include.
+pub fn app_ticket(steam_id: u64, included: &[u8]) -> Vec<u8> {
+    let mut t = APP_TICKET_MAGIC.to_vec();
+    t.extend_from_slice(&steam_id.to_le_bytes());
+    t.extend_from_slice(included);
+    t
+}
+
+/// What the sign-in learns from the game's app ticket.
+#[derive(Debug, Default, PartialEq)]
+pub struct Player {
+    pub steam_id: u64,
+    pub name: String,
+    /// The key the game put in its ticket (the client ticket's encryption key).
+    pub key: Vec<u8>,
+}
+
+/// Reads an app ticket from `app_ticket`. Another kind (a real Steam ticket, which only
+/// the publisher can decrypt) gives what's known of this player instead.
+pub fn read_app_ticket(ticket: &[u8]) -> Player {
+    if ticket.len() >= 12 && &ticket[..4] == APP_TICKET_MAGIC {
+        let steam_id = u64::from_le_bytes(ticket[4..12].try_into().unwrap());
+        let included = &ticket[12..];
+        let key = included.get(..24).unwrap_or_default().to_vec();
+        let name_bytes = included.get(24..).unwrap_or_default();
+        let end = name_bytes.iter().position(|b| *b == 0).unwrap_or(name_bytes.len()).min(64);
+        let name = String::from_utf8_lossy(&name_bytes[..end]).into_owned();
+        return Player { steam_id, name, key };
+    }
+    Player { steam_id: crate::steamlan::my_steam_id(), name: crate::net::lan().map(|l| l.name().to_string()).unwrap_or_default(), key: Vec::new() }
+}
+
+/// The reply's `auth_task`: the request's plus one (Steam sign-in asks with 28 and
+/// waits for 29; Demonware's client checks it before anything else in the reply).
+pub fn reply_task(request: u64) -> u64 {
+    request + 1
+}
+
+/// A number the game sent as a JSON string or number.
+fn num(v: &Json) -> Option<u64> {
+    match v {
+        Json::Num(n) if *n >= 0.0 => Some(*n as u64),
+        Json::Str(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// The 128-byte bdAuthTicket, packed: magic, type, title id, issued, expires, licence
+/// id, user id, user name (64), session key (24), then 7 bytes of hash fields left 0.
+pub fn client_ticket(title_id: u32, player: &Player, session_key: &[u8; 24], now: u32) -> [u8; 128] {
+    let mut t = [0u8; 128];
+    t[0..4].copy_from_slice(&TICKET_MAGIC.to_le_bytes());
+    t[4] = 0;
+    t[5..9].copy_from_slice(&title_id.to_le_bytes());
+    t[9..13].copy_from_slice(&now.to_le_bytes());
+    t[13..17].copy_from_slice(&now.wrapping_add(30_000).to_le_bytes());
+    // 17..25 licence id 0
+    t[25..33].copy_from_slice(&player.steam_id.to_le_bytes());
+    let name = player.name.as_bytes();
+    let n = name.len().min(63);
+    t[33..33 + n].copy_from_slice(&name[..n]);
+    t[97..121].copy_from_slice(session_key);
+    t
+}
+
+/// The 128-byte server ticket the game passes to the lobby service unread: the session
+/// key, PeerParty's mark, the user id and name.
+pub fn server_ticket(player: &Player, session_key: &[u8; 24]) -> [u8; 128] {
+    let mut t = [0u8; 128];
+    t[0..24].copy_from_slice(session_key);
+    t[24..28].copy_from_slice(SERVER_TICKET_MARK);
+    t[28..36].copy_from_slice(&player.steam_id.to_le_bytes());
+    let name = player.name.as_bytes();
+    let n = name.len().min(63);
+    t[36..36 + n].copy_from_slice(&name[..n]);
+    t
+}
+
+/// Answers one request to a Demonware host over HTTPS: (HTTP status, JSON body).
+pub fn handle(req: &Request) -> (u16, String) {
+    let host = req.header("Host").unwrap_or_default().split(':').next().unwrap_or_default().to_ascii_lowercase();
+    let path = req.path.split('?').next().unwrap_or_default().to_string();
+    crate::log::throttled(&format!("demonware https {} {host}{path}", req.method), 3, |n| {
+        log!("demonware {} https://{host}{path} n={n}", req.method)
+    });
+    if !(req.method == "POST" && path.trim_end_matches('/') == "/auth") {
+        log!("demonware: no answer for {} {host}{path} (body {} bytes)", req.method, req.body.len());
+        return (404, "{}".to_string());
+    }
+    let Some(body) = Json::parse(&String::from_utf8_lossy(&req.body)) else {
+        log!("demonware auth: the request isn't JSON: {}", String::from_utf8_lossy(&req.body));
+        return (400, "{}".to_string());
+    };
+    let task = num(body.get("auth_task")).unwrap_or(0);
+    let iv_seed = num(body.get("iv_seed")).unwrap_or(0);
+    let title_id = num(body.get("title_id")).unwrap_or(0) as u32;
+    let extra = body.get("extra_data").as_str().and_then(Json::parse).unwrap_or(Json::Null);
+    let token = extra
+        .get("token")
+        .as_str()
+        .and_then(crate::ugs::base64_decode)
+        .unwrap_or_default();
+    let player = read_app_ticket(&token);
+    TITLE.store(title_id, std::sync::atomic::Ordering::Relaxed);
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as u32).unwrap_or(0);
+    let session_key: [u8; 24] = crate::photon::crypto::random_bytes(24).try_into().unwrap();
+    let client = client_ticket(title_id, &player, &session_key, now);
+    let server = server_ticket(&player, &session_key);
+    super::lobby::remember_session_key(session_key);
+    log!(
+        "demonware auth: task {task}, title {title_id}, player {} ({}), app ticket {} bytes{}: signed in",
+        player.name,
+        player.steam_id,
+        token.len(),
+        if token.starts_with(APP_TICKET_MAGIC) { " (PeerParty's)" } else { "" }
+    );
+    let extra_out = Json::obj(vec![
+        ("username", Json::str(player.name.clone())),
+        ("time_to_live", Json::Num(9999.0)),
+        ("extended_data", Json::str(crate::ugs::base64(b"peerparty"))),
+    ]);
+    let reply = Json::obj(vec![
+        ("auth_task", Json::str(reply_task(task).to_string())),
+        ("code", Json::str("700")),
+        ("iv_seed", Json::str(iv_seed.to_string())),
+        ("client_ticket", Json::str(crate::ugs::base64(&client))),
+        ("server_ticket", Json::str(crate::ugs::base64(&server))),
+        ("client_id", Json::str("")),
+        ("account_type", Json::str("steam")),
+        ("crossplay_enabled", Json::Bool(false)),
+        ("loginqueue_eanbled", Json::Bool(false)),
+        ("identity", Json::str(body.get("identity").as_str().unwrap_or_default())),
+        ("extra_data", Json::str(extra_out.to_string())),
+        ("lsg_endpoint", Json::Null),
+    ]);
+    (200, reply.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_tickets_carry_the_games_key_and_name() {
+        let mut included = vec![9u8; 24];
+        included.extend_from_slice(b"Player\0\0\0");
+        let t = app_ticket(76561198000001234, &included);
+        let p = read_app_ticket(&t);
+        assert_eq!(p.steam_id, 76561198000001234);
+        assert_eq!(p.name, "Player");
+        assert_eq!(p.key, vec![9u8; 24]);
+    }
+
+    /// Once the game uses Demonware, Steam's encrypted app ticket is PeerParty's: the
+    /// request completes with k_EResultOK and the ticket carries the game's data.
+    #[test]
+    fn steams_encrypted_ticket_is_peerpartys_once_demonware_is_in_use() {
+        crate::demonware::set_active();
+        let mut included = vec![0x31u8; 24];
+        included.extend_from_slice(b"Player\0");
+        let call = crate::steamlan::encrypted_ticket_requested(included.as_ptr(), included.len() as i32).unwrap();
+        assert_ne!(call, 0);
+        assert!(crate::steam::injected().iter().any(|(id, _, data)| *id == 154 && data[..] == 1u32.to_le_bytes()));
+        let mut buf = [0u8; 0x200];
+        let mut len = 0u32;
+        assert_eq!(unsafe { crate::steamlan::encrypted_ticket(buf.as_mut_ptr(), buf.len() as i32, &mut len) }, Some(true));
+        let p = read_app_ticket(&buf[..len as usize]);
+        assert_eq!(p.key, vec![0x31u8; 24]);
+        assert_eq!(p.name, "Player");
+        // Too small a buffer is refused, not overrun.
+        assert_eq!(unsafe { crate::steamlan::encrypted_ticket(buf.as_mut_ptr(), 8, &mut len) }, Some(false));
+    }
+
+    #[test]
+    fn the_client_ticket_has_bdauthtickets_layout() {
+        let p = Player { steam_id: 0x0110_0001_0000_1234, name: "Player".into(), key: vec![] };
+        let t = client_ticket(4321, &p, &[0x42; 24], 1000);
+        assert_eq!(u32::from_le_bytes(t[0..4].try_into().unwrap()), TICKET_MAGIC);
+        assert_eq!(u32::from_le_bytes(t[5..9].try_into().unwrap()), 4321);
+        assert_eq!(u32::from_le_bytes(t[9..13].try_into().unwrap()), 1000);
+        assert_eq!(u64::from_le_bytes(t[25..33].try_into().unwrap()), p.steam_id);
+        assert_eq!(&t[33..40], b"Player\0");
+        assert_eq!(t[97..121], [0x42; 24]);
+        let s = server_ticket(&p, &[0x42; 24]);
+        assert_eq!(s[..24], [0x42; 24]);
+        assert_eq!(&s[24..28], SERVER_TICKET_MARK);
+    }
+
+    #[test]
+    fn sign_in_answers_code_700_with_both_tickets() {
+        let token = crate::ugs::base64(&app_ticket(7, &[1u8; 24]));
+        let extra = Json::obj(vec![("token", Json::str(token))]).to_string();
+        let body = Json::obj(vec![
+            ("auth_task", Json::Num(28.0)),
+            ("iv_seed", Json::Num(12345.0)),
+            ("title_id", Json::Num(4321.0)),
+            ("extra_data", Json::str(extra)),
+        ])
+        .to_string();
+        let req = Request {
+            method: "POST".into(),
+            path: "/auth/".into(),
+            headers: vec![("Host".into(), "title-pc-auth3.prod.demonware.net:443".into())],
+            body: body.into_bytes(),
+        };
+        let (status, out) = handle(&req);
+        assert_eq!(status, 200);
+        let j = Json::parse(&out).unwrap();
+        // The answer to task 28 is task 29.
+        assert_eq!(j.get("auth_task").as_str(), Some("29"));
+        assert_eq!(j.get("code").as_str(), Some("700"));
+        assert_eq!(j.get("iv_seed").as_str(), Some("12345"));
+        let client = crate::ugs::base64_decode(j.get("client_ticket").as_str().unwrap()).unwrap();
+        let server = crate::ugs::base64_decode(j.get("server_ticket").as_str().unwrap()).unwrap();
+        assert_eq!(client.len(), 128);
+        assert_eq!(server.len(), 128);
+        assert_eq!(u64::from_le_bytes(client[25..33].try_into().unwrap()), 7);
+        // Both tickets carry the same session key.
+        assert_eq!(client[97..121], server[..24]);
+    }
+}

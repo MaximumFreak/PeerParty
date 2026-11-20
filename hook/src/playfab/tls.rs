@@ -2,7 +2,8 @@
 //!
 //! - A self-signed certificate for `*.playfabapi.com` (and the Unity Gaming Services
 //!   hosts ugs/ answers: `*.services.api.unity.com`, `wire.unity3d.com`,
-//!   `config.unity3d.com`), made once per
+//!   `config.unity3d.com`; and Demonware's, `*.prod.demonware.net` and
+//!   `*.demonware.net`, for demonware/), made once per
 //!   process. Its RSA
 //!   key lives in the user's key container `peerparty-playfab` (SChannel needs a
 //!   persisted key; it's reused on later runs).
@@ -211,13 +212,16 @@ fn make_cert() -> Result<Cert, String> {
     // subjectAltName: *.playfabapi.com and playfabapi.com, the Unity Gaming Services
     // hosts ugs/ answers on the same server (Authentication, Lobby, Relay, Wire), and the
     // Xbox Live hosts xboxlive/ answers (named one by one: the rest of xboxlive.com never
-    // comes here).
+    // comes here), and Demonware's sign-in hosts demonware/ answers
+    // (`<title>-pc-auth3.prod.demonware.net`).
     let mut dns: Vec<Vec<u16>> = vec![
         wide("*.playfabapi.com"),
         wide("playfabapi.com"),
         wide("*.services.api.unity.com"),
         wide("wire.unity3d.com"),
         wide("config.unity3d.com"),
+        wide("*.prod.demonware.net"),
+        wide("*.demonware.net"),
     ];
     dns.extend(crate::xboxlive::HOSTS.iter().map(|(h, _)| wide(h)));
     let mut entries: Vec<CERT_ALT_NAME_ENTRY> = dns
@@ -733,7 +737,7 @@ impl TlsStream {
 
 /// The client side of a handshake on `ctx`: the first (`have_ctx` false), or one the
 /// server starts later (TLS 1.3's tickets and key updates come as SEC_I_RENEGOTIATE).
-fn client_handshake(sock: &mut TcpStream, creds: &SecHandle, target: &[u16], ctx: &mut SecHandle, mut have_ctx: bool, incoming: &mut Vec<u8>) -> io::Result<()> {
+pub(crate) fn client_handshake(sock: &mut TcpStream, creds: &SecHandle, target: &[u16], ctx: &mut SecHandle, mut have_ctx: bool, incoming: &mut Vec<u8>) -> io::Result<()> {
     loop {
         if have_ctx && incoming.is_empty() {
             read_more(sock, incoming)?;
@@ -1103,6 +1107,10 @@ mod tests {
         assert_eq!(verdict("wire.unity3d.com"), 0);
         assert_eq!(verdict("cloud-save.services.api.unity.com"), 0);
         assert_eq!(verdict("config.unity3d.com"), 0);
+        // And Demonware's sign-in hosts (demonware/), one label under its names only.
+        assert_eq!(verdict("title-pc-auth3.prod.demonware.net"), 0);
+        assert_eq!(verdict("umbrella.demonware.net"), 0);
+        assert_eq!(verdict("stun.us.demonware.net"), 0x800B_010F, "CERT_E_CN_NO_MATCH");
         // So do the Xbox Live friends hosts (xboxlive/), and no other Xbox Live host.
         assert_eq!(verdict("social.xboxlive.com"), 0);
         assert_eq!(verdict("profile.xboxlive.com"), 0);

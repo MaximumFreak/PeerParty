@@ -179,6 +179,7 @@ pub fn official_in_use() -> Vec<&'static str> {
         "playfab" => "PlayFab",
         "steam" => "Steam",
         "galaxy" => "GOG Galaxy",
+        "demonware" => "Demonware",
         _ => "an online service",
     };
     DECIDED.lock().unwrap().iter().filter(|(_, official)| *official).map(|(sdk, _)| label(sdk)).collect()

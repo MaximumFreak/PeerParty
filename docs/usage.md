@@ -245,13 +245,20 @@ both.
 - `PEERPARTY_VIVOX=0` / `=1`: never / always answer Vivox voice chat on the LAN
   (default: whenever Unity Gaming Services are answered locally, since Vivox would
   refuse that sign-in).
+- `PEERPARTY_SEPARATE_SAVES=0`: a second copy of a game on one PC shares the first
+  copy's saves again. Normally, when a game's saves aren't kept per player, the
+  second copy gets its own save folder (or file) beside the first: the deepest folder
+  named for saves, else a file so named, never the game's own folder
+  (`Saves` → `Saves.peerparty-2`), started once from a copy of the first copy's.
+- `PEERPARTY_DEMONWARE=0`: PeerParty doesn't answer Demonware (Activision's online
+  service), and the game reaches the real servers.
 - `PEERPARTY_LOOPBACK=1`: every socket binds to 127.0.0.1 and no beacons are broadcast,
   so copies on one PC meet only through the peer board and Windows Firewall never asks.
   The tests set it (and `cargo` sets it for what it runs, .cargo/config.toml).
 - `PEERPARTY_PEERS=host[:port],...`: extra beacon targets for networks that broadcast
   doesn't cross (VPNs, other subnets).
 - `PEERPARTY_SKIP=layer,...`: turns PeerParty layers off for a game that objects to
-  one: `swap`, `invite`, `eos`, `steam`, `party`, `pfmp`, `playfab`, `photon`, `ugs`, `galaxy`, `dns`,
+  one: `swap`, `invite`, `eos`, `steam`, `party`, `pfmp`, `playfab`, `photon`, `ugs`, `galaxy`, `demonware`, `dns`,
   `padblock` (holding controllers back while the overlay shows), `present` (drawing the
   overlay inside the game), `ipfwd` (typed-IP forwarding to internet players, and the
   path to another PC's Photon servers; without it they're reached directly, which that

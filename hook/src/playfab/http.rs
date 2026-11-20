@@ -1,7 +1,7 @@
 //! HTTP/1.1 over the TLS stream: PlayFab's SDKs POST JSON and keep the connection.
 //! Requests for Unity Gaming Services' hosts (by their Host header) go to ugs/, and a
 //! WebSocket upgrade there (Wire) takes the connection over; Xbox Live's friends hosts
-//! go to xboxlive/.
+//! go to xboxlive/, and Demonware's (its sign-in) to demonware/.
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -67,8 +67,11 @@ pub fn serve(conn: TcpStream) {
             return;
         }
         let xbox = req.header("Host").is_some_and(|h| crate::xboxlive::service_of(h).is_some());
+        let demonware = req.header("Host").is_some_and(crate::demonware::is_host);
         let (status, body) = if unity {
             crate::ugs::handle(&req)
+        } else if demonware {
+            crate::demonware::auth::handle(&req)
         } else if xbox {
             crate::xboxlive::handle(&req)
         } else {

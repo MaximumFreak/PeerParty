@@ -247,12 +247,15 @@ fn redirect(host: &str) -> Option<String> {
             crate::net::needed_but_off("ugs");
         } else if crate::xboxlive::service_of(&h).is_some() {
             crate::net::needed_but_off("xboxlive");
+        } else if crate::demonware::is_host(&h) {
+            crate::net::needed_but_off("demonware");
         }
     }
     crate::playfab::redirect(host)
         .or_else(|| crate::ugs::redirect(host))
         .or_else(|| crate::xboxlive::redirect(host))
         .or_else(|| crate::photon::redirect(host))
+        .or_else(|| crate::demonware::redirect(host))
 }
 
 thread_local! {

@@ -398,6 +398,11 @@ hook.official = 이 게임의 온라인 플레이는 {names} 자체 서버를 �
 hook.unsupported = 이 게임은 아직 지원되지 않습니다: PeerParty는 {names}을(를) 통해 초대를 전달할 수 없습니다
 hook.learn_invite = 먼저 게임 친구 목록에서 한 번 초대하세요. 그 후 여기서 초대와 참가가 작동합니다
 hook.asked_to_join = 플레이어가 참가를 요청했습니다
+hook.already_together = 이미 함께 플레이 중입니다
+hook.cant_join = 참가할 수 없음
+hook.together_detail = 이미 {name}님의 게임에 있습니다
+hook.nowhere_detail = {name}님은 아직 참가할 수 있는 게임에 있지 않습니다
+hook.to_name = {name}님에게
 hook.achievement = 업적 달성
 hook.to_players.other = {n}명에게
 

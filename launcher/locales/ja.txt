@@ -398,6 +398,11 @@ hook.official = このゲームのオンラインプレイは {names} 自身の�
 hook.unsupported = このゲームにはまだ対応していません: PeerParty は {names} を通じて招待を渡せません
 hook.learn_invite = まずゲームのフレンドリストから一度招待してください。その後、ここで招待と参加が使えます
 hook.asked_to_join = プレイヤーが参加を希望しています
+hook.already_together = すでに一緒にプレイ中です
+hook.cant_join = 参加できません
+hook.together_detail = すでに{name}のゲームに参加しています
+hook.nowhere_detail = {name}はまだ参加できるゲームにいません
+hook.to_name = {name}へ
 hook.achievement = 実績を解除しました
 hook.to_players.other = {n} 人へ
 

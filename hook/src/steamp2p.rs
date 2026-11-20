@@ -425,7 +425,28 @@ pub fn user() -> Vec<(&'static str, usize)> {
         ("BeginAuthSession", begin_auth_session as *const () as usize),
         ("EndAuthSession", end_auth_session as *const () as usize),
         ("UserHasLicenseForApp", user_has_license as *const () as usize),
+        ("RequestEncryptedAppTicket", request_encrypted_app_ticket as *const () as usize),
+        ("GetEncryptedAppTicket", get_encrypted_app_ticket as *const () as usize),
     ]
+}
+
+vmethod! {
+    /// PeerParty's own ticket for a game whose Demonware it answers (steamlan.rs).
+    fn request_encrypted_app_ticket(this: usize, data: *const u8, len: i32) -> u64 {
+        match crate::steamlan::encrypted_ticket_requested(data, len) {
+            Some(call) => call,
+            None => call_real!(this, "RequestEncryptedAppTicket", fn(*const u8, i32) -> u64, 0, data, len),
+        }
+    }
+}
+
+vmethod! {
+    fn get_encrypted_app_ticket(this: usize, ticket: *mut u8, max: i32, len: *mut u32) -> bool {
+        match unsafe { crate::steamlan::encrypted_ticket(ticket, max, len) } {
+            Some(ok) => ok,
+            None => call_real!(this, "GetEncryptedAppTicket", fn(*mut u8, i32, *mut u32) -> bool, false, ticket, max, len),
+        }
+    }
 }
 
 vmethod! {

@@ -398,6 +398,11 @@ hook.official = 此遊戲的連線遊玩透過 {names} 自己的伺服器進行�
 hook.unsupported = 尚不支援此遊戲：PeerParty 無法透過 {names} 傳遞邀請
 hook.learn_invite = 請先從遊戲的好友清單邀請一次。之後即可在這裡使用邀請和加入
 hook.asked_to_join = 有玩家要求加入你
+hook.already_together = 你們已經在一起玩了
+hook.cant_join = 無法加入
+hook.together_detail = 你已經在 {name} 的遊戲中
+hook.nowhere_detail = {name} 還沒有在你可以加入的遊戲中
+hook.to_name = 發給 {name}
 hook.achievement = 成就已解鎖
 hook.to_players.other = 送給 {n} 位玩家
 

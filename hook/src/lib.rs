@@ -3,6 +3,7 @@
 //! BattlEye module stops the process, as does an EOS Anti-Cheat session (eos/mod.rs).
 
 mod child;
+mod demonware;
 mod dns;
 mod eos;
 mod exitlog;

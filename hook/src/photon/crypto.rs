@@ -206,7 +206,7 @@ impl Aes {
         }
     }
 
-    fn decrypt_block(&self, b: &mut [u8; 16]) {
+    pub fn decrypt_block(&self, b: &mut [u8; 16]) {
         let (_, inv) = sbox();
         let last = self.rk.len() - 1;
         xor16(b, &self.rk[last]);

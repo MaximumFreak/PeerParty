@@ -136,6 +136,8 @@ pub fn attach(base: usize, module_name: &str, exports: &[Export]) {
                 || e.name == "SteamAPI_ISteamUser_GetAuthSessionTicket"
                 || e.name == "SteamAPI_ISteamUser_GetAuthTicketForWebApi"
                 || e.name == "SteamAPI_ISteamUser_GetSteamID"
+                || e.name == "SteamAPI_ISteamUser_RequestEncryptedAppTicket"
+                || e.name == "SteamAPI_ISteamUser_GetEncryptedAppTicket"
             {
                 real.insert(e.name.clone(), e.addr as usize);
             }
@@ -229,6 +231,10 @@ fn resolve(name: &str) -> Option<usize> {
             get_auth_ticket_for_web_api as *const () as usize
         }
         "SteamAPI_ISteamUser_BLoggedOn" => logged_on as *const () as usize,
+        "SteamAPI_ISteamUser_RequestEncryptedAppTicket" => {
+            request_encrypted_app_ticket as *const () as usize
+        }
+        "SteamAPI_ISteamUser_GetEncryptedAppTicket" => get_encrypted_app_ticket as *const () as usize,
         "SteamAPI_ISteamFriends_ActivateGameOverlayInviteDialog" => {
             invite_dialog_lobby as *const () as usize
         }
@@ -805,6 +811,88 @@ unsafe extern "C" fn get_auth_session_ticket(
         unsafe { add_ticket_proof(ticket, max, len) };
     }
     auth_ticket_issued(h)
+}
+
+/// `EncryptedAppTicketResponse_t` (k_iSteamUserCallbacks + 54): its EResult.
+const ENCRYPTED_APP_TICKET_RESPONSE: i32 = 154;
+
+/// The data the game asked to put in its encrypted app ticket (demonware/auth.rs).
+static TICKET_DATA: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+/// A game whose Demonware PeerParty answers (demonware/) asks for an encrypted app
+/// ticket to sign in with. Only the publisher can read a real one, so PeerParty makes
+/// its own, which carries the data the game put in it for PeerParty's sign-in to read:
+/// Some(the call's handle). None for any other game, whose request goes to Steam. Both
+/// the flat function and the C++ stand-in (steamp2p.rs) come here.
+pub fn encrypted_ticket_requested(data: *const u8, len: i32) -> Option<u64> {
+    if !crate::demonware::active() {
+        return None;
+    }
+    let included = if data.is_null() || len <= 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(data, len.min(1024) as usize) }.to_vec()
+    };
+    log!("steam-lan encrypted app ticket requested ({} bytes of the game's inside): PeerParty's, for its Demonware service", included.len());
+    *TICKET_DATA.lock().unwrap() = included;
+    let call = crate::steam::new_call();
+    crate::steam::complete(call, ENCRYPTED_APP_TICKET_RESPONSE, RESULT_OK.to_le_bytes().to_vec());
+    Some(call)
+}
+
+/// The ticket `encrypted_ticket_requested` made, written to `ticket`: Some(whether it
+/// fit), or None when the request went to Steam.
+///
+/// # Safety
+/// `ticket` holds `max` bytes; `len` is null or writable.
+pub unsafe fn encrypted_ticket(ticket: *mut u8, max: i32, len: *mut u32) -> Option<bool> {
+    if !crate::demonware::active() {
+        return None;
+    }
+    let t = crate::demonware::auth::app_ticket(my_steam_id(), &TICKET_DATA.lock().unwrap());
+    if ticket.is_null() || max < 0 || t.len() > max as usize {
+        log!("steam-lan encrypted app ticket: {} bytes don't fit the game's {max}", t.len());
+        return Some(false);
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(t.as_ptr(), ticket, t.len());
+        if !len.is_null() {
+            *len = t.len() as u32;
+        }
+    }
+    crate::log::throttled("steam-lan encrypted app ticket read", 2, |n| {
+        log!("steam-lan encrypted app ticket handed to the game ({} bytes) n={n}", t.len())
+    });
+    Some(true)
+}
+
+unsafe extern "C" fn request_encrypted_app_ticket(this: usize, data: *const u8, len: i32) -> u64 {
+    if let Some(call) = encrypted_ticket_requested(data, len) {
+        return call;
+    }
+    real_call!(
+        "SteamAPI_ISteamUser_RequestEncryptedAppTicket",
+        fn(usize, *const u8, i32) -> u64,
+        0,
+        this,
+        data,
+        len
+    )
+}
+
+unsafe extern "C" fn get_encrypted_app_ticket(this: usize, ticket: *mut u8, max: i32, len: *mut u32) -> bool {
+    if let Some(ok) = unsafe { encrypted_ticket(ticket, max, len) } {
+        return ok;
+    }
+    real_call!(
+        "SteamAPI_ISteamUser_GetEncryptedAppTicket",
+        fn(usize, *mut u8, i32, *mut u32) -> bool,
+        false,
+        this,
+        ticket,
+        max,
+        len
+    )
 }
 
 // ---- ISteamFriends ----

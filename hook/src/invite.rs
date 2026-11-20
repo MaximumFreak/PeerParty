@@ -209,9 +209,44 @@ pub const JOIN_REQUEST: &str = "peerparty:join-request";
 static JOINING: Mutex<Vec<(PeerId, Instant)>> = Mutex::new(Vec::new());
 const JOIN_WAIT: Duration = Duration::from_secs(20);
 
-/// The overlay's Join button: asks `peer` to invite us to where it is.
+/// The answers to a Join request that sends no invite, back to the player who asked:
+/// they're with us already, or we aren't anywhere to invite them to.
+pub const JOIN_TOGETHER: &str = "peerparty:join-together";
+pub const JOIN_NOWHERE: &str = "peerparty:join-nowhere";
+/// The first PeerParty that understands them.
+const ANSWERS_SINCE: (u32, u32, u32) = (0, 4, 7);
+
+/// The overlay's notes for those answers (the launcher's host/ui.rs translates them).
+pub const ALREADY_TOGETHER: &str = "Already playing together";
+pub const CANT_JOIN: &str = "Can't join";
+
+/// Whether `peer` plays with us in a session whose lobbies don't say so (demonware/mm.rs
+/// `together`): such a game makes a fresh lobby for each player who joins.
+pub fn in_our_session(peer: PeerId) -> bool {
+    crate::demonware::active() && crate::demonware::mm::together(crate::steamlan::my_steam_id(), crate::steamlan::steam_id(peer))
+}
+
+/// Whether `peer` is with us already: in the lobby we're in, through any SDK, or in our
+/// game's session.
+fn with_us(peer: PeerId) -> bool {
+    in_our_session(peer) || here().or_else(current_lobby).is_some_and(|l| l.member(peer).is_some())
+}
+
+/// A peer's name for the overlay's notes.
+fn name_of(peer: PeerId) -> String {
+    net::lan_if_started().and_then(|l| l.peer_name(peer)).filter(|n| !n.is_empty()).unwrap_or_else(|| "That player".into())
+}
+
+/// The overlay's Join button: asks `peer` to invite us to where it is. A player we're
+/// with already is told so instead of asked.
 pub fn request_join(peer: PeerId) {
     let Some(lan) = net::lan() else { return };
+    if with_us(peer) {
+        log!("join: {peer} is with us already; not asking for an invite");
+        join_answered(peer, JOIN_TOGETHER);
+        beep(false);
+        return;
+    }
     {
         let mut j = JOINING.lock().unwrap();
         j.retain(|(p, t)| *p != peer && t.elapsed() < JOIN_WAIT);
@@ -228,18 +263,59 @@ pub fn join_requested(from: PeerId) {
     std::thread::spawn(move || {
         let connect = my_connect();
         let lobby = here();
-        if lobby.as_ref().or(current_lobby().as_ref()).is_some_and(|l| l.member(from).is_some()) {
-            log!("join: {from} is in our lobby already; nothing to send");
+        // Older copies would show the answer as an invite to nowhere.
+        let answer = |what: &str| {
+            if let Some(lan) = net::lan_if_started()
+                && net::peer_at_least(lan, from, ANSWERS_SINCE)
+            {
+                lan.invite(Some(from), what, None);
+            }
+        };
+        if with_us(from) {
+            log!("join: {from} is with us already (our lobby or our game's session); telling them so");
+            answer(JOIN_TOGETHER);
             return;
         }
         if connect.is_empty() && lobby.is_none() {
             let why = why_not_with(&net::fronts());
             log!("join: nothing to invite {from} to yet: {why}");
             crate::ipc::note("A player asked to join you", &why);
+            answer(JOIN_NOWHERE);
             return;
         }
         deliver(Some(from), &connect, lobby);
     });
+}
+
+/// A player we asked to invite us answered without an invite (`JOIN_TOGETHER` or
+/// `JOIN_NOWHERE`): the overlay says why nothing came.
+pub fn join_answered(from: PeerId, what: &str) {
+    JOINING.lock().unwrap().retain(|(p, _)| *p != from);
+    let name = name_of(from);
+    if what == JOIN_TOGETHER {
+        log!("join: {from} says we're with them already");
+        crate::ipc::note(ALREADY_TOGETHER, &together_detail(&name));
+    } else {
+        log!("join: {from} isn't anywhere we can join yet");
+        crate::ipc::note(CANT_JOIN, &nowhere_detail(&name));
+    }
+}
+
+/// The notes' details, with the player's name (the launcher matches these shapes).
+pub fn together_detail(name: &str) -> String {
+    format!("You're already in {name}'s game")
+}
+
+pub fn nowhere_detail(name: &str) -> String {
+    format!("{name} isn't in a game you can join yet")
+}
+
+/// The invite note's detail: the player's name when one was invited.
+pub fn sent_detail(reached: &[String]) -> String {
+    match reached {
+        [one] => format!("To {one}"),
+        _ => format!("To {} players", reached.len()),
+    }
 }
 
 /// Whether we asked this player to invite us a moment ago (peeks; `decision` takes it).
@@ -344,9 +420,11 @@ pub fn to(target: Option<PeerId>) -> usize {
         beep(false);
         return 0;
     }
-    let n = deliver(target, &connect, lobby);
+    let reached = deliver_to(target, &connect, lobby);
+    let n = reached.len();
     if n > 0 {
-        crate::ipc::note("Invite sent", &format!("To {n} player{}", if n == 1 { "" } else { "s" }));
+        let names: Vec<String> = reached.iter().map(|p| name_of(*p)).collect();
+        crate::ipc::note("Invite sent", &sent_detail(&names));
     } else {
         crate::ipc::note("Nobody to invite", "No other player of this game is running on your network, or they're all with you already");
     }
@@ -359,7 +437,12 @@ pub fn to(target: Option<PeerId>) -> usize {
 /// that was working. Everyone (`to` None) means the players on this network only: a
 /// room's friends and public players get an invite only when picked by name.
 fn deliver(to: Option<PeerId>, connect: &str, lobby: Option<Lobby>) -> usize {
-    let Some(lan) = net::lan() else { return 0 };
+    deliver_to(to, connect, lobby).len()
+}
+
+/// `deliver`, saying who it reached.
+fn deliver_to(to: Option<PeerId>, connect: &str, lobby: Option<Lobby>) -> Vec<PeerId> {
+    let Some(lan) = net::lan() else { return Vec::new() };
     let inside = if lobby.is_none() { current_lobby() } else { None };
     let targets: Vec<PeerId> = lan
         .peers()
@@ -373,15 +456,13 @@ fn deliver(to: Option<PeerId>, connect: &str, lobby: Option<Lobby>) -> usize {
         .filter(|p| lobby.as_ref().or(inside.as_ref()).is_none_or(|l| l.member(*p).is_none()))
         .filter(|p| !connect.starts_with(CODE_PREFIX) || room_lobby().is_none_or(|r| r.member(*p).is_none()))
         .collect();
-    let mut n = 0;
-    for p in &targets {
-        n += lan.invite(Some(*p), connect, lobby.as_ref());
-    }
+    let reached: Vec<PeerId> = targets.into_iter().filter(|p| lan.invite(Some(*p), connect, lobby.as_ref()) > 0).collect();
     log!(
-        "invite sent to {n} player(s) not already in the lobby: connect={connect:?} lobby={:?}",
+        "invite sent to {} player(s) not already in the lobby: connect={connect:?} lobby={:?}",
+        reached.len(),
         lobby.as_ref().map(|l| l.id.as_str())
     );
-    n
+    reached
 }
 
 // ---- invites that arrive ----
@@ -862,6 +943,16 @@ mod tests {
         assert_eq!(template_of(JOIN_REQUEST, "join"), None);
         assert_eq!(template_of(&format!("{CODE_PREFIX}ABCD"), "ABCD"), None);
         assert_eq!(template_of("gameId:1|x", "1"), None);
+    }
+
+    /// The overlay's notes name the one player invited, and the player a Join went to
+    /// (the launcher's host/ui.rs hook_text matches these shapes).
+    #[test]
+    fn notes_name_the_player() {
+        assert_eq!(sent_detail(&["Lola".into()]), "To Lola");
+        assert_eq!(sent_detail(&["Lola".into(), "Ada".into()]), "To 2 players");
+        assert_eq!(together_detail("Lola"), "You're already in Lola's game");
+        assert_eq!(nowhere_detail("Lola"), "Lola isn't in a game you can join yet");
     }
 
     #[test]
