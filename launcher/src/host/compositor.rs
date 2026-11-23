@@ -354,9 +354,11 @@ impl CompositorWindow {
     pub fn tick(&mut self) -> bool {
         #[cfg(windows)]
         if let Some(b) = self.window.as_mut().and_then(|w| w.take_resized()).and_then(|_| self.window.as_ref()?.client_bounds()) {
-            let before = self.panes.clone();
+            // Moved to a monitor of the same size, or its DPI changed: the panes are the
+            // same in the window, not on screen, and the copies are told.
+            let before = (self.panes.clone(), self.bounds);
             self.set_bounds(b);
-            return self.panes != before;
+            return (self.panes.clone(), self.bounds) != before;
         }
         #[cfg(unix)]
         if let Some(b) = self.window.as_ref().filter(|w| w.take_resized()).map(|w| w.client_bounds()) {
@@ -760,7 +762,7 @@ mod win {
                     RESIZED.store(true, Ordering::Release);
                 }
             }
-            WM_MOVE | WM_DPICHANGED => RESIZED.store(true, Ordering::Release),
+            WM_MOVE | WM_DPICHANGED | WM_DISPLAYCHANGE => RESIZED.store(true, Ordering::Release),
             WM_KILLFOCUS | WM_CANCELMODE => push_input(ForwardedInput::ReleaseAll),
             WM_ACTIVATE if w & 0xffff == WA_INACTIVE as usize => push_input(ForwardedInput::ReleaseAll),
             WM_SETCURSOR if HIDE_POINTER.load(Ordering::Relaxed) && (l & 0xffff) as u32 == HTCLIENT => {
@@ -847,10 +849,14 @@ mod win {
     }
 
     /// Strips chrome & taskbar/Alt+Tab presence from a game window, resizes it to its
-    /// pane, and tucks it strictly behind `compositor`.
-    fn contain_window(compositor: HWND, src: HWND, pane: PaneRect, bounds: MonitorBounds, hidden: bool) {
-        if src.is_null() || unsafe { IsWindow(src) } == 0 {
-            return;
+    /// pane, and tucks it strictly behind `compositor`. The calls that wait on the game's
+    /// window thread are asked of it without waiting (`ShowWindowAsync`,
+    /// `SWP_ASYNCWINDOWPOS`): a game busy loading, or hung, mustn't stall the session's
+    /// window, its overlays and every other player's input with it. A hung one isn't
+    /// touched at all (its style changes would wait for it). False when it wasn't.
+    fn contain_window(compositor: HWND, src: HWND, pane: PaneRect, bounds: MonitorBounds, hidden: bool) -> bool {
+        if src.is_null() || unsafe { IsWindow(src) } == 0 || unsafe { IsHungAppWindow(src) } != 0 {
+            return false;
         }
         unsafe {
             let style = GetWindowLongW(src, GWL_STYLE) as u32;
@@ -860,7 +866,7 @@ mod win {
             let had_taskbar = (ex & WS_EX_TOOLWINDOW) == 0 || (ex & WS_EX_APPWINDOW) != 0;
             if had_taskbar && IsWindowVisible(src) != 0 {
                 // Shell removes an existing taskbar button only across a hide/show transition.
-                ShowWindow(src, SW_HIDE);
+                ShowWindowAsync(src, SW_HIDE);
             }
             if want_style != style {
                 SetWindowLongW(src, GWL_STYLE, want_style as i32);
@@ -868,14 +874,19 @@ mod win {
             if want_ex != ex {
                 SetWindowLongW(src, GWL_EXSTYLE, want_ex as i32);
             }
-            if hidden {
-                ShowWindow(src, SW_HIDE);
-                return;
+            // A topmost window stays above the session's whatever goes behind what: it's
+            // made a plain one first.
+            if ex & WS_EX_TOPMOST != 0 {
+                SetWindowPos(src, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
             }
-            if IsIconic(src) != 0 || IsWindowVisible(src) == 0 {
-                ShowWindow(src, SW_SHOWNOACTIVATE);
+            if hidden {
+                ShowWindowAsync(src, SW_HIDE);
+                return true;
+            }
+            if IsIconic(src) != 0 || IsWindowVisible(src) == 0 || had_taskbar {
+                ShowWindowAsync(src, SW_SHOWNOACTIVATE);
                 if IsIconic(src) != 0 {
-                    ShowWindow(src, SW_RESTORE);
+                    ShowWindowAsync(src, SW_RESTORE);
                     SetForegroundWindow(compositor);
                 }
             }
@@ -888,20 +899,24 @@ mod win {
                     bounds.y.saturating_add(pane.y),
                     w,
                     h,
-                    SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                    SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS,
                 );
             } else {
-                SetWindowPos(src, compositor, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+                SetWindowPos(src, compositor, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS);
             }
         }
         notify_active(src as u64);
+        true
     }
 
     /// Keeps `src` strictly behind `compositor` and inside `bounds` (without fighting a
     /// game that refuses to shrink below its minimum size).
     fn keep_behind(compositor: HWND, src: HWND, bounds: MonitorBounds) {
-        if src.is_null() || unsafe { IsWindow(src) } == 0 {
+        if src.is_null() || unsafe { IsWindow(src) } == 0 || unsafe { IsHungAppWindow(src) } != 0 {
             return;
+        }
+        if unsafe { GetWindowLongW(src, GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST != 0 {
+            unsafe { SetWindowPos(src, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS) };
         }
         unsafe {
             if GetForegroundWindow() == src {
@@ -918,9 +933,9 @@ mod win {
             let needs_move = have_rect && (clamped_x != wr.left || clamped_y != wr.top);
             let above = is_above(src, compositor);
             if needs_move {
-                SetWindowPos(src, compositor, clamped_x, clamped_y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+                SetWindowPos(src, compositor, clamped_x, clamped_y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
             } else if above {
-                SetWindowPos(src, compositor, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                SetWindowPos(src, compositor, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
             }
         }
     }
@@ -937,6 +952,9 @@ mod win {
         grace_retried: bool,
         /// The window draws its frames itself: its thumbnail is hidden.
         drawn: bool,
+        /// Its window's style and extended style before it was put in its pane, given
+        /// back when the session's window goes while it's still there.
+        style: (u32, u32),
     }
 
     pub struct HostWindow {
@@ -954,6 +972,9 @@ mod win {
         cursor_screen: Vec<Option<(i32, i32)>>,
         /// The real cursor is kept inside this copy's pane (`confine`).
         confined: Option<usize>,
+        /// Each copy's display pane, as `show` was last told it (whether or not its
+        /// window is known yet).
+        display: Vec<PaneRect>,
         /// Keys and buttons down in a game window, where (and how) they went.
         pressed: Vec<(Held, isize, LPARAM)>,
         /// What changed in each copy's pane, for its log (`take_notes`).
@@ -1020,7 +1041,7 @@ mod win {
                 SetForegroundWindow(hwnd);
             }
             let gpu = Gpu::start(hwnd);
-            Some(HostWindow { hwnd, shown: Vec::new(), gpu, surfaces: Vec::new(), hidden_for_minimize: false, icon_big, icon_small, cursor_screen: Vec::new(), confined: None, pressed: Vec::new(), notes: Vec::new() })
+            Some(HostWindow { hwnd, shown: Vec::new(), gpu, surfaces: Vec::new(), hidden_for_minimize: false, icon_big, icon_small, cursor_screen: Vec::new(), confined: None, display: Vec::new(), pressed: Vec::new(), notes: Vec::new() })
         }
 
         /// Where the mouse is in copy `i`'s window, on screen as the game counts it: where
@@ -1099,23 +1120,40 @@ mod win {
         /// Shows window `source` (0: none) in pane `i` of the client area; a display pane
         /// of no size hides its thumbnail.
         pub fn show(&mut self, i: usize, source: u64, layout_pane: PaneRect, display_pane: PaneRect, bounds: MonitorBounds, viewport: Option<(u32, u32)>) {
-            let Some(dwm) = dwm() else { return };
             if self.shown.len() <= i {
                 self.shown.resize_with(i + 1, || None);
             }
+            if self.display.len() <= i {
+                self.display.resize(i + 1, super::HIDDEN);
+            }
+            self.display[i] = display_pane;
             if self.shown[i].as_ref().is_some_and(|s| s.source != source) {
                 let old = self.shown[i].take().expect("checked");
-                unsafe { (dwm.unregister)(old.thumbnail) };
+                if old.thumbnail != 0
+                    && let Some(dwm) = dwm()
+                {
+                    unsafe { (dwm.unregister)(old.thumbnail) };
+                }
             }
             if source == 0 {
                 return;
             }
             let minimized = unsafe { IsIconic(self.hwnd) } != 0;
             if self.shown[i].is_none() {
-                contain_window(self.hwnd, source as HWND, layout_pane, bounds, minimized);
+                let src = source as HWND;
+                let style = unsafe { (GetWindowLongW(src, GWL_STYLE) as u32, GetWindowLongW(src, GWL_EXSTYLE) as u32) };
+                if !contain_window(self.hwnd, src, layout_pane, bounds, minimized) {
+                    self.notes.push((i, format!("session: the game's window 0x{source:x} isn't answering (busy or hung): put in its pane once it does")));
+                }
+                // The thumbnail is only the fallback for frames the window can't draw
+                // itself: without one, the pane and its input still work.
                 let mut thumbnail: Thumbnail = 0;
-                if unsafe { (dwm.register)(self.hwnd, source as HWND, &mut thumbnail) } < 0 {
-                    return;
+                match dwm() {
+                    Some(dwm) if unsafe { (dwm.register)(self.hwnd, src, &mut thumbnail) } >= 0 => {}
+                    _ => {
+                        thumbnail = 0;
+                        self.notes.push((i, format!("session: no DWM thumbnail of the game's window 0x{source:x}: its pane shows only the frames it hands over")));
+                    }
                 }
                 self.shown[i] = Some(Shown {
                     source,
@@ -1127,6 +1165,7 @@ mod win {
                     adopted_at: Instant::now(),
                     grace_retried: false,
                     drawn: false,
+                    style,
                 });
                 self.update(i, display_pane, viewport, true);
                 return;
@@ -1160,8 +1199,16 @@ mod win {
             let n = self.shown.len().max(self.surfaces.len());
             let panes: Vec<PaneDraw> = (0..n)
                 .map(|i| {
-                    let dest = self.shown.get(i).and_then(|s| s.as_ref()).map_or(super::HIDDEN, |s| s.dest);
                     let (ring, surface) = self.surfaces.get(i).cloned().unwrap_or((None, None));
+                    // Frames before the copy's window is known go in its pane too, fitted
+                    // by their own size.
+                    let dest = match self.shown.get(i).and_then(|s| s.as_ref()) {
+                        Some(s) => s.dest,
+                        None => match (surface.as_ref().map(|s| s.size), self.display.get(i)) {
+                            (Some((w, h)), Some(p)) if w > 0 && h > 0 => fit_aspect(*p, w, h),
+                            _ => super::HIDDEN,
+                        },
+                    };
                     PaneDraw { dest, ring, surface }
                 })
                 .collect();
@@ -1187,7 +1234,7 @@ mod win {
                 self.hidden_for_minimize = minimized;
                 for s in self.shown.iter().flatten() {
                     if minimized {
-                        unsafe { ShowWindow(s.source as HWND, SW_HIDE) };
+                        unsafe { ShowWindowAsync(s.source as HWND, SW_HIDE) };
                     } else {
                         contain_window(self.hwnd, s.source as HWND, s.layout_pane, bounds, false);
                     }
@@ -1200,10 +1247,14 @@ mod win {
                 let Some(s) = self.shown[i].as_mut() else { continue };
                 let src = s.source as HWND;
                 let mut force_thumb = false;
-                // Win+D can minimize background game windows without firing WM_SIZE on us.
+                // Win+D can minimize background game windows without firing WM_SIZE on
+                // us. Put back only while the session's window is in front: with the
+                // desktop shown, putting them back fights Windows (and the player).
                 if unsafe { IsIconic(src) != 0 || IsWindowVisible(src) == 0 } {
-                    contain_window(self.hwnd, src, s.layout_pane, bounds, false);
-                    force_thumb = true;
+                    if unsafe { GetForegroundWindow() } == self.hwnd {
+                        contain_window(self.hwnd, src, s.layout_pane, bounds, false);
+                        force_thumb = true;
+                    }
                 } else if !s.grace_retried && s.adopted_at.elapsed() >= Duration::from_secs(1) {
                     s.grace_retried = true;
                     let (cw, ch) = client_size(src);
@@ -1362,13 +1413,16 @@ mod win {
         }
 
         fn update(&mut self, i: usize, display_pane: PaneRect, viewport: Option<(u32, u32)>, force: bool) {
-            let Some(dwm) = dwm() else { return };
+            let dwm = dwm();
             // The frames the window draws itself are fitted by their own size: the game
             // may draw at a size its window and viewport don't say.
             let frames = self.surfaces.get(i).and_then(|(_, s)| s.as_ref()).map(|s| s.size).filter(|s| s.0 > 0 && s.1 > 0);
             let Some(s) = self.shown[i].as_mut() else { return };
             let client = client_size(s.source as HWND);
-            let dwm_src = dwm_source_size(dwm, s.thumbnail);
+            let dwm_src = match dwm {
+                Some(d) if s.thumbnail != 0 => dwm_source_size(d, s.thumbnail),
+                _ => (0, 0),
+            };
             let src_size = frames.unwrap_or_else(|| effective_source_size(client, dwm_src, viewport));
             let dest = fit_aspect(display_pane, src_size.0, src_size.1);
             if !force && s.display_pane == display_pane && s.dest == dest && s.src_size == src_size {
@@ -1402,7 +1456,9 @@ mod win {
                 visible: BOOL::from(dest.width > 0 && dest.height > 0 && !s.drawn),
                 client_area_only: 1,
             };
-            unsafe { (dwm.update)(s.thumbnail, &props) };
+            if let Some(dwm) = dwm.filter(|_| s.thumbnail != 0) {
+                unsafe { (dwm.update)(s.thumbnail, &props) };
+            }
         }
     }
 
@@ -1414,9 +1470,23 @@ mod win {
             }
             // The drawing thread goes before the window it draws in.
             self.gpu = None;
-            if let Some(dwm) = dwm() {
-                for s in self.shown.drain(..).flatten() {
+            for s in self.shown.drain(..).flatten() {
+                if s.thumbnail != 0
+                    && let Some(dwm) = dwm()
+                {
                     unsafe { (dwm.unregister)(s.thumbnail) };
+                }
+                // A game still running gets its window back as it was: its frame, its
+                // taskbar button, shown (it ends up on its own if the session's window
+                // goes first).
+                let src = s.source as HWND;
+                if unsafe { IsWindow(src) } != 0 && unsafe { IsHungAppWindow(src) } == 0 {
+                    unsafe {
+                        SetWindowLongW(src, GWL_STYLE, s.style.0 as i32);
+                        SetWindowLongW(src, GWL_EXSTYLE, s.style.1 as i32);
+                        SetWindowPos(src, std::ptr::null_mut(), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS);
+                        ShowWindowAsync(src, SW_SHOWNOACTIVATE);
+                    }
                 }
             }
             unsafe {

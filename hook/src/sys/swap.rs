@@ -249,7 +249,8 @@ pub fn pause(paused: bool) {
 }
 
 fn substitute(module: usize, name: *const u8) -> Option<usize> {
-    if module == 0 || (name as usize) <= 0xffff {
+    // Hooked for VR lookups alone (vr.rs), nothing else is swapped.
+    if module == 0 || (name as usize) <= 0xffff || !crate::net::enabled() || crate::net::skip("swap") {
         return None;
     }
     let resolve = {

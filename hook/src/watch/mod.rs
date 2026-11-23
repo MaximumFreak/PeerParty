@@ -333,8 +333,10 @@ fn consider(m: Mod) {
                 "eos anti-cheat exports present: not detoured; with the EOS layer on, starting a session stops the game and the rest fail as offline"
             );
         }
-    } else if let Some(vr) = crate::vr::identify(names.iter().copied()) {
-        crate::vr::attach(&m.full, vr, &table.code);
+    } else if let Some(kinds) = Some(crate::vr::identify(names.iter().copied())).filter(|k| !k.is_empty()) {
+        for vr in kinds {
+            crate::vr::attach(&m.full, vr, &table.code);
+        }
     } else if crate::video::is_graphics_module(&m.name) {
         crate::video::module_loaded(&m.name, m.base);
     } else if m.name.to_ascii_lowercase().starts_with("xinput")
@@ -374,9 +376,14 @@ fn consider(m: Mod) {
             let n = crate::saves::attach_kernelbase(&table.code);
             log!("saves {} file hooks {n}", m.full);
         }
-        if crate::net::enabled() && !crate::net::skip("swap") {
+        let swaps = crate::net::enabled() && !crate::net::skip("swap");
+        if swaps || crate::vr::needs_lookups() {
             let n = crate::sys::swap::attach_kernelbase(&table.code);
-            log!("swap ready for {} ({n})", m.full);
+            if swaps {
+                log!("swap ready for {} ({n})", m.full);
+            } else {
+                log!("swap: GetProcAddress hooked for VR lookups only (split screen, the network layer {}) ({n})", if crate::net::enabled() { "with swaps skipped" } else { "off" });
+            }
         }
         if crate::net::enabled() && !crate::net::skip("invite") && !crate::child::is_helper() {
             crate::invite::start();

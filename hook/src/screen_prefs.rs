@@ -4,7 +4,10 @@
 //! of another shape drew a frame of that size inside its window, with black bars. Here:
 //!
 //! - reads of those two values answer the pane's width and height (window.rs
-//!   `virtual_size`), and
+//!   `virtual_size`), and the saved fullscreen mode (`Screenmanager Fullscreen mode_h…`,
+//!   older engines' `Screenmanager Is Fullscreen mode_h…`) answers windowed: a copy that
+//!   last ran fullscreen would start by taking the whole monitor, and
+
 //! - a split-screen copy's writes of `Screenmanager …` values don't happen, so playing
 //!   in split screen leaves the single-window settings as they were.
 //!
@@ -41,6 +44,10 @@ const ERROR_SUCCESS: i32 = 0;
 pub enum Screen {
     Width,
     Height,
+    /// The fullscreen mode (0 exclusive, 1 fullscreen window, 2 maximized, 3 windowed).
+    FullscreenMode,
+    /// Older engines' fullscreen switch (1 fullscreen).
+    IsFullscreen,
     /// Another of the engine's screen settings (fullscreen mode, window position...).
     Other,
 }
@@ -56,6 +63,10 @@ pub fn screen_value(name: &str) -> Option<Screen> {
         Screen::Width
     } else if rest.starts_with("Resolution Height_h") {
         Screen::Height
+    } else if rest.starts_with("Fullscreen mode_h") {
+        Screen::FullscreenMode
+    } else if rest.starts_with("Is Fullscreen mode_h") {
+        Screen::IsFullscreen
     } else {
         Screen::Other
     })
@@ -97,6 +108,9 @@ fn pane_value(which: Screen) -> Option<u32> {
     match which {
         Screen::Width => Some(w),
         Screen::Height => Some(h),
+        // Windowed: a pane is a window.
+        Screen::FullscreenMode => Some(3),
+        Screen::IsFullscreen => Some(0),
         Screen::Other => None,
     }
 }
@@ -114,8 +128,19 @@ fn patch(name: Option<String>, kind: *const u32, data: *mut u8, len: *const u32)
     }
     let saved = unsafe { (data as *const u32).read_unaligned() };
     unsafe { (data as *mut u32).write_unaligned(v) };
-    if saved != v && !TOLD_READ.swap(true, Ordering::Relaxed) {
-        log!("window: the game's saved resolution ({saved} on one side) reads as its pane's {:?}", crate::window::virtual_size().unwrap_or_default());
+    if saved != v {
+        match which {
+            Screen::FullscreenMode | Screen::IsFullscreen => {
+                static TOLD_MODE: AtomicBool = AtomicBool::new(false);
+                if !TOLD_MODE.swap(true, Ordering::Relaxed) {
+                    log!("window: the game's saved fullscreen setting ({saved}) reads as windowed: a pane is a window");
+                }
+            }
+            _ if !TOLD_READ.swap(true, Ordering::Relaxed) => {
+                log!("window: the game's saved resolution ({saved} on one side) reads as its pane's {:?}", crate::window::virtual_size().unwrap_or_default());
+            }
+            _ => {}
+        }
     }
 }
 
@@ -201,7 +226,9 @@ mod tests {
         assert_eq!(screen_value("Screenmanager Resolution Width_h182942802"), Some(Screen::Width));
         assert_eq!(screen_value("Screenmanager Resolution Height_h2627697771"), Some(Screen::Height));
         assert_eq!(screen_value("Screenmanager Resolution Width Default_h680557497"), Some(Screen::Other), "the build's default");
-        assert_eq!(screen_value("Screenmanager Fullscreen mode_h3630240806"), Some(Screen::Other));
+        assert_eq!(screen_value("Screenmanager Fullscreen mode_h3630240806"), Some(Screen::FullscreenMode));
+        assert_eq!(screen_value("Screenmanager Is Fullscreen mode_h3981298716"), Some(Screen::IsFullscreen));
+        assert_eq!(screen_value("Screenmanager Fullscreen mode Default_h401710285"), Some(Screen::Other), "the build's default");
         assert_eq!(screen_value("Screenmanager Resolution Use Native_h1405027254"), Some(Screen::Other));
         assert_eq!(screen_value("VSyncSetting_h1635279426"), None, "the game's own");
     }

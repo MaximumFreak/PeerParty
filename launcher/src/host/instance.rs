@@ -261,6 +261,11 @@ impl InstanceConn {
     /// (every 100 ms while waiting for the window to appear, once a second once alive).
     /// True if `best_hwnd()` changed.
     pub fn refresh_window(&mut self) -> bool {
+        // The window its frames came from is gone (the game made a new one, as for a
+        // display mode change): looked for again.
+        if let Some(v) = self.viewport.as_mut().filter(|v| v.hwnd != 0 && !super::desktop::window_alive(v.hwnd)) {
+            v.hwnd = 0;
+        }
         if self.gone || self.pid == 0 || self.viewport.as_ref().is_some_and(|v| v.hwnd != 0) {
             return false;
         }

@@ -87,6 +87,7 @@ pub fn install_dxgi(swap: usize) -> usize {
     // IDXGIObject::GetParent.
     if vcall!(swap, 6, fn(*const Guid, *mut usize) -> i32, &IID_IDXGIFACTORY, &mut factory) >= 0 && factory != 0 {
         n += arm(&CREATE_SWAP_CHAIN, com::slot(factory, 10), create_swap_chain as CreateSwapChain, "IDXGIFactory::CreateSwapChain");
+        n += arm(&MAKE_ASSOCIATION, com::slot(factory, 8), make_window_association as MakeWindowAssociation, "IDXGIFactory::MakeWindowAssociation");
         let f2 = com::query(factory, &IID_IDXGIFACTORY2);
         if f2 != 0 {
             n += arm(&CREATE_FOR_HWND, com::slot(f2, 15), create_for_hwnd as CreateForHwnd, "IDXGIFactory2::CreateSwapChainForHwnd");
@@ -149,8 +150,29 @@ unsafe extern "system" fn resize_target(swap: usize, mode: usize) -> i32 {
     unsafe { RESIZE_TARGET.get().unwrap().call(swap, mode) }
 }
 
-/// A swap chain was made: what's known of the one before at its address goes.
+type MakeWindowAssociation = unsafe extern "system" fn(usize, usize, u32) -> i32;
+static MAKE_ASSOCIATION: OnceLock<GenericDetour<MakeWindowAssociation>> = OnceLock::new();
+/// `DXGI_MWA_NO_ALT_ENTER`.
+const NO_ALT_ENTER: u32 = 2;
+
+/// DXGI watches the game's window for Alt+Enter and switches the swap chain to
+/// fullscreen itself: in a pane that's turned off, as the game's own switch is.
+unsafe extern "system" fn make_window_association(factory: usize, hwnd: usize, flags: u32) -> i32 {
+    let real = MAKE_ASSOCIATION.get().unwrap();
+    if !keep_windowed() || flags & NO_ALT_ENTER != 0 {
+        return unsafe { real.call(factory, hwnd, flags) };
+    }
+    static TOLD_ALT: AtomicBool = AtomicBool::new(false);
+    if !TOLD_ALT.swap(true, Ordering::Relaxed) {
+        log!("video: DXGI's Alt+Enter switch to fullscreen is off for the game's window (0x{hwnd:x}): it stays in its pane");
+    }
+    unsafe { real.call(factory, hwnd, flags | NO_ALT_ENTER) }
+}
+
+/// A swap chain was made: what's known of the one before at its address goes (a
+/// fullscreen one's wish too: a windowed one made at the same address isn't it).
 fn made_swap(swap: usize, device: usize) {
+    wanted(swap, false);
     super::dxgi::forget(swap);
     super::d3d12::note_swap(swap, device);
 }

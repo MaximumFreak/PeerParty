@@ -89,6 +89,11 @@ mod win {
     }
 
     /// The process whose window is in front is `pid`.
+    /// Whether `hwnd` is still a window.
+    pub fn window_alive(hwnd: u64) -> bool {
+        hwnd != 0 && unsafe { IsWindow(hwnd as usize as HWND) } != 0
+    }
+
     pub fn in_front(pid: u32) -> bool {
         foreground().pid == pid
     }
@@ -242,6 +247,11 @@ mod unix {
     }
 
     /// The game has the screen.
+    /// Off Windows there are no window handles to outlive.
+    pub fn window_alive(_hwnd: u64) -> bool {
+        true
+    }
+
     pub fn in_front(_pid: u32) -> bool {
         true
     }

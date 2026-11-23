@@ -13,6 +13,12 @@
 //! - OpenXR (the Khronos loader, `openxr_loader.dll`): `xrCreateInstance` and
 //!   `xrEnumerateInstanceExtensionProperties` fail with "runtime unavailable", without
 //!   loading the runtime, and so does `xrGetInstanceProcAddr` handing them out.
+//! - LibOVR (Oculus's client library): `ovr_Detect` says neither the service nor a
+//!   headset is there.
+//!
+//! A library exporting more than one of them (a plugin carrying both an OpenVR and an
+//! OpenXR path) has each hooked. The `GetProcAddress` check below works whether or not
+//! PeerParty's network layer is on (sys/swap.rs is installed for it either way).
 //!
 //! - Every runtime, whichever library or plugin looks for it (Oculus's OVRPlugin, which
 //!   carries its own OpenXR loader and LibOVR client; an OpenXR loader built into the
@@ -49,6 +55,9 @@ type VrGetInterface = unsafe extern "C" fn(*const u8, *mut i32) -> usize;
 type XrCreateInstance = unsafe extern "system" fn(usize, *mut u64) -> i32;
 type XrEnumExtensions = unsafe extern "system" fn(*const u8, u32, *mut u32, usize) -> i32;
 type XrGetProc = unsafe extern "system" fn(u64, *const u8, *mut usize) -> i32;
+/// `ovr_Detect(timeoutMs)`: an `ovrDetectResult` (two `ovrBool`s, padded to 8 bytes),
+/// returned in registers as a u64 is.
+type OvrDetect = unsafe extern "C" fn(i32) -> u64;
 
 static HMD_PRESENT: OnceLock<GenericDetour<VrBool>> = OnceLock::new();
 static RUNTIME_INSTALLED: OnceLock<GenericDetour<VrBool>> = OnceLock::new();
@@ -58,6 +67,8 @@ static GET_INTERFACE: OnceLock<GenericDetour<VrGetInterface>> = OnceLock::new();
 static XR_CREATE: OnceLock<GenericDetour<XrCreateInstance>> = OnceLock::new();
 static XR_EXTENSIONS: OnceLock<GenericDetour<XrEnumExtensions>> = OnceLock::new();
 static XR_GET_PROC: OnceLock<GenericDetour<XrGetProc>> = OnceLock::new();
+static OVR_DETECT: OnceLock<GenericDetour<OvrDetect>> = OnceLock::new();
+static TOLD_OVR: AtomicBool = AtomicBool::new(false);
 
 static TOLD_OPENVR: AtomicBool = AtomicBool::new(false);
 static TOLD_OPENXR: AtomicBool = AtomicBool::new(false);
@@ -90,31 +101,32 @@ fn is_runtime_entry(name: &str) -> bool {
 pub enum Runtime {
     OpenVr,
     OpenXr,
+    LibOvr,
 }
 
-/// Which VR runtime interface a module's exports are, if any.
-pub fn identify<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<Runtime> {
-    let mut openvr = false;
-    let mut openxr = false;
+/// Which VR runtime interfaces a module's exports are (none, one, or several).
+pub fn identify<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<Runtime> {
+    let (mut openvr, mut openxr, mut ovr) = (false, false, false);
     for name in names {
         match name {
             "VR_InitInternal" | "VR_InitInternal2" | "VR_IsHmdPresent" => openvr = true,
             "xrCreateInstance" | "xrGetInstanceProcAddr" => openxr = true,
+            "ovr_Detect" => ovr = true,
             _ => {}
         }
     }
-    if openvr {
-        Some(Runtime::OpenVr)
-    } else if openxr {
-        Some(Runtime::OpenXr)
-    } else {
-        None
-    }
+    [(openvr, Runtime::OpenVr), (openxr, Runtime::OpenXr), (ovr, Runtime::LibOvr)].into_iter().filter(|(has, _)| *has).map(|(_, r)| r).collect()
 }
 
 /// Whether this copy is told there's no headset: it shares the screen with others.
 fn blocked() -> bool {
     crate::window::focus_spoofed()
+}
+
+/// Whether `GetProcAddress` has to be hooked for `refused` even with the network layer
+/// off (a split-screen copy).
+pub fn needs_lookups() -> bool {
+    blocked()
 }
 
 /// A module exporting a VR runtime interface loaded (watch.rs). It's hooked only in a
@@ -139,10 +151,12 @@ pub fn attach(full: &str, kind: Runtime, exports: &[Export]) {
                 + arm(arm_at(&XR_EXTENSIONS, find("xrEnumerateInstanceExtensionProperties"), xr_extensions as XrEnumExtensions, "vr", "xrEnumerateInstanceExtensionProperties"))
                 + arm(arm_at(&XR_GET_PROC, find("xrGetInstanceProcAddr"), xr_get_proc as XrGetProc, "vr", "xrGetInstanceProcAddr"))
         }
+        Runtime::LibOvr => arm(arm_at(&OVR_DETECT, find("ovr_Detect"), ovr_detect as OvrDetect, "vr", "ovr_Detect")),
     };
     let what = match kind {
         Runtime::OpenVr => "OpenVR",
         Runtime::OpenXr => "OpenXR",
+        Runtime::LibOvr => "LibOVR",
     };
     log!("vr: {full} is {what}: hooked {n}, so this split-screen copy is told there's no headset");
 }
@@ -167,6 +181,15 @@ unsafe extern "C" fn runtime_installed() -> bool {
     }
     told(&TOLD_OPENVR, "VR_IsRuntimeInstalled");
     false
+}
+
+unsafe extern "C" fn ovr_detect(timeout_ms: i32) -> u64 {
+    if !blocked() {
+        return unsafe { OVR_DETECT.get().unwrap().call(timeout_ms) };
+    }
+    told(&TOLD_OVR, "ovr_Detect");
+    // Neither the service running nor a headset connected.
+    0
 }
 
 unsafe fn no_headset(error: *mut i32) {
@@ -244,9 +267,11 @@ mod tests {
 
     #[test]
     fn vr_runtimes_are_known_by_their_exports() {
-        assert_eq!(identify(["VR_GetGenericInterface", "VR_InitInternal2", "VR_IsHmdPresent"]), Some(Runtime::OpenVr));
-        assert_eq!(identify(["xrCreateInstance", "xrGetInstanceProcAddr", "xrEnumerateApiLayerProperties"]), Some(Runtime::OpenXr));
-        assert_eq!(identify(["SteamAPI_Init", "XInputGetState"]), None);
+        assert_eq!(identify(["VR_GetGenericInterface", "VR_InitInternal2", "VR_IsHmdPresent"]), [Runtime::OpenVr]);
+        assert_eq!(identify(["xrCreateInstance", "xrGetInstanceProcAddr", "xrEnumerateApiLayerProperties"]), [Runtime::OpenXr]);
+        assert_eq!(identify(["ovr_Detect", "ovr_Initialize"]), [Runtime::LibOvr]);
+        assert_eq!(identify(["VR_IsHmdPresent", "xrCreateInstance"]), [Runtime::OpenVr, Runtime::OpenXr], "a library with both paths has both hooked");
+        assert!(identify(["SteamAPI_Init", "XInputGetState"]).is_empty());
     }
 
     #[test]

@@ -16,8 +16,8 @@ use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetClientRect, GetWindow, GetWindowLongW,
     GetWindowThreadProcessId, IsWindowVisible, SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOZORDER, SetWindowLongW, SetWindowPos, ShowWindow, WS_BORDER, WS_CAPTION,
-    WS_CHILD, WS_DLGFRAME, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX,
+    SWP_NOACTIVATE, SWP_NOZORDER, SetWindowLongW, SetWindowPos, WS_BORDER, WS_CAPTION,
+    WS_CHILD, WS_DLGFRAME, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_MAXIMIZEBOX,
     WS_MINIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
 };
 
@@ -46,6 +46,16 @@ type RegisterRawInputDevicesFn = unsafe extern "system" fn(*const RawInputDevice
 type TranslateMessageFn = unsafe extern "system" fn(*const Msg) -> i32;
 type TrackMouseEventFn = unsafe extern "system" fn(*mut TrackMouse) -> i32;
 type DispatchMessageWFn = unsafe extern "system" fn(*const Msg) -> isize;
+type CreateWindowExAFn = unsafe extern "system" fn(u32, *const u8, *const u8, u32, i32, i32, i32, i32, isize, isize, isize, *const core::ffi::c_void) -> isize;
+type SetWindowPosFn = unsafe extern "system" fn(isize, isize, i32, i32, i32, i32, u32) -> i32;
+type MoveWindowFn = unsafe extern "system" fn(isize, i32, i32, i32, i32, i32) -> i32;
+type SetWindowLongFn = unsafe extern "system" fn(isize, i32, i32) -> i32;
+type SetWindowLongPtrFn = unsafe extern "system" fn(isize, i32, isize) -> isize;
+type ShowWindowFn = unsafe extern "system" fn(isize, i32) -> i32;
+type EnumDisplaySettingsExWFn = unsafe extern "system" fn(*const u16, u32, *mut u8, u32) -> i32;
+type EnumDisplaySettingsExAFn = unsafe extern "system" fn(*const u8, u32, *mut u8, u32) -> i32;
+type GetSystemMetricsForDpiFn = unsafe extern "system" fn(i32, u32) -> i32;
+type EnumDisplayMonitorsFn = unsafe extern "system" fn(isize, *const RECT, Option<unsafe extern "system" fn(isize, isize, *mut RECT, isize) -> i32>, isize) -> i32;
 type CreateWindowExWFn = unsafe extern "system" fn(
     u32,
     *const u16,
@@ -79,6 +89,8 @@ const HID_USAGE_GENERIC_KEYBOARD: u16 = 0x06;
 const HID_USAGE_GENERIC_MULTI_AXIS: u16 = 0x08;
 const RIDEV_REMOVE: u32 = 0x0000_0001;
 const RIDEV_INPUTSINK: u32 = 0x0000_0100;
+const RIDEV_CAPTUREMOUSE: u32 = 0x0000_0200;
+const RIDEV_EXINPUTSINK: u32 = 0x0000_1000;
 
 static GET_METRICS: OnceLock<GenericDetour<GetSystemMetricsFn>> = OnceLock::new();
 static CHANGE_DISPLAY_EX_W: OnceLock<GenericDetour<ChangeDisplayExFn>> = OnceLock::new();
@@ -98,6 +110,18 @@ static CREATE_WINDOW_EX_W: OnceLock<GenericDetour<CreateWindowExWFn>> = OnceLock
 static TRANSLATE: OnceLock<GenericDetour<TranslateMessageFn>> = OnceLock::new();
 static TRACK_MOUSE: OnceLock<GenericDetour<TrackMouseEventFn>> = OnceLock::new();
 static DISPATCH_W: OnceLock<GenericDetour<DispatchMessageWFn>> = OnceLock::new();
+static CREATE_WINDOW_EX_A: OnceLock<GenericDetour<CreateWindowExAFn>> = OnceLock::new();
+static SET_WINDOW_POS: OnceLock<GenericDetour<SetWindowPosFn>> = OnceLock::new();
+static MOVE_WINDOW: OnceLock<GenericDetour<MoveWindowFn>> = OnceLock::new();
+static SET_LONG_W: OnceLock<GenericDetour<SetWindowLongFn>> = OnceLock::new();
+static SET_LONG_A: OnceLock<GenericDetour<SetWindowLongFn>> = OnceLock::new();
+static SET_LONG_PTR_W: OnceLock<GenericDetour<SetWindowLongPtrFn>> = OnceLock::new();
+static SET_LONG_PTR_A: OnceLock<GenericDetour<SetWindowLongPtrFn>> = OnceLock::new();
+static SHOW_WINDOW: OnceLock<GenericDetour<ShowWindowFn>> = OnceLock::new();
+static ENUM_DISP_EX_W: OnceLock<GenericDetour<EnumDisplaySettingsExWFn>> = OnceLock::new();
+static ENUM_DISP_EX_A: OnceLock<GenericDetour<EnumDisplaySettingsExAFn>> = OnceLock::new();
+static GET_METRICS_DPI: OnceLock<GenericDetour<GetSystemMetricsForDpiFn>> = OnceLock::new();
+static ENUM_MONITORS: OnceLock<GenericDetour<EnumDisplayMonitorsFn>> = OnceLock::new();
 
 /// Win32 `TRACKMOUSEEVENT`.
 #[repr(C)]
@@ -157,6 +181,7 @@ const DEVMODEA_PELS_HEIGHT: usize = 112;
 pub const WM_ACTIVATE: u32 = 0x0006;
 pub const WM_KILLFOCUS: u32 = 0x0008;
 pub const WM_ACTIVATEAPP: u32 = 0x001C;
+pub const WM_NCACTIVATE: u32 = 0x0086;
 
 /// Loads `PEERPARTY_INSTANCE` (if set) at start-up.
 pub fn init_from_env() {
@@ -208,6 +233,9 @@ pub fn viewport_of(spec: &InstanceSpec) -> Option<(u32, u32)> {
 pub fn note_game_window(hwnd: usize) {
     if hwnd != 0 {
         let prev = PRIMARY_HWND.swap(hwnd, Ordering::Relaxed);
+        if prev != hwnd && prev != 0 {
+            log!("window: the game draws in window 0x{hwnd:x} now (0x{prev:x} before)");
+        }
         if wants_hooks() && (prev == 0 || !RAW_SINKS_UPGRADED.load(Ordering::Relaxed)) {
             upgrade_registered_raw_input_sinks(hwnd as isize);
         }
@@ -217,52 +245,85 @@ pub fn note_game_window(hwnd: usize) {
     }
 }
 
-/// Game windows whose window procedure is wrapped (`focus_proc`): the window, and the
-/// procedure it had.
-static WRAPPED: [(AtomicUsize, AtomicUsize); 4] = [const { (AtomicUsize::new(0), AtomicUsize::new(0)) }; 4];
+/// A game window whose window procedure is wrapped (`focus_proc`): the window, the
+/// procedure it had, and whether it's a Unicode window (an ANSI one's procedure is
+/// set and called through the ANSI calls, or its text messages come garbled).
+#[derive(Clone, Copy)]
+struct Wrapped {
+    hwnd: usize,
+    old: usize,
+    unicode: bool,
+}
+
+/// Every wrapped window, until it's destroyed (`WM_NCDESTROY`).
+static WRAPPED: Mutex<Vec<Wrapped>> = Mutex::new(Vec::new());
+
+/// More wrapped windows than this is a game making and dropping windows: the rest are
+/// left alone.
+const MAX_WRAPPED: usize = 64;
 
 /// Wraps game window `hwnd`'s procedure so the focus losses Windows tells it about don't
 /// reach it (`should_suppress_focus_loss`). The session's window takes the focus from
 /// every copy; a copy told it lost it stops its menus taking input (Unity's UI ignores
 /// the mouse and controllers then), though the game itself goes on.
 fn keep_focus(hwnd: usize) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{GWLP_WNDPROC, SetWindowLongPtrW};
-    if WRAPPED.iter().any(|(h, _)| h.load(Ordering::Acquire) == hwnd) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GWLP_WNDPROC, IsWindowUnicode};
+    type Proc = unsafe extern "system" fn(HWND, u32, usize, isize) -> isize;
+    let h = hwnd as HWND;
+    let mut w = crate::sys::lock(&WRAPPED);
+    if w.iter().any(|x| x.hwnd == hwnd) {
         return;
     }
-    let Some(slot) = WRAPPED.iter().find(|(h, _)| h.load(Ordering::Acquire) == 0) else { return };
+    if w.len() >= MAX_WRAPPED {
+        crate::log::throttled("window: wrapped full", 1, |_| log!("window: {MAX_WRAPPED} game windows wrapped already: window 0x{hwnd:x} is told of its focus losses"));
+        return;
+    }
+    let unicode = unsafe { IsWindowUnicode(h) } != 0;
     // The procedure is known before the window can call the wrapper.
-    let old = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(hwnd as HWND, GWLP_WNDPROC) };
+    let old = unsafe { if unicode { get_window_long_ptr_w(h, GWLP_WNDPROC) } else { get_window_long_ptr_a(h, GWLP_WNDPROC) } };
     if old == 0 {
         return;
     }
-    slot.1.store(old as usize, Ordering::Release);
-    slot.0.store(hwnd, Ordering::Release);
-    type Proc = unsafe extern "system" fn(HWND, u32, usize, isize) -> isize;
-    let was = unsafe { SetWindowLongPtrW(hwnd as HWND, GWLP_WNDPROC, focus_proc as Proc as usize as _) };
+    w.push(Wrapped { hwnd, old: old as usize, unicode });
+    drop(w);
+    let new = focus_proc as Proc as usize as _;
+    let was = unsafe { if unicode { set_window_long_ptr_w(h, GWLP_WNDPROC, new) } else { set_window_long_ptr_a(h, GWLP_WNDPROC, new) } };
+    let mut w = crate::sys::lock(&WRAPPED);
     if was == 0 {
-        slot.0.store(0, Ordering::Release);
+        w.retain(|x| x.hwnd != hwnd);
         return;
     }
-    slot.1.store(was as usize, Ordering::Release);
-    log!("window: the game's window (0x{hwnd:x}) isn't told when it loses the focus (split screen: every copy keeps it)");
+    if let Some(x) = w.iter_mut().find(|x| x.hwnd == hwnd) {
+        x.old = was as usize;
+    }
+    log!("window: the game's window (0x{hwnd:x}, {}) isn't told when it loses the focus (split screen: every copy keeps it)", if unicode { "Unicode" } else { "ANSI" });
 }
 
+#[cfg(target_pointer_width = "64")]
+use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrA as get_window_long_ptr_a, GetWindowLongPtrW as get_window_long_ptr_w, SetWindowLongPtrA as set_window_long_ptr_a, SetWindowLongPtrW as set_window_long_ptr_w};
+#[cfg(target_pointer_width = "32")]
+use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongA as get_window_long_ptr_a, GetWindowLongW as get_window_long_ptr_w, SetWindowLongA as set_window_long_ptr_a, SetWindowLongW as set_window_long_ptr_w};
+
+const WM_NCDESTROY: u32 = 0x0082;
+
 unsafe extern "system" fn focus_proc(h: HWND, m: u32, w: usize, l: isize) -> isize {
-    let old = WRAPPED.iter().find(|(x, _)| x.load(Ordering::Acquire) == h as usize).map_or(0, |(_, p)| p.load(Ordering::Acquire));
+    use windows_sys::Win32::UI::WindowsAndMessaging::{CallWindowProcA, CallWindowProcW, DefWindowProcA, DefWindowProcW, WNDPROC};
+    let me = crate::sys::lock(&WRAPPED).iter().find(|x| x.hwnd == h as usize).copied();
+    let (old, unicode) = me.map_or((0, true), |x| (x.old, x.unicode));
     if should_suppress_focus_loss(m, w, FOCUS_SPOOF.load(Ordering::Relaxed)) {
         static TOLD: AtomicBool = AtomicBool::new(false);
         if !TOLD.swap(true, Ordering::Relaxed) {
             log!("window: a focus loss (message 0x{m:x}) didn't reach the game");
         }
-        return 0;
+        // WM_NCACTIVATE's answer lets the frame go inactive: TRUE, as if drawn.
+        return isize::from(m == WM_NCACTIVATE);
     }
     let call = |m: u32, w: usize, l: isize| -> isize {
         if old == 0 {
-            return unsafe { windows_sys::Win32::UI::WindowsAndMessaging::DefWindowProcW(h, m, w, l) };
+            return unsafe { if unicode { DefWindowProcW(h, m, w, l) } else { DefWindowProcA(h, m, w, l) } };
         }
-        let proc: windows_sys::Win32::UI::WindowsAndMessaging::WNDPROC = unsafe { std::mem::transmute::<usize, windows_sys::Win32::UI::WindowsAndMessaging::WNDPROC>(old) };
-        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::CallWindowProcW(proc, h, m, w, l) }
+        let proc: WNDPROC = unsafe { std::mem::transmute::<usize, WNDPROC>(old) };
+        unsafe { if unicode { CallWindowProcW(proc, h, m, w, l) } else { CallWindowProcA(proc, h, m, w, l) } }
     };
     // A game that took the mouse as pointer messages gets the forwarded mouse as those
     // (pointer.rs).
@@ -274,7 +335,13 @@ unsafe extern "system" fn focus_proc(h: HWND, m: u32, w: usize, l: isize) -> isi
         }
         return rc;
     }
-    call(m, w, l)
+    let rc = call(m, w, l);
+    if m == WM_NCDESTROY {
+        // The window's last message: its entry goes (a later window may get its handle).
+        crate::sys::lock(&WRAPPED).retain(|x| x.hwnd != h as usize);
+        let _ = PRIMARY_HWND.compare_exchange(h as usize, 0, Ordering::Relaxed, Ordering::Relaxed);
+    }
+    rc
 }
 
 /// Pure helper: adds `RIDEV_INPUTSINK` to keyboard, mouse and controller (joystick,
@@ -297,6 +364,10 @@ pub fn upgrade_raw_input_device(dev: &mut RawInputDevice, fallback_hwnd: isize) 
     if dev.hwnd_target == 0 || (dev.flags & RIDEV_INPUTSINK) != 0 {
         return false;
     }
+    // Windows refuses INPUTSINK beside these (the whole registration fails, and the game
+    // gets no raw input at all): capturing the mouse needs the foreground anyway, and
+    // EXINPUTSINK is the weaker form of the same.
+    dev.flags &= !(RIDEV_CAPTUREMOUSE | RIDEV_EXINPUTSINK);
     dev.flags |= RIDEV_INPUTSINK;
     true
 }
@@ -362,13 +433,42 @@ fn upgrade_registered_raw_input_sinks(fallback_hwnd: isize) {
 /// pane is specified.
 pub fn update_spec(spec: InstanceSpec) {
     let pane = spec.pane;
+    let slot = spec.slot;
+    let had = wants_hooks();
     apply_spec(spec);
     if wants_hooks() {
         install_loaded_user32();
+        if !had {
+            attach_late(slot);
+        }
     }
     if let Some(pane) = pane {
         reposition_window(pane);
     }
+}
+
+/// A spec that turned split screen on arrived while the game runs (not at its start):
+/// what start-up would have done with it is done now, for what's already there.
+fn attach_late(slot: u32) {
+    peerparty_core::want_slot(slot);
+    let primary = PRIMARY_HWND.load(Ordering::Relaxed);
+    if primary != 0 {
+        upgrade_registered_raw_input_sinks(primary as isize);
+        if FOCUS_SPOOF.load(Ordering::Relaxed) {
+            keep_focus(primary);
+        }
+    }
+    if virtual_size().is_some()
+        && let Some(kb) = module("kernelbase.dll")
+        && let Ok(table) = unsafe { crate::sys::pe::exports(kb.cast()) }
+    {
+        let n = crate::screen_prefs::attach_kernelbase(&table.code);
+        log!("screen kernelbase hooked {n} (split screen began while the game ran)");
+    }
+    if module("mmdevapi.dll").is_some() {
+        crate::input::audio_loaded();
+    }
+    log!("window: split screen began while the game ran: its window, raw input, saved screen size and audio were taken up now");
 }
 
 fn apply_spec(spec: InstanceSpec) {
@@ -445,11 +545,46 @@ fn find_own_window() -> usize {
     f.best as usize
 }
 
+/// The pane the game's window is to be put in next (`reposition_window`), and whether a
+/// thread is doing it.
+static PENDING_PANE: Mutex<Option<PaneRect>> = Mutex::new(None);
+static REPOSITIONING: AtomicBool = AtomicBool::new(false);
+
+/// Puts the game's window in `pane`, on a thread of its own: the calls wait on the
+/// game's window thread, and the one asking (the session's connection) mustn't wait on
+/// a game busy loading or holding a lock its window thread wants. Panes asked for while
+/// one is being done: the last one is done next.
 fn reposition_window(pane: PaneRect) {
     if pane.width == 0 || pane.height == 0 {
         return;
     }
-    let mut hwnd = PRIMARY_HWND.load(Ordering::Relaxed);
+    *crate::sys::lock(&PENDING_PANE) = Some(pane);
+    if REPOSITIONING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let spawned = std::thread::Builder::new().name("peerparty-pane".into()).spawn(|| {
+        loop {
+            while let Some(p) = crate::sys::lock(&PENDING_PANE).take() {
+                put_in_pane(p);
+            }
+            REPOSITIONING.store(false, Ordering::Release);
+            // One asked for between the last look and the flag going down.
+            if crate::sys::lock(&PENDING_PANE).is_none() || REPOSITIONING.swap(true, Ordering::AcqRel) {
+                break;
+            }
+        }
+    });
+    if spawned.is_err() {
+        REPOSITIONING.store(false, Ordering::Release);
+        if let Some(p) = crate::sys::lock(&PENDING_PANE).take() {
+            put_in_pane(p);
+        }
+    }
+}
+
+fn put_in_pane(pane: PaneRect) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{HWND_NOTOPMOST, SWP_ASYNCWINDOWPOS, SWP_NOMOVE, SWP_NOSIZE, ShowWindowAsync, WS_EX_TOPMOST};
+    let mut hwnd = live_primary() as usize;
     if hwnd == 0 {
         hwnd = find_own_window();
         if hwnd != 0 {
@@ -467,7 +602,7 @@ fn reposition_window(pane: PaneRect) {
         let want_ex = (ex | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) & !WS_EX_APPWINDOW;
         let toggle = IsWindowVisible(h) != 0 && ((ex & WS_EX_TOOLWINDOW) == 0 || (ex & WS_EX_APPWINDOW) != 0);
         if toggle {
-            ShowWindow(h, SW_HIDE);
+            ShowWindowAsync(h, SW_HIDE);
         }
         if want_style != style {
             SetWindowLongW(h, GWL_STYLE, want_style as i32);
@@ -475,8 +610,12 @@ fn reposition_window(pane: PaneRect) {
         if want_ex != ex {
             SetWindowLongW(h, GWL_EXSTYLE, want_ex as i32);
         }
+        // Topmost isn't a style SetWindowLong changes.
+        if ex & WS_EX_TOPMOST != 0 {
+            SetWindowPos(h, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+        }
         if toggle {
-            ShowWindow(h, SW_SHOWNOACTIVATE);
+            ShowWindowAsync(h, SW_SHOWNOACTIVATE);
         }
         SetWindowPos(
             h,
@@ -485,7 +624,7 @@ fn reposition_window(pane: PaneRect) {
             pane.y,
             pane.width as i32,
             pane.height as i32,
-            SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS,
         );
     }
 }
@@ -528,6 +667,18 @@ fn install_loaded_user32() {
         hook_proc!(GET_FOCUS, c"GetFocus", GetFocusFn, detour_get_focus);
         hook_proc!(REGISTER_RAW_INPUT, c"RegisterRawInputDevices", RegisterRawInputDevicesFn, detour_register_raw_input);
         hook_proc!(CREATE_WINDOW_EX_W, c"CreateWindowExW", CreateWindowExWFn, detour_create_window_ex_w);
+        hook_proc!(CREATE_WINDOW_EX_A, c"CreateWindowExA", CreateWindowExAFn, detour_create_window_ex_a);
+        hook_proc!(SET_WINDOW_POS, c"SetWindowPos", SetWindowPosFn, detour_set_window_pos);
+        hook_proc!(MOVE_WINDOW, c"MoveWindow", MoveWindowFn, detour_move_window);
+        hook_proc!(SET_LONG_W, c"SetWindowLongW", SetWindowLongFn, detour_set_window_long_w);
+        hook_proc!(SET_LONG_A, c"SetWindowLongA", SetWindowLongFn, detour_set_window_long_a);
+        hook_proc!(SET_LONG_PTR_W, c"SetWindowLongPtrW", SetWindowLongPtrFn, detour_set_window_long_ptr_w);
+        hook_proc!(SET_LONG_PTR_A, c"SetWindowLongPtrA", SetWindowLongPtrFn, detour_set_window_long_ptr_a);
+        hook_proc!(SHOW_WINDOW, c"ShowWindow", ShowWindowFn, detour_show_window);
+        hook_proc!(ENUM_DISP_EX_W, c"EnumDisplaySettingsExW", EnumDisplaySettingsExWFn, detour_enum_display_ex_w);
+        hook_proc!(ENUM_DISP_EX_A, c"EnumDisplaySettingsExA", EnumDisplaySettingsExAFn, detour_enum_display_ex_a);
+        hook_proc!(GET_METRICS_DPI, c"GetSystemMetricsForDpi", GetSystemMetricsForDpiFn, detour_get_system_metrics_for_dpi);
+        hook_proc!(ENUM_MONITORS, c"EnumDisplayMonitors", EnumDisplayMonitorsFn, detour_enum_display_monitors);
         hook_proc!(TRANSLATE, c"TranslateMessage", TranslateMessageFn, detour_translate_message);
         n += crate::pointer::hook_loaded(|s| proc_addr(u32_mod, s));
         hook_proc!(TRACK_MOUSE, c"TrackMouseEvent", TrackMouseEventFn, detour_track_mouse);
@@ -555,6 +706,18 @@ fn hook_exports(exports: &[Export]) -> usize {
     one("GetFocus", Box::new(|a| crate::sys::detour::arm(&GET_FOCUS, unsafe { std::mem::transmute::<*const (), GetFocusFn>(a) }, detour_get_focus, "window", "GetFocus")));
     one("RegisterRawInputDevices", Box::new(|a| crate::sys::detour::arm(&REGISTER_RAW_INPUT, unsafe { std::mem::transmute::<*const (), RegisterRawInputDevicesFn>(a) }, detour_register_raw_input, "window", "RegisterRawInputDevices")));
     one("CreateWindowExW", Box::new(|a| crate::sys::detour::arm(&CREATE_WINDOW_EX_W, unsafe { std::mem::transmute::<*const (), CreateWindowExWFn>(a) }, detour_create_window_ex_w, "window", "CreateWindowExW")));
+    one("CreateWindowExA", Box::new(|a| crate::sys::detour::arm(&CREATE_WINDOW_EX_A, unsafe { std::mem::transmute::<*const (), CreateWindowExAFn>(a) }, detour_create_window_ex_a, "window", "CreateWindowExA")));
+    one("SetWindowPos", Box::new(|a| crate::sys::detour::arm(&SET_WINDOW_POS, unsafe { std::mem::transmute::<*const (), SetWindowPosFn>(a) }, detour_set_window_pos, "window", "SetWindowPos")));
+    one("MoveWindow", Box::new(|a| crate::sys::detour::arm(&MOVE_WINDOW, unsafe { std::mem::transmute::<*const (), MoveWindowFn>(a) }, detour_move_window, "window", "MoveWindow")));
+    one("SetWindowLongW", Box::new(|a| crate::sys::detour::arm(&SET_LONG_W, unsafe { std::mem::transmute::<*const (), SetWindowLongFn>(a) }, detour_set_window_long_w, "window", "SetWindowLongW")));
+    one("SetWindowLongA", Box::new(|a| crate::sys::detour::arm(&SET_LONG_A, unsafe { std::mem::transmute::<*const (), SetWindowLongFn>(a) }, detour_set_window_long_a, "window", "SetWindowLongA")));
+    one("SetWindowLongPtrW", Box::new(|a| crate::sys::detour::arm(&SET_LONG_PTR_W, unsafe { std::mem::transmute::<*const (), SetWindowLongPtrFn>(a) }, detour_set_window_long_ptr_w, "window", "SetWindowLongPtrW")));
+    one("SetWindowLongPtrA", Box::new(|a| crate::sys::detour::arm(&SET_LONG_PTR_A, unsafe { std::mem::transmute::<*const (), SetWindowLongPtrFn>(a) }, detour_set_window_long_ptr_a, "window", "SetWindowLongPtrA")));
+    one("ShowWindow", Box::new(|a| crate::sys::detour::arm(&SHOW_WINDOW, unsafe { std::mem::transmute::<*const (), ShowWindowFn>(a) }, detour_show_window, "window", "ShowWindow")));
+    one("EnumDisplaySettingsExW", Box::new(|a| crate::sys::detour::arm(&ENUM_DISP_EX_W, unsafe { std::mem::transmute::<*const (), EnumDisplaySettingsExWFn>(a) }, detour_enum_display_ex_w, "window", "EnumDisplaySettingsExW")));
+    one("EnumDisplaySettingsExA", Box::new(|a| crate::sys::detour::arm(&ENUM_DISP_EX_A, unsafe { std::mem::transmute::<*const (), EnumDisplaySettingsExAFn>(a) }, detour_enum_display_ex_a, "window", "EnumDisplaySettingsExA")));
+    one("GetSystemMetricsForDpi", Box::new(|a| crate::sys::detour::arm(&GET_METRICS_DPI, unsafe { std::mem::transmute::<*const (), GetSystemMetricsForDpiFn>(a) }, detour_get_system_metrics_for_dpi, "window", "GetSystemMetricsForDpi")));
+    one("EnumDisplayMonitors", Box::new(|a| crate::sys::detour::arm(&ENUM_MONITORS, unsafe { std::mem::transmute::<*const (), EnumDisplayMonitorsFn>(a) }, detour_enum_display_monitors, "window", "EnumDisplayMonitors")));
     one("TranslateMessage", Box::new(|a| crate::sys::detour::arm(&TRANSLATE, unsafe { std::mem::transmute::<*const (), TranslateMessageFn>(a) }, detour_translate_message, "window", "TranslateMessage")));
     one("TrackMouseEvent", Box::new(|a| crate::sys::detour::arm(&TRACK_MOUSE, unsafe { std::mem::transmute::<*const (), TrackMouseEventFn>(a) }, detour_track_mouse, "window", "TrackMouseEvent")));
     one("DispatchMessageW", Box::new(|a| crate::sys::detour::arm(&DISPATCH_W, unsafe { std::mem::transmute::<*const (), DispatchMessageWFn>(a) }, detour_dispatch_w, "window", "DispatchMessageW")));
@@ -691,6 +854,22 @@ pub fn game_window() -> usize {
     PRIMARY_HWND.load(Ordering::Relaxed)
 }
 
+/// The game's window if it's still one (0 for none, or one destroyed): a focus call
+/// answered with a dead window would send the game after nothing.
+fn live_primary() -> isize {
+    let h = PRIMARY_HWND.load(Ordering::Relaxed);
+    if h != 0 && unsafe { windows_sys::Win32::UI::WindowsAndMessaging::IsWindow(h as HWND) } != 0 { h as isize } else { 0 }
+}
+
+/// A window the game made was put in its pane: it's the game's window until a frame says
+/// another is, but a second one (a splash, a launcher dialog) doesn't take over from one
+/// still there.
+fn note_created_window(hwnd: usize) {
+    if live_primary() == 0 {
+        note_game_window(hwnd);
+    }
+}
+
 const WM_DEVICECHANGE: u32 = 0x0219;
 const DBT_DEVNODES_CHANGED: usize = 0x0007;
 
@@ -784,6 +963,8 @@ pub fn should_suppress_focus_loss(msg: u32, wparam: usize, focus_spoof: bool) ->
         WM_KILLFOCUS => true,
         WM_ACTIVATE => (wparam & 0xFFFF) == 0,
         WM_ACTIVATEAPP => wparam == 0,
+        // The frame drawn inactive, which some engines take as the focus gone too.
+        WM_NCACTIVATE => wparam == 0,
         _ => false,
     }
 }
@@ -899,7 +1080,7 @@ unsafe extern "system" fn detour_get_foreground() -> isize {
     if !spoof {
         return real;
     }
-    spoof_focus_hwnd(real, is_our_window(real), PRIMARY_HWND.load(Ordering::Relaxed) as isize, true)
+    spoof_focus_hwnd(real, is_our_window(real), live_primary(), true)
 }
 
 unsafe extern "system" fn detour_get_active() -> isize {
@@ -908,7 +1089,7 @@ unsafe extern "system" fn detour_get_active() -> isize {
     if !spoof {
         return real;
     }
-    spoof_focus_hwnd(real, is_our_window(real), PRIMARY_HWND.load(Ordering::Relaxed) as isize, true)
+    spoof_focus_hwnd(real, is_our_window(real), live_primary(), true)
 }
 
 unsafe extern "system" fn detour_get_focus() -> isize {
@@ -917,7 +1098,7 @@ unsafe extern "system" fn detour_get_focus() -> isize {
     if !spoof {
         return real;
     }
-    spoof_focus_hwnd(real, is_our_window(real), PRIMARY_HWND.load(Ordering::Relaxed) as isize, true)
+    spoof_focus_hwnd(real, is_our_window(real), live_primary(), true)
 }
 
 unsafe extern "system" fn detour_register_raw_input(
@@ -969,23 +1150,216 @@ unsafe extern "system" fn detour_create_window_ex_w(
     param: *const core::ffi::c_void,
 ) -> isize {
     let Some(hook) = CREATE_WINDOW_EX_W.get() else { return 0 };
-    let mut contained = false;
-    if let (Some((vw, vh)), Some(pane)) = (virtual_size(), current_pane())
-        && should_contain_created_window(ex_style, style, w, h, parent)
-    {
-        style = (style & !CHROME_STYLES) | WS_POPUP;
-        ex_style = (ex_style | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) & !WS_EX_APPWINDOW;
-        x = pane.x;
-        y = pane.y;
-        w = vw as i32;
-        h = vh as i32;
-        contained = true;
-    }
+    let contained = contain_created(&mut ex_style, &mut style, &mut x, &mut y, &mut w, &mut h, parent);
     let hwnd = unsafe { hook.call(ex_style, class_name, window_name, style, x, y, w, h, parent, menu, instance, param) };
     if contained && hwnd != 0 {
-        note_game_window(hwnd as usize);
+        note_created_window(hwnd as usize);
     }
     hwnd
+}
+
+/// A window the game is making goes straight into its pane, as `reposition_window`
+/// puts one already there (the pane's size: the window is the pane). Whether it did.
+fn contain_created(ex_style: &mut u32, style: &mut u32, x: &mut i32, y: &mut i32, w: &mut i32, h: &mut i32, parent: isize) -> bool {
+    let Some(pane) = current_pane() else { return false };
+    if !should_contain_created_window(*ex_style, *style, *w, *h, parent) {
+        return false;
+    }
+    *style = (*style & !CHROME_STYLES) | WS_POPUP;
+    *ex_style = (*ex_style | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) & !(WS_EX_APPWINDOW | WS_EX_TOPMOST);
+    (*x, *y, *w, *h) = (pane.x, pane.y, pane.width as i32, pane.height as i32);
+    true
+}
+
+/// The ANSI form, for games built without Unicode.
+unsafe extern "system" fn detour_create_window_ex_a(
+    mut ex_style: u32,
+    class_name: *const u8,
+    window_name: *const u8,
+    mut style: u32,
+    mut x: i32,
+    mut y: i32,
+    mut w: i32,
+    mut h: i32,
+    parent: isize,
+    menu: isize,
+    instance: isize,
+    param: *const core::ffi::c_void,
+) -> isize {
+    let Some(hook) = CREATE_WINDOW_EX_A.get() else { return 0 };
+    let contained = contain_created(&mut ex_style, &mut style, &mut x, &mut y, &mut w, &mut h, parent);
+    let hwnd = unsafe { hook.call(ex_style, class_name, window_name, style, x, y, w, h, parent, menu, instance, param) };
+    if contained && hwnd != 0 {
+        note_created_window(hwnd as usize);
+    }
+    hwnd
+}
+
+/// The pane the game's own window is kept in, when `h` is that window.
+fn contained(h: isize) -> Option<PaneRect> {
+    if h == 0 || h as usize != PRIMARY_HWND.load(Ordering::Relaxed) {
+        return None;
+    }
+    current_pane()
+}
+
+/// Says once in the log that the game tried to move its window out of its pane.
+fn told_kept(what: &str) {
+    static TOLD: AtomicUsize = AtomicUsize::new(0);
+    if TOLD.fetch_add(1, Ordering::Relaxed) < 3 {
+        log!("window: the game's {what} would take its window out of its pane: kept there");
+    }
+}
+
+const SWP_NOSIZE: u32 = 0x0001;
+const SWP_NOMOVE: u32 = 0x0002;
+const SWP_NOZORDER_FLAG: u32 = 0x0004;
+
+/// Pure helper: a `SetWindowPos` on the game's window in pane `p`: its place and size
+/// are the pane's, and it isn't put in front of anything (it stays behind the session's
+/// window). Returns the call's x, y, width, height and flags.
+pub fn kept_window_pos(p: PaneRect, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> (i32, i32, i32, i32, u32) {
+    let (x, y) = if flags & SWP_NOMOVE == 0 { (p.x, p.y) } else { (x, y) };
+    let (cx, cy) = if flags & SWP_NOSIZE == 0 { (p.width as i32, p.height as i32) } else { (cx, cy) };
+    (x, y, cx, cy, flags | SWP_NOZORDER_FLAG)
+}
+
+/// Pure helper: a style the game sets on its window in a pane: no frame, no topmost,
+/// no taskbar button.
+pub fn kept_style(index: i32, v: u32) -> u32 {
+    match index {
+        GWL_STYLE => (v & !CHROME_STYLES) | WS_POPUP,
+        GWL_EXSTYLE => (v | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) & !(WS_EX_APPWINDOW | WS_EX_TOPMOST),
+        _ => v,
+    }
+}
+
+/// Pure helper: a `ShowWindow` command on the game's window in a pane: never minimized
+/// or maximized (its frames would stop, or it would cover the screen), never activated
+/// (it would take the foreground from the session's window).
+pub fn kept_show(cmd: i32) -> i32 {
+    const SW_SHOWNOACTIVATE_CMD: i32 = 4;
+    match cmd {
+        // SHOWNORMAL, SHOWMINIMIZED, MAXIMIZE, SHOW, MINIMIZE, SHOWMINNOACTIVE, RESTORE,
+        // SHOWDEFAULT, FORCEMINIMIZE.
+        1 | 2 | 3 | 5 | 6 | 7 | 9 | 10 | 11 => SW_SHOWNOACTIVATE_CMD,
+        c => c,
+    }
+}
+
+unsafe extern "system" fn detour_set_window_pos(h: isize, after: isize, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> i32 {
+    let Some(hook) = SET_WINDOW_POS.get() else { return 0 };
+    let Some(p) = contained(h) else { return unsafe { hook.call(h, after, x, y, cx, cy, flags) } };
+    let (nx, ny, ncx, ncy, nflags) = kept_window_pos(p, x, y, cx, cy, flags);
+    // HWND_NOTOPMOST only takes it down: that one goes through.
+    const HWND_NOTOPMOST: isize = -2;
+    if after == HWND_NOTOPMOST {
+        return unsafe { hook.call(h, after, nx, ny, ncx, ncy, flags) };
+    }
+    if (nx, ny, ncx, ncy) != (x, y, cx, cy) || (flags & SWP_NOZORDER_FLAG == 0 && after != 0) {
+        told_kept("SetWindowPos");
+    }
+    unsafe { hook.call(h, 0, nx, ny, ncx, ncy, nflags) }
+}
+
+unsafe extern "system" fn detour_move_window(h: isize, x: i32, y: i32, w: i32, ht: i32, repaint: i32) -> i32 {
+    let Some(hook) = MOVE_WINDOW.get() else { return 0 };
+    match contained(h) {
+        Some(p) => {
+            if (x, y, w, ht) != (p.x, p.y, p.width as i32, p.height as i32) {
+                told_kept("MoveWindow");
+            }
+            unsafe { hook.call(h, p.x, p.y, p.width as i32, p.height as i32, repaint) }
+        }
+        None => unsafe { hook.call(h, x, y, w, ht, repaint) },
+    }
+}
+
+unsafe extern "system" fn detour_set_window_long_w(h: isize, index: i32, v: i32) -> i32 {
+    let Some(hook) = SET_LONG_W.get() else { return 0 };
+    let v = if contained(h).is_some() { kept_style(index, v as u32) as i32 } else { v };
+    unsafe { hook.call(h, index, v) }
+}
+
+unsafe extern "system" fn detour_set_window_long_a(h: isize, index: i32, v: i32) -> i32 {
+    let Some(hook) = SET_LONG_A.get() else { return 0 };
+    let v = if contained(h).is_some() { kept_style(index, v as u32) as i32 } else { v };
+    unsafe { hook.call(h, index, v) }
+}
+
+unsafe extern "system" fn detour_set_window_long_ptr_w(h: isize, index: i32, v: isize) -> isize {
+    let Some(hook) = SET_LONG_PTR_W.get() else { return 0 };
+    let v = if contained(h).is_some() && matches!(index, GWL_STYLE | GWL_EXSTYLE) { kept_style(index, v as u32) as isize } else { v };
+    unsafe { hook.call(h, index, v) }
+}
+
+unsafe extern "system" fn detour_set_window_long_ptr_a(h: isize, index: i32, v: isize) -> isize {
+    let Some(hook) = SET_LONG_PTR_A.get() else { return 0 };
+    let v = if contained(h).is_some() && matches!(index, GWL_STYLE | GWL_EXSTYLE) { kept_style(index, v as u32) as isize } else { v };
+    unsafe { hook.call(h, index, v) }
+}
+
+unsafe extern "system" fn detour_show_window(h: isize, cmd: i32) -> i32 {
+    let Some(hook) = SHOW_WINDOW.get() else { return 0 };
+    let cmd = match contained(h) {
+        Some(_) => {
+            let kept = kept_show(cmd);
+            if kept != cmd {
+                static TOLD: AtomicUsize = AtomicUsize::new(0);
+                if TOLD.fetch_add(1, Ordering::Relaxed) < 3 {
+                    log!("window: the game's ShowWindow({cmd}) on its window is shown without minimizing, maximizing or taking the foreground ({kept})");
+                }
+            }
+            kept
+        }
+        None => cmd,
+    };
+    unsafe { hook.call(h, cmd) }
+}
+
+/// `EnumDisplaySettingsExW/A`: as `EnumDisplaySettingsW/A`, the pane's size.
+unsafe extern "system" fn detour_enum_display_ex_w(dev: *const u16, mode: u32, dm: *mut u8, flags: u32) -> i32 {
+    let Some(h) = ENUM_DISP_EX_W.get() else { return 0 };
+    let ok = unsafe { h.call(dev, mode, dm, flags) };
+    if ok != 0 {
+        patch_devmode(mode, dm, DEVMODEW_PELS_WIDTH, DEVMODEW_PELS_HEIGHT);
+    }
+    ok
+}
+
+unsafe extern "system" fn detour_enum_display_ex_a(dev: *const u8, mode: u32, dm: *mut u8, flags: u32) -> i32 {
+    let Some(h) = ENUM_DISP_EX_A.get() else { return 0 };
+    let ok = unsafe { h.call(dev, mode, dm, flags) };
+    if ok != 0 {
+        patch_devmode(mode, dm, DEVMODEA_PELS_WIDTH, DEVMODEA_PELS_HEIGHT);
+    }
+    ok
+}
+
+unsafe extern "system" fn detour_get_system_metrics_for_dpi(index: i32, dpi: u32) -> i32 {
+    let real = GET_METRICS_DPI.get().map_or(0, |h| unsafe { h.call(index, dpi) });
+    spoof_system_metric(index, real, virtual_size())
+}
+
+type MonitorEnumProc = unsafe extern "system" fn(isize, isize, *mut RECT, isize) -> i32;
+
+/// `EnumDisplayMonitors` of the whole desktop in a pane: one monitor, the one the pane
+/// is on, the pane's size (as `GetMonitorInfo` says it). A game that lists monitors to
+/// pick the biggest, or to span them, finds only its pane.
+unsafe extern "system" fn detour_enum_display_monitors(hdc: isize, clip: *const RECT, f: Option<MonitorEnumProc>, data: isize) -> i32 {
+    let Some(hook) = ENUM_MONITORS.get() else { return 0 };
+    let (Some(pane), Some((w, h)), Some(f)) = (current_pane(), virtual_size(), f) else {
+        return unsafe { hook.call(hdc, clip, f, data) };
+    };
+    if hdc != 0 || !clip.is_null() {
+        return unsafe { hook.call(hdc, clip, Some(f), data) };
+    }
+    let at = windows_sys::Win32::Foundation::POINT { x: pane.x.saturating_add(pane.width as i32 / 2), y: pane.y.saturating_add(pane.height as i32 / 2) };
+    // MONITOR_DEFAULTTOPRIMARY.
+    let mon = unsafe { windows_sys::Win32::Graphics::Gdi::MonitorFromPoint(at, 1) } as isize;
+    let mut r = RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 };
+    unsafe { f(mon, 0, &mut r, data) };
+    1
 }
 
 #[cfg(test)]
@@ -1051,6 +1425,19 @@ mod tests {
         assert!(!should_contain_created_window(0, WS_POPUP, 64, 64, 0));
     }
 
+    /// The game's own moves, styles and show commands on its window keep it in its pane.
+    #[test]
+    fn the_window_stays_in_its_pane() {
+        let p = PaneRect { x: 960, y: 0, width: 960, height: 1080 };
+        assert_eq!(kept_window_pos(p, 0, 0, 1920, 1080, 0), (960, 0, 960, 1080, SWP_NOZORDER_FLAG));
+        assert_eq!(kept_window_pos(p, 5, 6, 7, 8, SWP_NOMOVE | SWP_NOSIZE), (5, 6, 7, 8, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER_FLAG), "only the z-order");
+        assert_eq!(kept_style(GWL_STYLE, WS_OVERLAPPEDWINDOW) & (WS_CAPTION | WS_THICKFRAME | WS_POPUP), WS_POPUP);
+        let ex = kept_style(GWL_EXSTYLE, WS_EX_TOPMOST | WS_EX_APPWINDOW);
+        assert_eq!(ex & (WS_EX_TOPMOST | WS_EX_APPWINDOW | WS_EX_TOOLWINDOW), WS_EX_TOOLWINDOW);
+        assert_eq!(kept_style(-21, 7), 7, "GWLP_USERDATA is the game's");
+        assert_eq!((kept_show(6), kept_show(3), kept_show(5), kept_show(0), kept_show(8)), (4, 4, 4, 0, 8));
+    }
+
     #[test]
     fn raw_input_devices_get_inputsink() {
         let mut kb = RawInputDevice { usage_page: 1, usage: 6, flags: 0, hwnd_target: 0x100 };
@@ -1067,6 +1454,13 @@ mod tests {
             assert!(upgrade_raw_input_device(&mut pad, 0x200), "usage {usage}");
             assert_eq!(pad.flags, RIDEV_INPUTSINK);
         }
+        // INPUTSINK can't go beside CAPTUREMOUSE or EXINPUTSINK: those go.
+        let mut cap = RawInputDevice { usage_page: 1, usage: 2, flags: RIDEV_CAPTUREMOUSE | 0x30, hwnd_target: 0x100 };
+        assert!(upgrade_raw_input_device(&mut cap, 0x200));
+        assert_eq!(cap.flags, RIDEV_INPUTSINK | 0x30);
+        let mut ex = RawInputDevice { usage_page: 1, usage: 6, flags: RIDEV_EXINPUTSINK, hwnd_target: 0x100 };
+        assert!(upgrade_raw_input_device(&mut ex, 0x200));
+        assert_eq!(ex.flags, RIDEV_INPUTSINK);
         // Removals and other devices are left alone.
         let mut rem = RawInputDevice { usage_page: 1, usage: 6, flags: RIDEV_REMOVE, hwnd_target: 0 };
         assert!(!upgrade_raw_input_device(&mut rem, 0x200));
