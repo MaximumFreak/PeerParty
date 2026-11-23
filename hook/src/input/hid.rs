@@ -10,9 +10,13 @@
 //! (`device::refuse_open`). It used to be held at its first report too, and a stick
 //! that was off-centre then stayed that way in this copy for good.
 //!
-//! `ReadFile` is hooked here; `GetOverlappedResult(Ex)` completions arrive through the
-//! shared `crate::overlapped` dispatcher (`on_overlapped_result`), breaking the old cycle
-//! between `net::ipfwd` and `padblock`.
+//! `ReadFile` and `ReadFileEx` are hooked here (and the writes: `WriteFile`,
+//! `WriteFileEx`, HID's control codes); `GetOverlappedResult(Ex)` completions arrive
+//! through the shared `crate::overlapped` dispatcher (`on_overlapped_result`), breaking
+//! the old cycle between `net::ipfwd` and `padblock`. An overlapped read held still is
+//! the device's own read, its report swapped for the held one when it completes: never
+//! answered at once, or a loop reading until nothing is left (HIDAPI's) never ends. One
+//! completed through a completion port isn't seen, and gets the device's own report.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -28,10 +32,13 @@ type ReadFile = unsafe extern "system" fn(usize, *mut u8, u32, *mut u32, *mut Ov
 
 static READ: OnceLock<GenericDetour<ReadFile>> = OnceLock::new();
 
-/// Per overlay opening: which handles are HID devices (`device::of_handle`), each one's
-/// held report, and reads still in flight (overlapped, handle, buffer).
+/// Which device handles are HID devices (`device::of_handle`), most recently used last;
+/// files, pipes and the console are never kept (`GetFileType` tells them apart at once).
 static KNOWN: Mutex<Vec<(usize, Option<device::Hid>)>> = Mutex::new(Vec::new());
-/// Handles of other players' controllers, unplugged for this copy for good.
+/// How many device handles `KNOWN` keeps; the least recently used goes.
+const KNOWN_MAX: usize = 128;
+/// Handles of other players' controllers, unplugged for this copy (until one turns out
+/// to be its own after all: `judge`).
 static GONE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 static HELD: Mutex<Vec<(usize, Vec<u8>)>> = Mutex::new(Vec::new());
 static PENDING: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
@@ -60,8 +67,14 @@ pub fn install() -> usize {
     if let Some(a) = proc_addr(kb, c"ReadFile".as_ptr().cast()) {
         n += arm(&READ, a, read_file as ReadFile, "ReadFile");
     }
+    if let Some(a) = proc_addr(kb, c"ReadFileEx".as_ptr().cast()) {
+        n += arm(&READ_EX, a, read_file_ex as ReadFileEx, "ReadFileEx");
+    }
     if let Some(a) = proc_addr(kb, c"WriteFile".as_ptr().cast()) {
         n += arm(&WRITE, a, write_file as WriteFile, "WriteFile");
+    }
+    if let Some(a) = proc_addr(kb, c"WriteFileEx".as_ptr().cast()) {
+        n += arm(&WRITE_EX, a, write_file_ex as WriteFileEx, "WriteFileEx");
     }
     if let Some(a) = proc_addr(kb, c"DeviceIoControl".as_ptr().cast()) {
         n += arm(&IOCTL, a, device_io_control as DeviceIoControl, "DeviceIoControl");
@@ -71,9 +84,18 @@ pub fn install() -> usize {
 
 type WriteFile = unsafe extern "system" fn(usize, *const u8, u32, *mut u32, *mut Overlapped) -> i32;
 type DeviceIoControl = unsafe extern "system" fn(usize, u32, *const u8, u32, *mut u8, u32, *mut u32, *mut Overlapped) -> i32;
+/// `LPOVERLAPPED_COMPLETION_ROUTINE`: error, bytes, the read's OVERLAPPED.
+type Completion = unsafe extern "system" fn(u32, u32, *mut Overlapped);
+type ReadFileEx = unsafe extern "system" fn(usize, *mut u8, u32, *mut Overlapped, Option<Completion>) -> i32;
+type WriteFileEx = unsafe extern "system" fn(usize, *const u8, u32, *mut Overlapped, Option<Completion>) -> i32;
 
 static WRITE: OnceLock<GenericDetour<WriteFile>> = OnceLock::new();
 static IOCTL: OnceLock<GenericDetour<DeviceIoControl>> = OnceLock::new();
+static READ_EX: OnceLock<GenericDetour<ReadFileEx>> = OnceLock::new();
+static WRITE_EX: OnceLock<GenericDetour<WriteFileEx>> = OnceLock::new();
+/// `ReadFileEx` reads held still in flight: (overlapped, handle, buffer, the game's
+/// completion routine).
+static EX_PENDING: Mutex<Vec<(usize, usize, usize, usize)>> = Mutex::new(Vec::new());
 /// Writes (output reports: rumble, lights, and over Bluetooth a DualSense's sound and
 /// haptics) held back from other players' controllers.
 static BLOCKED_WRITES: AtomicU32 = AtomicU32::new(0);
@@ -89,7 +111,8 @@ fn write_unplugged(h: usize) -> bool {
     if !super::shm::attached() {
         return false;
     }
-    let known_hid = KNOWN.lock().unwrap().iter().any(|(k, d)| *k == h && d.is_some()) || device::opened_seen(h).is_some();
+    // Unplugged already: whatever else was forgotten since (`hidden`), it stays so.
+    let known_hid = is_gone(h) || KNOWN.lock().unwrap().iter().any(|(k, d)| *k == h && d.is_some()) || device::opened_seen(h).is_some();
     if !known_hid {
         return false;
     }
@@ -111,11 +134,29 @@ unsafe extern "system" fn write_file(h: usize, buf: *const u8, len: u32, written
     unsafe { WRITE.get().unwrap().call(h, buf, len, written, ol) }
 }
 
+unsafe extern "system" fn write_file_ex(h: usize, buf: *const u8, len: u32, ol: *mut Overlapped, done: Option<Completion>) -> i32 {
+    if write_unplugged(h) {
+        set_last_error(ERROR_DEVICE_NOT_CONNECTED);
+        return 0;
+    }
+    unsafe { WRITE_EX.get().unwrap().call(h, buf, len, ol, done) }
+}
+
+/// Whether handle `h` was unplugged for this copy (another player's controller).
+fn is_gone(h: usize) -> bool {
+    let g = GONE.lock().unwrap();
+    !g.is_empty() && g.contains(&h)
+}
+
 /// HID's own control codes (`FILE_DEVICE_KEYBOARD`, which hid.dll's `HidD_SetOutputReport`
-/// and `HidD_SetFeature` send): judged as writes. Every other code passes untouched.
+/// and `HidD_SetFeature` send): judged as writes. A device unplugged for this copy
+/// answers no control code at all (its reports, features and strings read through
+/// `HidD_GetInputReport`, `HidD_GetFeature` and the like are another player's). Every
+/// other handle's codes pass untouched.
 unsafe extern "system" fn device_io_control(h: usize, code: u32, inb: *const u8, inl: u32, outb: *mut u8, outl: u32, ret: *mut u32, ol: *mut Overlapped) -> i32 {
     // IOCTL_HID_SET_FEATURE (0xB0191), IOCTL_HID_SET_OUTPUT_REPORT (0xB0195).
-    if matches!(code, 0x000B_0191 | 0x000B_0195) && write_unplugged(h) {
+    let unplugged = super::shm::attached() && ((code >> 16) == 0xB && is_gone(h) && judge(h) == Read::Unplugged);
+    if unplugged || (matches!(code, 0x000B_0191 | 0x000B_0195) && write_unplugged(h)) {
         if !ret.is_null() {
             unsafe { *ret = 0 };
         }
@@ -144,11 +185,26 @@ fn arm<T: retour::Function + Copy>(cell: &OnceLock<GenericDetour<T>>, addr: usiz
     })
 }
 
-/// The overlay closed: everything learnt for this opening goes.
+/// The overlay closed: the reports held for this opening go. Which handles are devices,
+/// and which are unplugged for this copy, stay known.
 pub fn hidden() {
-    KNOWN.lock().unwrap().clear();
     HELD.lock().unwrap().clear();
     PENDING.lock().unwrap().clear();
+}
+
+/// Controllers came or went (`HostMsg::DevicesChanged`): every device handle is judged
+/// again at its next read, a handle unplugged for this copy too (it may be its own now).
+pub fn devices_changed() {
+    KNOWN.lock().unwrap().clear();
+    let n = {
+        let mut g = GONE.lock().unwrap();
+        let n = g.len();
+        g.clear();
+        n
+    };
+    if n > 0 {
+        log!("input: controllers changed: {n} HID handle(s) unplugged for this copy are judged again at their next read");
+    }
 }
 
 /// A fresh CreateFile returned handle `h`: drop any stale entry from an earlier closed
@@ -161,21 +217,36 @@ pub(super) fn reopened(h: usize) {
 /// Whether `h` is a HID device (not a file, pipe or console, and hid.dll answers for
 /// it), and what it is.
 fn device_of(h: usize) -> Option<device::Hid> {
-    if let Some(&(_, hid)) = KNOWN.lock().unwrap().iter().find(|(k, _)| *k == h) {
-        return hid;
-    }
-    let is_device = unsafe { windows_sys::Win32::Storage::FileSystem::GetFileType(h as _) } == 0
-        && module("hid.dll").and_then(|m| proc_addr(m, c"HidD_GetAttributes".as_ptr().cast())).is_some_and(|f| {
-            let get: unsafe extern "system" fn(usize, *mut [u32; 3]) -> u8 = unsafe { std::mem::transmute(f) };
-            let mut attrs = [12u32, 0, 0];
-            unsafe { get(h, &mut attrs) != 0 }
-        });
-    let d = if is_device { device::of_handle(h) } else { None };
     {
         let mut known = KNOWN.lock().unwrap();
-        if known.len() < 256 {
-            known.push((h, d));
+        if let Some(i) = known.iter().position(|(k, _)| *k == h) {
+            let hid = known[i].1;
+            // Most recently used last: the one dropped when full is the longest unread.
+            let last = known.len() - 1;
+            if i != last {
+                let e = known.remove(i);
+                known.push(e);
+            }
+            return hid;
         }
+    }
+    // A file, pipe or the console: not a device, and not kept (a game reads thousands
+    // of files; their handle values come back as other files).
+    if unsafe { windows_sys::Win32::Storage::FileSystem::GetFileType(h as _) } != 0 {
+        return None;
+    }
+    let is_hid = module("hid.dll").and_then(|m| proc_addr(m, c"HidD_GetAttributes".as_ptr().cast())).is_some_and(|f| {
+        let get: unsafe extern "system" fn(usize, *mut [u32; 3]) -> u8 = unsafe { std::mem::transmute(f) };
+        let mut attrs = [12u32, 0, 0];
+        unsafe { get(h, &mut attrs) != 0 }
+    });
+    let d = if is_hid { device::of_handle(h) } else { None };
+    {
+        let mut known = KNOWN.lock().unwrap();
+        if known.len() >= KNOWN_MAX {
+            known.remove(0);
+        }
+        known.push((h, d));
     }
     // Not under `KNOWN`: placing a handle opened before the hook (`may_unplug`) opens
     // the HID devices present, and an open forgets what was known of its handle value
@@ -206,18 +277,24 @@ enum Read {
 }
 
 fn judge(h: usize) -> Read {
-    let gone = {
-        let g = GONE.lock().unwrap();
-        // A handle closed and its value reused for a file isn't a device any more.
-        g.contains(&h) && unsafe { windows_sys::Win32::Storage::FileSystem::GetFileType(h as _) } == 0
-    };
-    if gone {
-        UNPLUGGED_READS.fetch_add(1, Ordering::Relaxed);
-        return Read::Unplugged;
+    // A handle closed and its value reused for a file isn't a device any more.
+    if is_gone(h) && unsafe { windows_sys::Win32::Storage::FileSystem::GetFileType(h as _) } == 0 {
+        // The copy's seat may have changed since it was unplugged: its own now, it's
+        // plugged back in (and read as it is from here on).
+        let own = match (super::topology(), device_of(h)) {
+            (Policy::Virtual(snap), Some(d)) => device::is_own(&d, &snap).then_some(d),
+            _ => None,
+        };
+        let Some(d) = own else {
+            UNPLUGGED_READS.fetch_add(1, Ordering::Relaxed);
+            return Read::Unplugged;
+        };
+        GONE.lock().unwrap().retain(|k| *k != h);
+        log!("input: HID {:04x}:{:04x} (handle {h:#x}) is this copy's own controller now: plugged back in", d.vid, d.pid);
     }
     match policy() {
         Policy::PassThrough => Read::Real,
-        Policy::BlockAll => match (device_of(h), super::seat()) {
+        Policy::BlockAll => match (device_of(h), super::seat_or_nothing()) {
             // A split-screen copy: another player's controller stays unplugged, and only
             // its own is held.
             (Some(d), Some(seat)) if device::is_others(&d, &seat) && device::may_unplug(h, &d) => {
@@ -234,8 +311,8 @@ fn judge(h: usize) -> Read {
         },
         Policy::Virtual(snap) => {
             let Some(d) = device_of(h) else { return Read::Real };
-            let (r, why) = if device::is_own(d.key, &snap) {
-                super::note_own_hid_read(d.key);
+            let (r, why) = if device::is_own(&d, &snap) {
+                super::note_own_hid_read(snap.pad.hid_key);
                 OWN_READS.fetch_add(1, Ordering::Relaxed);
                 (Read::Real, "this copy's own controller")
             } else if !d.controller {
@@ -347,28 +424,20 @@ unsafe extern "system" fn read_file(h: usize, buf: *mut u8, len: u32, read: *mut
         set_last_error(ERROR_DEVICE_NOT_CONNECTED);
         return 0;
     }
-    // Held, with its report in hand: the read is answered with it, and no real one is
-    // started (a game that takes a finished read's bytes some way the hook doesn't see
-    // would get the device's own).
+    // Held, with its report in hand, read and waited for (no OVERLAPPED): answered with
+    // it, about a report's time later, and no real one is started. An overlapped read
+    // isn't answered at once: a loop that reads until a read finds nothing (HIDAPI's
+    // `hid_read_timeout(0)` drain) would never end, and the game's thread with it. It is
+    // the device's own read, which ends when the device sends its next report, and takes
+    // the held report then (`hold`, at once or through `GetOverlappedResult`).
     if read_now == Read::Held
+        && ol.is_null()
         && !crate::overlay::hid_reports_fresh()
         && let Some(n) = unsafe { serve_held(h, buf, len) }
     {
         std::thread::sleep(HELD_PACE);
         if !read.is_null() {
             unsafe { *read = n };
-        }
-        if !ol.is_null() {
-            unsafe {
-                (*ol).internal = 0;
-                (*ol).internal_high = n as usize;
-                // The low bit only says not to queue a completion port packet.
-                let event = (*ol).event & !1;
-                if event != 0 {
-                    windows_sys::Win32::System::Threading::SetEvent(event as _);
-                }
-            }
-            forget(ol);
         }
         HELD_READS.fetch_add(1, Ordering::Relaxed);
         set_last_error(0);
@@ -406,6 +475,54 @@ fn forget(ol: *mut Overlapped) {
     if !p.is_empty() {
         p.retain(|(o, _, _)| *o != ol as usize);
     }
+}
+
+/// `ReadFileEx`: the read's completion routine runs as an APC on the reading thread. A
+/// controller unplugged for this copy fails at once; one held still is read as it is,
+/// its report swapped for the held one before the game's routine sees it (`held_done`).
+unsafe extern "system" fn read_file_ex(h: usize, buf: *mut u8, len: u32, ol: *mut Overlapped, done: Option<Completion>) -> i32 {
+    let real = READ_EX.get().unwrap();
+    let read_now = if super::shm::attached() || crate::overlay::pads_held_back() { judge(h) } else { Read::Real };
+    match (read_now, done) {
+        (Read::Unplugged, _) => {
+            set_last_error(ERROR_DEVICE_NOT_CONNECTED);
+            0
+        }
+        (Read::Held, Some(f)) if !ol.is_null() => {
+            {
+                let mut p = EX_PENDING.lock().unwrap();
+                p.retain(|(o, _, _, _)| *o != ol as usize);
+                if p.len() >= 64 {
+                    p.remove(0);
+                }
+                p.push((ol as usize, h, buf as usize, f as usize));
+            }
+            let ok = unsafe { real.call(h, buf, len, ol, Some(held_done)) };
+            if ok == 0 {
+                let err = last_error();
+                EX_PENDING.lock().unwrap().retain(|(o, _, _, _)| *o != ol as usize);
+                set_last_error(err);
+            }
+            ok
+        }
+        _ => unsafe { real.call(h, buf, len, ol, done) },
+    }
+}
+
+/// A held `ReadFileEx` read finished: the held report in its buffer (while still held),
+/// then the game's own completion routine.
+unsafe extern "system" fn held_done(err: u32, n: u32, ol: *mut Overlapped) {
+    let entry = {
+        let mut p = EX_PENDING.lock().unwrap();
+        p.iter().position(|(o, _, _, _)| *o == ol as usize).map(|i| p.swap_remove(i))
+    };
+    let Some((_, h, buf, f)) = entry else { return };
+    if err == 0 && held(h) {
+        hold(h, buf as *mut u8, n);
+        HELD_READS.fetch_add(1, Ordering::Relaxed);
+    }
+    let f: Completion = unsafe { std::mem::transmute(f) };
+    unsafe { f(err, n, ol) };
 }
 
 const ERROR_IO_INCOMPLETE: u32 = 996;

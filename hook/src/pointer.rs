@@ -308,12 +308,14 @@ pub fn hook_exports(exports: &[Export]) -> usize {
 
 /// The pointer calls, from a loaded user32 (`proc` looks each one up).
 pub fn hook_loaded(proc: impl Fn(&std::ffi::CStr) -> Option<usize>) -> usize {
-    use crate::sys::detour::arm;
+    use crate::sys::detour::{Armed, try_arm};
     let mut n = 0;
+    // The game may be running in these: its other threads are paused while each
+    // prologue is written.
     macro_rules! one {
         ($cell:expr, $sym:literal, $ty:ty, $detour:expr) => {
             if let Some(a) = proc($sym) {
-                n += usize::from(arm(&$cell, unsafe { std::mem::transmute::<usize, $ty>(a) }, $detour as $ty, "window", $sym.to_str().unwrap_or("")));
+                n += usize::from(try_arm(&$cell, unsafe { std::mem::transmute::<usize, $ty>(a) }, $detour as $ty, "window", $sym.to_str().unwrap_or(""), true) == Armed::Hooked);
             }
         };
     }

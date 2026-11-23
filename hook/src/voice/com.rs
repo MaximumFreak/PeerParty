@@ -96,7 +96,8 @@ pub fn device_name(dev: usize) -> Option<String> {
 /// The default endpoint of `flow` for `role`.
 pub fn default_device(enumerator: usize, flow: u32, role: u32) -> Option<usize> {
     let mut def = 0usize;
-    (vcall!(enumerator, 4, fn(u32, u32, *mut usize) -> Hresult, flow, role, &mut def) >= 0 && def != 0).then_some(def)
+    // Every endpoint, as Windows has them (a split-screen copy's game sees fewer).
+    crate::input::audio_unfiltered(|| vcall!(enumerator, 4, fn(u32, u32, *mut usize) -> Hresult, flow, role, &mut def) >= 0 && def != 0).then_some(def)
 }
 
 /// The active endpoints of `flow`, in the enumerator's order (the order the Voice Capture
@@ -104,7 +105,7 @@ pub fn default_device(enumerator: usize, flow: u32, role: u32) -> Option<usize> 
 pub fn active_devices(enumerator: usize, flow: u32) -> Vec<usize> {
     let mut coll = 0usize;
     // DEVICE_STATE_ACTIVE
-    if vcall!(enumerator, 3, fn(u32, u32, *mut usize) -> Hresult, flow, 1, &mut coll) < 0 || coll == 0 {
+    if crate::input::audio_unfiltered(|| vcall!(enumerator, 3, fn(u32, u32, *mut usize) -> Hresult, flow, 1, &mut coll)) < 0 || coll == 0 {
         return Vec::new();
     }
     let mut count = 0u32;
@@ -124,5 +125,5 @@ pub fn active_devices(enumerator: usize, flow: u32) -> Vec<usize> {
 pub fn device_by_id(enumerator: usize, id: &str) -> Option<usize> {
     let w = wide(id);
     let mut dev = 0usize;
-    (vcall!(enumerator, 5, fn(*const u16, *mut usize) -> Hresult, w.as_ptr(), &mut dev) >= 0 && dev != 0).then_some(dev)
+    (crate::input::audio_unfiltered(|| vcall!(enumerator, 5, fn(*const u16, *mut usize) -> Hresult, w.as_ptr(), &mut dev)) >= 0 && dev != 0).then_some(dev)
 }

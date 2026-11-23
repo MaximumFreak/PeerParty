@@ -79,28 +79,37 @@ pub fn read() -> Option<InputSnapshot> {
     read_from(header)
 }
 
-/// Reads a snapshot from `header`, using `LAST` as a fallback if the seqlock is mid-write.
+/// How many times a read tries for a whole snapshot while the session writes one, and
+/// after how many it lets other threads run (the writer may be waiting for this core).
+const TRIES: u32 = 64;
+const SPIN_FIRST: u32 = 16;
+
+/// Reads a snapshot from `header`. While the session is writing one, the read waits a
+/// moment for it; failing that, the last whole one read stands in. With none read yet
+/// the copy's controllers are held still for that one call (`BlockAll`): never a made-up
+/// snapshot with no controller, which every input layer would take as the copy's seat
+/// being empty (and unplug its own controller for good).
 pub(super) fn read_from(header: &InputHeader) -> Option<InputSnapshot> {
     match header.mode() {
         InputMode::PassThrough => Some(InputSnapshot { mode: InputMode::PassThrough, ..Default::default() }),
         InputMode::BlockAll => Some(InputSnapshot { mode: InputMode::BlockAll, ..Default::default() }),
         InputMode::Virtual => {
-            for _ in 0..3 {
+            for i in 0..TRIES {
                 if let Some(snap) = header.read_stable() {
-                    if let Ok(mut last) = LAST.try_lock() {
-                        *last = Some(snap);
-                    }
+                    *crate::sys::lock(&LAST) = Some(snap);
                     return Some(snap);
                 }
-                std::hint::spin_loop();
+                if i < SPIN_FIRST {
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
+                }
             }
-            // Writer mid-update: keep the last complete virtual snapshot, or default Virtual.
-            let fallback = LAST
-                .try_lock()
-                .ok()
-                .and_then(|g| *g)
-                .unwrap_or(InputSnapshot { mode: InputMode::Virtual, ..Default::default() });
-            Some(fallback)
+            let last = *crate::sys::lock(&LAST);
+            crate::log::throttled("input: torn read", 1, |n| {
+                log!("input: the session was writing this copy's input for {TRIES} tries ({n} time(s) so far): {}", if last.is_some() { "the last whole snapshot stands in" } else { "none read yet, its controllers held still for that read" });
+            });
+            Some(last.unwrap_or(InputSnapshot { mode: InputMode::BlockAll, ..Default::default() }))
         }
     }
 }

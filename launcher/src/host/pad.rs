@@ -134,8 +134,21 @@ pub(crate) struct Hid {
     pub(crate) home: bool,
     /// The direction its stick gave at the last poll (`State::stick`).
     pub(crate) stick: u32,
-    /// Its key for the game's hook (`input_shm::hid_key`), 0 where there's none.
-    pub(crate) key: u64,
+    /// Its keys for the game's hook: by its serial number (`input_shm::hid_key`, 0 when
+    /// it has none) and by where it's plugged in (`input_shm::hid_instance_key`, 0 when
+    /// its path isn't a HID one). `key` picks one.
+    pub(crate) serial_key: u64,
+    pub(crate) inst_key: u64,
+}
+
+impl Hid {
+    /// The key the game's hook knows this device by: its serial's, unless it has none
+    /// or another device in `all` has the same (two identical pads with one serial
+    /// number), then where it's plugged in. 0 when neither can be had.
+    pub(crate) fn key(&self, all: &[Hid]) -> u64 {
+        let shared = all.iter().any(|o| !Arc::ptr_eq(&o.alive, &self.alive) && o.alive.load(Ordering::Relaxed) && o.serial_key == self.serial_key);
+        if self.serial_key != 0 && !shared { self.serial_key } else { self.inst_key }
+    }
 }
 
 /// One controller as the last poll read it (`Pads::readings`).
@@ -458,7 +471,7 @@ impl Pads {
                     style: h.style,
                     state: *h.state.lock().unwrap(),
                     xinput: None,
-                    hid_key: h.key,
+                    hid_key: h.key(&hid),
                 }),
             })
             .collect();
@@ -887,8 +900,10 @@ fn open_hid(list: &Arc<Mutex<Vec<Hid>>>, threads: &Arc<Threads>, path: String) {
     }
     let state = Arc::new(Mutex::new(State::default()));
     let alive = Arc::new(AtomicBool::new(true));
-    let key = peerparty_protocol::input_shm::hid_key(attr.VendorID, attr.ProductID, &serial_of(h));
-    let entry = Hid { path, vid: attr.VendorID, pid: attr.ProductID, style: style_of(attr.VendorID), state: state.clone(), alive: alive.clone(), home: true, stick: 0, key };
+    let serial = serial_of(h);
+    let serial_key = if serial.trim().is_empty() { 0 } else { peerparty_protocol::input_shm::hid_key(attr.VendorID, attr.ProductID, &serial) };
+    let inst_key = peerparty_protocol::input_shm::hid_instance_key(attr.VendorID, attr.ProductID, &path).unwrap_or(0);
+    let entry = Hid { path, vid: attr.VendorID, pid: attr.ProductID, style: style_of(attr.VendorID), state: state.clone(), alive: alive.clone(), home: true, stick: 0, serial_key, inst_key };
     let (vid, pid, len) = (attr.VendorID, attr.ProductID, caps.InputReportByteLength as usize);
     let ranges = Ranges {
         x: value_range(pre, 0x30),

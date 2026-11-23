@@ -22,7 +22,10 @@
 //! The pad's state is what the copy's controller is doing, for every input API the hook
 //! answers itself. Where the copy's controller can be reached as it is, the pad also
 //! says which one: its XInput slot (the hook's XInput calls go to that slot), or its HID
-//! device's key (`hid_key`: the game's reads of that device go through untouched).
+//! device's key (`hid_key`: the game's reads of that device go through untouched). A
+//! device with a serial number of its own is keyed by it; one with none, or whose serial
+//! another connected device shares (two identical pads), by where it's plugged in
+//! (`hid_instance_key`), so neither is taken for the other.
 //!
 //! The mouse's motion and wheel are running totals (wrapping), not one event's: a
 //! reader that misses a publish loses no motion, it takes the difference from the last
@@ -107,6 +110,42 @@ pub fn hid_key(vid: u16, pid: u16, serial: &str) -> u64 {
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     h.max(1)
+}
+
+/// The part of a HID device interface path (`\\?\HID#VID_054C&PID_0CE6&MI_03&Col01#8&3a1b2c&0&0001#{guid}`)
+/// that names the physical device where it's plugged in, the same for each of its
+/// top-level collections and whoever reads the path (the session's own scan, Raw Input,
+/// DirectInput, the game's CreateFile): the device id without its collection, and the
+/// instance id without the collection's number, lower case. None for a path that isn't
+/// a HID one.
+pub fn hid_instance(path: &str) -> Option<String> {
+    let lower = path.trim_end_matches('\0').to_ascii_lowercase();
+    let rest = lower.strip_prefix(r"\\?\").or_else(|| lower.strip_prefix(r"\\.\")).unwrap_or(&lower);
+    let mut parts = rest.split('#');
+    if parts.next()? != "hid" {
+        return None;
+    }
+    let device: Vec<&str> = parts.next()?.split('&').filter(|p| !p.is_empty() && !p.starts_with("col")).collect();
+    let mut instance: Vec<&str> = parts.next()?.split('&').collect();
+    if device.is_empty() || instance.iter().all(|p| p.is_empty()) {
+        return None;
+    }
+    if instance.len() > 1 {
+        instance.pop();
+    }
+    Some(format!("{}#{}", device.join("&"), instance.join("&")))
+}
+
+/// A HID device's key by where it's plugged in (`hid_instance`), for one without a
+/// serial number of its own: never equal to a serial one (`hid_key`), never 0.
+pub fn hid_instance_key(vid: u16, pid: u16, path: &str) -> Option<u64> {
+    let instance = hid_instance(path)?;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in format!("{vid:04x}:{pid:04x}@{instance}").bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Some(h.max(1))
 }
 
 impl VirtualPad {
@@ -609,6 +648,19 @@ mod tests {
         assert_eq!(hid_key(0x054c, 0x09cc, "AB:CD"), hid_key(0x054c, 0x09cc, " ab:cd "));
         assert_ne!(hid_key(0x054c, 0x09cc, "ab:cd"), hid_key(0x054c, 0x09cc, "ab:ce"));
         assert_ne!(hid_key(0x054c, 0x09cc, ""), 0);
+        // Where it's plugged in: one key for every collection of one device, whoever
+        // reads its path (any case, with or without the interface's GUID).
+        let col1 = r"\\?\HID#VID_054C&PID_0CE6&MI_03&Col01#8&3a1b2c&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}";
+        let col2 = r"\\?\hid#vid_054c&pid_0ce6&mi_03&col02#8&3a1b2c&0&0001#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}";
+        let other_port = r"\\?\HID#VID_054C&PID_0CE6&MI_03&Col01#8&99ffee&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}";
+        assert_eq!(hid_instance(col1).as_deref(), Some("vid_054c&pid_0ce6&mi_03#8&3a1b2c&0"));
+        assert_eq!(hid_instance_key(0x054c, 0x0ce6, col1), hid_instance_key(0x054c, 0x0ce6, col2));
+        assert_ne!(hid_instance_key(0x054c, 0x0ce6, col1), hid_instance_key(0x054c, 0x0ce6, other_port), "an identical pad elsewhere");
+        assert_ne!(hid_instance_key(0x054c, 0x0ce6, col1), Some(hid_key(0x054c, 0x0ce6, "")));
+        let bluetooth = r"\\?\HID#{00001124-0000-1000-8000-00805f9b34fb}_VID&0002054c_PID&0ce6#9&2b3c4d&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}";
+        assert!(hid_instance(bluetooth).is_some());
+        assert_eq!(hid_instance(r"\\?\USB#VID_045E&PID_028E#123#{x}"), None, "not a HID path");
+        assert_eq!(hid_instance(r"C:\saves\slot1.dat"), None);
 
         let earlier = VirtualMouse { delta_x: i32::MAX - 1, delta_y: 10, wheel_delta: -120, ..Default::default() };
         let now = VirtualMouse { delta_x: i32::MIN + 2, delta_y: 4, wheel_delta: 120, buttons: MOUSE_RIGHT | MOUSE_MIDDLE, ..Default::default() };

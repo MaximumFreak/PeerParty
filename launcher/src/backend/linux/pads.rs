@@ -309,7 +309,7 @@ mod device {
         let (vid, pid) = (id[1], id[2]);
         let state = Arc::new(Mutex::new(State::default()));
         let alive = Arc::new(AtomicBool::new(true));
-        list.lock().unwrap().push(Hid { path, vid, pid, style: style_of(vid), state: state.clone(), alive: alive.clone(), home: true, stick: 0, key: 0 });
+        list.lock().unwrap().push(Hid { path, vid, pid, style: style_of(vid), state: state.clone(), alive: alive.clone(), home: true, stick: 0, serial_key: 0, inst_key: 0 });
         let (stop, reader_alive) = (threads.clone(), alive.clone());
         let read = move || {
             let alive = reader_alive;

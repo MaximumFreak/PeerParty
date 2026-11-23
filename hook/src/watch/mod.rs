@@ -43,10 +43,21 @@ static COOKIE: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(ptr::null_mut());
 
 thread_local! {
     static DEPTH: Cell<u32> = const { Cell::new(0) };
+    /// The hook's own start (`init`, from DllMain): the loader lock is held and the game's
+    /// entry point hasn't run, so none of its threads exist yet.
+    static STARTING: Cell<bool> = const { Cell::new(false) };
     static PENDING: RefCell<Vec<Mod>> = const { RefCell::new(Vec::new()) };
 }
 
 pub fn init(module: *mut core::ffi::c_void) {
+    STARTING.with(|s| s.set(true));
+    struct Started;
+    impl Drop for Started {
+        fn drop(&mut self) {
+            STARTING.with(|s| s.set(false));
+        }
+    }
+    let _started = Started;
     unsafe { DisableThreadLibraryCalls(module) };
     let exe = module_path(ptr::null_mut());
     let dll = module_path(module);
@@ -159,7 +170,13 @@ fn poll_modules() {
 /// own start, both under the loader lock): nothing here may wait on another thread,
 /// which would need that lock to load anything.
 pub fn in_loader() -> bool {
-    DEPTH.with(|d| d.get()) > 0
+    DEPTH.with(|d| d.get()) > 0 || starting()
+}
+
+/// Whether this thread is in the hook's own start (`init`): under the loader lock, before
+/// the game's entry point, so no thread of the game's can be in a function being hooked.
+pub fn starting() -> bool {
+    STARTING.with(Cell::get)
 }
 
 fn watch_module(m: Mod) {

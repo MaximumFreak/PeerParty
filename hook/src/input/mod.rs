@@ -20,11 +20,17 @@
 //!
 //! APIs covered:
 //! - XInput (`xinput1_4`, `xinput1_3`, `xinput9_1_0`, `xinputuap`): `XInputGetState`,
-//!   `XInputGetStateEx`, `XInputGetKeystroke`.
-//! - DirectInput 8: `IDirectInputDevice8::GetDeviceState`, `GetDeviceData`.
-//! - Raw Input + Win32 KBM: `GetRawInputData`, `GetAsyncKeyState`, `GetCursorPos`.
+//!   `XInputGetStateEx`, `XInputGetKeystroke`, vibration, capabilities, battery, and the
+//!   headset's sound devices (`XInputGetAudioDeviceIds`, `XInputGetDSoundAudioDeviceGuids`).
+//! - DirectInput 8 (`dinput.rs`), winmm's joysticks (`joy.rs`).
+//! - Raw Input + Win32 KBM: `GetRawInputData`, `GetRawInputBuffer` (32-bit games too),
+//!   `GetRawInputDeviceList`, `GetRawInputDeviceInfo`, `GetAsyncKeyState`, `GetCursorPos`.
 //! - Windows.Gaming.Input (`wgi.rs`), GameInput (`gameinput.rs`), direct HID (`hid.rs`).
-//! - Steam Input (`steam/lan.rs` queries `input::policy()`).
+//! - Steam Input (`steam/lan.rs` asks `input::steam_input_held`).
+//!
+//! Nothing here calls into an input DLL under the loader lock (the hook's start, a load
+//! notification): what's hooked by export goes in then, and what needs the DLL's own
+//! objects (GameInput's) waits for a thread.
 //!
 //! Compatibility: `PEERPARTY_SKIP=padblock` continues to disable this layer alongside
 //! `PEERPARTY_SKIP=input`.
@@ -47,9 +53,12 @@ macro_rules! per_slot {
 
 mod audio;
 mod device;
+mod dinput;
 mod gameinput;
+mod joy;
 
 pub(crate) use device::{opened_a, opened_w, refuse_open_a, refuse_open_w};
+pub(crate) use audio::unfiltered as audio_unfiltered;
 pub(crate) mod hid;
 mod shm;
 mod wgi;
@@ -84,6 +93,8 @@ pub(super) static USED_DINPUT: AtomicBool = AtomicBool::new(false);
 pub(super) static USED_WGI: AtomicBool = AtomicBool::new(false);
 pub(super) static USED_WGI_RAW: AtomicBool = AtomicBool::new(false);
 pub(super) static USED_GAMEINPUT: AtomicBool = AtomicBool::new(false);
+pub(super) static USED_WINMM: AtomicBool = AtomicBool::new(false);
+pub(super) static USED_WGI_OTHER: AtomicBool = AtomicBool::new(false);
 
 /// Into the log the first time a split-screen copy's game reads controllers `what` way.
 pub(super) fn first_use(flag: &AtomicBool, what: &str) {
@@ -173,19 +184,79 @@ pub(super) fn seat() -> Option<InputSnapshot> {
     Some(InputSnapshot { mode: InputMode::Virtual, pad, ..Default::default() })
 }
 
+/// `seat()`, or for a split-screen copy that has never been told one (the overlay had
+/// the controllers from the start, or the copy plays with none) a seat with no
+/// controller: it owns none of them. Taken as no seat at all, every other player's
+/// controller, its rumble and its sound device reached the copy.
+pub(super) fn seat_or_nothing() -> Option<InputSnapshot> {
+    seat().or_else(|| {
+        (shm::attached() || crate::window::in_pane()).then(|| {
+            crate::log::throttled("input: no seat yet", 1, |_| {
+                log!("input: the controllers are held before this copy has a seat: it owns none of them until it has one");
+            });
+            InputSnapshot { mode: InputMode::Virtual, ..Default::default() }
+        })
+    })
+}
+
 /// Which controllers the game sees: `policy()`, but a split-screen copy's seat while
-/// the overlay has the controllers (`seat`), at rest.
+/// the overlay has the controllers (`seat_or_nothing`), at rest.
 pub(super) fn topology() -> Policy {
     match policy() {
-        Policy::BlockAll => seat().map_or(Policy::BlockAll, Policy::Virtual),
+        Policy::BlockAll => seat_or_nothing().map_or(Policy::BlockAll, Policy::Virtual),
         p => p,
     }
 }
 
-/// Whether physical controller input should be suppressed (true in both `BlockAll` and
-/// `Virtual` modes).
-pub fn suppress_physical_pads() -> bool {
-    !matches!(policy(), Policy::PassThrough)
+/// A value that changes whenever the copy's seat does (another controller, or its slot):
+/// what was chosen for one seat is chosen again for the next.
+pub(super) fn seat_stamp() -> u64 {
+    SEAT_AT_MS.load(Ordering::Relaxed) ^ SEAT_KEY.load(Ordering::Relaxed).rotate_left(17) ^ (u64::from(SEAT_SLOT.load(Ordering::Relaxed)) << 56)
+}
+
+/// Whether Steam Input's actions read for controller `handle` are held at rest:
+/// everything while the overlay has the controllers; in a split-screen copy, every
+/// controller but its own. Steam Input numbers its controllers itself; `xinput_index`
+/// asks it which XInput slot one is (`GetGamepadIndexForController`), which places the
+/// copy's XInput controller. A copy whose controller isn't an XInput one has nothing to
+/// place it by, and its Steam Input actions are held (logged once, as a gap).
+pub fn steam_input_held(handle: u64, xinput_index: impl FnOnce(u64) -> Option<i32>) -> bool {
+    match policy() {
+        Policy::PassThrough => false,
+        Policy::BlockAll => true,
+        Policy::Virtual(snap) => {
+            first_use(&USED_STEAM_INPUT, "Steam Input actions (its own controller's only)");
+            let Some(slot) = snap.pad.xinput_slot.filter(|_| snap.pad.connected) else {
+                if snap.pad.connected {
+                    crate::log::gap("input", "Steam Input can't place this copy's controller (not an XInput one): its actions read at rest");
+                }
+                return true;
+            };
+            let own = xinput_index(handle) == Some(i32::from(slot));
+            note_steam_handle(handle, own);
+            !own
+        }
+    }
+}
+
+static USED_STEAM_INPUT: AtomicBool = AtomicBool::new(false);
+
+/// Into the log when a Steam Input controller starts or stops being the copy's own.
+fn note_steam_handle(handle: u64, own: bool) {
+    static SEEN: Mutex<Vec<(u64, bool)>> = Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    match seen.iter_mut().find(|(h, _)| *h == handle) {
+        Some((_, was)) if *was == own => return,
+        Some((_, was)) => *was = own,
+        None => {
+            if seen.len() >= 16 {
+                seen.remove(0);
+            }
+            seen.push((handle, own));
+        }
+    }
+    drop(seen);
+    log!("input: Steam Input controller {handle:#x} is {}", if own { "this copy's own: its actions read as they are" } else { "another player's: its actions read at rest" });
 }
 
 fn skipped() -> bool {
@@ -200,13 +271,13 @@ type GetBattery = unsafe extern "system" fn(u32, u8, *mut u8) -> u32;
 type GetRawInputData = unsafe extern "system" fn(isize, u32, *mut u8, *mut u32, u32) -> u32;
 type GetRawInputBuffer = unsafe extern "system" fn(*mut u8, *mut u32, u32) -> u32;
 type GetRawInputDeviceList = unsafe extern "system" fn(*mut RawDevice, *mut u32, u32) -> u32;
+type GetRawInputDeviceInfo = unsafe extern "system" fn(isize, u32, *mut u8, *mut u32) -> u32;
+type GetAudioDeviceIds = unsafe extern "system" fn(u32, *mut u16, *mut u32, *mut u16, *mut u32) -> u32;
+type GetDSoundGuids = unsafe extern "system" fn(u32, *mut [u8; 16], *mut [u8; 16]) -> u32;
 type GetAsyncKeyStateFn = unsafe extern "system" fn(i32) -> i16;
 type GetKeyStateFn = unsafe extern "system" fn(i32) -> i16;
 type GetKeyboardStateFn = unsafe extern "system" fn(*mut u8) -> i32;
 type GetCursorPosFn = unsafe extern "system" fn(*mut POINT) -> i32;
-type DevGetState = unsafe extern "system" fn(usize, u32, *mut u8) -> i32;
-type DevGetData = unsafe extern "system" fn(usize, u32, *mut u8, *mut u32, u32) -> i32;
-type DevSetCooperativeLevel = unsafe extern "system" fn(usize, isize, u32) -> i32;
 
 /// Each hooked function gets a slot of its own (its own detour function, so a call
 /// always goes on to the function it came from), kept for the life of the process.
@@ -226,6 +297,10 @@ static KEYSTROKES: Slots<GetKeystroke, 4> = Slots::new();
 static SET_STATES: Slots<SetState, 4> = Slots::new();
 static CAPABILITIES: Slots<GetCapabilities, 4> = Slots::new();
 static BATTERIES: Slots<GetBattery, 4> = Slots::new();
+static AUDIO_IDS: Slots<GetAudioDeviceIds, 4> = Slots::new();
+static DSOUND_GUIDS: Slots<GetDSoundGuids, 4> = Slots::new();
+static RAW_INFO_W: OnceLock<GenericDetour<GetRawInputDeviceInfo>> = OnceLock::new();
+static RAW_INFO_A: OnceLock<GenericDetour<GetRawInputDeviceInfo>> = OnceLock::new();
 static RAW: OnceLock<GenericDetour<GetRawInputData>> = OnceLock::new();
 static RAW_BUFFER: OnceLock<GenericDetour<GetRawInputBuffer>> = OnceLock::new();
 static RAW_LIST: OnceLock<GenericDetour<GetRawInputDeviceList>> = OnceLock::new();
@@ -233,17 +308,11 @@ static ASYNC_KEY: OnceLock<GenericDetour<GetAsyncKeyStateFn>> = OnceLock::new();
 static KEY_STATE: OnceLock<GenericDetour<GetKeyStateFn>> = OnceLock::new();
 static KEYBOARD_STATE: OnceLock<GenericDetour<GetKeyboardStateFn>> = OnceLock::new();
 static CURSOR_POS: OnceLock<GenericDetour<GetCursorPosFn>> = OnceLock::new();
-static DEV_STATE: Slots<DevGetState, 2> = Slots::new();
-static DEV_DATA: Slots<DevGetData, 2> = Slots::new();
-static DEV_COOP: Slots<DevSetCooperativeLevel, 2> = Slots::new();
-/// DirectInput devices' keys (`device.rs`), per device, asked once.
-static DEV_KEYS: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
 
 static INSTALL: Once = Once::new();
-/// Reads held back while the overlay showed: XInput states, raw-input reports, DirectInput reads.
+/// Reads held back while the overlay showed: XInput states, raw-input reports.
 static HELD_XINPUT: AtomicU32 = AtomicU32::new(0);
 static HELD_RAW: AtomicU32 = AtomicU32::new(0);
-static HELD_DINPUT: AtomicU32 = AtomicU32::new(0);
 /// Per-30 s split-screen diagnostics (`log_summary`).
 static XINPUT_CALLS: AtomicU32 = AtomicU32::new(0);
 static XINPUT_OK: AtomicU32 = AtomicU32::new(0);
@@ -253,7 +322,6 @@ static XINPUT_ABSENT: AtomicU32 = AtomicU32::new(0);
 static XINPUT_REENTRANT: AtomicU32 = AtomicU32::new(0);
 static RAW_HID_KEPT: AtomicU32 = AtomicU32::new(0);
 static RAW_HID_DROPPED: AtomicU32 = AtomicU32::new(0);
-static DINPUT_READS: AtomicU32 = AtomicU32::new(0);
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
@@ -281,8 +349,6 @@ impl Drop for XInputCall {
 fn in_xinput() -> bool {
     IN_XINPUT.with(std::cell::Cell::get)
 }
-/// DirectInput joysticks' axis ranges `(min, max)`, per device, asked once per opening.
-static RANGES: Mutex<Vec<(usize, [Option<(i32, i32)>; 8])>> = Mutex::new(Vec::new());
 
 const XINPUT: [&str; 4] = ["xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll", "xinputuap.dll"];
 const ERROR_DEVICE_NOT_CONNECTED: u32 = 1167;
@@ -309,7 +375,8 @@ pub fn attach_shm(name: &str) {
 }
 
 /// Hooks input APIs loaded in the process (called when the overlay opens or an input SHM
-/// block is attached).
+/// block is attached, which for a split-screen copy is the hook's own start, under the
+/// loader lock).
 pub fn install() {
     if skipped() {
         return;
@@ -321,11 +388,17 @@ pub fn install() {
         }
         n += hook_raw_input();
         n += hook_kbm();
-        n += hook_dinput();
-        n += gameinput::install();
+        // By export: their objects come to the hooks as the game makes them.
+        n += dinput::module_loaded();
+        n += joy::module_loaded();
+        for dll in ["gameinput.dll", "gameinputredist.dll"] {
+            if module(dll).is_some() {
+                gameinput::module_loaded(dll);
+            }
+        }
         n += hid::install();
         INSTALLED.store(true, Ordering::Relaxed);
-        log!("input: {n} input entry points hooked");
+        log!("input: {n} input entry points hooked{}", if crate::watch::in_loader() { " (at start: GameInput's object methods and Windows.Gaming.Input's on a thread once the loader lock is free)" } else { "" });
         if shm::attached() {
             // A split-screen copy's CreateFile keeps other players' controllers from it
             // (device.rs `refuse_open`): the file hooks go in even when it has no saves
@@ -334,10 +407,38 @@ pub fn install() {
         }
     });
     // Windows.Gaming.Input's methods are found through a connected pad, so this is
-    // tried at every opening until it works; GameInput when its DLL arrived later.
+    // tried at every opening until it works; GameInput's through objects of its own,
+    // which mustn't be made under the loader lock (its start-up waits on threads).
+    if crate::watch::in_loader() {
+        let _ = std::thread::Builder::new().name("peerparty-input".into()).spawn(install_objects);
+    } else {
+        install_objects();
+    }
+}
+
+/// The hooks found through an input DLL's own objects.
+fn install_objects() {
     let n = wgi::install() + gameinput::install();
     if n > 0 {
         log!("input: {n} more input entry points hooked");
+    }
+}
+
+/// Controllers came or went (`HostMsg::DevicesChanged`, the session's seat changes too):
+/// what was learnt of devices is asked again, and Windows.Gaming.Input hooked if it had
+/// no controller to hook through before.
+pub fn devices_changed() {
+    if skipped() || !INSTALLED.load(Ordering::Relaxed) {
+        return;
+    }
+    device::forget_devices();
+    hid::devices_changed();
+    dinput::devices_changed();
+    audio::devices_changed();
+    wgi::devices_changed();
+    gameinput::devices_changed();
+    if !crate::watch::in_loader() {
+        install_objects();
     }
 }
 
@@ -360,7 +461,7 @@ pub fn log_summary() {
         take(&XINPUT_ABSENT),
         take(&XINPUT_REENTRANT),
     );
-    let (raw_kept, raw_drop, di) = (take(&RAW_HID_KEPT), take(&RAW_HID_DROPPED), take(&DINPUT_READS));
+    let (raw_kept, raw_drop, di) = (take(&RAW_HID_KEPT), take(&RAW_HID_DROPPED), take(&dinput::READS));
     let (hid_own, hid_unplugged) = hid::take_counts();
     let hid_blocked = hid::take_blocked_writes();
     let wgi_reads = wgi::take_reads();
@@ -385,8 +486,8 @@ pub fn log_summary() {
 
 /// The overlay closed: what was held for this opening goes.
 pub fn hidden() {
-    RANGES.lock().unwrap_or_else(|e| e.into_inner()).clear();
     if INSTALLED.load(Ordering::Relaxed) {
+        dinput::hidden();
         wgi::hidden();
         gameinput::hidden();
         hid::hidden();
@@ -394,7 +495,7 @@ pub fn hidden() {
     let (x, r, d, h) = (
         HELD_XINPUT.swap(0, Ordering::Relaxed),
         HELD_RAW.swap(0, Ordering::Relaxed),
-        HELD_DINPUT.swap(0, Ordering::Relaxed),
+        dinput::HELD.swap(0, Ordering::Relaxed),
         hid::take_held(),
     );
     log!("input: held back while the overlay showed: {x} XInput reads, {r} raw-input reports, {d} DirectInput reads, {h} HID reads");
@@ -435,18 +536,12 @@ pub fn module_loaded(name: &str) {
     let n = if XINPUT.contains(&lower.as_str()) {
         hook_xinput(&lower)
     } else if lower == "dinput8.dll" {
-        // Hooking it means calling into it (DirectInput8Create), which can't be done
-        // from a load notification: the loader lock is held and dinput8's own start-up
-        // hasn't run. A thread does it once the load is through.
-        if crate::watch::in_loader() {
-            let name = name.to_string();
-            let _ = std::thread::Builder::new().name("peerparty-input".into()).spawn(move || {
-                let n = hook_dinput();
-                log!("input: {name} loaded, {n} hooked");
-            });
-            return;
-        }
-        hook_dinput()
+        // By its export alone: calling into it (DirectInput8Create) can't be done from
+        // a load notification, where the loader lock is held and dinput8's own start-up
+        // hasn't run.
+        dinput::module_loaded()
+    } else if lower == "winmm.dll" {
+        joy::module_loaded()
     } else {
         return;
     };
@@ -550,6 +645,12 @@ fn hook_xinput(dll: &str) -> usize {
     }
     if let Some(a) = proc_addr(m, c"XInputGetBatteryInformation".as_ptr().cast()) {
         n += arm(&BATTERIES, a, per_slot!(GetBattery, [0, 1, 2, 3], battery, (pad: u32, kind: u8, out: *mut u8) -> u32), "XInputGetBatteryInformation");
+    }
+    if let Some(a) = proc_addr(m, c"XInputGetAudioDeviceIds".as_ptr().cast()) {
+        n += arm(&AUDIO_IDS, a, per_slot!(GetAudioDeviceIds, [0, 1, 2, 3], audio_ids, (pad: u32, render: *mut u16, render_n: *mut u32, capture: *mut u16, capture_n: *mut u32) -> u32), "XInputGetAudioDeviceIds");
+    }
+    if let Some(a) = proc_addr(m, c"XInputGetDSoundAudioDeviceGuids".as_ptr().cast()) {
+        n += arm(&DSOUND_GUIDS, a, per_slot!(GetDSoundGuids, [0, 1, 2, 3], dsound_guids, (pad: u32, render: *mut [u8; 16], capture: *mut [u8; 16]) -> u32), "XInputGetDSoundAudioDeviceGuids");
     }
     if !names.is_empty() {
         log!("input: {dll}: {}", names.join(", "));
@@ -708,6 +809,17 @@ pub(super) fn real_xinput(slot: u32) -> Option<[u8; 16]> {
     let mut s = [0u8; 16];
     let _g = XInputCall::enter();
     (unsafe { h.call(slot, s.as_mut_ptr()) } == 0).then_some(s)
+}
+
+/// Shakes XInput slot `slot`'s motors (`XINPUT_VIBRATION`), through the detour's own way
+/// to the real call.
+pub(super) fn real_xinput_vibrate(slot: u32, left: u16, right: u16) {
+    let Some(h) = SET_STATES.hooks.iter().find_map(|h| h.get()) else { return };
+    let mut v = [0u8; 4];
+    v[0..2].copy_from_slice(&left.to_le_bytes());
+    v[2..4].copy_from_slice(&right.to_le_bytes());
+    let _g = XInputCall::enter();
+    unsafe { h.call(slot, v.as_mut_ptr()) };
 }
 
 /// `XINPUT_STATE`'s bytes as a virtual pad on slot `slot`.
@@ -898,6 +1010,70 @@ fn battery(i: usize, pad: u32, kind: u8, out: *mut u8) -> u32 {
     }
 }
 
+/// A controller's headset (its sound devices): a split-screen copy's goes to its own
+/// controller's, a virtual pad has none, the others' aren't there.
+fn audio_ids(i: usize, pad: u32, render: *mut u16, render_n: *mut u32, capture: *mut u16, capture_n: *mut u32) -> u32 {
+    let Some(h) = AUDIO_IDS.hooks[i].get() else { return ERROR_DEVICE_NOT_CONNECTED };
+    if in_xinput() {
+        return unsafe { h.call(pad, render, render_n, capture, capture_n) };
+    }
+    match topology() {
+        Policy::Virtual(snap) => match route(pad, &snap) {
+            Route::Real(k) => {
+                let _g = XInputCall::enter();
+                unsafe { h.call(k, render, render_n, capture, capture_n) }
+            }
+            Route::Virtual => {
+                // No headset: empty ids, counts 0.
+                for (s, n) in [(render, render_n), (capture, capture_n)] {
+                    if !s.is_null() && !n.is_null() && unsafe { *n } > 0 {
+                        unsafe { *s = 0 };
+                    }
+                    if !n.is_null() {
+                        unsafe { *n = 0 };
+                    }
+                }
+                0
+            }
+            Route::Absent => ERROR_DEVICE_NOT_CONNECTED,
+        },
+        _ => {
+            let _g = XInputCall::enter();
+            unsafe { h.call(pad, render, render_n, capture, capture_n) }
+        }
+    }
+}
+
+/// `XInputGetDSoundAudioDeviceGuids` (the older XInputs'): as `audio_ids`, GUID_NULL for
+/// none.
+fn dsound_guids(i: usize, pad: u32, render: *mut [u8; 16], capture: *mut [u8; 16]) -> u32 {
+    let Some(h) = DSOUND_GUIDS.hooks[i].get() else { return ERROR_DEVICE_NOT_CONNECTED };
+    if in_xinput() {
+        return unsafe { h.call(pad, render, capture) };
+    }
+    match topology() {
+        Policy::Virtual(snap) => match route(pad, &snap) {
+            Route::Real(k) => {
+                let _g = XInputCall::enter();
+                unsafe { h.call(k, render, capture) }
+            }
+            Route::Virtual => {
+                for g in [render, capture] {
+                    if !g.is_null() {
+                        unsafe { *g = [0; 16] };
+                    }
+                }
+                0
+            }
+            Route::Absent => ERROR_DEVICE_NOT_CONNECTED,
+        },
+        _ => {
+            let _g = XInputCall::enter();
+            unsafe { h.call(pad, render, capture) }
+        }
+    }
+}
+
 fn keystroke_detours() -> [GetKeystroke; 4] {
     per_slot!(GetKeystroke, [0, 1, 2, 3], get_keystroke, (pad: u32, reserved: u32, out: *mut u8) -> u32)
 }
@@ -948,7 +1124,40 @@ fn hook_raw_input() -> usize {
     if let Some(a) = proc_addr(m, c"GetRawInputDeviceList".as_ptr().cast()) {
         n += arm_once(&RAW_LIST, a, raw_device_list as GetRawInputDeviceList, "GetRawInputDeviceList");
     }
+    if let Some(a) = proc_addr(m, c"GetRawInputDeviceInfoW".as_ptr().cast()) {
+        n += arm_once(&RAW_INFO_W, a, raw_device_info_w as GetRawInputDeviceInfo, "GetRawInputDeviceInfoW");
+    }
+    if let Some(a) = proc_addr(m, c"GetRawInputDeviceInfoA".as_ptr().cast()) {
+        n += arm_once(&RAW_INFO_A, a, raw_device_info_a as GetRawInputDeviceInfo, "GetRawInputDeviceInfoA");
+    }
     n
+}
+
+/// The hook of `GetRawInputDeviceInfoW` (its `call` is the real one), once hooked:
+/// device.rs asks devices' paths, which the hook itself would ask again.
+pub(super) fn real_raw_device_info_w() -> Option<&'static GenericDetour<GetRawInputDeviceInfo>> {
+    RAW_INFO_W.get()
+}
+
+/// Raw Input's device information: another player's game controller isn't there for a
+/// split-screen copy (a handle kept from before the list left it out: not found).
+fn raw_device_info(real: &GenericDetour<GetRawInputDeviceInfo>, dev: isize, cmd: u32, data: *mut u8, size: *mut u32) -> u32 {
+    if let Policy::Virtual(snap) = topology()
+        && let Some(d) = device::of_raw(dev)
+        && device::is_others(&d, &snap)
+    {
+        unsafe { windows_sys::Win32::Foundation::SetLastError(windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE) };
+        return u32::MAX;
+    }
+    unsafe { real.call(dev, cmd, data, size) }
+}
+
+unsafe extern "system" fn raw_device_info_w(dev: isize, cmd: u32, data: *mut u8, size: *mut u32) -> u32 {
+    RAW_INFO_W.get().map_or(u32::MAX, |h| raw_device_info(h, dev, cmd, data, size))
+}
+
+unsafe extern "system" fn raw_device_info_a(dev: isize, cmd: u32, data: *mut u8, size: *mut u32) -> u32 {
+    RAW_INFO_A.get().map_or(u32::MAX, |h| raw_device_info(h, dev, cmd, data, size))
 }
 
 /// `RAWINPUTDEVICELIST`: the device's handle and its type.
@@ -1063,9 +1272,10 @@ unsafe extern "system" fn raw_input_data(h: isize, cmd: u32, data: *mut u8, size
     if cmd != RID_INPUT || data.is_null() || rc == u32::MAX || (rc as usize) < 4 {
         return rc;
     }
-    // `rc`: the bytes written to `data`.
+    // `rc`: the bytes written to `data` (the process's own layout, whatever Windows'
+    // is: `GetRawInputData` converts it).
     let report = unsafe { std::slice::from_raw_parts_mut(data, rc as usize) };
-    if keep_raw(report) {
+    if keep_raw(report, RAW_HEADER) {
         rc
     } else {
         HELD_RAW.fetch_add(1, Ordering::Relaxed);
@@ -1073,30 +1283,39 @@ unsafe extern "system" fn raw_input_data(h: isize, cmd: u32, data: *mut u8, size
     }
 }
 
-/// Whether one raw input report (`RAWINPUT`, header first) reaches the game now, as it
-/// is or rewritten (`releases_only`).
-fn keep_raw(report: &mut [u8]) -> bool {
-    if report.len() < RAW_HEADER {
+/// Whether one raw input report (`RAWINPUT`, a `header`-byte header first) reaches the
+/// game now, as it is or rewritten (`releases_only`). Only game controllers are held
+/// back from a copy: another HID device (a headset's buttons, a touchpad) is no
+/// player's.
+fn keep_raw(report: &mut [u8], header: usize) -> bool {
+    if report.len() < header {
         return true;
     }
     let kind = u32::from_le_bytes([report[0], report[1], report[2], report[3]]);
+    // RAWINPUTHEADER: type, size, then the device's handle (its low bytes first in a
+    // 64-bit header too).
+    let dev = || isize::from_le_bytes(report[8..8 + size_of::<isize>()].try_into().unwrap());
     let block = match policy() {
         Policy::PassThrough => false,
-        Policy::BlockAll => kind == RIM_TYPEHID || (shm::attached() && matches!(kind, RIM_TYPEKEYBOARD | RIM_TYPEMOUSE)),
+        Policy::BlockAll => match kind {
+            RIM_TYPEHID => device::of_raw(dev()).is_none_or(|d| d.controller),
+            _ => shm::attached() && matches!(kind, RIM_TYPEKEYBOARD | RIM_TYPEMOUSE),
+        },
         Policy::Virtual(snap) => match kind {
-            // RAWINPUTHEADER: type, size, then the device's handle.
             RIM_TYPEHID => {
-                let dev = isize::from_le_bytes(report[8..8 + size_of::<isize>()].try_into().unwrap());
                 first_use(&USED_RAW_HID, "Raw Input reports from HID controllers (only its own reach it)");
-                let key = device::key_of_raw(dev);
-                let own = device::is_own(key, &snap);
-                if own {
-                    note_own_hid_read(key);
-                    RAW_HID_KEPT.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    RAW_HID_DROPPED.fetch_add(1, Ordering::Relaxed);
+                match device::of_raw(dev()) {
+                    Some(d) if device::is_own(&d, &snap) => {
+                        note_own_hid_read(snap.pad.hid_key);
+                        RAW_HID_KEPT.fetch_add(1, Ordering::Relaxed);
+                        false
+                    }
+                    Some(d) if !d.controller => false,
+                    _ => {
+                        RAW_HID_DROPPED.fetch_add(1, Ordering::Relaxed);
+                        true
+                    }
                 }
-                !own
             }
             RIM_TYPEKEYBOARD => !snap.keyboard.active,
             RIM_TYPEMOUSE => !snap.mouse.active,
@@ -1106,42 +1325,73 @@ fn keep_raw(report: &mut [u8]) -> bool {
     // A key or button let go still reaches a copy that doesn't have the keyboard and
     // mouse now (the focus moved to another pane, or its overlay opened while it was
     // held): it was pressed while the copy had them, and would stay down there for good.
-    !block || (shm::attached() && matches!(kind, RIM_TYPEKEYBOARD | RIM_TYPEMOUSE) && releases_only(kind, report))
+    !block || (shm::attached() && matches!(kind, RIM_TYPEKEYBOARD | RIM_TYPEMOUSE) && releases_only_at(kind, report, header))
+}
+
+/// Whether this is a 32-bit process on 64-bit Windows (WOW64, on x64 or Arm).
+fn wow64() -> bool {
+    static WOW: OnceLock<bool> = OnceLock::new();
+    *WOW.get_or_init(|| {
+        if size_of::<usize>() == 8 {
+            return false;
+        }
+        let mut wow = 0i32;
+        let ok = unsafe { windows_sys::Win32::System::Threading::IsWow64Process(windows_sys::Win32::System::Threading::GetCurrentProcess(), &mut wow) };
+        ok != 0 && wow != 0
+    })
+}
+
+/// `GetRawInputBuffer`'s reports' header size and alignment in this process: a 32-bit
+/// game on 64-bit Windows gets 64-bit headers (24 bytes, the handle and WPARAM 8 bytes
+/// each) on 8-byte boundaries, which the 32-bit headers' own sizes don't say.
+fn batch_layout() -> (usize, usize) {
+    if size_of::<usize>() == 8 || wow64() { (24, 8) } else { (16, 4) }
 }
 
 /// Raw input read in batches: the reports a copy shouldn't get (`keep_raw`) are taken
-/// out and the rest moved up, each where the next block starts (8-byte aligned).
+/// out and the rest moved up, each where the next block starts (aligned in memory, as
+/// `NEXTRAWINPUTBLOCK` finds it).
 unsafe extern "system" fn raw_input_buffer(data: *mut u8, size: *mut u32, header: u32) -> u32 {
     let Some(d) = RAW_BUFFER.get() else { return u32::MAX };
     let n = unsafe { d.call(data, size, header) };
-    // A 32-bit game on 64-bit Windows gets 64-bit headers in batches: not parsed here.
-    if data.is_null() || n == 0 || n == u32::MAX || size_of::<usize>() == 4 || matches!(policy(), Policy::PassThrough) {
+    if data.is_null() || n == 0 || n == u32::MAX || matches!(policy(), Policy::PassThrough) {
         return n;
     }
-    first_use(&USED_RAW_BUFFER, "Raw Input in batches (GetRawInputBuffer)");
+    first_use(&USED_RAW_BUFFER, &format!("Raw Input in batches (GetRawInputBuffer, {}-byte headers)", batch_layout().0));
     // `size`: the buffer's size in bytes (the reports are inside it).
     let room = unsafe { size.as_ref() }.map_or(0, |s| *s as usize);
-    let align = |o: usize| (o + 7) & !7;
+    let kept = unsafe { filter_batch(data, room, n, batch_layout(), keep_raw) };
+    HELD_RAW.fetch_add(n.saturating_sub(kept), Ordering::Relaxed);
+    kept
+}
+
+/// Keeps the `n` reports in the `room` bytes at `data` that `keep` takes (`layout`: the
+/// header's size and the blocks' alignment), moved up; how many are kept.
+///
+/// # Safety
+/// `data` holds `room` bytes.
+unsafe fn filter_batch(data: *mut u8, room: usize, n: u32, (header, align): (usize, usize), keep: impl Fn(&mut [u8], usize) -> bool) -> u32 {
+    let base = data as usize;
+    // The next block's offset: the end of this one, aligned as an address.
+    let next = |o: usize| ((base + o + align - 1) & !(align - 1)) - base;
     let (mut read, mut write, mut kept) = (0usize, 0usize, 0u32);
     for _ in 0..n {
-        if read + RAW_HEADER > room {
+        if read + header > room {
             break;
         }
         let len = u32::from_le_bytes(unsafe { std::slice::from_raw_parts(data.add(read + 4), 4) }.try_into().unwrap()) as usize;
-        if len < RAW_HEADER || read + len > room {
+        if len < header || read + len > room {
             break;
         }
         let report = unsafe { std::slice::from_raw_parts_mut(data.add(read), len) };
-        if keep_raw(report) {
+        if keep(report, header) {
             if write != read {
                 unsafe { std::ptr::copy(data.add(read), data.add(write), len) };
             }
-            write = align(write + len);
+            write = next(write + len);
             kept += 1;
-        } else {
-            HELD_RAW.fetch_add(1, Ordering::Relaxed);
         }
-        read = align(read + len);
+        read = next(read + len);
     }
     kept
 }
@@ -1154,19 +1404,26 @@ const RI_KEY_BREAK: u16 = 0x01;
 const MOUSE_UPS: u16 = 0x0002 | 0x0008 | 0x0020 | 0x0080 | 0x0200;
 const MOUSE_MOVE_ABSOLUTE: u16 = 0x01;
 
-/// Pure helper: whether a raw keyboard or mouse report for a copy without the keyboard
-/// and mouse goes through, rewritten to its releases alone: a key up as it is; a mouse
-/// report as the buttons that went up (none, often), without its motion, wheel or
-/// presses. False (the report is held back) for a key down or an absolute mouse.
-pub(crate) fn releases_only(kind: u32, report: &mut [u8]) -> bool {
+/// `releases_only_at` for a report of the process's own layout.
+#[cfg(test)]
+fn releases_only(kind: u32, report: &mut [u8]) -> bool {
+    releases_only_at(kind, report, RAW_HEADER)
+}
+
+/// Pure helper: whether a raw keyboard or mouse report (its header `header` bytes) for a
+/// copy without the keyboard and mouse goes through, rewritten to its releases alone: a
+/// key up as it is; a mouse report as the buttons that went up (none, often), without its
+/// motion, wheel or presses. False (the report is held back) for a key down or an
+/// absolute mouse.
+fn releases_only_at(kind: u32, report: &mut [u8], header: usize) -> bool {
     let u16_at = |r: &[u8], at: usize| u16::from_le_bytes([r[at], r[at + 1]]);
     match kind {
         // RAWKEYBOARD: MakeCode, Flags, Reserved, VKey, Message, ExtraInformation.
-        RIM_TYPEKEYBOARD => report.len() >= RAW_HEADER + 4 && u16_at(report, RAW_HEADER + 2) & RI_KEY_BREAK != 0,
+        RIM_TYPEKEYBOARD => report.len() >= header + 4 && u16_at(report, header + 2) & RI_KEY_BREAK != 0,
         // RAWMOUSE: usFlags, 2 bytes, usButtonFlags, usButtonData, ulRawButtons,
         // lLastX, lLastY, ulExtraInformation.
         RIM_TYPEMOUSE => {
-            let m = RAW_HEADER;
+            let m = header;
             if report.len() < m + 20 {
                 return false;
             }
@@ -1214,17 +1471,26 @@ unsafe extern "system" fn async_key_state(vkey: i32) -> i16 {
     }
 }
 
+/// Caps Lock, Num Lock and Scroll Lock: their toggles are the keyboard's own, one for
+/// every copy (their lights say so), so `GetKeyState`'s low bit is the real one.
+fn toggle_of(vkey: i32) -> i16 {
+    if !matches!(vkey, 0x14 | 0x90 | 0x91) {
+        return 0;
+    }
+    KEY_STATE.get().map_or(0, |h| unsafe { h.call(vkey) }) & 1
+}
+
 unsafe extern "system" fn key_state(vkey: i32) -> i16 {
     match policy() {
         Policy::PassThrough => KEY_STATE.get().map_or(0, |h| unsafe { h.call(vkey) }),
         Policy::BlockAll => {
             if shm::attached() {
-                0
+                toggle_of(vkey)
             } else {
                 KEY_STATE.get().map_or(0, |h| unsafe { h.call(vkey) })
             }
         }
-        Policy::Virtual(snap) => virtual_async_key_state(vkey, &snap),
+        Policy::Virtual(snap) => virtual_async_key_state(vkey, &snap) | toggle_of(vkey),
     }
 }
 
@@ -1237,6 +1503,9 @@ unsafe extern "system" fn keyboard_state(out: *mut u8) -> i32 {
         Policy::BlockAll => {
             if shm::attached() {
                 unsafe { std::ptr::write_bytes(out, 0, 256) };
+                for vk in [0x14, 0x90, 0x91] {
+                    unsafe { *out.add(vk) = toggle_of(vk as i32) as u8 };
+                }
                 1
             } else {
                 KEYBOARD_STATE.get().map_or(0, |h| unsafe { h.call(out) })
@@ -1245,7 +1514,7 @@ unsafe extern "system" fn keyboard_state(out: *mut u8) -> i32 {
         Policy::Virtual(snap) => {
             let buf = unsafe { std::slice::from_raw_parts_mut(out, 256) };
             for (vk, slot) in buf.iter_mut().enumerate() {
-                *slot = if virtual_async_key_state(vk as i32, &snap) < 0 { 0x80 } else { 0 };
+                *slot = if virtual_async_key_state(vk as i32, &snap) < 0 { 0x80 } else { 0 } | toggle_of(vk as i32) as u8;
             }
             1
         }
@@ -1260,7 +1529,13 @@ static LAST_CURSOR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 const OFF_WINDOW: (i32, i32) = (-32000, -32000);
 
 unsafe extern "system" fn cursor_pos(pt: *mut POINT) -> i32 {
-    if let Policy::Virtual(snap) = policy()
+    // While a split-screen copy's overlay has its input, the real cursor (another
+    // pane's, or over the overlay) isn't its: it stays where it last was.
+    let p = match policy() {
+        Policy::BlockAll if shm::attached() => Policy::Virtual(InputSnapshot { mode: InputMode::Virtual, ..Default::default() }),
+        p => p,
+    };
+    if let Policy::Virtual(snap) = p
         && !pt.is_null()
     {
         if snap.mouse.active {
@@ -1286,345 +1561,9 @@ unsafe extern "system" fn cursor_pos(pt: *mut POINT) -> i32 {
     CURSOR_POS.get().map_or(0, |h| unsafe { h.call(pt) })
 }
 
-fn hook_dinput() -> usize {
-    let Some(m) = module("dinput8.dll") else { return 0 };
-    let Some(create) = proc_addr(m, c"DirectInput8Create".as_ptr().cast()) else { return 0 };
-    type Create = unsafe extern "system" fn(isize, u32, *const [u8; 16], *mut usize, usize) -> i32;
-    let create: Create = unsafe { std::mem::transmute(create) };
-    // IID_IDirectInput8W / A and GUID_SysKeyboard.
-    let iid_w = guid(0xBF798031, 0x483A, 0x4DA2, [0xAA, 0x99, 0x5D, 0x64, 0xED, 0x36, 0x97, 0x00]);
-    let iid_a = guid(0xBF798030, 0x483A, 0x4DA2, [0xAA, 0x99, 0x5D, 0x64, 0xED, 0x36, 0x97, 0x00]);
-    let keyboard = guid(0x6F1D2B61, 0xD5A0, 0x11CF, [0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00]);
-    let instance = unsafe { windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null()) } as isize;
-    type CreateDevice = unsafe extern "system" fn(usize, *const [u8; 16], *mut usize, usize) -> i32;
-    type Release = unsafe extern "system" fn(usize) -> u32;
-    let mut n = 0;
-    for iid in [iid_w, iid_a] {
-        let mut di = 0usize;
-        if unsafe { create(instance, 0x0800, &iid, &mut di, 0) } < 0 || di == 0 {
-            continue;
-        }
-        // IDirectInput8: Release is slot 2, CreateDevice slot 3.
-        let vt = unsafe { *(di as *const *const usize) };
-        let create_device: CreateDevice = unsafe { std::mem::transmute(*vt.add(3)) };
-        let release: Release = unsafe { std::mem::transmute(*vt.add(2)) };
-        let mut dev = 0usize;
-        if unsafe { create_device(di, &keyboard, &mut dev, 0) } >= 0 && dev != 0 {
-            // IDirectInputDevice8: GetDeviceState is slot 9, GetDeviceData slot 10.
-            let dvt = unsafe { *(dev as *const *const usize) };
-            n += arm(&DEV_STATE, unsafe { *dvt.add(9) }, dev_state_detours(), "IDirectInputDevice8::GetDeviceState");
-            n += arm(&DEV_DATA, unsafe { *dvt.add(10) }, dev_data_detours(), "IDirectInputDevice8::GetDeviceData");
-            // SetCooperativeLevel is slot 13.
-            n += arm(
-                &DEV_COOP,
-                unsafe { *dvt.add(13) },
-                per_slot!(DevSetCooperativeLevel, [0, 1], set_cooperative_level, (this: usize, hwnd: isize, flags: u32) -> i32),
-                "IDirectInputDevice8::SetCooperativeLevel",
-            );
-            let dev_release: Release = unsafe { std::mem::transmute(*dvt.add(2)) };
-            unsafe { dev_release(dev) };
-        }
-        unsafe { release(di) };
-    }
-    n
-}
-
-const fn guid(a: u32, b: u16, c: u16, d: [u8; 8]) -> [u8; 16] {
+pub(super) const fn guid(a: u32, b: u16, c: u16, d: [u8; 8]) -> [u8; 16] {
     let (a, b, c) = (a.to_le_bytes(), b.to_le_bytes(), c.to_le_bytes());
     [a[0], a[1], a[2], a[3], b[0], b[1], c[0], c[1], d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]]
-}
-
-const DISCL_EXCLUSIVE: u32 = 0x1;
-const DISCL_NONEXCLUSIVE: u32 = 0x2;
-const DISCL_FOREGROUND: u32 = 0x4;
-const DISCL_BACKGROUND: u32 = 0x8;
-const DISCL_NOWINKEY: u32 = 0x10;
-
-/// The cooperative level a split-screen copy asks for instead of `flags`: in the
-/// background, as its pane's game is while another pane has the focus (DirectInput
-/// stops a foreground device the moment its window isn't in front, whatever the game
-/// is told). A keyboard or mouse can't be exclusive in the background.
-pub(crate) fn background_level(flags: u32, keyboard_or_mouse: bool) -> u32 {
-    if flags & DISCL_FOREGROUND == 0 {
-        return flags;
-    }
-    let mut f = (flags & !(DISCL_FOREGROUND | DISCL_NOWINKEY)) | DISCL_BACKGROUND;
-    if keyboard_or_mouse && f & DISCL_EXCLUSIVE != 0 {
-        f = (f & !DISCL_EXCLUSIVE) | DISCL_NONEXCLUSIVE;
-    }
-    f
-}
-
-/// Whether DirectInput device `this` is a keyboard or mouse (`GetCapabilities`, slot 3).
-fn keyboard_or_mouse(this: usize) -> bool {
-    type GetCaps = unsafe extern "system" fn(usize, *mut [u32; 11]) -> i32;
-    let get: GetCaps = unsafe { std::mem::transmute(*(*(this as *const *const usize)).add(3)) };
-    let mut caps = [0u32; 11];
-    caps[0] = 44;
-    // DIDEVCAPS.dwDevType's low byte: DI8DEVTYPE_MOUSE 0x12, DI8DEVTYPE_KEYBOARD 0x13.
-    (unsafe { get(this, &mut caps) }) >= 0 && matches!(caps[2] & 0xFF, 0x12 | 0x13)
-}
-
-fn set_cooperative_level(i: usize, this: usize, hwnd: isize, flags: u32) -> i32 {
-    let Some(h) = DEV_COOP.hooks[i].get() else { return 0 };
-    if crate::window::focus_spoofed() {
-        let want = background_level(flags, keyboard_or_mouse(this));
-        if want != flags {
-            let rc = unsafe { h.call(this, hwnd, want) };
-            if rc >= 0 {
-                static TOLD: AtomicBool = AtomicBool::new(false);
-                if !TOLD.swap(true, Ordering::Relaxed) {
-                    log!("input: DirectInput asked for foreground access ({flags:#x}); given background ({want:#x}), so its pane keeps its input while another has the focus");
-                }
-                return rc;
-            }
-        }
-    }
-    unsafe { h.call(this, hwnd, flags) }
-}
-
-/// DIPROPGUIDANDPATH: DIPROPHEADER, the class GUID and the device's interface path.
-#[repr(C)]
-struct PropPath {
-    size: u32,
-    header_size: u32,
-    obj: u32,
-    how: u32,
-    class: [u8; 16],
-    path: [u16; 260],
-}
-
-/// DirectInput device `this`'s key (`device.rs`), asked once; 0 for a device that
-/// isn't a HID one (the system keyboard and mouse).
-fn dev_key(this: usize) -> u64 {
-    if let Some(&(_, k)) = DEV_KEYS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(d, _)| *d == this) {
-        return k;
-    }
-    // IDirectInputDevice8::GetProperty is slot 5; DIPROP_GUIDANDPATH is MAKEDIPROP(12).
-    type GetProperty = unsafe extern "system" fn(usize, usize, *mut PropPath) -> i32;
-    let get: GetProperty = unsafe { std::mem::transmute(*(*(this as *const *const usize)).add(5)) };
-    let mut p = PropPath { size: size_of::<PropPath>() as u32, header_size: 16, obj: 0, how: 0, class: [0; 16], path: [0; 260] };
-    let key = if unsafe { get(this, 12, &mut p) } >= 0 {
-        let n = p.path.iter().position(|c| *c == 0).unwrap_or(p.path.len() - 1);
-        device::key_of_path(&p.path[..=n.min(p.path.len() - 1)])
-    } else {
-        0
-    };
-    let mut keys = DEV_KEYS.lock().unwrap_or_else(|e| e.into_inner());
-    if keys.len() >= 16 {
-        keys.remove(0);
-    }
-    keys.push((this, key));
-    key
-}
-
-fn dev_state_detours() -> [DevGetState; 2] {
-    per_slot!(DevGetState, [0, 1], dev_state, (this: usize, size: u32, out: *mut u8) -> i32)
-}
-
-fn dev_state(i: usize, this: usize, size: u32, out: *mut u8) -> i32 {
-    let Some(h) = DEV_STATE.hooks[i].get() else { return 0 };
-    let rc = unsafe { h.call(this, size, out) };
-    if rc < 0 || out.is_null() {
-        return rc;
-    }
-    match policy() {
-        Policy::PassThrough => {}
-        Policy::BlockAll => {
-            HELD_DINPUT.fetch_add(1, Ordering::Relaxed);
-            let buf = unsafe { std::slice::from_raw_parts_mut(out, size as usize) };
-            if size == 80 || size == 272 {
-                let c = centres_of(&ranges(this));
-                at_rest(buf, &c);
-            } else {
-                buf.fill(0);
-            }
-        }
-        Policy::Virtual(snap) => {
-            let buf = unsafe { std::slice::from_raw_parts_mut(out, size as usize) };
-            if size == 80 || size == 272 {
-                DINPUT_READS.fetch_add(1, Ordering::Relaxed);
-                first_use(&USED_DINPUT, "DirectInput joysticks (only its own moves)");
-                let key = dev_key(this);
-                if device::is_own(key, &snap) {
-                    note_own_hid_read(key);
-                    // The copy's own controller: its real state.
-                    return rc;
-                }
-                let r = ranges(this);
-                // Another player's controller rests; with none of the copy's own to be
-                // found (an XInput pad, or no key), every joystick reads the virtual pad.
-                if snap.pad.connected && snap.pad.hid_key == 0 {
-                    pack_dinput_pad(buf, &snap.pad, &r);
-                } else {
-                    at_rest(buf, &centres_of(&r));
-                }
-            } else if size == 256 {
-                buf.fill(0);
-                if snap.keyboard.active {
-                    pack_dinput_keyboard(buf, &snap.keyboard);
-                }
-            } else if !snap.mouse.active {
-                buf.fill(0);
-            }
-        }
-    }
-    rc
-}
-
-/// DIPROPRANGE: DIPROPHEADER (size, header size, object, how) and the range.
-#[repr(C)]
-struct PropRange {
-    size: u32,
-    header_size: u32,
-    obj: u32,
-    how: u32,
-    min: i32,
-    max: i32,
-}
-
-/// The `(min, max)` of each DIJOYSTATE axis's range (lX, lY, lZ, lRx, lRy, lRz, two sliders),
-/// None for one the device doesn't have.
-fn ranges(this: usize) -> [Option<(i32, i32)>; 8] {
-    let mut known = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, r)) = known.iter().find(|(d, _)| *d == this) {
-        return *r;
-    }
-    // IDirectInputDevice8::GetProperty is slot 5; DIPROP_RANGE is MAKEDIPROP(4), and
-    // DIPH_BYOFFSET finds an axis by its offset in the standard joystick format.
-    type GetProperty = unsafe extern "system" fn(usize, usize, *mut PropRange) -> i32;
-    let get: GetProperty = unsafe { std::mem::transmute(*(*(this as *const *const usize)).add(5)) };
-    let mut out = [None; 8];
-    for (i, slot) in out.iter_mut().enumerate() {
-        let mut r = PropRange { size: 24, header_size: 16, obj: i as u32 * 4, how: 1, min: 0, max: 0 };
-        if unsafe { get(this, 4, &mut r) } >= 0 {
-            *slot = Some((r.min, r.max));
-        }
-    }
-    if known.len() < 16 {
-        known.push((this, out));
-    }
-    out
-}
-
-fn centres_of(ranges: &[Option<(i32, i32)>; 8]) -> [Option<i32>; 8] {
-    let mut c = [None; 8];
-    for (dst, r) in c.iter_mut().zip(ranges) {
-        *dst = r.map(|(min, max)| middle(min, max));
-    }
-    c
-}
-
-fn middle(min: i32, max: i32) -> i32 {
-    ((min as i64 + max as i64) / 2) as i32
-}
-
-fn map_axis(norm: f64, range: (i32, i32)) -> i32 {
-    let (min, max) = (range.0 as f64, range.1 as f64);
-    let t = ((norm.clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(0.0, 1.0);
-    (min + t * (max - min)).round() as i32
-}
-
-/// A DIJOYSTATE (80 bytes) or DIJOYSTATE2 (272) at rest: buttons up, POV hats centred
-/// (0xFFFFFFFF, not 0, which is "up"), the axes and sliders at `centres`, the rest 0.
-fn at_rest(out: &mut [u8], centres: &[Option<i32>; 8]) {
-    out.fill(0);
-    for (i, c) in centres.iter().enumerate() {
-        if let Some(c) = c {
-            out[i * 4..i * 4 + 4].copy_from_slice(&c.to_le_bytes());
-        }
-    }
-    for k in 0..4 {
-        out[32 + k * 4..36 + k * 4].copy_from_slice(&u32::MAX.to_le_bytes());
-    }
-}
-
-/// Packs `VirtualPad` into a `DIJOYSTATE` (80B) or `DIJOYSTATE2` (272B) buffer.
-pub(crate) fn pack_dinput_pad(out: &mut [u8], pad: &VirtualPad, ranges: &[Option<(i32, i32)>; 8]) {
-    let c = centres_of(ranges);
-    at_rest(out, &c);
-    let default_range = (0i32, 65535i32);
-    let axis = |idx: usize, norm: f64| {
-        let r = ranges[idx].unwrap_or(default_range);
-        map_axis(norm, r)
-    };
-    let lx = f64::from(pad.thumb_lx) / 32767.0;
-    let ly = -f64::from(pad.thumb_ly) / 32767.0;
-    let rx = f64::from(pad.thumb_rx) / 32767.0;
-    let ry = -f64::from(pad.thumb_ry) / 32767.0;
-    let lz = (f64::from(pad.left_trigger) - f64::from(pad.right_trigger)) / 255.0;
-    let rz = (f64::from(pad.right_trigger) / 255.0) * 2.0 - 1.0;
-
-    let vals = [axis(0, lx), axis(1, ly), axis(2, lz), axis(3, rx), axis(4, ry), axis(5, rz)];
-    for (i, v) in vals.into_iter().enumerate() {
-        if ranges[i].is_some() || i < 2 {
-            out[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
-        }
-    }
-
-    // D-pad bits (0x0001 UP, 0x0002 DOWN, 0x0004 LEFT, 0x0008 RIGHT) -> POV[0] hundredths of degree.
-    let b = pad.xinput_buttons();
-    let pov: u32 = match (b & 0x0001 != 0, b & 0x0002 != 0, b & 0x0004 != 0, b & 0x0008 != 0) {
-        (true, false, false, false) => 0,
-        (true, false, false, true) => 4500,
-        (false, false, false, true) => 9000,
-        (false, true, false, true) => 13500,
-        (false, true, false, false) => 18000,
-        (false, true, true, false) => 22500,
-        (false, false, true, false) => 27000,
-        (true, false, true, false) => 31500,
-        _ => u32::MAX,
-    };
-    out[32..36].copy_from_slice(&pov.to_le_bytes());
-
-    // XInput face/shoulder/menu/thumb buttons -> DirectInput rgbButtons[0..11] (at offset 48).
-    const BTN_BITS: [u16; 11] = [
-        0x1000, // A -> 0
-        0x2000, // B -> 1
-        0x4000, // X -> 2
-        0x8000, // Y -> 3
-        0x0100, // LB -> 4
-        0x0200, // RB -> 5
-        0x0020, // Back -> 6
-        0x0010, // Start -> 7
-        0x0040, // LThumb -> 8
-        0x0080, // RThumb -> 9
-        0x0400, // Guide -> 10
-    ];
-    for (idx, mask) in BTN_BITS.into_iter().enumerate() {
-        out[48 + idx] = if b & mask != 0 { 0x80 } else { 0x00 };
-    }
-}
-
-fn pack_dinput_keyboard(out: &mut [u8], kb: &peerparty_protocol::input_shm::VirtualKeyboard) {
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VK_TO_VSC, MapVirtualKeyW};
-    for vk in 1u8..=254 {
-        if kb.is_down(vk) {
-            let sc = unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC) } as usize;
-            if sc > 0 && sc < out.len() {
-                out[sc] = 0x80;
-            }
-        }
-    }
-}
-
-fn dev_data_detours() -> [DevGetData; 2] {
-    per_slot!(DevGetData, [0, 1], dev_data, (this: usize, size: u32, data: *mut u8, count: *mut u32, flags: u32) -> i32)
-}
-
-fn dev_data(i: usize, this: usize, size: u32, data: *mut u8, count: *mut u32, flags: u32) -> i32 {
-    let Some(h) = DEV_DATA.hooks[i].get() else { return 0 };
-    let rc = unsafe { h.call(this, size, data, count, flags) };
-    let pass = match policy() {
-        Policy::PassThrough => true,
-        Policy::BlockAll => false,
-        // The copy's own controller's buffered events are its own.
-        Policy::Virtual(snap) => snap.pad.hid_key != 0 && device::is_own(dev_key(this), &snap),
-    };
-    if rc >= 0 && !pass && !count.is_null() {
-        unsafe { *count = 0 };
-    }
-    rc
 }
 
 #[cfg(test)]
@@ -1675,23 +1614,34 @@ mod tests {
         assert!(!releases_only(RIM_TYPEHID, &mut [0u8; 64]));
     }
 
+    /// A 32-bit game on 64-bit Windows gets its batches with 64-bit headers on 8-byte
+    /// boundaries; one dropped report moves the next up to where it would start.
     #[test]
-    fn dinput_joysticks_read_centred() {
-        assert_eq!(middle(0, 65535), 32767);
-        assert_eq!(middle(-1000, 1000), 0);
-        assert_eq!(middle(i32::MIN, i32::MAX), 0);
-        for size in [80usize, 272] {
-            let mut s = vec![0xAAu8; size];
-            at_rest(&mut s, &[Some(32767), Some(32767), None, Some(0), Some(-5), None, Some(127), None]);
-            let int = |o: usize| i32::from_le_bytes(s[o..o + 4].try_into().unwrap());
-            assert_eq!([int(0), int(4), int(8), int(12), int(16), int(20), int(24), int(28)], [32767, 32767, 0, 0, -5, 0, 127, 0]);
-            assert!((0..4).all(|k| int(32 + k * 4) == -1), "hats centred");
-            assert!(s[48..].iter().all(|b| *b == 0), "buttons up, the rest 0");
+    fn batches_keep_their_layout() {
+        for (header, align) in [(24usize, 8usize), (16, 4)] {
+            // Three keyboard reports of `header + 16 + 2` bytes (not a multiple of 8):
+            // the middle one's a key down to drop.
+            let len = header + 18;
+            let step = (len + align - 1) & !(align - 1);
+            let mut buf = vec![0u8; step * 3 + 64];
+            // Starting on an aligned address, as Windows hands it.
+            let at = buf.as_ptr().align_offset(8);
+            for i in 0..3 {
+                let r = at + i * step;
+                buf[r..r + 4].copy_from_slice(&RIM_TYPEKEYBOARD.to_le_bytes());
+                buf[r + 4..r + 8].copy_from_slice(&(len as u32).to_le_bytes());
+                buf[r + header + 2] = if i == 1 { 0 } else { RI_KEY_BREAK as u8 };
+                buf[r + header + 6] = 0x41 + i as u8;
+            }
+            let room = buf.len() - at;
+            let kept = unsafe { filter_batch(buf.as_mut_ptr().add(at), room, 3, (header, align), |r, h| r[h + 2] & RI_KEY_BREAK as u8 != 0) };
+            assert_eq!(kept, 2);
+            assert_eq!((buf[at + header + 6], buf[at + step + header + 6]), (0x41, 0x43), "the third moved up to the second's place");
         }
     }
 
     #[test]
-    fn xinput_and_dinput_pack_virtual_pad() {
+    fn xinput_packs_virtual_pad() {
         let pad = VirtualPad {
             connected: true,
             buttons: 0x1000 | 0x0001 | 0x0008, // A + D-pad Up-Right
@@ -1711,17 +1661,6 @@ mod tests {
         assert_eq!((xi[6], xi[7]), (200, 50));
         assert_eq!(i16::from_le_bytes(xi[8..10].try_into().unwrap()), 32767);
         assert_eq!(i16::from_le_bytes(xi[12..14].try_into().unwrap()), -32767);
-
-        let mut di = vec![0u8; 80];
-        let ranges = [Some((0, 65535)), Some((0, 65535)), Some((0, 65535)), Some((-1000, 1000)), Some((-1000, 1000)), None, None, None];
-        pack_dinput_pad(&mut di, &pad, &ranges);
-        let int = |o: usize| i32::from_le_bytes(di[o..o + 4].try_into().unwrap());
-        assert_eq!(int(0), 65535, "LX right");
-        assert_eq!(int(4), 0, "LY up (inverted in DI)");
-        assert_eq!(int(12), -1000, "RX left");
-        assert_eq!(int(32), 4500, "NE POV hat");
-        assert_eq!(di[48], 0x80, "A button");
-        assert_eq!(di[49], 0x00, "B released");
     }
 
     /// A split-screen copy's first controller is the real slot its controller is, or
@@ -1786,15 +1725,6 @@ mod tests {
         }
     }
 
-    /// DirectInput's foreground access becomes background access in a split-screen
-    /// copy; a keyboard or mouse can't stay exclusive there.
-    #[test]
-    fn dinput_asks_for_the_background() {
-        assert_eq!(background_level(DISCL_EXCLUSIVE | DISCL_FOREGROUND, false), DISCL_EXCLUSIVE | DISCL_BACKGROUND, "a joystick keeps exclusive (force feedback needs it)");
-        assert_eq!(background_level(DISCL_EXCLUSIVE | DISCL_FOREGROUND | DISCL_NOWINKEY, true), DISCL_NONEXCLUSIVE | DISCL_BACKGROUND);
-        assert_eq!(background_level(DISCL_NONEXCLUSIVE | DISCL_FOREGROUND, true), DISCL_NONEXCLUSIVE | DISCL_BACKGROUND);
-        assert_eq!(background_level(DISCL_NONEXCLUSIVE | DISCL_BACKGROUND, true), DISCL_NONEXCLUSIVE | DISCL_BACKGROUND, "background already");
-    }
 
     #[test]
     fn virtual_kbm_async_key_state() {
@@ -1819,7 +1749,8 @@ mod tests {
         let _turn = GAMEINPUT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         load("GameInput.dll");
         let Some(m) = module("gameinput.dll") else { return };
-        assert!(gameinput::install() >= 2, "every version's reads hooked");
+        gameinput::install();
+        assert!(gameinput::reads_hooked() >= 2, "every version's reads hooked");
         let create: unsafe extern "system" fn(*mut usize) -> i32 =
             unsafe { std::mem::transmute(proc_addr(m, c"GameInputCreate".as_ptr().cast()).unwrap()) };
         let mut gi = 0usize;

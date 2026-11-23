@@ -20,9 +20,13 @@ static HOOK_LOCK: Mutex<()> = Mutex::new(());
 /// instruction in the first bytes of the function at `at` (the bytes a hook overwrites:
 /// a thread paused there would resume into the middle of the new jump). For hooks
 /// switched on while the game runs (the overlay's); the start-up hooks go in before the
-/// game's threads exist.
+/// game's threads exist, so in the hook's own start (`watch::starting`, under the loader
+/// lock) nothing is paused.
 pub fn frozen<R>(at: usize, f: impl FnOnce() -> R) -> R {
     use windows_sys::Win32::Foundation::CloseHandle;
+    if crate::watch::starting() {
+        return f();
+    }
     use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
     use windows_sys::Win32::System::Threading::*;
     let me = unsafe { GetCurrentThreadId() };

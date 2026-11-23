@@ -1,7 +1,8 @@
 //! Which controller a HID handle, a Raw Input device or a device path is, by the key the
 //! session host gives a copy's own controller (`input_shm::hid_key`: vendor, product and
-//! serial number), and whether it's a game controller at all (a gamepad, joystick or
-//! multi-axis collection). A split-screen copy sees one controller: its own, read as it
+//! serial number; or, for a device with no serial of its own or one another device
+//! shares, `input_shm::hid_instance_key`: where it's plugged in), and whether it's a game
+//! controller at all (a gamepad, joystick or multi-axis collection). A split-screen copy sees one controller: its own, read as it
 //! is. The other players' game controllers aren't there for it: opening one fails as
 //! if it were unplugged (`refuse_open`, from the file hooks in saves.rs), Raw Input
 //! doesn't list them (`input::raw_device_list`) and a handle opened before reads as
@@ -10,7 +11,7 @@
 use std::cell::Cell;
 use std::sync::{Mutex, OnceLock};
 
-use peerparty_protocol::input_shm::{InputSnapshot, hid_key};
+use peerparty_protocol::input_shm::{InputSnapshot, hid_instance_key, hid_key};
 
 use super::{module, proc_addr};
 use crate::log;
@@ -40,10 +41,26 @@ const USAGE_PAGE_GENERIC: u16 = 0x01;
 pub(super) struct Hid {
     pub vid: u16,
     pub pid: u16,
-    /// Its key (`input_shm::hid_key`).
+    /// Its key by its serial number (`input_shm::hid_key`); 0 when it has none.
     pub key: u64,
+    /// Its key by where it's plugged in (`input_shm::hid_instance_key`); 0 when its path
+    /// isn't known (a handle opened before the hook) and it couldn't be placed.
+    pub inst: u64,
     /// A gamepad, joystick or multi-axis controller (its top collection's usage).
     pub controller: bool,
+}
+
+impl Hid {
+    /// Whether the session's key for a copy's controller (`snap.pad.hid_key`) names it.
+    pub fn is(&self, key: u64) -> bool {
+        key != 0 && (self.key == key || self.inst == key)
+    }
+
+    /// Whether it can be told apart from an identical device: it has a serial number, or
+    /// where it's plugged in is known.
+    pub fn placed(&self) -> bool {
+        self.key != 0 || self.inst != 0
+    }
 }
 
 /// Whether a generic-desktop usage is a game controller's: joystick, gamepad,
@@ -93,8 +110,18 @@ fn hid() -> Option<&'static HidFns> {
     .as_ref()
 }
 
-/// The HID device `h` is open on; None when it isn't one.
+/// The HID device `h` is open on; None when it isn't one. Where it's plugged in comes
+/// from the path the game opened it with, or for a handle opened before the hook from the
+/// devices present (`place`).
 pub(super) fn of_handle(h: usize) -> Option<Hid> {
+    let d = of_handle_at(h, None)?;
+    // Only split screen tells devices apart by where they're plugged in.
+    let inst = opened_inst(h).unwrap_or_else(|| if super::shm::attached() { place(&d).map_or(0, |(inst, _)| inst) } else { 0 });
+    Some(Hid { inst, ..d })
+}
+
+/// The HID device `h` is open on, `path` the one it was opened with if known.
+fn of_handle_at(h: usize, path: Option<&[u16]>) -> Option<Hid> {
     let f = hid()?;
     let mut a = Attributes { size: size_of::<Attributes>() as u32, vid: 0, pid: 0, version: 0 };
     if unsafe { (f.attributes)(h, &mut a) } == 0 {
@@ -117,7 +144,9 @@ pub(super) fn of_handle(h: usize) -> Option<Hid> {
         }
         unsafe { (f.free)(pp) };
     }
-    Some(Hid { vid: a.vid, pid: a.pid, key: hid_key(a.vid, a.pid, &text), controller })
+    let key = if text.trim().is_empty() { 0 } else { hid_key(a.vid, a.pid, &text) };
+    let inst = path.and_then(|p| hid_instance_key(a.vid, a.pid, &String::from_utf16_lossy(p))).unwrap_or(0);
+    Some(Hid { vid: a.vid, pid: a.pid, key, inst, controller })
 }
 
 thread_local! {
@@ -141,14 +170,9 @@ pub(super) fn of_path(path: &[u16]) -> Option<Hid> {
     if h == INVALID_HANDLE_VALUE {
         return None;
     }
-    let d = of_handle(h as usize);
+    let d = of_handle_at(h as usize, Some(path));
     unsafe { CloseHandle(h) };
     d
-}
-
-/// The key of the HID device at `path`; 0 when it isn't one.
-pub(super) fn key_of_path(path: &[u16]) -> u64 {
-    of_path(path).map_or(0, |d| d.key)
 }
 
 /// Devices already asked, by Raw Input device handle.
@@ -185,22 +209,25 @@ pub(super) fn of_raw(dev: isize) -> Option<Hid> {
     d
 }
 
-/// The key of Raw Input device `dev`.
-pub(super) fn key_of_raw(dev: isize) -> u64 {
-    of_raw(dev).map_or(0, |d| d.key)
-}
-
 /// Raw Input device `dev`'s interface path, NUL-terminated.
 fn raw_path(dev: isize) -> Option<Vec<u16>> {
     let m = module("user32.dll")?;
-    let get: GetDeviceInfo = unsafe { std::mem::transmute(proc_addr(m, c"GetRawInputDeviceInfoW".as_ptr().cast())?) };
+    // The real one when the game's is hooked (`input::raw_device_info`): that hook asks
+    // what the device is, which would ask its path again.
+    let export: GetDeviceInfo = unsafe { std::mem::transmute(proc_addr(m, c"GetRawInputDeviceInfoW".as_ptr().cast())?) };
+    let get = |dev: isize, cmd: u32, buf: *mut u16, len: *mut u32| -> u32 {
+        match super::real_raw_device_info_w() {
+            Some(h) => unsafe { h.call(dev, cmd, buf.cast(), len) },
+            None => unsafe { export(dev, cmd, buf, len) },
+        }
+    };
     let mut len = 0u32;
-    unsafe { get(dev, RIDI_DEVICENAME, std::ptr::null_mut(), &mut len) };
+    get(dev, RIDI_DEVICENAME, std::ptr::null_mut(), &mut len);
     if len == 0 || len > 1024 {
         return None;
     }
     let mut buf = vec![0u16; len as usize + 1];
-    let got = unsafe { get(dev, RIDI_DEVICENAME, buf.as_mut_ptr(), &mut len) };
+    let got = get(dev, RIDI_DEVICENAME, buf.as_mut_ptr(), &mut len);
     if got == u32::MAX || got == 0 {
         return None;
     }
@@ -211,15 +238,15 @@ fn raw_path(dev: isize) -> Option<Vec<u16>> {
     Some(buf)
 }
 
-/// Whether a device of key `key` is this copy's own controller.
-pub(super) fn is_own(key: u64, snap: &InputSnapshot) -> bool {
-    key != 0 && snap.pad.connected && key == snap.pad.hid_key
+/// Whether device `d` is this copy's own controller.
+pub(super) fn is_own(d: &Hid, snap: &InputSnapshot) -> bool {
+    snap.pad.connected && d.is(snap.pad.hid_key)
 }
 
 /// Whether device `d` is a game controller that isn't this copy's: another player's, or
 /// any when the copy plays with the keyboard.
 pub(super) fn is_others(d: &Hid, snap: &InputSnapshot) -> bool {
-    d.controller && !is_own(d.key, snap)
+    d.controller && !is_own(d, snap)
 }
 
 /// Whether `path` names a HID device (`\\?\HID#...`, any case).
@@ -272,7 +299,7 @@ pub(crate) fn refuse_open(path: &[u16]) -> bool {
     if d.controller {
         GAME_OPENS_PADS.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    let refuse = is_others(&d, &snap);
+    let refuse = is_others(&d, &snap) && d.placed();
     if d.controller && prev_refused != Some(refuse) {
         if let Some(entry) = PATHS.lock().unwrap_or_else(|e| e.into_inner()).iter_mut().find(|(p, _, _)| *p == path) {
             entry.2 = Some(refuse);
@@ -291,11 +318,12 @@ pub(super) fn game_opens_pads() -> bool {
     GAME_OPENS_PADS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// HID devices the game opened through CreateFile (handle, and whether it's an XInput
-/// controller's HID side, `is_xinput_path`). Only these can be unplugged for a copy: a
+/// HID devices the game opened through CreateFile (handle, whether it's an XInput
+/// controller's HID side, `is_xinput_path`, and its key by where it's plugged in). A
 /// handle the hook didn't see opened (another way in, or before the file hooks) has no
-/// path to tell an XInput controller's from another player's own, and is left alone.
-static OPENED: Mutex<Vec<(usize, bool)>> = Mutex::new(Vec::new());
+/// path to tell an XInput controller's from another player's own, and is only unplugged
+/// when the devices present place it (`place`).
+static OPENED: Mutex<Vec<(usize, bool, u64)>> = Mutex::new(Vec::new());
 
 /// The game opened `path` as handle `h` (CreateFile's result). Leaves the thread's
 /// last error as CreateFile set it.
@@ -307,12 +335,16 @@ fn opened(path: &[u16], h: isize) {
     let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
     let _keep = Restore(err);
     let xinput = is_xinput_path(path);
+    // The vendor and product ids are in the path, the same as the device's own
+    // (`input_shm::hid_instance_key` takes them with where it's plugged in).
+    let text = String::from_utf16_lossy(path);
+    let inst = ids_in_path(&text).and_then(|(vid, pid)| hid_instance_key(vid, pid, &text)).unwrap_or(0);
     let mut hs = OPENED.lock().unwrap_or_else(|e| e.into_inner());
-    hs.retain(|(k, _)| *k != h as usize);
+    hs.retain(|(k, _, _)| *k != h as usize);
     if hs.len() >= 64 {
         hs.remove(0);
     }
-    hs.push((h as usize, xinput));
+    hs.push((h as usize, xinput, inst));
     drop(hs);
     super::hid::reopened(h as usize);
 }
@@ -329,45 +361,91 @@ impl Drop for Restore {
 /// Whether the hook saw handle `h` opened (`Some`), and as an XInput controller's HID
 /// side (`Some(true)`).
 pub(super) fn opened_seen(h: usize) -> Option<bool> {
-    OPENED.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(k, _)| *k == h).map(|(_, x)| *x)
+    OPENED.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(k, _, _)| *k == h).map(|(_, x, _)| *x)
+}
+
+/// The key by where it's plugged in of the device the game opened as handle `h`, when the
+/// hook saw the path (and it was a HID one).
+fn opened_inst(h: usize) -> Option<u64> {
+    OPENED.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(k, _, i)| *k == h && *i != 0).map(|(_, _, i)| *i)
+}
+
+/// The vendor and product ids in a HID path (`VID_054C&PID_0CE6`, or Bluetooth's
+/// `VID&0002054C_PID&0CE6`).
+fn ids_in_path(path: &str) -> Option<(u16, u16)> {
+    let lower = path.to_ascii_lowercase();
+    let hex = |after: &str, len: usize| -> Option<u16> {
+        let at = lower.find(after)? + after.len();
+        let digits = lower.get(at..at + len)?;
+        u16::from_str_radix(&digits[len - 4..], 16).ok()
+    };
+    let vid = hex("vid_", 4).or_else(|| hex("vid&", 8))?;
+    let pid = hex("pid_", 4).or_else(|| hex("pid&", 4))?;
+    Some((vid, pid))
 }
 
 /// Whether handle `h` (device `d`) may be unplugged for this copy: it isn't an XInput
 /// controller's HID side, by the path the hook saw it opened with or, for one opened
-/// before the hook (a game opening its controllers at start), by the paths of the HID
-/// devices present with its vendor, product and serial (`xinput_side_of`).
+/// before the hook (a game opening its controllers at start), by the one device present
+/// it can be (`place`). One that can't be told from an identical pad is left alone: it
+/// could be the copy's own.
 pub(super) fn may_unplug(h: usize, d: &Hid) -> bool {
     match opened_seen(h) {
-        Some(xinput) => !xinput,
-        None => xinput_side_of(d) == Some(false),
+        Some(xinput) => !xinput && d.placed(),
+        None => place(d).is_some_and(|(_, xinput)| !xinput),
     }
 }
 
-/// HID devices already looked up by key: whether one is an XInput controller's HID side.
-static SIDES: Mutex<Vec<(u64, Option<bool>)>> = Mutex::new(Vec::new());
+/// Devices already placed, by vendor, product and serial key: where each is plugged in
+/// and whether it's an XInput controller's HID side.
+type Placed = (u16, u16, u64, Option<(u64, bool)>);
+static SIDES: Mutex<Vec<Placed>> = Mutex::new(Vec::new());
 
-/// Whether HID device `d` is an XInput controller's HID side (`&IG_` in its path), found
-/// among the HID devices present by its key: Some(false) when every device with its key
-/// is something else, None when none is found (or the list can't be had).
-pub(super) fn xinput_side_of(d: &Hid) -> Option<bool> {
-    if let Some(&(_, s)) = SIDES.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(k, _)| *k == d.key) {
+/// Which of the HID devices present device `d` (opened before the hook could see its
+/// path) is: the one with its vendor, product and serial number (or none). Its key by
+/// where it's plugged in, and whether it's an XInput controller's HID side (`&IG_` in its
+/// path). None when no device present matches, or more than one does (two identical pads
+/// without serial numbers: which is which can't be told).
+pub(super) fn place(d: &Hid) -> Option<(u64, bool)> {
+    if let Some(&(_, _, _, s)) = SIDES.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(v, p, k, _)| (*v, *p, *k) == (d.vid, d.pid, d.key)) {
         return s;
     }
     let paths = hid_interface_paths();
-    let matching: Vec<&Vec<u16>> = paths.iter().filter(|p| of_path(p).is_some_and(|o| o.key == d.key)).collect();
-    let side = if matching.is_empty() { None } else { Some(matching.iter().any(|p| is_xinput_path(p))) };
-    let shown: Vec<String> = matching.iter().map(|p| String::from_utf16_lossy(&p[..p.len().saturating_sub(1)])).collect();
-    let what = match side {
-        None => format!("no HID device present matches it ({} looked at): left as it is", paths.len()),
-        Some(true) => format!("an XInput controller's HID side ({}): left to XInput's own routing", shown.join(", ")),
-        Some(false) => format!("not an XInput controller's ({}): judged as if its opening had been seen", shown.join(", ")),
+    if paths.is_empty() {
+        // Not there to ask (under the loader lock): asked again next time.
+        return None;
+    }
+    let matching: Vec<(&Vec<u16>, Hid)> = paths.iter().filter_map(|p| of_path(p).filter(|o| (o.vid, o.pid, o.key) == (d.vid, d.pid, d.key)).map(|o| (p, o))).collect();
+    // A device's collections are one device: one place.
+    let mut places: Vec<u64> = matching.iter().map(|(_, o)| o.inst).collect();
+    places.sort_unstable();
+    places.dedup();
+    let side = match places.as_slice() {
+        [inst] => Some((*inst, matching.iter().any(|(p, _)| is_xinput_path(p)))),
+        _ => None,
+    };
+    let shown: Vec<String> = matching.iter().map(|(p, _)| String::from_utf16_lossy(&p[..p.len().saturating_sub(1)])).collect();
+    let what = match (side, places.len()) {
+        (None, 0) => format!("no HID device present matches it ({} looked at): left as it is", paths.len()),
+        (None, n) => format!("{n} identical devices match it ({}): which is which can't be told, left as it is", shown.join(", ")),
+        (Some((_, true)), _) => format!("an XInput controller's HID side ({}): left to XInput's own routing", shown.join(", ")),
+        (Some((_, false)), _) => format!("not an XInput controller's ({}): judged as if its opening had been seen", shown.join(", ")),
     };
     log!("input: HID {:04x}:{:04x} was opened before the hook could see its path; {what}", d.vid, d.pid);
     let mut s = SIDES.lock().unwrap_or_else(|e| e.into_inner());
-    if s.len() < 64 {
-        s.push((d.key, side));
+    if s.len() >= 64 {
+        s.remove(0);
     }
+    s.push((d.vid, d.pid, d.key, side));
     side
+}
+
+/// Controllers came or went (`HostMsg::DevicesChanged`): what was learnt of devices by
+/// Raw Input handle or path may be stale (a handle reused, a device in another port).
+pub(super) fn forget_devices() {
+    RAW.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    PATHS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    SIDES.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
 /// The interface paths (NUL-terminated) of the HID devices present, from cfgmgr32.dll
@@ -493,18 +571,30 @@ mod tests {
     #[test]
     fn only_the_copys_own_device_is_its_own() {
         let snap = |connected, hid_key| InputSnapshot { mode: InputMode::Virtual, pad: VirtualPad { connected, hid_key, ..Default::default() }, ..Default::default() };
-        assert!(is_own(7, &snap(true, 7)));
-        assert!(!is_own(8, &snap(true, 7)), "another player's");
-        assert!(!is_own(0, &snap(true, 0)), "no key is nobody's");
-        assert!(!is_own(7, &snap(false, 7)), "its controller is gone");
-        assert_eq!(key_of_path(&[0]), 0);
-        assert_eq!(key_of_path(&"\\\\?\\nothing-here".encode_utf16().chain(Some(0)).collect::<Vec<_>>()), 0);
-        assert_eq!(key_of_raw(0x7777_0000), 0, "no such Raw Input device");
-        let pad = |key| Hid { vid: 1, pid: 2, key, controller: true };
+        let pad = |key| Hid { vid: 1, pid: 2, key, inst: 0, controller: true };
+        assert!(is_own(&pad(7), &snap(true, 7)));
+        assert!(!is_own(&pad(8), &snap(true, 7)), "another player's");
+        assert!(!is_own(&pad(0), &snap(true, 0)), "no key is nobody's");
+        assert!(!is_own(&pad(7), &snap(false, 7)), "its controller is gone");
+        // Without a serial number: by where it's plugged in.
+        let unnamed = |inst| Hid { vid: 1, pid: 2, key: 0, inst, controller: true };
+        assert!(is_own(&unnamed(0x55), &snap(true, 0x55)));
+        assert!(!is_own(&unnamed(0x56), &snap(true, 0x55)), "an identical pad in another port");
+        assert!(!unnamed(0).placed() && unnamed(0x55).placed() && pad(7).placed());
+        assert_eq!(of_path(&[0]), None);
+        assert_eq!(of_path(&"\\\\?\\nothing-here".encode_utf16().chain(Some(0)).collect::<Vec<_>>()), None);
+        assert_eq!(of_raw(0x7777_0000), None, "no such Raw Input device");
         assert!(is_others(&pad(8), &snap(true, 7)));
         assert!(!is_others(&pad(7), &snap(true, 7)));
         assert!(is_others(&pad(7), &snap(false, 0)), "a keyboard player's copy has no controller");
         assert!(!is_others(&Hid { controller: false, ..pad(8) }, &snap(true, 7)), "not a controller: left alone");
+    }
+
+    #[test]
+    fn vendor_and_product_come_from_a_path() {
+        assert_eq!(ids_in_path("\\\\?\\HID#VID_054C&PID_0CE6&MI_03#8&1&0&0000#{4d1e55b2}"), Some((0x054c, 0x0ce6)));
+        assert_eq!(ids_in_path("\\\\?\\HID#{00001124-0000-1000-8000-00805f9b34fb}_VID&0002054c_PID&0ce6#9&2&0&0000#{4d1e55b2}"), Some((0x054c, 0x0ce6)));
+        assert_eq!(ids_in_path("\\\\?\\HID#Nothing"), None);
     }
 
     #[test]

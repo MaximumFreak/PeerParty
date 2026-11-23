@@ -977,7 +977,11 @@ where
     let Some(e) = exports.iter().find(|e| e.name == name) else {
         return 0;
     };
-    usize::from(crate::sys::detour::arm_at(slot, e.addr as usize, detour, "saves", name))
+    // `arm_now` hooks these while the game runs (its threads may be in them): the
+    // others are paused while each prologue is written (not at the hook's own start,
+    // before the game has threads: `sys::hook::frozen`).
+    let target: T = unsafe { T::from_ptr(e.addr as *const ()) };
+    usize::from(crate::sys::detour::try_arm(slot, target, detour, "saves", name, true) == crate::sys::detour::Armed::Hooked)
 }
 
 /// Arms the file hooks in kernelbase (once).

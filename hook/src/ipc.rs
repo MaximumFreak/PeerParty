@@ -421,6 +421,8 @@ fn command(cmd: HostMsg) {
             crate::video::set_capture(enabled, ring.as_deref(), event.as_deref(), pixels);
         }
         HostMsg::DevicesChanged => {
+            // What the hook knows of devices first, so the game's own look finds it fresh.
+            crate::input::devices_changed();
             crate::window::notify_devices_changed();
         }
     }

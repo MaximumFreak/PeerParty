@@ -1179,14 +1179,56 @@ unsafe extern "C" fn clear_rich_presence(this: usize) {
     );
 }
 
+/// Steam Input's XInput slot for controller `input` (`GetGamepadIndexForController`,
+/// -1 for one that isn't an XInput controller): a stand-in's real object's own method,
+/// else steam_api's flat function, found beside the hooked read `sibling`.
+fn gamepad_index(this: usize, sibling: &str, input: u64) -> Option<i32> {
+    if unsafe { crate::steam::obj::real_method(this, "GetGamepadIndexForController") }.is_some() {
+        return Some(call_real!(this, "GetGamepadIndexForController", fn(u64) -> i32, -1, input));
+    }
+    let flat = format!("{}GetGamepadIndexForController", &sibling[..sibling.len() - method_of(sibling).len()]);
+    let f = flat_beside(sibling, &flat)?;
+    let f: unsafe extern "C" fn(usize, u64) -> i32 = unsafe { std::mem::transmute(f) };
+    Some(unsafe { f(unwrap(this), input) })
+}
+
+/// steam_api's flat function `want`, from the module the real `sibling` is in.
+fn flat_beside(sibling: &str, want: &str) -> Option<usize> {
+    static FOUND: Mutex<Vec<(String, Option<usize>)>> = Mutex::new(Vec::new());
+    if let Some((_, f)) = crate::sys::lock(&FOUND).iter().find(|(n, _)| n == want) {
+        return *f;
+    }
+    use windows_sys::Win32::System::LibraryLoader::{GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleHandleExW, GetProcAddress};
+    let f = real(sibling).and_then(|at| {
+        let mut m = std::ptr::null_mut();
+        let flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
+        if unsafe { GetModuleHandleExW(flags, at as *const u16, &mut m) } == 0 {
+            return None;
+        }
+        let name = CString::new(want).ok()?;
+        unsafe { GetProcAddress(m, name.as_ptr().cast()) }.map(|f| f as usize)
+    });
+    let mut found = crate::sys::lock(&FOUND);
+    if found.len() < 8 {
+        found.push((want.to_string(), f));
+    }
+    f
+}
+
+/// Whether controller `input`'s actions read at rest now (`input::steam_input_held`).
+fn held(this: usize, sibling: &str, input: u64) -> bool {
+    crate::input::steam_input_held(input, |h| gamepad_index(this, sibling, h))
+}
+
 /// `InputDigitalActionData_t { bool bState; bool bActive; }`: two bytes, returned in a
-/// register. While the overlay shows, the button reads released (still active).
+/// register. While the overlay shows, the button reads released (still active); in a
+/// split-screen copy, so does every controller's but its own.
 fn digital(name: &str, this: usize, input: u64, action: u64) -> u16 {
     let Some(f) = real(name) else { return 0 };
     let f: unsafe extern "C" fn(usize, u64, u64) -> u16 = unsafe { std::mem::transmute(f) };
     // The real object: a stand-in's methods would gate the read a second time.
     let r = unsafe { f(unwrap(this), input, action) };
-    if crate::input::suppress_physical_pads() { r & 0xFF00 } else { r }
+    if held(this, name, input) { r & 0xFF00 } else { r }
 }
 
 /// `InputAnalogActionData_t { EInputSourceMode eMode; float x; float y; bool bActive; }`:
@@ -1202,7 +1244,7 @@ fn analog(name: &str, out: *mut u8, this: usize, input: u64, action: u64) -> *mu
     };
     let f: unsafe extern "C" fn(*mut u8, usize, u64, u64) -> *mut u8 = unsafe { std::mem::transmute(f) };
     let r = unsafe { f(out, unwrap(this), input, action) };
-    if crate::input::suppress_physical_pads() && !r.is_null() {
+    if !r.is_null() && held(this, name, input) {
         unsafe { std::ptr::write_bytes(r.add(4), 0, 8) };
     }
     r
@@ -1229,7 +1271,7 @@ vmethod! {
             r
         };
         // bState, then bActive (kept).
-        if crate::input::suppress_physical_pads() && !r.is_null() {
+        if !r.is_null() && held(this, "SteamAPI_ISteamInput_GetDigitalActionData", input) {
             unsafe { *r = 0 };
         }
         r
@@ -1245,7 +1287,7 @@ vmethod! {
         } else {
             r
         };
-        if crate::input::suppress_physical_pads() && !r.is_null() {
+        if !r.is_null() && held(this, "SteamAPI_ISteamInput_GetAnalogActionData", input) {
             unsafe { std::ptr::write_bytes(r.add(4), 0, 8) };
         }
         r

@@ -300,7 +300,22 @@ pub fn upgrade_raw_input_device(dev: &mut RawInputDevice, fallback_hwnd: isize) 
     true
 }
 
+/// `PEERPARTY_SKIP=input` takes the input layer out: background Raw Input with it, which
+/// without the layer's filtering hands every pane every player's keys and controllers.
+fn sinks_skipped() -> bool {
+    let skipped = crate::net::skip("input") || crate::net::skip("padblock");
+    if skipped {
+        crate::log::throttled("window: sinks skipped", 1, |_| {
+            log!("window: PEERPARTY_SKIP=input: Raw Input stays foreground-only (no RIDEV_INPUTSINK)");
+        });
+    }
+    skipped
+}
+
 fn upgrade_registered_raw_input_sinks(fallback_hwnd: isize) {
+    if sinks_skipped() {
+        return;
+    }
     let Some(u32_mod) = module("user32.dll") else { return };
     let Some(get_addr) = proc_addr(u32_mod, c"GetRegisteredRawInputDevices") else { return };
     type GetRegisteredFn = unsafe extern "system" fn(*mut RawInputDevice, *mut u32, u32) -> u32;
@@ -494,7 +509,9 @@ fn install_loaded_user32() {
             ($cell:expr, $sym:literal, $ty:ty, $detour:ident) => {
                 if let Some(a) = proc_addr(u32_mod, $sym) {
                     let target: $ty = unsafe { std::mem::transmute(a) };
-                    if crate::sys::detour::arm(&$cell, target, $detour as $ty, "window", $sym.to_str().unwrap_or("")) {
+                    // user32 is loaded and the game may be running in these: its other
+                    // threads are paused while each prologue is written.
+                    if crate::sys::detour::try_arm(&$cell, target, $detour as $ty, "window", $sym.to_str().unwrap_or(""), true) == crate::sys::detour::Armed::Hooked {
                         n += 1;
                     }
                 }
@@ -696,6 +713,26 @@ pub fn notify_devices_changed() {
     }
     let mut c = Collect { pid: unsafe { GetCurrentProcessId() }, hwnds: Vec::new() };
     unsafe { EnumWindows(Some(each), &mut c as *mut Collect as isize) };
+    // Message-only windows (SDL's and Unity's device watchers) aren't top-level ones:
+    // EnumWindows doesn't list them.
+    let top_level = c.hwnds.len();
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowExW, HWND_MESSAGE};
+        let mut after: HWND = std::ptr::null_mut();
+        for _ in 0..4096 {
+            let h = unsafe { FindWindowExW(HWND_MESSAGE, after, std::ptr::null(), std::ptr::null()) };
+            if h.is_null() {
+                break;
+            }
+            let mut pid = 0u32;
+            unsafe { GetWindowThreadProcessId(h, &mut pid) };
+            if pid == c.pid && !c.hwnds.contains(&(h as usize)) {
+                c.hwnds.push(h as usize);
+            }
+            after = h;
+        }
+    }
+    let message_only = c.hwnds.len() - top_level;
     let primary = PRIMARY_HWND.load(Ordering::Relaxed);
     if primary != 0 && !c.hwnds.contains(&primary) {
         c.hwnds.push(primary);
@@ -706,7 +743,7 @@ pub fn notify_devices_changed() {
             posted.push(format!("0x{h:x}"));
         }
     }
-    log!("window: told {} game window(s) [{}] that controllers changed (WM_DEVICECHANGE)", posted.len(), posted.join(", "));
+    log!("window: told {} game window(s) [{}] that controllers changed (WM_DEVICECHANGE; {message_only} of them message-only)", posted.len(), posted.join(", "));
 }
 
 /// Pure helper: whether a `CreateWindowExW` call looks like the game's top-level window
@@ -889,6 +926,7 @@ unsafe extern "system" fn detour_register_raw_input(
 ) -> i32 {
     let Some(hook) = REGISTER_RAW_INPUT.get() else { return 0 };
     if !wants_hooks()
+        || sinks_skipped()
         || devices.is_null()
         || count == 0
         || count > 64
