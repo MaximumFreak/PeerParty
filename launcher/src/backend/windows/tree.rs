@@ -154,19 +154,35 @@ impl Closer {
     }
 
     pub fn close(&self) {
-        let pids: Vec<u32> = if self.job.is_null() { Vec::new() } else { members(self.job) };
-        let asked = ask_windows_to_close(&pids, self.first);
+        let asked = self.ask(0);
         eprintln!("peerparty: closing the game (Close all in PeerParty's window): {asked} window(s) asked to close");
         let until = std::time::Instant::now() + CLOSE_WAIT;
         while std::time::Instant::now() < until {
-            let left = if self.job.is_null() { 0 } else { members(self.job).len() };
-            let first_runs = !self.first.is_null() && unsafe { WaitForSingleObject(self.first, 0) } != WAIT_OBJECT_0;
-            if left == 0 && !first_runs {
+            if !self.runs() {
                 return;
             }
             std::thread::sleep(Duration::from_millis(200));
         }
         eprintln!("peerparty: the game still ran {}s after being asked to close: ended", CLOSE_WAIT.as_secs());
+        self.force();
+    }
+
+    /// Asks the game's windows to close, as their close buttons would: the visible ones,
+    /// and `known` (a split-screen copy's window, hidden while another pane is zoomed),
+    /// which would otherwise be ended without the chance to save. How many were asked.
+    pub fn ask(&self, known: u64) -> usize {
+        let pids: Vec<u32> = if self.job.is_null() { Vec::new() } else { members(self.job) };
+        ask_windows_to_close(&pids, self.first, known)
+    }
+
+    /// Whether any program of the game still runs.
+    pub fn runs(&self) -> bool {
+        let left = if self.job.is_null() { 0 } else { members(self.job).len() };
+        left > 0 || (!self.first.is_null() && unsafe { WaitForSingleObject(self.first, 0) } != WAIT_OBJECT_0)
+    }
+
+    /// Ends every program of the game now, with exit code 1 (ended, not finished).
+    pub fn force(&self) {
         unsafe {
             if !self.job.is_null() {
                 TerminateJobObject(self.job, 1);
@@ -175,6 +191,16 @@ impl Closer {
                 TerminateProcess(self.first, 1);
             }
         }
+    }
+}
+
+impl crate::host::StopCopy for Closer {
+    fn ask(&self, known: u64) -> usize {
+        Closer::ask(self, known)
+    }
+
+    fn force(&self) {
+        Closer::force(self)
     }
 }
 
@@ -202,8 +228,9 @@ fn duplicate(h: HANDLE) -> HANDLE {
 }
 
 /// Posts WM_CLOSE to the visible top-level windows of `pids` (and of `first`'s
-/// program); returns how many.
-fn ask_windows_to_close(pids: &[u32], first: HANDLE) -> usize {
+/// program), and to `known` (0: none) whether it shows or not, if it is one of theirs;
+/// returns how many.
+fn ask_windows_to_close(pids: &[u32], first: HANDLE, known: u64) -> usize {
     use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId, IsWindowVisible, PostMessageW, WM_CLOSE};
     let mut want: Vec<u32> = pids.to_vec();
@@ -215,6 +242,7 @@ fn ask_windows_to_close(pids: &[u32], first: HANDLE) -> usize {
     }
     struct Ctx {
         want: Vec<u32>,
+        known: u64,
         asked: usize,
     }
     unsafe extern "system" fn each(hwnd: HWND, lp: LPARAM) -> i32 {
@@ -222,13 +250,14 @@ fn ask_windows_to_close(pids: &[u32], first: HANDLE) -> usize {
             let ctx = &mut *(lp as *mut Ctx);
             let mut pid = 0u32;
             GetWindowThreadProcessId(hwnd, &mut pid);
-            if ctx.want.contains(&pid) && IsWindowVisible(hwnd) != 0 && PostMessageW(hwnd, WM_CLOSE, 0 as WPARAM, 0) != 0 {
+            let shown = IsWindowVisible(hwnd) != 0 || hwnd as u64 == ctx.known;
+            if ctx.want.contains(&pid) && shown && PostMessageW(hwnd, WM_CLOSE, 0 as WPARAM, 0) != 0 {
                 ctx.asked += 1;
             }
         }
         1
     }
-    let mut ctx = Ctx { want, asked: 0 };
+    let mut ctx = Ctx { want, known, asked: 0 };
     unsafe { EnumWindows(Some(each), &mut ctx as *mut Ctx as LPARAM) };
     ctx.asked
 }

@@ -32,7 +32,7 @@ pub mod test_ports;
 mod wire;
 
 pub use hex::{hex, unhex};
-pub use id::{Identity, PeerId, take_slot_from, want_slot};
+pub use id::{Identity, PeerId, take_slot_from, want_name, want_slot};
 pub use lan::{ChanInfo, ChannelKind, CloseReason, Event, JoinCheck, Lan, LobbyError, MemberStatus, Options, Packet, SendResult, Trust, choose_internet, internet_wanted};
 #[cfg(any(test, feature = "test-util"))]
 pub use lan::{TestIntervals, TestTiming};

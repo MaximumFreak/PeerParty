@@ -11,7 +11,7 @@ use std::process::ExitCode;
 use crate::launch::{self, Launch, LaunchError, SplitScreen};
 use crate::{backend, firewall, host};
 
-pub const USAGE: &str = "usage: peerparty [--room CODE] [--public] [--set key=value] [--log-dir DIR] [--multi-instance] [--copy-saves] [--split-screen [--instances N] [--layout horizontal|vertical|grid] [--inputs auto|kbm|pad,...]] <game.exe> [args...]\n         plays the game through peerparty: the local network, plus the internet with --room or --public\n         a simple .bat or .cmd that starts the game works too: peerparty starts the program it runs\n         --set changes one setting for this run: name=Alex, voice=off, internet=off, overlay=off, auto_accept=on, ... (docs/usage.md)\n       peerparty --invite   (invites every other player to the game in front)\n       peerparty --new-room   (makes a room code for internet play)\n       peerparty --net-test   (checks this PC's internet path: STUN, NAT type, the DHT)\n       peerparty --pads   (lists the controllers the overlay reads, and their buttons)\n       peerparty --firewall <game.exe>   (whether Windows Firewall lets other players connect to it)\n       peerparty --fix-firewall <game.exe> [--public]   (as administrator: lets them, on private and domain networks, and public ones with --public)\n       peerparty --remove-firewall   (as administrator: removes every firewall rule peerparty added)\n       peerparty --blocked | --block FINGERPRINT | --unblock FINGERPRINT|all   (public players you blocked)\n       peerparty --friends | --friend FINGERPRINT | --unfriend FINGERPRINT|all   (friends for PEERPARTY_PUBLIC_FRIENDS_ONLY=1)";
+pub const USAGE: &str = "usage: peerparty [--room CODE] [--public] [--set key=value] [--log-dir DIR] [--multi-instance] [--copy-saves] [--split-screen [--instances N] [--layout horizontal|vertical|grid] [--inputs auto|kbm|pad,...] [--names A,B,...]] <game.exe> [args...]\n         plays the game through peerparty: the local network, plus the internet with --room or --public\n         a simple .bat or .cmd that starts the game works too: peerparty starts the program it runs\n         --set changes one setting for this run: name=Alex, voice=off, internet=off, overlay=off, auto_accept=on, ... (docs/usage.md)\n       peerparty --invite   (invites every other player to the game in front)\n       peerparty --new-room   (makes a room code for internet play)\n       peerparty --net-test   (checks this PC's internet path: STUN, NAT type, the DHT)\n       peerparty --pads   (lists the controllers the overlay reads, and their buttons)\n       peerparty --firewall <game.exe>   (whether Windows Firewall lets other players connect to it)\n       peerparty --fix-firewall <game.exe> [--public]   (as administrator: lets them, on private and domain networks, and public ones with --public)\n       peerparty --remove-firewall   (as administrator: removes every firewall rule peerparty added)\n       peerparty --blocked | --block FINGERPRINT | --unblock FINGERPRINT|all   (public players you blocked)\n       peerparty --friends | --friend FINGERPRINT | --unfriend FINGERPRINT|all   (friends for PEERPARTY_PUBLIC_FRIENDS_ONLY=1)";
 
 /// A parsed command-line invocation.
 pub enum Command {
@@ -81,6 +81,12 @@ pub fn parse(raw: impl IntoIterator<Item = OsString>) -> Result<Command, String>
                 let list = args.next().ok_or(USAGE)?.to_string_lossy().into_owned();
                 let inputs = SplitScreen::inputs_named(&list).ok_or_else(|| format!("bad --inputs {list:?} (expected up to {} of auto, kbm or pad, comma-separated)", SplitScreen::MAX_INSTANCES))?;
                 launch.split.get_or_insert_with(SplitScreen::default).inputs = inputs;
+            }
+            Some("--names") => {
+                args.next();
+                let list = args.next().ok_or(USAGE)?.to_string_lossy().into_owned();
+                let names = SplitScreen::names_listed(&list).ok_or_else(|| format!("bad --names {list:?} (expected up to {} names, comma-separated)", SplitScreen::MAX_INSTANCES))?;
+                launch.split.get_or_insert_with(SplitScreen::default).names = names;
             }
             Some("--why") => {
                 args.next();
@@ -327,6 +333,8 @@ mod tests {
             "grid",
             "--inputs",
             "kbm,auto",
+            "--names",
+            ",Sam, Robin ",
             "--why",
             "game.exe",
             "-windowed",
@@ -336,7 +344,9 @@ mod tests {
         assert!(why_lines);
         assert_eq!(launch.first, PathBuf::from("game.exe"));
         assert_eq!(launch.args, args(&["-windowed"]));
-        assert_eq!(launch.split, Some(SplitScreen { instances: 4, layout: LayoutPreset::Grid2x2, inputs: vec![SlotInput::KeyboardMouse, SlotInput::Auto] }));
+        assert_eq!(launch.split, Some(SplitScreen { instances: 4, layout: LayoutPreset::Grid2x2, inputs: vec![SlotInput::KeyboardMouse, SlotInput::Auto], names: vec!["".into(), "Sam".into(), "Robin".into()] }));
+        let split = launch.split.as_ref().unwrap();
+        assert_eq!((split.name(0), split.name(1), split.name(3)), (None, Some("Sam".into()), None));
         assert_eq!(
             launch.sets,
             vec![("room".into(), "PP1-ABC".into()), ("public".into(), "on".into()), ("voice".into(), "off".into())]
@@ -349,6 +359,7 @@ mod tests {
         assert!(parse(args(&["--instances", "5", "game.exe"])).is_err());
         assert!(parse(args(&["--layout", "spiral", "game.exe"])).is_err());
         assert!(parse(args(&["--inputs", "kbm,joystick", "game.exe"])).is_err());
+        assert!(parse(args(&["--names", "a,b,c,d,e", "game.exe"])).is_err());
         assert!(parse(args(&["--set", "broken", "game.exe"])).is_err());
         assert!(parse(args(&[])).is_err());
     }

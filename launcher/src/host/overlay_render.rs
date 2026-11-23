@@ -37,6 +37,18 @@ pub struct OverlayRenderer {
     pub last_frame: Instant,
     /// Something changed: the next tick draws a frame.
     pub dirty: bool,
+    /// What the notifications last drawn showed, and where: drawn again only when it
+    /// changes (or they were hidden meanwhile), not every tick.
+    toast_key: Option<ToastKey>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ToastKey {
+    toasts: Vec<(String, String)>,
+    rect: (i32, i32, i32, i32),
+    size: (u32, u32),
+    ppp: u32,
+    inside: bool,
 }
 
 impl OverlayRenderer {
@@ -53,6 +65,7 @@ impl OverlayRenderer {
             ppp: 1.0,
             last_frame: Instant::now(),
             dirty: true,
+            toast_key: None,
         }
     }
 
@@ -89,6 +102,7 @@ impl OverlayRenderer {
     }
 
     pub fn hide_toast_window(&mut self) {
+        self.toast_key = None;
         if let Some(w) = self.toast_window.as_mut() {
             w.hide();
         }
@@ -117,11 +131,24 @@ impl OverlayRenderer {
 
     /// Draws the corner notifications over the copy at `r` (its pane, or its window;
     /// `time`: seconds since the session started): inside its frames when `ingame` (the
-    /// whole canvas, mostly clear), else in a small window of their own.
-    pub fn toasts(&mut self, inst: &mut InstanceConn, overlay: &mut Overlay, ingame: bool, r: Rect, overlay_scale: f32, time: f64) {
+    /// whole canvas, mostly clear, `frames` big when their size is known), else in a
+    /// small window of their own. Only drawn again when what they show changed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn toasts(&mut self, inst: &mut InstanceConn, overlay: &mut Overlay, ingame: bool, r: Rect, frames: Option<(u32, u32)>, overlay_scale: f32, time: f64) {
         self.fonts();
-        let (w, h) = ((r.right - r.left) as f32, (r.bottom - r.top) as f32);
+        let pane = (u32::try_from(r.right - r.left).unwrap_or(0), u32::try_from(r.bottom - r.top).unwrap_or(0));
+        let inside = ingame && {
+            let (fw, fh) = frames.unwrap_or(pane);
+            inst.frame_for(fw as usize * fh as usize);
+            inst.frame.is_some()
+        };
+        let size = if inside { frames.unwrap_or(pane) } else { pane };
+        let (w, h) = (size.0 as f32, size.1 as f32);
         let ppp = scale_for(h, overlay_scale);
+        let key = ToastKey { toasts: overlay.toast_list(), rect: (r.left, r.top, r.right, r.bottom), size, ppp: (ppp * 1000.0) as u32, inside };
+        if self.toast_key.as_ref() == Some(&key) {
+            return;
+        }
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w / ppp, h / ppp))),
             time: Some(time),
@@ -140,11 +167,11 @@ impl OverlayRenderer {
         let y0 = (area.min.y * ppp).floor().max(0.0);
         let cw = ((area.max.x * ppp).ceil() - x0).max(1.0) as usize;
         let ch = ((area.max.y * ppp).ceil() - y0).max(1.0) as usize;
-        if ingame {
-            inst.frame_for(w as usize * h as usize);
-        }
-        if ingame && inst.frame.is_some() {
-            // Inside the game: the full-size canvas, mostly clear.
+        if inside {
+            // Inside the game: the full-size canvas, mostly clear. A window of theirs
+            // from before (drawing changed to inside) goes.
+            self.hide_toast_window();
+            self.toast_key = Some(key);
             self.render.resize(w as usize, h as usize);
             self.render.invalidate();
             let canvas = &mut self.render.canvas;
@@ -165,6 +192,7 @@ impl OverlayRenderer {
         if let Some(win) = self.toast_window.as_mut() {
             let all = [0, 0, self.toast_canvas.w as i32, self.toast_canvas.h as i32];
             win.present(&self.toast_canvas, r.left + x0 as i32, r.top + y0 as i32, &[all]);
+            self.toast_key = Some(key);
         }
     }
 }

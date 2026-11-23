@@ -182,7 +182,7 @@ included. Options for one run go in front of the game's path (or of `%command%`)
 | `--public` | Turns public sessions on this run. |
 | `--set key=value` | Changes one setting this run, e.g. `name=Alex`, `voice=off`, `internet=off`. |
 | `--multi-instance` | Lets a second copy of the game start on the same PC. |
-| `--split-screen` | Starts 2–4 copies (`--instances N`, default 2) in one shared split-screen window (`--layout horizontal\|vertical\|grid`), each player on a controller or the keyboard and mouse (`--inputs auto\|kbm\|pad,...`). |
+| `--split-screen` | Starts 2–4 copies (`--instances N`, default 2) in one shared split-screen window (`--layout horizontal\|vertical\|grid`), each player on a controller or the keyboard and mouse (`--inputs auto\|kbm\|pad,...`), with names of their own (`--names A,B,...`). |
 | `--copy-saves` | This copy starts from player 1's whole save; its own save, if any, is moved aside as a backup. Only when given. |
 | `--log-dir DIR` | Where the logs go. |
 

@@ -1320,9 +1320,12 @@ impl Overlay {
     /// One frame of the full overlay. `screen` is the game's client area in points.
     pub fn frame(&mut self, ui: &mut egui::Ui, mut nav: Nav, prefs: &mut Prefs, out: &mut Vec<Cmd>) {
         let screen = ui.max_rect();
-        // A pass egui runs again (`request_discard` below) has the same input: it was
-        // already acted on.
-        if ui.ctx().current_pass_index() > 0 {
+        // A pass egui runs again (`request_discard` below) is the same frame: its `nav`
+        // was already acted on. egui doesn't hand that pass the mouse's events again, and
+        // nothing here acts on a click in it either, should that change (a switch would
+        // flip back).
+        let replay = ui.ctx().current_pass_index() > 0;
+        if replay {
             nav = Nav::default();
         }
         // The rows are built once a frame, and again only when something this frame
@@ -1412,7 +1415,7 @@ impl Overlay {
         let panel = panel_rect(screen);
         self.panel = Some(panel);
         // A click on the dimmed game around the panel closes the overlay.
-        if ui.input(|i| i.pointer.any_pressed() && i.pointer.press_origin().is_some_and(|p| !panel.contains(p))) {
+        if !replay && ui.input(|i| i.pointer.any_pressed() && i.pointer.press_origin().is_some_and(|p| !panel.contains(p))) {
             out.push(Cmd::Close);
         }
         let painter = ui.painter().clone();
@@ -1466,7 +1469,7 @@ impl Overlay {
                 painter.circle_filled(bc, 9.0, c);
                 painter.text(bc, Align2::CENTER_CENTER, b, theme::strong(11.0), Color32::BLACK);
             }
-            if resp.clicked() {
+            if resp.clicked() && !replay {
                 self.open(page.clone(), false);
             }
             x += w + 6.0;
@@ -1591,13 +1594,13 @@ impl Overlay {
                             p.circle_stroke(Pos2::new(br.left() + 16.0, br.center().y), 6.0, Stroke::new(1.2, Color32::from_white_alpha(50)));
                         }
                         p.text(Pos2::new(br.left() + 30.0, br.center().y), Align2::LEFT_CENTER, label, theme::strong(13.0), TEXT);
-                        if bresp.clicked() {
+                        if bresp.clicked() && !replay {
                             pending_action = action;
                         }
                         rx = br.left() - 8.0;
                     }
                 }
-                if resp.clicked() && row.selectable && pending_action == Action::None {
+                if resp.clicked() && !replay && row.selectable && pending_action == Action::None {
                     self.sel = i;
                     pending_action = row.main;
                 }
@@ -1662,6 +1665,13 @@ impl Overlay {
         Some([(r.min.x * ppp).max(0.0) as u32, (r.min.y * ppp).max(0.0) as u32, (r.width() * ppp) as u32, (r.height() * ppp) as u32])
     }
 
+    /// The notifications showing now (the ones over go): what they say.
+    pub fn toast_list(&mut self) -> Vec<(String, String)> {
+        let now = Instant::now();
+        self.toasts.retain(|t| t.until > now);
+        self.toasts.iter().map(|t| (t.title.clone(), t.detail.clone())).collect()
+    }
+
     /// The corner notifications, drawn alone while the overlay is closed. Returns their
     /// area in points (what the host needs to show).
     pub fn toasts_frame(&mut self, ui: &mut egui::Ui) -> Option<Rect> {
@@ -1671,14 +1681,20 @@ impl Overlay {
             return None;
         }
         let screen = ui.max_rect();
-        let w = 360.0;
+        // As wide as fits a narrow pane (a quarter of a small screen).
+        let w = 360.0f32.min(screen.width() - 40.0).max(160.0);
         let painter = ui.painter();
         let mut y = screen.top() + 28.0;
         let mut area = Rect::NOTHING;
+        let right = if screen.width() < w + 56.0 { 20.0 } else { 28.0 };
         for t in &self.toasts {
+            // A pane too short for the next one: the newest showing are enough.
+            if y > screen.bottom() - 60.0 {
+                break;
+            }
             let dg = painter.layout(t.detail.clone(), theme::font(12.5), DIM, w - 64.0);
             let h = 44.0 + dg.size().y;
-            let r = Rect::from_min_size(Pos2::new(screen.right() - w - 28.0, y), Vec2::new(w, h));
+            let r = Rect::from_min_size(Pos2::new(screen.right() - w - right, y), Vec2::new(w, h));
             fx::glow(painter, r, 12.0, ACCENT.gamma_multiply(0.22), 16.0);
             fx::gradient(painter, r, 12.0, true, &[(0.0, Color32::from_rgba_unmultiplied(32, 36, 47, 246)), (1.0, Color32::from_rgba_unmultiplied(22, 24, 31, 246))]);
             painter.rect_stroke(r, 12.0, Stroke::new(1.0, theme::line_strong()), egui::StrokeKind::Inside);
@@ -1696,7 +1712,9 @@ impl Overlay {
 /// Where the panel goes on a screen (both in points).
 pub fn panel_rect(screen: Rect) -> Rect {
     let size = Vec2::new((screen.width() * 0.62).clamp(540.0, 920.0), (screen.height() * 0.8).clamp(400.0, 700.0));
-    Rect::from_center_size(screen.center(), size)
+    // Never bigger than the screen (a split-screen player's small pane): cut off, its
+    // footer and Close would be out of reach.
+    Rect::from_center_size(screen.center(), size.min(screen.size()))
 }
 
 /// The panel's background: its light, gradient and edge. The same every frame, so the
@@ -2307,6 +2325,57 @@ mod tests {
         }
         let cmds = press(&ctx, &mut tex, &mut o, &mut prefs, Nav { select: true, ..Nav::default() });
         assert_eq!(accepted(&cmds), Some(3));
+    }
+
+    /// The panel fits a split-screen player's small pane (a quarter of a small screen),
+    /// and is its usual size on a big one.
+    #[test]
+    fn the_panel_fits_a_small_pane() {
+        let small = Rect::from_min_size(Pos2::ZERO, Vec2::new(500.0, 340.0));
+        let p = panel_rect(small);
+        assert!(small.contains_rect(p), "{p:?} in {small:?}");
+        let big = Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 900.0));
+        assert_eq!(panel_rect(big).size(), Vec2::new(920.0, 700.0));
+    }
+
+    /// A mouse click at `at` (pressed in one frame, let go in the next): what the frames
+    /// asked for.
+    fn click(ctx: &egui::Context, tex: &mut Textures, o: &mut Overlay, prefs: &mut Prefs, at: Pos2) -> Vec<Cmd> {
+        let mut cmds = Vec::new();
+        for pressed in [true, false] {
+            let events = vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE },
+            ];
+            let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 900.0))), events, ..Default::default() };
+            let out = ctx.run_ui(input, |ui| o.frame(ui, Nav::default(), prefs, &mut cmds));
+            tex.apply(out.textures_delta);
+        }
+        cmds
+    }
+
+    /// One click on a row does its action once: the pass egui runs again at once (to
+    /// show what the click changed) sees the same click, and mustn't act on it again
+    /// (a switch would flip back, an invite be answered twice).
+    #[test]
+    fn a_click_acts_once() {
+        crate::i18n::set("en");
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let (mut tex, mut prefs) = (Textures::default(), Prefs::default());
+        let mut clicked = false;
+        for y in (150..760).step_by(12) {
+            let mut o = Overlay::new("Game".into());
+            o.state = invites_state(&[(3, "Alex")], 0);
+            o.open(Page::Home, false);
+            press(&ctx, &mut tex, &mut o, &mut prefs, Nav::default());
+            let at = Pos2::new(o.panel.unwrap().center().x, y as f32);
+            let cmds = click(&ctx, &mut tex, &mut o, &mut prefs, at);
+            let answers = cmds.iter().filter(|c| matches!(c, Cmd::Hook(HostMsg::Accept { .. }) | Cmd::Hook(HostMsg::Decline { .. }))).count();
+            assert!(answers <= 1, "one click at y {y} answered the invite {answers} times");
+            clicked |= answers == 1;
+        }
+        assert!(clicked, "no click reached the invite's row");
     }
 
     /// Draws one frame and returns its pixels.

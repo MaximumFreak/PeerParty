@@ -160,7 +160,7 @@ fn unity_log_for(exe: &Path, args: &[OsString], log_dir: &Path, stamp: &str, pla
     Some(log_dir.join(format!("{stem}-{stamp}-player{player}.unity.log")))
 }
 
-pub fn start_session(t: Target, base_env: ChildEnv, split: &SplitScreen, prefs: Prefs, log_dir: &Path) -> Result<Exited, LaunchError> {
+pub fn start_session(t: Target, base_env: ChildEnv, split: &SplitScreen, prefs: Prefs, log_dir: &Path, root: Option<&Path>) -> Result<Exited, LaunchError> {
     launch::set_log_dir(log_dir);
     if t.packaged() {
         return Err(LaunchError::Other("split-screen sessions aren't supported for packaged Microsoft Store games yet".into()));
@@ -184,8 +184,7 @@ pub fn start_session(t: Target, base_env: ChildEnv, split: &SplitScreen, prefs: 
         format!("{y:04}{mo:02}{d:02}-{h:02}{mi:02}{s:02}")
     };
 
-    let tree = tree::Tree::new(None);
-    let mut procs: Vec<PROCESS_INFORMATION> = Vec::with_capacity(count as usize);
+    let mut copies: Vec<SessionCopy> = Vec::with_capacity(count as usize);
     let mut launches: Vec<SessionLaunch> = Vec::with_capacity(count as usize);
 
     // Enable DPI awareness before measuring the monitor so every game starts with the
@@ -207,6 +206,7 @@ pub fn start_session(t: Target, base_env: ChildEnv, split: &SplitScreen, prefs: 
         // to show the copies' windows.
         spec.compositor_capture = !std::env::var(penv::COMPOSITOR).is_ok_and(|v| v.trim().eq_ignore_ascii_case("dwm"));
         spec.input_assignment = split.input(slot).assignment(slot);
+        spec.identity_override = split.name(slot);
         if let Some(&pane) = panes.get(slot as usize) {
             spec.pane = Some(peerparty_protocol::session::PaneRect {
                 x: bounds.x.saturating_add(pane.x),
@@ -226,6 +226,10 @@ pub fn start_session(t: Target, base_env: ChildEnv, split: &SplitScreen, prefs: 
             line.push(" -logFile ");
             line.push(quote(unity_log.as_os_str()));
         }
+        // Each copy has a job of its own: a starter (Unreal's bootstrap, a launcher beside
+        // the game) ends once its game runs, and the copy is the game's programs from the
+        // game's folder until the last of them ends, as a game started alone is (tree.rs).
+        let tree = tree::Tree::new(root);
         match unsafe { start_injected(&exe, &line, cwd, &env, &dll, x86, tree.as_ref()) } {
             Ok(pi) => {
                 eprintln!(
@@ -235,16 +239,22 @@ pub fn start_session(t: Target, base_env: ChildEnv, split: &SplitScreen, prefs: 
                     pi.dwProcessId,
                     if x86 { "x86" } else { "x64" }
                 );
-                launches.push(SessionLaunch { process: pi.hProcess, pid: pi.dwProcessId, pipe, spec, input: split.input(slot) });
-                procs.push(pi);
+                let closer = tree.as_ref().map_or_else(|| tree::Closer::process(pi.hProcess), |tr| tr.closer(pi.hProcess));
+                let watch = tree.map(|tr| tr.watch(pi.hProcess, pi.dwProcessId, exe.clone()));
+                let done = watch.as_ref().map_or(pi.hProcess, |w| w.0);
+                launches.push(SessionLaunch { process: done, pid: pi.dwProcessId, pipe, spec, input: split.input(slot), stop: Some(Box::new(closer)) });
+                copies.push(SessionCopy { pi, watch });
             }
             Err(e) => {
-                for pi in procs {
-                    unsafe {
-                        TerminateProcess(pi.hProcess, 1);
-                        CloseHandle(pi.hThread);
-                        CloseHandle(pi.hProcess);
+                // The copies started already go: every program of each (a starter may
+                // have started its game by now).
+                for l in &launches {
+                    if let Some(stop) = &l.stop {
+                        stop.force();
                     }
+                }
+                for c in copies {
+                    unsafe { c.wait(log_dir, &exe) };
                 }
                 return Err(e);
             }
@@ -252,28 +262,67 @@ pub fn start_session(t: Target, base_env: ChildEnv, split: &SplitScreen, prefs: 
     }
 
     launch::remember(&t.listed);
-    if let Some(first) = procs.first() {
-        let closer = tree.as_ref().map_or_else(|| tree::Closer::process(first.hProcess), |tr| tr.closer(first.hProcess));
-        listen_for_close(closer);
-    }
+    // Close all in the launcher's window goes through the session, as its own window's
+    // Close does: each copy asked, then ended after a while.
+    listen_for_close_with(host::close_session);
     host::run_session(launches, split.layout.clone(), &exe, prefs, false);
 
-    let mut first_exit = Exited(Some(0));
-    for (i, pi) in procs.into_iter().enumerate() {
+    // PeerParty's exit code is the first player's, unless another player's game crashed:
+    // a session is as good as its worst copy.
+    let mut exits = Vec::with_capacity(copies.len());
+    for (i, c) in copies.into_iter().enumerate() {
+        let exited = unsafe { c.wait(log_dir, &exe) };
+        if exited.0 != Some(0) {
+            eprintln!("peerparty: player {}'s game ended with {}", i + 1, exited.0.map_or("no exit code".into(), |c| format!("exit code {c:#X}")));
+        }
+        exits.push(exited);
+    }
+    Ok(session_exit(exits))
+}
+
+/// What a split-screen session ends with: the first player's exit, unless another
+/// player's game ended with an error.
+fn session_exit(exits: Vec<Exited>) -> Exited {
+    let first = exits.first().map_or(Exited(Some(0)), |e| Exited(e.0));
+    if first.0 != Some(0) {
+        return first;
+    }
+    exits.into_iter().find(|e| e.0 != Some(0)).unwrap_or(first)
+}
+
+/// One copy of a split-screen session: the program started, and the wait for all of its
+/// programs (tree.rs; none if it couldn't be put in a job).
+struct SessionCopy {
+    pi: PROCESS_INFORMATION,
+    watch: Option<(HANDLE, std::sync::Arc<std::sync::Mutex<Option<tree::Ended>>>)>,
+}
+
+impl SessionCopy {
+    /// Waits for every program of it to end, says how it ended in its log, and lets its
+    /// handles go.
+    unsafe fn wait(self, log_dir: &Path, exe: &Path) -> Exited {
+        let pi = self.pi;
+        let done = self.watch.as_ref().map_or(pi.hProcess, |w| w.0);
         unsafe {
-            let waited = WaitForSingleObject(pi.hProcess, INFINITE) != WAIT_FAILED;
-            let mut code = 0u32;
-            let known = waited && GetExitCodeProcess(pi.hProcess, &mut code) != 0;
-            let ran = run_time(pi.hProcess);
+            let waited = WaitForSingleObject(done, INFINITE) != WAIT_FAILED;
+            let ended = self.watch.as_ref().and_then(|w| w.1.lock().unwrap_or_else(|e| e.into_inner()).take()).unwrap_or_else(|| {
+                let mut code = 0u32;
+                let known = waited && GetExitCodeProcess(pi.hProcess, &mut code) != 0;
+                tree::Ended { pid: pi.dwProcessId, exe: exe.to_path_buf(), code: known.then_some(code), ran: run_time(pi.hProcess), starter: None }
+            });
+            if let Some((pid, starter, code)) = &ended.starter {
+                let code = code.map(|c| format!(" with exit code {c}")).unwrap_or_default();
+                let line = format!("{} ended{code}; the game went on in {} (pid {})", starter.display(), ended.exe.display(), ended.pid);
+                launch::log_exit(log_dir, starter, *pid, &line);
+            }
             CloseHandle(pi.hThread);
             CloseHandle(pi.hProcess);
-            let exited = launch::report_exit(log_dir, &exe, pi.dwProcessId, known.then_some(code), ran);
-            if i == 0 {
-                first_exit = exited;
+            if let Some(w) = &self.watch {
+                CloseHandle(w.0);
             }
+            launch::report_exit(log_dir, &ended.exe, ended.pid, ended.code, ended.ran)
         }
     }
-    Ok(first_exit)
 }
 
 /// A Microsoft Store (GDK) game: started through Windows' packaged-app activation with
@@ -385,6 +434,11 @@ unsafe fn start_injected(
 /// Waits on a thread of its own for the window's Close all, then closes the game. The
 /// wait for the game to end goes on as usual and reports how it ended.
 fn listen_for_close(closer: tree::Closer) {
+    listen_for_close_with(move || closer.close());
+}
+
+/// Waits on a thread of its own for the window's Close all, then runs `close`.
+fn listen_for_close_with(close: impl FnOnce() + Send + 'static) {
     use windows_sys::Win32::System::Threading::CreateEventW;
     let event = unsafe { CreateEventW(ptr::null(), 1, 0, super::invite::close_event(std::process::id()).as_ptr()) };
     if event.is_null() {
@@ -393,7 +447,7 @@ fn listen_for_close(closer: tree::Closer) {
     let event = event as usize;
     std::thread::spawn(move || unsafe {
         if WaitForSingleObject(event as _, INFINITE) == 0 {
-            closer.close();
+            close();
         }
         CloseHandle(event as _);
     });
@@ -500,6 +554,18 @@ fn quote(arg: &OsStr) -> OsString {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session ends with its first player's exit code, unless another player's game
+    /// crashed.
+    #[test]
+    fn a_session_ends_with_its_worst_copy() {
+        let ex = |v: &[Option<u32>]| session_exit(v.iter().map(|&c| Exited(c)).collect()).0;
+        assert_eq!(ex(&[Some(0), Some(0)]), Some(0));
+        assert_eq!(ex(&[Some(0), Some(0xC000_0005)]), Some(0xC000_0005));
+        assert_eq!(ex(&[Some(3), Some(0xC000_0005)]), Some(3));
+        assert_eq!(ex(&[Some(0), None]), None);
+        assert_eq!(ex(&[]), Some(0));
+    }
 
     #[test]
     fn a_unity_copy_gets_its_own_log() {

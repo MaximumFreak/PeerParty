@@ -188,8 +188,25 @@ pub fn init_from_env() {
     if let Some(spec) = InstanceSpec::from_env() {
         // Its player is the session's slot for it, claimed when the engine starts.
         peerparty_core::want_slot(spec.slot);
+        if let Some(name) = spec.identity_override.as_deref() {
+            peerparty_core::want_name(name);
+        }
+        // A later player's saves are its own from the game's first look at them, not
+        // from when its LAN comes up (saves.rs).
+        if spec.focus_spoof {
+            crate::saves::own_slot_from_session(spec.slot);
+        }
         apply_spec(spec);
     }
+}
+
+/// This copy's player in a split-screen session of more than one copy (0 for the
+/// first); None alone.
+pub fn session_slot() -> Option<u32> {
+    if !FOCUS_SPOOF.load(Ordering::Relaxed) {
+        return None;
+    }
+    crate::sys::lock(&SPEC).as_ref().map(|s| s.slot)
 }
 
 /// Whether this copy is told it has the focus while another has it (a split-screen

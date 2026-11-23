@@ -98,7 +98,23 @@ pub fn visible() -> bool {
 /// Whether controllers are held back from the game: while the overlay shows, and after
 /// it closed with buttons down until they're up (padblock's detours ask this).
 pub fn pads_held_back() -> bool {
-    visible() || (HELD.load(Ordering::Relaxed) && crate::sys::lock(&HOLD).on(Instant::now()))
+    if visible() {
+        return true;
+    }
+    if !HELD.load(Ordering::Relaxed) {
+        return false;
+    }
+    if crate::sys::lock(&HOLD).on(Instant::now()) {
+        return true;
+    }
+    // The launcher never said the buttons were up (PADS_HELD_FOR): the hold ends here,
+    // and what the input layers held for it goes, as when it says so. Off the game's
+    // input call, which is where this is asked.
+    if end_hold() {
+        log!("overlay: controllers reach the game again: the launcher didn't say the buttons were up within {} s", PADS_HELD_FOR.as_secs());
+        let _ = std::thread::Builder::new().name("peerparty-hold".into()).spawn(crate::input::hidden);
+    }
+    false
 }
 
 /// Tests that make the overlay "show" take turns (the switch is one per process).
@@ -229,6 +245,24 @@ pub fn frame_ready(name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hold the launcher never ends (it didn't see the buttons go up) ends by itself:
+    /// controllers reach the game again, and the hold is gone (not ended again at the
+    /// next opening).
+    #[test]
+    fn a_hold_that_times_out_lets_the_controllers_go() {
+        let _turn = test_turn();
+        set_visible_for_test(false);
+        crate::sys::lock(&HOLD).until = Some(Instant::now() - Duration::from_millis(1));
+        HELD.store(true, Ordering::Relaxed);
+        assert!(!pads_held_back());
+        assert!(!HELD.load(Ordering::Relaxed) && crate::sys::lock(&HOLD).until.is_none());
+        // One still on holds them.
+        crate::sys::lock(&HOLD).start(Instant::now());
+        HELD.store(true, Ordering::Relaxed);
+        assert!(pads_held_back());
+        end_hold();
+    }
 
     /// A hold lasts until it's ended or PADS_HELD_FOR passes, and ending it says once
     /// that there was one (so padblock's state for that opening goes once).

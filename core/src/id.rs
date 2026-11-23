@@ -164,7 +164,7 @@ impl Identity {
                 if !server {
                     retire_old_id(dir, slot, id);
                 }
-                let name = copy_name(&base, slot, if server { None } else { other_name() });
+                let name = if server { copy_name(&base, slot, None) } else { wanted_name().unwrap_or_else(|| copy_name(&base, slot, other_name())) };
                 return Identity {
                     id,
                     name,
@@ -191,14 +191,38 @@ fn other_name() -> Option<String> {
         .filter(|n| !n.is_empty())
 }
 
-/// The name of the copy in `slot` on this PC: the first is `base`; later ones are
-/// `other` when one is set (the third onwards numbered, "Sam (3)"), else "base (2)".
+/// The name of the copy in `slot` on this PC: the first is `base`; the second `other`
+/// when one is set (the second player's name), and the rest `base` numbered, "Alex (3)":
+/// the third player is someone else again, not the second one's second copy.
 fn copy_name(base: &str, slot: u32, other: Option<String>) -> String {
     match (slot, other) {
         (0, _) => base.to_string(),
         (1, Some(o)) => o,
-        (n, Some(o)) => format!("{o} ({})", n + 1),
-        (n, None) => format!("{base} ({})", n + 1),
+        (n, _) => format!("{base} ({})", n + 1),
+    }
+}
+
+/// The name a split-screen session gave this copy's player (`want_name`).
+static WANTED_NAME: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// This process's player goes by `name` (a split-screen session's name for its player,
+/// over the PC's naming of its copies). Blank: no name of its own.
+pub fn want_name(name: &str) {
+    let name: String = name.trim().chars().take(32).collect();
+    *WANTED_NAME.lock().unwrap_or_else(|e| e.into_inner()) = (!name.is_empty()).then_some(name);
+}
+
+fn wanted_name() -> Option<String> {
+    WANTED_NAME.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+impl Identity {
+    /// Makes the PC's first player's key (`slot-0`) in `dir` if there's none yet: a
+    /// split-screen session does before its copies start, so a later player's copy
+    /// finds the first one's id at once (its saves start from the first player's),
+    /// not only after that copy got round to making it.
+    pub fn ensure_first(dir: &Path) {
+        let _ = IdentityKey::load_or_create(&dir.join("slot-0.ed25519"));
     }
 }
 
@@ -352,12 +376,14 @@ mod tests {
     use super::*;
 
     /// The second player's name goes to copy 2 only; copy 1 keeps the player's name, and
-    /// with none set, copy 2 is "name (2)" as before.
+    /// with none set, copy 2 is "name (2)" as before. The third and fourth are the first
+    /// player's name numbered, not the second player's.
     #[test]
-    fn the_second_players_name_is_for_later_copies_only() {
+    fn the_second_players_name_is_for_the_second_copy_only() {
         assert_eq!(copy_name("Kim", 0, Some("Sam".into())), "Kim");
         assert_eq!(copy_name("Kim", 1, Some("Sam".into())), "Sam");
-        assert_eq!(copy_name("Kim", 2, Some("Sam".into())), "Sam (3)");
+        assert_eq!(copy_name("Kim", 2, Some("Sam".into())), "Kim (3)");
+        assert_eq!(copy_name("Kim", 3, None), "Kim (4)");
         assert_eq!(copy_name("Kim", 1, None), "Kim (2)");
     }
 

@@ -217,11 +217,10 @@ mod run {
     }
 
     /// Runs `split.instances` copies in one `SessionHost` (`run_session`).
-    pub fn start_session(t: Target, mut base_env: ChildEnv, split: &SplitScreen, prefs: Prefs, log_dir: &Path) -> Result<Exited, LaunchError> {
+    pub fn start_session(t: Target, mut base_env: ChildEnv, split: &SplitScreen, prefs: Prefs, log_dir: &Path, _root: Option<&Path>) -> Result<Exited, LaunchError> {
         launch::set_log_dir(log_dir);
         let count = split.instances.clamp(1, SplitScreen::MAX_INSTANCES);
         let command = prepare_command(&t, &mut base_env);
-        let started = Instant::now();
         let mut launches = Vec::with_capacity(count as usize);
         let mut waiters = Vec::with_capacity(count as usize);
         let mut pids = Vec::with_capacity(count as usize);
@@ -235,7 +234,11 @@ mod run {
                 env.remove(penv::COPY_SAVES);
             }
             let pipe = host::pipe::Pipe::for_game(env.get(penv::IPC).as_deref())
-                .ok_or_else(|| LaunchError::Other(format!("couldn't create IPC socket for player {}", slot + 1)))?;
+                .ok_or_else(|| LaunchError::Other(format!("couldn't create IPC socket for player {}", slot + 1)));
+            let pipe = match pipe {
+                Ok(p) => p,
+                Err(e) => return Err(abandon(&pids, waiters, e)),
+            };
             launch::connect(&mut env, &pipe);
             let mut spec = InstanceSpec::solo(InstanceId(slot), slot);
             spec.focus_spoof = count > 1;
@@ -243,6 +246,7 @@ mod run {
             // into a file by its hook, unless told to leave the copies' windows be.
             spec.compositor_capture = !std::env::var(penv::COMPOSITOR).is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "dwm" | "off" | "none"));
             spec.input_assignment = split.input(slot).assignment(slot);
+            spec.identity_override = split.name(slot);
             if let Some(&pane) = panes.get(slot as usize) {
                 spec.pane = Some(peerparty_protocol::session::PaneRect {
                     x: bounds.x.saturating_add(pane.x),
@@ -260,45 +264,81 @@ mod run {
             cmd.args(&command[1..]);
             env.apply(&mut cmd);
             cmd.process_group(0);
-            let mut child = cmd.spawn().map_err(|e| LaunchError::os(format!("{}: {e}", Path::new(&command[0]).display()), &e))?;
+            let mut child = match cmd.spawn() {
+                Ok(c) => c,
+                Err(e) => return Err(abandon(&pids, waiters, LaunchError::os(format!("{}: {e}", Path::new(&command[0]).display()), &e))),
+            };
             let pid = child.id();
+            let started = Instant::now();
             let ended = Arc::new(AtomicBool::new(false));
             let done = ended.clone();
+            // How long this copy ran, its own clock.
             let waiter = std::thread::spawn(move || {
                 let status = child.wait();
                 done.store(true, Ordering::SeqCst);
-                status
+                (status, started.elapsed())
             });
             pids.push((pid, ended.clone()));
             waiters.push((pid, waiter));
-            launches.push(SessionLaunch { process: ended, pid, pipe, spec, input: split.input(slot) });
+            let stop = GroupStop { pid, ended: ended.clone() };
+            launches.push(SessionLaunch { process: ended, pid, pipe, spec, input: split.input(slot), stop: Some(Box::new(stop)) });
         }
 
         launch::remember(&t.listed);
-        let _control = control::listen(
-            || false,
-            move || {
-                for (pid, ended) in &pids {
-                    close_group(*pid, ended.clone());
-                }
-            },
-        );
+        let _control = control::listen(|| false, host::close_session);
         host::run_session(launches, split.layout.clone(), &t.exe, prefs, false);
 
-        let mut first_exit = Exited(Some(0));
+        // The first player's exit, unless another player's game ended with an error.
+        let mut exits = Vec::with_capacity(waiters.len());
         for (i, (pid, waiter)) in waiters.into_iter().enumerate() {
-            let status = waiter.join().map_err(|_| LaunchError::Other("waiting for the game failed".into()))?.map_err(|e| LaunchError::Other(format!("waiting for the game: {e}")))?;
+            let (status, ran) = waiter.join().map_err(|_| LaunchError::Other("waiting for the game failed".into()))?;
+            let status = status.map_err(|e| LaunchError::Other(format!("waiting for the game: {e}")))?;
             let code = status.code().map(|c| c as u32).or_else(|| status.signal().map(|s| 128 + s as u32));
-            let exited = launch::report_exit(log_dir, &t.exe, pid, code, Some(started.elapsed()));
-            if i == 0 {
-                first_exit = exited;
+            if code != Some(0) {
+                eprintln!("peerparty: player {}'s game ended with {}", i + 1, code.map_or("no exit code".into(), |c| format!("exit code {c}")));
             }
+            exits.push(launch::report_exit(log_dir, &t.exe, pid, code, Some(ran)));
         }
-        Ok(first_exit)
+        let first = exits.first().map_or(Exited(Some(0)), |e| Exited(e.0));
+        Ok(if first.0 == Some(0) { exits.into_iter().find(|e| e.0 != Some(0)).unwrap_or(first) } else { first })
     }
 
-    /// Close all: the game's process group is asked to end (SIGTERM), and made to
-    /// (SIGKILL) if it's still there after a few seconds.
+    type Waiter = std::thread::JoinHandle<(std::io::Result<std::process::ExitStatus>, Duration)>;
+
+    /// A session that couldn't start every copy: the ones started go (their whole process
+    /// groups), and are waited for.
+    fn abandon(pids: &[(u32, Arc<AtomicBool>)], waiters: Vec<(u32, Waiter)>, e: LaunchError) -> LaunchError {
+        for (pid, _) in pids {
+            unsafe { libc::kill(-(*pid as libc::pid_t), libc::SIGKILL) };
+        }
+        for (_, w) in waiters {
+            let _ = w.join();
+        }
+        e
+    }
+
+    /// Closes one copy of a session: its process group (the game and what it started).
+    struct GroupStop {
+        pid: u32,
+        ended: Arc<AtomicBool>,
+    }
+
+    impl host::StopCopy for GroupStop {
+        fn ask(&self, _known: u64) -> usize {
+            if self.ended.load(Ordering::SeqCst) {
+                return 0;
+            }
+            unsafe { libc::kill(-(self.pid as libc::pid_t), libc::SIGTERM) };
+            1
+        }
+
+        fn force(&self) {
+            if !self.ended.load(Ordering::SeqCst) {
+                unsafe { libc::kill(-(self.pid as libc::pid_t), libc::SIGKILL) };
+            }
+        }
+    }
+
     fn close_group(pid: u32, ended: Arc<AtomicBool>) {
         if ended.load(Ordering::SeqCst) {
             return;

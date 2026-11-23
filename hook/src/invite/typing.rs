@@ -138,9 +138,16 @@ fn post_char(hwnd: usize, c: char) {
     let found = if units.len() == 1 { unsafe { VkKeyScanW(units[0]) } } else { -1 };
     let vk = if found == -1 { 0 } else { (found & 0xff) as usize };
     let sc = if vk == 0 { 0 } else { scan(vk as u32) };
+    // An uppercase letter or `_` is its key with Shift: a game reading the keys (not the
+    // characters) sees Shift go down around it.
+    let shift = vk != 0 && shifted(found);
+    let shift_sc = scan(u32::from(VK_SHIFT));
     let mark = peerparty_protocol::session::FORWARDED_KEY;
     let h = hwnd as windows_sys::Win32::Foundation::HWND;
     unsafe {
+        if shift {
+            PostMessageW(h, WM_KEYDOWN, usize::from(VK_SHIFT), key_lparam(shift_sc, false) | mark);
+        }
         if vk != 0 {
             PostMessageW(h, WM_KEYDOWN, vk, key_lparam(sc, false) | mark);
         }
@@ -150,7 +157,16 @@ fn post_char(hwnd: usize, c: char) {
         if vk != 0 {
             PostMessageW(h, WM_KEYUP, vk, key_lparam(sc, true) | mark);
         }
+        if shift {
+            PostMessageW(h, WM_KEYUP, usize::from(VK_SHIFT), key_lparam(shift_sc, true) | mark);
+        }
     }
+}
+
+/// Whether `VkKeyScanW`'s answer for a character needs Shift (its high byte's lowest
+/// bit; -1, none).
+fn shifted(found: i16) -> bool {
+    found != -1 && (found >> 8) & 1 != 0
 }
 
 /// Types `code` into the game once the overlay is gone and the game has the keyboard
@@ -202,6 +218,19 @@ pub fn type_code(code: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Shift goes down around an uppercase letter or `_`, not around the rest.
+    #[test]
+    fn shifted_characters_need_shift() {
+        let scan = |c: char| unsafe { VkKeyScanW(c as u16) };
+        assert!(!shifted(-1));
+        assert!(shifted(0x0141), "Shift+A, as VkKeyScanW gives it");
+        assert!(!shifted(0x0041));
+        // On this PC's layout, whatever it is: an uppercase letter is shifted, its lowercase isn't.
+        if scan('a') != -1 && scan('A') != -1 {
+            assert!(shifted(scan('A')) && !shifted(scan('a')));
+        }
+    }
 
     #[test]
     fn only_plain_codes_are_typed() {

@@ -115,6 +115,8 @@ pub struct InstanceConn {
     pub focus_away: Option<(Instant, u32)>,
     /// It has been the window in front at least once.
     pub focus_seen: bool,
+    /// What closes it, every program of it (a session's copies).
+    pub stop: Option<Box<dyn super::StopCopy>>,
 }
 
 impl InstanceConn {
@@ -149,6 +151,7 @@ impl InstanceConn {
             unseen: Unseen::default(),
             focus_away: None,
             focus_seen: false,
+            stop: None,
         }
     }
 
@@ -220,7 +223,6 @@ impl InstanceConn {
         self.surface = None;
         self.ring = None;
     }
-
 
     /// What signals its end.
     pub fn ended(&self) -> Option<&Ended> {

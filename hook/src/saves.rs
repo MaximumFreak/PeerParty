@@ -139,11 +139,31 @@ fn add_pair(ours: &str, from: &str, once: bool, fallback: bool) -> bool {
 }
 
 /// `--copy-saves`: paths containing `lan` get `main`'s copy first. Several mains for one
-/// LAN id are tried in the order learned, the first that exists winning.
+/// LAN id are tried in the order learned, the first that exists winning. Either way, a
+/// path with `lan` in it is this copy's own already (`keyed_by_own_id`).
 pub fn learn(lan: &str, main: &str) {
+    own_id(lan);
     if enabled() && add(lan, main, false) {
         log!("saves: paths with {lan} start from {main}'s copy");
     }
+}
+
+/// Ids of this copy's own (its LAN ids), as they appear in paths.
+static OWN_IDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// `id` is one of this copy's own: a save keyed by it is apart from the first copy's
+/// without a twin.
+fn own_id(id: &str) {
+    let id = id.to_ascii_lowercase();
+    let mut ids = crate::sys::lock(&OWN_IDS);
+    if !id.is_empty() && !ids.contains(&id) && ids.len() < 16 {
+        ids.push(id);
+    }
+}
+
+/// Whether `full` names a save keyed by one of this copy's own ids.
+fn keyed_by_own_id(full: &str) -> bool {
+    crate::sys::lock(&OWN_IDS).iter().any(|id| find_token(full, id).is_some())
 }
 
 /// The game was shown SteamID `own` in place of steam_api's `game`: saves under its
@@ -360,7 +380,12 @@ fn steam_names(own: u64, game: u64) -> Vec<(String, String)> {
 /// The LAN came up: a copy in a slot other than the first maps its ids (EOS and
 /// PlayFab, from its peer id) to the first slot's. A dedicated server keeps its own.
 pub fn learn_lan(lan: &peerparty_core::Lan) {
-    if !enabled() || lan.slot() == 0 || lan.slot() == u32::MAX || lan.server() {
+    if lan.slot() == 0 || lan.slot() == u32::MAX || lan.server() {
+        return;
+    }
+    own_id(&lan.me().hex());
+    own_id(&crate::playfab::entity_of(lan.me()));
+    if !enabled() {
         return;
     }
     let Some(main) = first_slot() else { return };
@@ -712,6 +737,23 @@ fn ansi(p: *const u8) -> Option<String> {
 /// The slot of a copy whose saves are its own (1 and up); 0 while off.
 static OWN_SLOT: AtomicU32 = AtomicU32::new(0);
 
+/// Whether this copy's saves are its own (a later player's), known already.
+pub fn own_saves() -> bool {
+    OWN_SLOT.load(Ordering::Relaxed) != 0
+}
+
+/// A split-screen session's later player (`slot` from its `InstanceSpec`, read at the
+/// hook's start): its saves are its own before the game first reads them. A game that
+/// reads its save before its LAN comes up would otherwise read, and keep writing, the
+/// first player's. The hooks go in at kernelbase (watch.rs).
+pub fn own_slot_from_session(slot: u32) {
+    if slot == 0 || slot == u32::MAX || crate::config::HookConfig::global().separate_saves == Some(false) {
+        return;
+    }
+    OWN_SLOT.store(slot, Ordering::Relaxed);
+    log!("saves: split-screen player {}: saves shared by every copy are this player's own from the start (a twin beside each, `.peerparty-{}`)", slot + 1, slot + 1);
+}
+
 /// The LAN came up: a player's copy in a slot other than the first keeps its own saves
 /// (module comment).
 pub fn learn_slot(lan: &peerparty_core::Lan) {
@@ -722,15 +764,33 @@ pub fn learn_slot(lan: &peerparty_core::Lan) {
     if crate::config::HookConfig::global().separate_saves == Some(false) {
         return;
     }
-    OWN_SLOT.store(slot, Ordering::Relaxed);
-    log!("saves: this copy is the PC's copy {}: saves shared by every copy are its own (a twin beside each, `.peerparty-{}`)", slot + 1, slot + 1);
+    let before = OWN_SLOT.swap(slot, Ordering::Relaxed);
+    if before == slot {
+        return;
+    }
+    if before != 0 {
+        log!("saves: the session made this player {}, but the LAN gave it copy {}'s slot: its saves are copy {}'s from now on", before + 1, slot + 1, slot + 1);
+    } else {
+        log!("saves: this copy is the PC's copy {}: saves shared by every copy are its own (a twin beside each, `.peerparty-{}`)", slot + 1, slot + 1);
+    }
     // Called while the LAN is being set up: not from here (adopt_earlier_ids).
     std::thread::spawn(arm_now);
+}
+
+/// A path's Win32 long-path prefix (`\\?\`, not a UNC one's), and the path without it.
+fn split_verbatim(path: &str) -> (&str, &str) {
+    match path.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.get(..4).is_some_and(|p| p.eq_ignore_ascii_case(r"UNC\")) => (r"\\?\", rest),
+        _ => ("", path),
+    }
 }
 
 /// For a full path the game uses, in a copy whose saves are its own: (the save's root,
 /// its twin, the rest of the path after the root). None for a path outside any save.
 pub fn twin_of(full: &str, exe_dir: &str, slot: u32) -> Option<(String, String, String)> {
+    // A long path (`\\?\C:\...`) is the same save: its twin keeps the prefix.
+    let (prefix, full) = split_verbatim(full);
+    let (_, exe_dir) = split_verbatim(exe_dir);
     let norm = full.replace('/', "\\");
     if norm.starts_with("\\\\") || norm.to_ascii_lowercase().contains(".peerparty-") {
         return None;
@@ -777,32 +837,43 @@ pub fn twin_of(full: &str, exe_dir: &str, slot: u32) -> Option<(String, String, 
         Some(d) => format!("{}{}{}{}", &norm[..rs], &name[..d], mark, &name[d..]),
         None => format!("{root}{mark}"),
     };
-    Some((root.to_string(), twin, norm[re..].to_string()))
+    Some((format!("{prefix}{root}"), format!("{prefix}{twin}"), norm[re..].to_string()))
 }
 
 /// Roots whose twin this run has made (or found), and that twin.
 static TWINS: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Mutex::default);
 
 /// Makes `twin` from `root` the first time this run sees it (a twin already there is
-/// the copy's own and stays). The root's twin: the one made first, so a root reached
-/// two ways ("Saves v1.0" itself, a file in it) keeps one twin.
+/// the copy's own and stays, unless `--copy-saves` asked for the first copy's again).
+/// The root's twin: the one made first, so a root reached two ways ("Saves v1.0"
+/// itself, a file in it) keeps one twin. Another thread asking meanwhile waits for the
+/// copy (`COPYING`): the twin is listed only once it's whole, so no thread is handed a
+/// path to a save still being copied (and a game finding none there doesn't start a
+/// new one that the copy then can't be renamed onto).
 fn make_twin(root: &str, twin: &str) -> String {
     let key = root.to_ascii_lowercase();
     if let Some(t) = crate::sys::lock(&TWINS).get(&key) {
         return t.clone();
     }
     let _copying = crate::sys::lock(&COPYING);
-    {
-        let mut twins = crate::sys::lock(&TWINS);
-        if let Some(t) = twins.get(&key) {
-            return t.clone();
-        }
-        twins.insert(key, twin.to_string());
+    if let Some(t) = crate::sys::lock(&TWINS).get(&key) {
+        return t.clone();
     }
     let (from, to) = (Path::new(root), Path::new(twin));
-    if to.exists() {
+    let too_big = || from.exists() && size_of_tree(from, MAX_COPY) >= MAX_COPY;
+    if to.exists() && enabled() && from.exists() && !too_big() {
+        // `--copy-saves`: the first copy's save over this one's, as for saves keyed by
+        // an id (`replace`); this one's is kept as a backup.
+        match replace(from, to) {
+            Ok((n, backup)) => log!(
+                "saves: {root} is {twin} in this copy, replaced by the first copy's for --copy-saves ({n} files copied; this copy's is kept as {})",
+                backup.map_or("nothing".into(), |b| b.display().to_string())
+            ),
+            Err(e) => log!("saves: {root} is {twin} in this copy; copying the first copy's over it for --copy-saves failed ({e}), so it stays as it was"),
+        }
+    } else if to.exists() {
         log!("saves: {root} is {twin} in this copy (its own, kept from before)");
-    } else if from.exists() && size_of_tree(from, MAX_COPY) >= MAX_COPY {
+    } else if too_big() {
         log!("saves: {root} is {twin} in this copy; the first copy's is too big to copy here, so it starts empty");
     } else if from.exists() {
         match copy_fresh(from, to) {
@@ -812,6 +883,7 @@ fn make_twin(root: &str, twin: &str) -> String {
     } else {
         log!("saves: {root} is {twin} in this copy (nothing there yet)");
     }
+    crate::sys::lock(&TWINS).insert(key, twin.to_string());
     twin.to_string()
 }
 
@@ -828,9 +900,10 @@ fn own_path(path: &str) -> Option<String> {
     }
     let exe_dir = std::env::current_exe().ok()?.parent()?.to_string_lossy().into_owned();
     let (root, mut twin, rest) = twin_of(&full, &exe_dir, slot)?;
-    // A save keyed by an id (the other way above) is this copy's already.
+    // A save keyed by an id (the other way above, or one of this copy's own) is this
+    // copy's already.
     let pairs = crate::sys::lock(&PAIRS).clone();
-    if !sources_of(&full, &pairs).is_empty() {
+    if !sources_of(&full, &pairs).is_empty() || keyed_by_own_id(&full) {
         return None;
     }
     // A folder with a dot in its name ("MyGame v1.0") is a folder's twin, as it is
@@ -1263,6 +1336,45 @@ mod tests {
         assert_eq!(twin_of(r"C:\Games\Foo\data\x.pak", r"C:\Games\Foo", 1), None);
         assert_eq!(twin_of(r"C:\x\Saves.peerparty-2\a.dat", r"C:\Games\Foo", 1), None);
         assert_eq!(twin_of(r"\\.\pipe\savepipe", r"C:\Games\Foo", 1), None);
+        // A long path is the same save, its twin a long path too; a UNC one isn't.
+        let l = twin_of(r"\\?\C:\Games\Some Game\Profile\Player\Saves\savegame.dat", exe, 1).unwrap();
+        assert_eq!(l.0, r"\\?\C:\Games\Some Game\Profile\Player\Saves");
+        assert_eq!(l.1, r"\\?\C:\Games\Some Game\Profile\Player\Saves.peerparty-2");
+        assert_eq!(l.2, r"\savegame.dat");
+        assert_eq!(twin_of(r"\\?\C:\Games\Some Game\data\Saves\x", r"\\?\C:\Games\Some Game\data\Saves", 1), None);
+        assert_eq!(twin_of(r"\\?\UNC\server\share\Saves\a.dat", exe, 1), None);
+    }
+
+    /// Threads asking for the same twin at once all get it whole: none is handed the
+    /// twin's path while the first copy's save is still being copied into it.
+    #[test]
+    fn threads_asking_for_a_twin_at_once_wait_for_it() {
+        let base = std::env::temp_dir().join(format!("peerparty-twin-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let saves = base.join("Saves");
+        std::fs::create_dir_all(&saves).unwrap();
+        for i in 0..200 {
+            std::fs::write(saves.join(format!("part{i}.dat")), vec![i as u8; 4096]).unwrap();
+        }
+        let twin = base.join("Saves.peerparty-2");
+        let (root, to) = (saves.to_string_lossy().into_owned(), twin.to_string_lossy().into_owned());
+        let threads: Vec<_> = (0..6)
+            .map(|_| {
+                let (root, to) = (root.clone(), to.clone());
+                std::thread::spawn(move || {
+                    let got = make_twin(&root, &to);
+                    // What the thread was handed is all there.
+                    let n = std::fs::read_dir(&got).map(|d| d.count()).unwrap_or(0);
+                    (got, n)
+                })
+            })
+            .collect();
+        for t in threads {
+            let (got, n) = t.join().unwrap();
+            assert_eq!(got, to);
+            assert_eq!(n, 200, "a thread was handed a twin still being copied");
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The first time, the twin starts as a copy of the first copy's save, which is

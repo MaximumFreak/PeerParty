@@ -239,6 +239,9 @@ pub struct SplitScreen {
     pub layout: LayoutPreset,
     /// What each player plays with (`--inputs`), by player; missing ones are `Auto`.
     pub inputs: Vec<SlotInput>,
+    /// Each player's name (`--names`), by player; blank or missing: the PC's naming
+    /// (player 1 the PC's, player 2 the second player's name, then "<name> (3)").
+    pub names: Vec<String>,
 }
 
 /// What a split-screen player plays with (`--inputs auto,kbm,pad`).
@@ -307,11 +310,22 @@ impl SplitScreen {
     pub fn input(&self, slot: u32) -> SlotInput {
         self.inputs.get(slot as usize).copied().unwrap_or_default()
     }
+
+    /// `--names`' list: one per player, comma-separated (blank: the PC's naming).
+    pub fn names_listed(list: &str) -> Option<Vec<String>> {
+        let v: Vec<String> = list.split(',').map(|n| n.trim().chars().take(32).collect()).collect();
+        (v.len() <= Self::MAX_INSTANCES as usize).then_some(v)
+    }
+
+    /// Player `slot`'s own name, if the session gave one.
+    pub fn name(&self, slot: u32) -> Option<String> {
+        self.names.get(slot as usize).filter(|n| !n.trim().is_empty()).cloned()
+    }
 }
 
 impl Default for SplitScreen {
     fn default() -> Self {
-        SplitScreen { instances: 2, layout: LayoutPreset::Horizontal, inputs: Vec::new() }
+        SplitScreen { instances: 2, layout: LayoutPreset::Horizontal, inputs: Vec::new(), names: Vec::new() }
     }
 }
 
@@ -409,7 +423,11 @@ pub fn start(l: Launch) -> Result<Exited, LaunchError> {
     }
 
     if let Some(split) = &l.split {
-        return backend::start_session(target, env, split, prefs, &log_dir);
+        // The first player's id is on disk before any copy looks for it (core's
+        // `Identity::ensure_first`). Under Proton the copies keep theirs inside Wine.
+        #[cfg(windows)]
+        peerparty_core::Identity::ensure_first(&peerparty_core::Identity::default_dir());
+        return backend::start_session(target, env, split, prefs, &log_dir, root.as_deref());
     }
     // The overlay's connection to the hook. On Linux it is also how `--invite` reaches
     // the game (backend/linux/control.rs), so it is made whether the overlay is on or not.
@@ -820,7 +838,7 @@ mod tests {
         assert_eq!(SplitScreen::layout_named("Vertical"), Some(LayoutPreset::Vertical));
         assert_eq!(SplitScreen::layout_named("grid"), Some(LayoutPreset::Grid2x2));
         assert_eq!(SplitScreen::layout_named("diagonal"), None);
-        assert_eq!(SplitScreen::default(), SplitScreen { instances: 2, layout: LayoutPreset::Horizontal, inputs: Vec::new() });
+        assert_eq!(SplitScreen::default(), SplitScreen { instances: 2, layout: LayoutPreset::Horizontal, inputs: Vec::new(), names: Vec::new() });
     }
 
     #[test]

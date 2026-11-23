@@ -524,6 +524,12 @@ fn hand_over_when_claimed(event: usize, process: usize, pid: u32, image: &str) {
             } else {
                 log!("child: {image} (pid {pid}) is the game: the launcher goes to it");
                 give_up_lan();
+                // Its frames aren't the game's: the game's copy of the hook shares its own
+                // into the same ring once it's told to (the session sends it again).
+                if crate::video::capture::enabled() {
+                    log!("child: this starter's frames stop going to the split-screen window");
+                    crate::video::set_capture(false, None, None, false);
+                }
                 crate::ipc::hand_over();
                 if let Some(g) = grant {
                     unsafe { windows_sys::Win32::System::Threading::SetEvent(g as _) };
@@ -541,11 +547,11 @@ fn hand_over_when_claimed(event: usize, process: usize, pid: u32, image: &str) {
 /// internet play set up) lets it go: its player slot goes to the game, which waits for
 /// it (core's `take_slot_from`), and its peers see it leave.
 fn give_up_lan() {
-    if sdk_seen() {
-        return;
-    }
     let Some(lan) = crate::net::lan_if_started() else { return };
-    log!("child: this starter's LAN goes, so the game it started is this PC's player");
+    // A starter that loaded a game SDK itself still holds its slot, which the game waits
+    // for: it goes all the same, as the game is the other program now.
+    let sdk = if sdk_seen() { " (it loaded a game SDK, but the game is the program it started)" } else { "" };
+    log!("child: this starter's LAN goes, so the game it started is this PC's player{sdk}");
     lan.release_port_maps();
     lan.shutdown();
     lan.release_slot();
@@ -581,27 +587,39 @@ fn parent_process() -> Option<usize> {
     (!h.is_null()).then_some(h as usize)
 }
 
+/// The smallest window taken for a game's: 640x360, or half a split-screen pane when
+/// that is smaller (a game kept in a quarter of an 800-line screen is 400 lines tall).
+fn game_window_min(pane: Option<(u32, u32)>) -> (i32, i32) {
+    let (w, h) = pane.map_or((640, 360), |(w, h)| ((w / 2).min(640), (h / 2).min(360)));
+    (w.max(1) as i32, h.max(1) as i32)
+}
+
 /// Whether this process shows a window the size of a game's (not a splash or a tray
 /// helper's).
 fn game_window() -> bool {
     use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT};
     use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible};
-    unsafe extern "system" fn each(w: HWND, found: LPARAM) -> i32 {
+    struct Look {
+        min: (i32, i32),
+        found: bool,
+    }
+    unsafe extern "system" fn each(w: HWND, look: LPARAM) -> i32 {
+        let look = unsafe { &mut *(look as *mut Look) };
         let mut pid = 0u32;
         unsafe { GetWindowThreadProcessId(w, &mut pid) };
         if pid != std::process::id() || unsafe { IsWindowVisible(w) } == 0 {
             return 1;
         }
         let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
-        if unsafe { GetWindowRect(w, &mut r) } != 0 && r.right - r.left >= 640 && r.bottom - r.top >= 360 {
-            unsafe { *(found as *mut bool) = true };
+        if unsafe { GetWindowRect(w, &mut r) } != 0 && r.right - r.left >= look.min.0 && r.bottom - r.top >= look.min.1 {
+            look.found = true;
             return 0;
         }
         1
     }
-    let mut found = false;
-    unsafe { EnumWindows(Some(each), &mut found as *mut bool as LPARAM) };
-    found
+    let mut look = Look { min: game_window_min(crate::window::virtual_size()), found: false };
+    unsafe { EnumWindows(Some(each), &mut look as *mut Look as LPARAM) };
+    look.found
 }
 
 /// In a child a parent followed (it made our event): true, and the pipe to the launcher
@@ -841,6 +859,15 @@ unsafe extern "system" fn create_hook(
         Err(e) => {
             if let Some(event) = event {
                 unsafe { windows_sys::Win32::Foundation::CloseHandle(event as _) };
+                // Nothing will claim its grant: left listed, this starter would look
+                // pending (`starter_pending`) for the whole run.
+                let grant = {
+                    let mut g = crate::sys::lock(&GRANTS);
+                    g.iter().position(|(p, _)| *p == info.pid).map(|i| g.remove(i).1)
+                };
+                if let Some(g) = grant {
+                    unsafe { windows_sys::Win32::Foundation::CloseHandle(g as _) };
+                }
             }
             log!("child: {image} (pid {}) started without peerparty: {e} (flags {flags:#x}, token {token:#x})", info.pid)
         }
@@ -853,11 +880,21 @@ unsafe extern "system" fn create_hook(
 
 #[cfg(test)]
 mod tests {
-    use super::{filter_block, is_peerparty, program_of, is_unreal_starter_dir, norm_dir, norm_path, verdict};
+    use super::{filter_block, game_window_min, is_peerparty, program_of, is_unreal_starter_dir, norm_dir, norm_path, verdict};
     use std::fs;
 
     fn follows(image: &str, root: &str, sdk_seen: bool) -> bool {
         verdict(&norm_path(image), false, &[], norm_dir(root).as_deref(), sdk_seen).is_ok()
+    }
+
+    /// A split-screen copy's window is its pane's size: a quarter of a small screen is
+    /// still the game's.
+    #[test]
+    fn a_game_window_in_a_small_pane_is_the_games() {
+        assert_eq!(game_window_min(None), (640, 360));
+        assert_eq!(game_window_min(Some((1920, 1080))), (640, 360));
+        assert_eq!(game_window_min(Some((640, 400))), (320, 200));
+        assert_eq!(game_window_min(Some((0, 0))), (1, 1));
     }
 
     #[test]

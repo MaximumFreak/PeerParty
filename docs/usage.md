@@ -184,9 +184,9 @@ both.
   EOS and GOG display names, PlayFab, Unity). Set from the launcher's Settings ("Your
   name"); empty means the Windows user name, and a second copy on one PC adds " (2)".
 - `PEERPARTY_OTHER_NAME`: the name a second copy of a game on this PC goes by instead
-  of "name (2)" (the third onwards: "that name (3)"). Set from a game's page ("Player 2's
-  name", shown only at two players or with an instance running); the first copy keeps
-  `PEERPARTY_NAME`.
+  of "name (2)" (the third and fourth stay "name (3)", "name (4)": other players again).
+  Set from a game's page ("Player 2's name", shown only at two players or with an
+  instance running); the first copy keeps `PEERPARTY_NAME`.
 - Programs the game starts: PeerParty works out the game's install folder (its Steam
   library folder, Epic's install list, the folder under one of the window's game folders,
   Unreal's layout, or the program's own folder above ones named like `bin` or `Win64`;
@@ -224,7 +224,7 @@ both.
   game's program name; stores' and Windows' own are left alone) is made per copy, and
   FindWindow doesn't find the other copy's windows.
 - `--split-screen` (`--instances 2..4`, `--layout horizontal|vertical|grid`,
-  `--inputs auto|kbm|pad,...`): start two to four copies on this PC in one shared
+  `--inputs auto|kbm|pad,...`, `--names A,B,...`): start two to four copies on this PC in one shared
   split-screen window. Each pane gets its own controller (assigned when a controller is
   first used, and kept across unplugging), its own in-game overlay when that player
   presses the overlay button, and its own audio and rumble; `Ctrl+Alt+L` cycles the
@@ -236,7 +236,17 @@ both.
   has none. One controller read twice (a remapper's virtual pad beside the real one)
   takes one seat. The overlay's Players page lists this PC's players: swap two players'
   controllers, free one for the next controller pressed, or hand the keyboard and mouse
-  to another player.
+  to another player. `--names` gives players names of their own, in player order (a
+  blank one keeps the usual: player 1 `PEERPARTY_NAME`, player 2 `PEERPARTY_OTHER_NAME`,
+  then "name (3)"). A game with a starter program (one that starts the real game and
+  ends) stays in its pane: each copy is all the programs it started from the game's
+  folder. Players 2 to 4 keep saves the copies share apart from player 1's from the
+  game's first look at them (a `.peerparty-N` twin beside each, started from player 1's;
+  with `--copy-saves`, made from player 1's again). Voice chat uses the PC's microphone
+  and speakers once, through player 1's copy: the other copies send and play no voice.
+  Closing the session's window (or Close all) asks every copy to close and save; what
+  still runs 6 seconds later is ended, at once if asked again. PeerParty's exit code is
+  player 1's, or another player's when theirs crashed.
 - `--copy-saves`: this copy starts from player 1's progress, for games that don't
   offer multiplayer from a fresh save. A second copy plays under LAN ids (SteamID, EOS
   id, PlayFab id); the first time the game touches a path that contains one, the same

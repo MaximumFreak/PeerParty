@@ -140,6 +140,31 @@ pub struct SessionLaunch {
     pub spec: InstanceSpec,
     /// What the player plays with (their spec's `input_assignment` says it to the hook).
     pub input: SlotInput,
+    /// What closes this copy, every program of it (a starter's game too).
+    pub stop: Option<Box<dyn StopCopy>>,
+}
+
+/// Closes one copy of a session: the backend's, which knows all of its programs (on
+/// Windows its job, tree.rs).
+pub trait StopCopy: Send {
+    /// Asks its windows to close as their close buttons would, `known` among them (its
+    /// window as the session knows it, 0: none) even while hidden. How many were asked.
+    fn ask(&self, known: u64) -> usize;
+    /// Ends every program of it now.
+    fn force(&self);
+}
+
+/// How long the copies have to close (and save) after being asked before they're ended.
+const CLOSE_WAIT: Duration = Duration::from_secs(6);
+
+/// Close all in the launcher's window, for a session running in this process: taken by
+/// its next tick, as its own window's Close is.
+static CLOSE_ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Asks the split-screen session in this process to close every copy (they're ended if
+/// they haven't after `CLOSE_WAIT`).
+pub fn close_session() {
+    CLOSE_ASKED.store(true, std::sync::atomic::Ordering::Release);
 }
 
 /// Keys and mouse buttons pressed in a player's pane, with no controller of theirs, that
@@ -306,9 +331,10 @@ struct SessionHost {
     /// The panes need telling to the copies again (a layout change, a copy's window
     /// reported).
     panes_stale: bool,
-    /// When the user asked to close the compositor window (escalates to force-terminate
-    /// after 2 seconds if a game ignores `WM_CLOSE`).
+    /// When the user asked to close the session (its window's Close, or Close all): the
+    /// copies still running after `CLOSE_WAIT` are ended, once (`ended_all`).
     closing_since: Option<Instant>,
+    ended_all: bool,
     nav: NavState,
     key: String,
     prefs: Prefs,
@@ -357,7 +383,15 @@ pub fn run_session(instances: Vec<SessionLaunch>, layout: LayoutPreset, exe: &Pa
     }
     prepare(&prefs);
     let inputs: Vec<SlotInput> = instances.iter().map(|l| l.input).collect();
-    let copies: Vec<InstanceConn> = instances.into_iter().map(|l| InstanceConn::new(l.spec, l.process, l.pid, l.pipe)).collect();
+    let copies: Vec<InstanceConn> = instances
+        .into_iter()
+        .map(|l| {
+            let mut c = InstanceConn::new(l.spec, l.process, l.pid, l.pipe);
+            c.stop = l.stop;
+            c
+        })
+        .collect();
+    CLOSE_ASKED.store(false, std::sync::atomic::Ordering::Release);
     let name = exe.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let title = game_title(exe, &name);
     // The window is made on this thread, which hands it its messages (desktop::wait).
@@ -404,6 +438,7 @@ impl SessionHost {
             saver: PrefsSync::start(&prefs),
             panes_stale: compositor.is_some(),
             closing_since: None,
+            ended_all: false,
             compositor,
             nav: NavState::new(),
             key: crate::ui::store::key_of(exe),
@@ -848,7 +883,16 @@ impl SessionHost {
         self.track_focus(front);
         self.poll_pads();
         self.watch_keyboard(front);
-        let rect = if front { self.game_rect() } else { None };
+        // Game Bar opens over the whole screen: a session's whole window is looked at, so
+        // one over another pane than the focused one's counts too.
+        let rect = if !front {
+            None
+        } else if let Some(b) = self.compositor.as_ref().filter(|c| c.hwnd() != 0).map(|c| c.bounds()) {
+            let (w, h) = (i32::try_from(b.width).unwrap_or(i32::MAX), i32::try_from(b.height).unwrap_or(i32::MAX));
+            Some(Rect { left: b.x, top: b.y, right: b.x.saturating_add(w), bottom: b.y.saturating_add(h) })
+        } else {
+            self.game_rect()
+        };
         let gamebar = front && self.gamebar.open(rect);
         if gamebar != self.under_gamebar {
             self.under_gamebar = gamebar;
@@ -930,16 +974,21 @@ impl SessionHost {
         if c.tick() {
             self.panes_stale = true;
         }
-        if c.take_close_requested() {
-            if self.closing_since.is_some() {
-                // Second Close request: force-terminate right away.
-                c.terminate_instances(&self.instances);
-            } else {
-                c.close_instances(&self.instances);
+        let window_close = c.take_close_requested();
+        let close_all = CLOSE_ASKED.swap(false, std::sync::atomic::Ordering::AcqRel);
+        if window_close || close_all {
+            let how = if window_close { "the session's window was closed" } else { "Close all in PeerParty's window" };
+            if self.closing_since.is_none() {
+                c.close_instances(&self.instances, how);
                 self.closing_since = Some(Instant::now());
+            } else if !self.ended_all {
+                // Asked again while they close: ended now.
+                self.ended_all = true;
+                c.terminate_instances(&self.instances, &format!("{how} again while closing"));
             }
-        } else if self.closing_since.is_some_and(|t| t.elapsed() >= Duration::from_secs(2)) {
-            c.terminate_instances(&self.instances);
+        } else if !self.ended_all && self.closing_since.is_some_and(|t| t.elapsed() >= CLOSE_WAIT) {
+            self.ended_all = true;
+            c.terminate_instances(&self.instances, &format!("still running {} s after being asked to close", CLOSE_WAIT.as_secs()));
         }
         let mut focus = c.take_click().and_then(|(x, y)| c.pane_at(x, y));
         let ours = c.hwnd() != 0 && desktop::in_front(std::process::id());
@@ -980,6 +1029,7 @@ impl SessionHost {
                 c.sync_instances(&mut self.instances);
             }
             self.redraw_all();
+            self.close_hidden_overlays();
         }
         let overlay_open = self.panes[self.focus].visible;
         let clicked_focus = if let Some(c) = self.compositor.as_mut() {
@@ -997,6 +1047,47 @@ impl SessionHost {
         if let Some(i) = clicked_focus.filter(|&i| i != self.focus && i < self.instances.len() && !self.instances[i].gone) {
             self.set_focus(i);
         }
+    }
+
+    /// An open overlay on a pane the session's window doesn't show now (another pane is
+    /// zoomed) closes: left open, it would hold its player's controller and keep showing
+    /// over the zoomed pane.
+    fn close_hidden_overlays(&mut self) {
+        let Some(c) = self.compositor.as_ref() else { return };
+        let shown = c.display_panes();
+        for i in 0..self.panes.len() {
+            let hidden = shown.get(i).is_none_or(|p| p.width <= 100 || p.height <= 100);
+            if hidden && self.panes[i].visible {
+                self.instances[i].send(&HostMsg::Note { text: format!("overlay: closed: player {}'s pane isn't shown (another pane is zoomed)", i + 1) });
+                self.hide(i);
+            }
+        }
+    }
+
+    /// The size of copy `i`'s overlay canvas over `r` (its pane on screen): the game's
+    /// frames' when it's drawn inside them (the session's window shows them scaled into
+    /// the pane, letterboxed), else the pane's.
+    fn canvas_size(&self, i: usize, r: &Rect) -> (usize, usize) {
+        let pane = (usize::try_from(r.right - r.left).unwrap_or(0), usize::try_from(r.bottom - r.top).unwrap_or(0));
+        if !self.use_ingame_for(i) {
+            return pane;
+        }
+        match self.instances[i].viewport.as_ref().filter(|v| v.width > 100 && v.height > 100) {
+            Some(v) => (v.width as usize, v.height as usize),
+            None => pane,
+        }
+    }
+
+    /// The controller kind whose button pictures copy `i`'s overlay shows: its own
+    /// player's controller in a split-screen session, else the one last used.
+    fn pane_styles(&mut self) -> Vec<pad::Style> {
+        let pads = self.input.pads();
+        let last = pads.style;
+        if self.compositor.is_none() || self.instances.len() <= 1 {
+            return vec![last; self.panes.len()];
+        }
+        let seats = pads.seat_info();
+        (0..self.panes.len()).map(|i| seats.get(i).and_then(|s| s.as_ref()).map_or(last, |s| s.style)).collect()
     }
 
     /// The buttons down when copy `i`'s overlay closed: once they're up, the game gets
@@ -1288,8 +1379,8 @@ impl SessionHost {
             }
             self.nav.keys_down[k] = d;
         }
-        let style = self.input.pads().style;
-        for p in &mut self.panes {
+        let styles = self.pane_styles();
+        for (p, style) in self.panes.iter_mut().zip(styles) {
             p.overlay.style = style;
         }
         self.log_pads();
@@ -1380,12 +1471,15 @@ impl SessionHost {
             return;
         };
         let pad = self.pane_pad(i);
+        // The scale the first frame will have (`frame_open`), not the last one's: the
+        // pointer starts in the middle of the panel.
+        let (w, h) = self.canvas_size(i, &r);
+        let ppp = scale_for(h as f32, self.prefs.overlay_scale);
         let p = &mut self.panes[i];
         p.visible = true;
         p.render.dirty = true;
         p.render.render.invalidate();
-        let ppp = p.render.ppp;
-        p.nav.cursor = egui::Pos2::new(((r.right - r.left) / 2) as f32 / ppp, ((r.bottom - r.top) / 2) as f32 / ppp);
+        p.nav.cursor = egui::Pos2::new(w as f32 / 2.0 / ppp, h as f32 / 2.0 / ppp);
         p.nav.pointer = false;
         p.nav.click_shown = None;
         // Buttons held while opening don't act on the first frame.
@@ -1532,7 +1626,9 @@ impl SessionHost {
             events.insert(0, egui::Event::PointerMoved(n.cursor));
         }
         let pad = self.pane_pad(i);
-        self.panes[i].overlay.style = self.input.pads().style;
+        if let Some(&style) = self.pane_styles().get(i) {
+            self.panes[i].overlay.style = style;
+        }
         if self.panes[i].nav.recording.is_some() {
             self.record_chord(i, pad);
             self.panes[i].nav.pad_prev = pad;
@@ -1603,9 +1699,14 @@ impl SessionHost {
             // Soon: the loop wakes again when the gap is over.
             return;
         }
-        let (w, h) = ((r.right - r.left) as usize, (r.bottom - r.top) as usize);
+        let (w, h) = self.canvas_size(i, &r);
         let scale = scale_for(h as f32, self.prefs.overlay_scale);
         {
+            let canvas = &self.panes[i].render.render.canvas;
+            let pane = (usize::try_from(r.right - r.left).unwrap_or(0), usize::try_from(r.bottom - r.top).unwrap_or(0));
+            if (canvas.w, canvas.h) != (w, h) && (w, h) != pane {
+                self.instances[i].send(&HostMsg::Note { text: format!("overlay: drawn inside the game's {w}x{h} frames (its pane on screen is {}x{})", pane.0, pane.1) });
+            }
             let p = &mut self.panes[i];
             p.render.fit(w, h, scale);
             if p.overlay.notice.as_ref().is_some_and(|(_, until)| *until <= Instant::now()) {
@@ -1672,6 +1773,12 @@ impl SessionHost {
         }
         for c in cmds {
             match c {
+                // Internet play is the session's, not one player's: every copy switches.
+                Cmd::Hook(m @ HostMsg::Set { .. }) if matches!(&m, HostMsg::Set { key, .. } if key == "internet") => {
+                    for inst in self.instances.iter().filter(|c| !c.gone) {
+                        inst.send(&m);
+                    }
+                }
                 Cmd::Hook(m) => self.instances[i].send(&m),
                 Cmd::Close => self.hide(i),
                 Cmd::Prefs => {}
@@ -1781,9 +1888,10 @@ impl SessionHost {
                 self.panes[i].render.hide_toast_window();
                 continue;
             };
+            let frames = self.instances[i].viewport.as_ref().filter(|v| ingame && v.width > 100 && v.height > 100).map(|v| (v.width, v.height));
             let p = &mut self.panes[i];
             p.render.fonts();
-            p.render.toasts(&mut self.instances[i], &mut p.overlay, ingame, r, scale, time);
+            p.render.toasts(&mut self.instances[i], &mut p.overlay, ingame, r, frames, scale, time);
         }
     }
 }

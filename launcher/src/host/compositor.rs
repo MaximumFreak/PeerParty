@@ -446,37 +446,36 @@ impl CompositorWindow {
         false
     }
 
-    /// Asks each running copy's window to close gracefully (`WM_CLOSE`).
-    pub fn close_instances(&self, instances: &[InstanceConn]) {
-        #[cfg(windows)]
-        {
-            for inst in instances {
-                if !inst.gone {
-                    let h = inst.best_hwnd();
-                    if h != 0 {
-                        win::post_close(h);
-                    }
+    /// Asks each running copy to close as its close button would (every window of it,
+    /// its hidden one too), `why` said in its log.
+    pub fn close_instances(&self, instances: &[InstanceConn], why: &str) {
+        for (i, inst) in instances.iter().enumerate().filter(|(_, inst)| !inst.gone) {
+            let known = inst.best_hwnd();
+            let asked = match inst.stop.as_ref() {
+                Some(s) => s.ask(known),
+                None => {
+                    #[cfg(windows)]
+                    win::post_close(known);
+                    usize::from(known != 0)
                 }
-            }
+            };
+            crate::launch::note(inst.pid, &format!("session: closing ({why}): player {}'s game was asked to close ({asked} window(s))", i + 1));
         }
-        #[cfg(not(windows))]
-        let _ = instances;
     }
 
-    /// Force-terminates any still-running game copies after graceful `WM_CLOSE` timed out.
-    pub fn terminate_instances(&self, instances: &[InstanceConn]) {
-        #[cfg(windows)]
-        {
-            for inst in instances {
-                if !inst.gone
-                    && let Some(h) = inst.ended()
-                {
-                    unsafe { windows_sys::Win32::System::Threading::TerminateProcess(*h, 0) };
+    /// Ends every copy still running, all of its programs, `why` said in its log.
+    pub fn terminate_instances(&self, instances: &[InstanceConn], why: &str) {
+        for (i, inst) in instances.iter().enumerate().filter(|(_, inst)| !inst.gone) {
+            crate::launch::note(inst.pid, &format!("session: player {}'s game is ended ({why})", i + 1));
+            eprintln!("peerparty: session: player {}'s game is ended ({why})", i + 1);
+            match inst.stop.as_ref() {
+                Some(s) => s.force(),
+                None => {
+                    #[cfg(windows)]
+                    win::terminate(inst.pid);
                 }
             }
         }
-        #[cfg(not(windows))]
-        let _ = instances;
     }
 
     /// Each copy's spec as its pane says: where it is on screen, the virtual screen the
@@ -611,6 +610,21 @@ mod win {
             }
         })
         .as_ref()
+    }
+
+    /// Ends process `pid` with exit code 1 (ended, not finished).
+    pub(super) fn terminate(pid: u32) {
+        use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+        if pid == 0 {
+            return;
+        }
+        unsafe {
+            let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if !h.is_null() {
+                TerminateProcess(h, 1);
+                windows_sys::Win32::Foundation::CloseHandle(h);
+            }
+        }
     }
 
     pub(super) fn post_close(hwnd: u64) {

@@ -372,7 +372,7 @@ fn consider(m: Mod) {
             let n = crate::instance::attach_kernelbase(&table.code);
             log!("instance {} hooked {n}", m.full);
         }
-        if crate::saves::enabled() {
+        if crate::saves::enabled() || crate::saves::own_saves() {
             let n = crate::saves::attach_kernelbase(&table.code);
             log!("saves {} file hooks {n}", m.full);
         }

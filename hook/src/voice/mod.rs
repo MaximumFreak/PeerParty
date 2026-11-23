@@ -342,7 +342,22 @@ pub fn in_use() -> bool {
 }
 
 pub fn devices_allowed() -> bool {
-    crate::config::HookConfig::global().voice != Some(false)
+    crate::config::HookConfig::global().voice != Some(false) && !quiet_copy()
+}
+
+/// A split-screen session's copies share one microphone and one set of speakers: the
+/// first player's copy speaks and listens for the PC. The others don't open the devices,
+/// send no voice (a game reading the microphone itself would send the same voice again)
+/// and play none (it would come out of the same speakers again, and feed back into the
+/// microphone); their rooms, data and who's speaking still work.
+fn quiet_copy() -> bool {
+    crate::window::session_slot().is_some_and(|s| s != 0)
+}
+
+/// Whether `peer`'s voice is this PC's own already: another copy in the same
+/// split-screen session, in the same room as the player.
+fn same_room_here(peer: PeerId) -> bool {
+    crate::window::session_slot().is_some() && crate::ipc::on_this_pc(peer)
 }
 
 fn send(lan: &Lan, peer: PeerId, room: &str, ch: u8, data: &[u8], reliable: bool) -> SendResult {
@@ -369,6 +384,9 @@ pub fn join(lan: &Lan, room: &str, device_in: bool, device_out: bool) {
     }
     crate::sys::lock(&S).swept = None;
     log!("voice joined room {room} (devices: in={device_in} out={device_out}, allowed={})", devices_allowed());
+    if quiet_copy() {
+        log!("voice: split-screen player {}: the PC's microphone and speakers are player 1's; this copy sends and plays no voice", crate::window::session_slot().unwrap_or(0) + 1);
+    }
     devices::update();
 }
 
@@ -565,10 +583,12 @@ pub fn send_audio(lan: &Lan, room: &str, frame: &Frame) -> bool {
     let (members, gain) = {
         let s = crate::sys::lock(&S);
         let Some(r) = s.rooms.get(room) else { return false };
-        if !r.sending || !mic_on() {
+        if !r.sending || !mic_on() || quiet_copy() {
             return true;
         }
-        (r.audio_to(), r.volume_in)
+        // The session's other copies are in the room with the player already.
+        let to: Vec<PeerId> = r.audio_to().into_iter().filter(|p| !same_room_here(*p)).collect();
+        (to, r.volume_in)
     };
     let scaled_frame;
     let frame = if (gain - 1.0).abs() < f32::EPSILON {
@@ -735,7 +755,14 @@ pub fn pump(lan: &Lan) {
                         r.members.insert(p.peer);
                         r.events.push_back(RoomEvent::Joined(p.peer));
                     }
-                    if r.hears(p.peer) && !player_muted(p.peer) {
+                    if same_room_here(p.peer) {
+                        // Another copy of this session: its player is in the room here.
+                    } else if quiet_copy() {
+                        // Player 1's copy plays it: who's speaking is all this one shows.
+                        if r.hears(p.peer) && !player_muted(p.peer) && r.heard.insert(p.peer, Instant::now()).is_none() {
+                            r.events.push_back(RoomEvent::Speaking(p.peer, true));
+                        }
+                    } else if r.hears(p.peer) && !player_muted(p.peer) {
                         let f = if kind == OPUS { r.opus.decode(p.peer, &p.data) } else { decode_audio(&p.data) };
                         if let Some(f) = f {
                             if r.heard.insert(p.peer, Instant::now()).is_none() {

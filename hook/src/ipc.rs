@@ -655,7 +655,7 @@ fn state() -> String {
 /// Whether a peer is another copy on this PC (its id is one of this PC's identity
 /// slots'): the player's own second copy or server, not someone else. Looked up once
 /// per peer: a copy's key file is written before it meets anyone.
-fn on_this_pc(peer: peerparty_core::PeerId) -> bool {
+pub(crate) fn on_this_pc(peer: peerparty_core::PeerId) -> bool {
     static SEEN: std::sync::Mutex<Vec<(peerparty_core::PeerId, bool)>> = std::sync::Mutex::new(Vec::new());
     let mut seen = crate::sys::lock(&SEEN);
     if let Some((_, here)) = seen.iter().find(|(p, _)| *p == peer) {

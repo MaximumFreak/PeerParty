@@ -1462,7 +1462,7 @@ fn strip_split_flags(args: &[String]) -> Vec<String> {
     while i < args.len() {
         match args[i].as_str() {
             "--split-screen" => i += 1,
-            "--instances" | "--layout" | "--inputs" => i += 2,
+            "--instances" | "--layout" | "--inputs" | "--names" => i += 2,
             _ => break,
         }
     }
