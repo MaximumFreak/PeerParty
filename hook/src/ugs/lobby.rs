@@ -32,11 +32,13 @@ use std::time::Duration;
 
 use peerparty_core::{find_attr, remove_attr, set_attr, Attr, Filter, JoinResult, Lobby, LobbyError, Member, MemberStatus, Op, PeerId, Query, Value};
 
-use crate::json::Json;
+use crate::util::json::Json;
 use crate::log;
 use crate::net;
 
-use super::{error_body, now_iso, peer_of, player_id, random_text, wire};
+use super::{error_body, peer_of, player_id, wire};
+use crate::util::encoding::random_text;
+use crate::util::time::now_iso;
 
 pub const NS: &str = "ugs.lobby";
 const SEARCH_WAIT: Duration = Duration::from_secs(2);
@@ -115,7 +117,7 @@ fn set(obj: &mut Json, key: &str, value: Json) {
 const PASSWORD_KEY: &str = "pw";
 
 fn password_hash(lobby: &str, password: &str) -> String {
-    crate::photon::crypto::sha256(format!("peerparty-ugs:{lobby}:{password}").as_bytes())
+    crate::util::crypto::sha256(format!("peerparty-ugs:{lobby}:{password}").as_bytes())
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
@@ -332,24 +334,24 @@ pub fn channel(id: &str) -> String {
 
 /// Lobbies whose changes this copy follows.
 pub fn tracked() -> Vec<String> {
-    TRACK.lock().unwrap().keys().cloned().collect()
+    crate::sys::lock(&TRACK).keys().cloned().collect()
 }
 
 /// A LAN member status change: we may have been kicked.
 pub fn member_status(id: &str, member: PeerId, status: MemberStatus) {
     let Some(lan) = net::lan() else { return };
-    if !TRACK.lock().unwrap().contains_key(id) {
+    if !crate::sys::lock(&TRACK).contains_key(id) {
         return;
     }
     if member == lan.me() && status == MemberStatus::Kicked {
-        KICKED.lock().unwrap().insert(id.to_string());
+        crate::sys::lock(&KICKED).insert(id.to_string());
     }
     log!("ugs lobby {id}: player {} {status:?}", player_id(member));
 }
 
 /// Stops following a lobby without telling the game it's gone (we left or deleted it).
 fn forget(id: &str) {
-    TRACK.lock().unwrap().remove(id);
+    crate::sys::lock(&TRACK).remove(id);
 }
 
 /// Our copy's current view of a lobby we're in, with its version; changes since the
@@ -360,7 +362,7 @@ pub fn refresh(id: &str) -> Option<Json> {
         Some(l) if l.namespace == NS => {
             let view = render(&l, lan.me());
             let now = now_iso();
-            let mut t = TRACK.lock().unwrap();
+            let mut t = crate::sys::lock(&TRACK);
             let e = t.entry(id.to_string()).or_insert_with(|| Tracked {
                 version: 1,
                 view: view.clone(),
@@ -377,9 +379,9 @@ pub fn refresh(id: &str) -> Option<Json> {
         }
         Some(_) => None,
         None => {
-            let gone = TRACK.lock().unwrap().remove(id);
+            let gone = crate::sys::lock(&TRACK).remove(id);
             if let Some(e) = gone {
-                if KICKED.lock().unwrap().remove(id) {
+                if crate::sys::lock(&KICKED).remove(id) {
                     log!("ugs lobby {id}: we were removed");
                     wire::kick(&channel(id));
                 } else {
@@ -587,7 +589,9 @@ fn sort(views: &mut [Json], order: &[Json]) {
             let asc = !matches!(o.get("asc"), Json::Bool(false));
             let (x, y) = (field_value(a, field).unwrap_or(Json::Null), field_value(b, field).unwrap_or(Json::Null));
             let c = if numeric(field) {
-                x.as_f64().unwrap_or(0.0).partial_cmp(&y.as_f64().unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal)
+                // Indexed numbers are stored as text (`data_entry`), so read them as `passes` does.
+                let num = |j: &Json| j.as_f64().or_else(|| j.as_str().and_then(|s| s.trim().parse().ok())).unwrap_or(0.0);
+                num(&x).partial_cmp(&num(&y)).unwrap_or(std::cmp::Ordering::Equal)
             } else {
                 x.to_string().cmp(&y.to_string())
             };

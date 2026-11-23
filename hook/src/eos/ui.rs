@@ -6,8 +6,6 @@
 //!
 //! Layouts: eos_ui_types.h (SDK 1.19).
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use super::abi::result::*;
 use super::abi::{CompletionId, CompletionTwoIds};
 use super::ids;
@@ -15,9 +13,6 @@ use super::{Kind, add_listener, call, later, listeners, remove_listener};
 
 /// EOS_NotConfigured (31 is EOS_Invalid_Sandbox).
 const NOT_CONFIGURED: i32 = 14;
-
-/// Whether PeerParty's overlay is showing, as the game sees it.
-static VISIBLE: AtomicBool = AtomicBool::new(false);
 
 #[allow(non_snake_case)]
 #[repr(C)]
@@ -70,12 +65,12 @@ unsafe extern "system" fn show_friends(_h: usize, o: *const LocalUserOptions, cd
 
 unsafe extern "system" fn hide_friends(_h: usize, o: *const LocalUserOptions, cd: usize, cb: usize) {
     let local = user(o);
-    crate::ipc::send(crate::json::Json::obj(vec![("t", crate::json::Json::str("close"))]));
+    crate::overlay::close();
     later(move || unsafe { call(cb, &CompletionId { ResultCode: SUCCESS, ClientData: cd, Id: local }) });
 }
 
 unsafe extern "system" fn friends_visible(_h: usize, _o: *const LocalUserOptions) -> i32 {
-    i32::from(VISIBLE.load(Ordering::Relaxed))
+    i32::from(crate::overlay::visible())
 }
 
 unsafe extern "system" fn show_profile(_h: usize, o: *const LocalTargetOptions, cd: usize, cb: usize) {
@@ -97,9 +92,9 @@ unsafe extern "system" fn success(_h: usize, _o: usize) -> i32 {
     SUCCESS
 }
 
-/// PeerParty's overlay opened or closed: `DisplaySettingsUpdated` on the game's tick.
+/// PeerParty's overlay opened or closed (overlay.rs tells every `OverlayListener`):
+/// `DisplaySettingsUpdated` on the game's tick.
 pub(crate) fn overlay_visible(on: bool) {
-    VISIBLE.store(on, Ordering::Relaxed);
     later(move || {
         for (f, cd) in listeners(Kind::DisplaySettings, None) {
             let info = DisplaySettingsInfo { ClientData: cd, bIsVisible: i32::from(on), bIsExclusiveInput: i32::from(on) };

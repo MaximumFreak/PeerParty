@@ -1,18 +1,26 @@
 //! What the window remembers (`%LOCALAPPDATA%\peerparty\ui.json`) and the launches
 //! peerparty.exe records (`%LOCALAPPDATA%\peerparty\recent.tsv`, written by the launcher
 //! for every game it starts, from this window, a .bat or a Steam launch option).
+//!
+//! ui.json has more than one writer: the launcher window, and the overlay of every copy
+//! of a game that runs. Each save is a read, a merge and a write of the whole file under
+//! an advisory lock (`ui.json.lock` beside it, `File::lock`), the write a temporary file
+//! renamed over ui.json so a reader never sees half a file. What a writer merges in is
+//! only what it changed since it last read or wrote the file (`merge3`): two saves at
+//! once each keep the other's changes. The lock orders the writers that take it; nothing
+//! waits on it to read.
 
-use std::collections::HashMap;
-use std::fs;
+use std::collections::{BTreeSet, HashMap};
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
+/// PeerParty's own folder (`platform::data_dir`: `%LOCALAPPDATA%\peerparty` on Windows,
+/// `$XDG_DATA_HOME/peerparty` on Linux).
 pub fn data_dir() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("peerparty")
+    crate::platform::data_dir()
 }
 
 /// A game's identity across scans: its exe path, case folded.
@@ -23,8 +31,13 @@ pub fn key_of(exe: &Path) -> String {
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct GameOptions {
-    /// Copies on this PC: 1, or 2 for testing two players on one machine.
+    /// Copies on this PC: 1, or 2–4 for local multiplayer / split screen.
     pub players: u8,
+    /// Run all copies in one split-screen window (when `players >= 2`).
+    pub split_screen: bool,
+    /// Split-screen layout preset: "" (auto: side by side for 2, grid for 3–4),
+    /// "horizontal", "vertical", or "grid".
+    pub split_layout: String,
     // "Copy Player 1's saves to Player N" isn't kept here: it is for one start (the window's
     // `App::copy_saves`). A `copy_saves` an older ui.json has is ignored on reading and
     // gone at the next save.
@@ -45,10 +58,41 @@ pub struct GameOptions {
     pub game_key: String,
 }
 
+impl GameOptions {
+    /// Whether this game launches in a unified split-screen session.
+    pub fn uses_split_screen(&self) -> bool {
+        self.players >= 2 && self.split_screen
+    }
+
+    /// The layout preset name passed to `--layout` (`"horizontal"`, `"vertical"`, or `"grid"`).
+    pub fn effective_split_layout(&self) -> &'static str {
+        match self.split_layout.as_str() {
+            "horizontal" => "horizontal",
+            "vertical" => "vertical",
+            "grid" => "grid",
+            _ if self.players >= 3 => "grid",
+            _ => "horizontal",
+        }
+    }
+
+    /// The settings a game can answer for itself (`None` follows `Prefs`), each with its
+    /// field in `Prefs`.
+    fn own_answers(&self) -> [(Option<bool>, fn(&mut Prefs) -> &mut bool); 4] {
+        [
+            (self.auto_accept, |p| &mut p.auto_accept),
+            (self.overlay, |p| &mut p.overlay),
+            (self.voice, |p| &mut p.voice),
+            (self.steam_saves, |p| &mut p.steam_saves),
+        ]
+    }
+}
+
 impl Default for GameOptions {
     fn default() -> Self {
         GameOptions {
             players: 1,
+            split_screen: false,
+            split_layout: String::new(),
             args: String::new(),
             exe: None,
             auto_accept: None,
@@ -174,36 +218,41 @@ impl Default for Prefs {
     }
 }
 
-/// The SDKs that can use official servers instead of PeerParty's own stand-ins, and what
-/// each does by default.
-pub const SDK_MODES: &[(&str, &str, &str)] = &[
-    ("photon", "Photon", "lan"),
-    ("eos", "Epic Online Services", "lan"),
-    ("ugs", "Unity Gaming Services", "lan"),
-    ("playfab", "PlayFab", "lan"),
-    ("steam", "Steam lobbies", "lan"),
-    ("galaxy", "GOG Galaxy", "lan"),
-    // Not a service: whether the game gets a SteamID of its own for this PC ("lan"),
-    // keeps steam_api's ("official"), or the first unless the Steam client runs it.
-    ("steamid", "Steam player ID", "auto"),
-];
+/// The SDKs that can use official servers instead of PeerParty's own stand-ins
+/// (`catalog::mode_sdks`): each one's id, name and mode by default. The last isn't a
+/// service: whether the game gets a SteamID of its own for this PC ("lan"), keeps
+/// steam_api's ("official"), or the first unless the Steam client runs it.
+pub fn sdk_modes() -> impl Iterator<Item = (&'static str, &'static str, &'static str)> {
+    peerparty_protocol::catalog::mode_sdks().map(|s| (s.id, s.label, s.default_mode.as_str()))
+}
 
 impl Prefs {
+    /// The settings that apply to `game`: these, with its own answers on top.
+    pub fn effective_for(&self, game: &GameOptions) -> Prefs {
+        let mut p = self.clone();
+        for (own, field) in game.own_answers() {
+            if let Some(v) = own {
+                *field(&mut p) = v;
+            }
+        }
+        p
+    }
+
     /// A game's mode for an SDK: its own, else the global one, else the default.
     pub fn mode(&self, game: &GameOptions, sdk: &str) -> String {
         game.modes
             .get(sdk)
             .or_else(|| self.modes.get(sdk))
             .cloned()
-            .unwrap_or_else(|| SDK_MODES.iter().find(|m| m.0 == sdk).map(|m| m.2).unwrap_or("lan").to_string())
+            .unwrap_or_else(|| sdk_modes().find(|m| m.0 == sdk).map_or("lan", |m| m.2).to_string())
     }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// Folders whose subfolders are games. `C:\Games` to begin with; the player can
-    /// remove it.
+    /// Folders whose subfolders are games. `platform::default_games_dir` to begin with;
+    /// the player can remove it.
     pub folders: Vec<PathBuf>,
     /// Programs added with "Add a game…".
     pub added: Vec<PathBuf>,
@@ -243,7 +292,7 @@ pub const SECOND_DELAYS: [u32; 10] = [3, 5, 8, 10, 12, 15, 20, 30, 45, 60];
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            folders: vec![PathBuf::from(r"C:\Games")],
+            folders: vec![crate::platform::default_games_dir()],
             added: Vec::new(),
             hidden: Vec::new(),
             games: HashMap::new(),
@@ -274,17 +323,24 @@ impl Settings {
     /// its place are saved over it at the next change, and with it would go the room
     /// code, the game folders and every game's own settings.
     fn load_from(path: &Path) -> Settings {
-        let text = match fs::read_to_string(path) {
-            Ok(t) => t,
+        match Self::read(path) {
+            Ok(s) => s,
             // No file is a first run. Anything else is a file we mustn't replace.
-            Err(e) => return Settings { unread: e.kind() != std::io::ErrorKind::NotFound, ..Settings::default() },
-        };
-        let Some(mut s) = Self::parse(&text) else {
-            if !text.trim().is_empty() {
-                let _ = fs::write(path.with_extension("json.bad"), &text);
+            Err(Unread::Missing) => Settings::default(),
+            Err(Unread::Held) => Settings { unread: true, ..Settings::default() },
+            Err(Unread::Broken(text)) => {
+                if !text.trim().is_empty() {
+                    let _ = fs::write(path.with_extension("json.bad"), &text);
+                }
+                Settings::default()
             }
-            return Settings::default();
-        };
+        }
+    }
+
+    /// The settings at `path` as they are, brought up to `UI_VERSION`.
+    fn read(path: &Path) -> Result<Settings, Unread> {
+        let text = fs::read_to_string(path).map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { Unread::Missing } else { Unread::Held })?;
+        let Some(mut s) = Self::parse(&text) else { return Err(Unread::Broken(text)) };
         if s.ui_version == 0 {
             // Someone who used PeerParty before the first-run setup existed: they've set
             // it up already.
@@ -301,7 +357,7 @@ impl Settings {
             s.second_delay = SECOND_DELAYS.iter().copied().find(|d| *d >= s.second_delay).unwrap_or(Settings::default().second_delay);
         }
         s.ui_version = UI_VERSION;
-        s
+        Ok(s)
     }
 
     fn parse(text: &str) -> Option<Settings> {
@@ -313,19 +369,51 @@ impl Settings {
         Some(s)
     }
 
-    pub fn save(&self) {
-        self.save_to(&Self::path());
+    /// Saves what changed here since `base` (what this window last read or wrote) over
+    /// the file as it is now, under the lock: a change another writer made meanwhile
+    /// stays. Returns the settings as saved, the next save's `base`.
+    pub fn save_over(&self, base: &Settings) -> Settings {
+        self.save_over_at(&Self::path(), base)
     }
 
-    fn save_to(&self, path: &Path) {
+    fn save_over_at(&self, path: &Path, base: &Settings) -> Settings {
         if self.unread {
-            return;
+            return self.clone();
         }
+        locked(path, || {
+            // A file that doesn't read (or isn't there) has nothing to keep: ours goes in whole.
+            let merged = match Self::read(path) {
+                Ok(disk) => merge3_into(base, self, &disk).unwrap_or_else(|| self.clone()),
+                Err(_) => self.clone(),
+            };
+            merged.write_to(path);
+            merged
+        })
+        .unwrap_or_else(|_| self.clone())
+    }
+
+    /// Reads the settings, changes them with `f` and writes them back, all under the
+    /// lock (an overlay's save). Settings that couldn't be read aren't written.
+    pub fn update(f: impl FnOnce(&mut Settings)) {
+        Self::update_at(&Self::path(), f);
+    }
+
+    fn update_at(path: &Path, f: impl FnOnce(&mut Settings)) {
+        let _ = locked(path, || {
+            let mut s = Self::load_from(path);
+            if !s.unread {
+                f(&mut s);
+                s.write_to(path);
+            }
+        });
+    }
+
+    /// The whole file, through a temporary file of this process's own renamed over it.
+    fn write_to(&self, path: &Path) {
         if let Some(dir) = path.parent() {
             let _ = fs::create_dir_all(dir);
         }
         if let Ok(text) = serde_json::to_string_pretty(self) {
-            // A name of this process's own: the window and a game's overlay both save.
             let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
             if fs::write(&tmp, text).is_ok() && fs::rename(&tmp, path).is_err() {
                 let _ = fs::remove_file(&tmp);
@@ -333,14 +421,94 @@ impl Settings {
         }
     }
 
+    /// An overlay's settings changes for the game `key`: what it changed since `base`
+    /// (its prefs at its last save) goes over these. A game's own answers stay, and the
+    /// global ones they stand in for too: what the overlay changed for this game alone
+    /// isn't written over every other game's.
+    pub fn apply_overlay_edit(&mut self, key: &str, base: &Prefs, edited: &Prefs) {
+        let mut disk = self.prefs.clone();
+        let mut p = merge3_into(base, edited, &disk).unwrap_or_else(|| edited.clone());
+        for (own, field) in self.options(key).own_answers() {
+            if own.is_some() {
+                *field(&mut p) = *field(&mut disk);
+            }
+        }
+        self.prefs = p;
+    }
+
     /// When ui.json last changed.
     pub fn modified() -> Option<std::time::SystemTime> {
         fs::metadata(Self::path()).and_then(|m| m.modified()).ok()
     }
 
+    /// A game's options by its program's key: the found program's, or the one chosen
+    /// in its place ("Change…"), which is what peerparty.exe is started with.
     pub fn options(&self, key: &str) -> GameOptions {
-        self.games.get(key).cloned().unwrap_or_default()
+        if let Some(o) = self.games.get(key) {
+            return o.clone();
+        }
+        self.games.values().find(|o| o.exe.as_deref().is_some_and(|e| key_of(e) == key)).cloned().unwrap_or_default()
     }
+}
+
+/// Why the settings file didn't read.
+enum Unread {
+    Missing,
+    /// There, and held by another program (or not a file).
+    Held,
+    /// There, and not settings: its text.
+    Broken(String),
+}
+
+/// The lock file beside the settings at `path` (`ui.json.lock`).
+fn lock_path(path: &Path) -> PathBuf {
+    path.with_extension("json.lock")
+}
+
+/// Runs `f` holding the advisory lock beside `path` (made if it isn't there), waiting for
+/// whoever holds it now. The lock goes when `f` returns (or the process ends).
+fn locked<T>(path: &Path, f: impl FnOnce() -> T) -> std::io::Result<T> {
+    let lock = lock_path(path);
+    if let Some(dir) = lock.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let file = File::options().read(true).write(true).create(true).truncate(false).open(&lock)?;
+    file.lock()?;
+    let out = f();
+    let _ = file.unlock();
+    Ok(out)
+}
+
+/// `merge3` on values of a type, as that type again (None if the merge doesn't read
+/// back as one).
+fn merge3_into<T: Serialize + serde::de::DeserializeOwned>(base: &T, ours: &T, theirs: &T) -> Option<T> {
+    let v = |x: &T| serde_json::to_value(x).ok();
+    serde_json::from_value(merge3(&v(base)?, &v(ours)?, &v(theirs)?)).ok()
+}
+
+/// A three-way merge: what `ours` changed since `base` goes over `theirs`, which keeps
+/// everything else. Objects (the settings, a game's options, the map of games) merge
+/// key by key; anything else (a list, a number) is taken whole.
+fn merge3(base: &Value, ours: &Value, theirs: &Value) -> Value {
+    let (Value::Object(b), Value::Object(o), Value::Object(t)) = (base, ours, theirs) else {
+        return if ours == base { theirs.clone() } else { ours.clone() };
+    };
+    let mut out = t.clone();
+    for k in b.keys().chain(o.keys()).collect::<BTreeSet<_>>() {
+        match (b.get(k), o.get(k), t.get(k)) {
+            (bv, ov, _) if bv == ov => {}
+            (_, None, _) => {
+                out.remove(k);
+            }
+            (Some(bv), Some(ov), Some(tv)) => {
+                out.insert(k.clone(), merge3(bv, ov, tv));
+            }
+            (_, Some(ov), _) => {
+                out.insert(k.clone(), ov.clone());
+            }
+        }
+    }
+    Value::Object(out)
 }
 
 pub struct Recent {
@@ -438,15 +606,17 @@ mod tests {
         fs::create_dir_all(&path).unwrap();
         let s = Settings::load_from(&path);
         assert!(s.unread);
-        s.save_to(&path);
+        s.save_over_at(&path, &Settings::default());
         assert!(path.is_dir(), "the unreadable thing is still there");
         let fresh = dir.join("first-run.json");
-        let mut s = Settings::load_from(&fresh);
-        assert!(!s.unread);
+        let base = Settings::load_from(&fresh);
+        assert!(!base.unread);
+        let mut s = base.clone();
         s.prefs.name = "Robin".into();
-        s.save_to(&fresh);
+        s.save_over_at(&fresh, &base);
         assert_eq!(Settings::load_from(&fresh).prefs.name, "Robin");
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2, "no temporary file left behind");
+        let tmp = fs::read_dir(&dir).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".tmp")).count();
+        assert_eq!(tmp, 0, "no temporary file left behind");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -478,7 +648,7 @@ mod tests {
         let s = Settings::load_from(&path);
         let o = s.options("c:/games/a/a.exe");
         assert_eq!((o.players, o.args.as_str()), (2, "-windowed"));
-        s.save_to(&path);
+        s.save_over_at(&path, &s);
         let text = fs::read_to_string(&path).unwrap();
         assert!(!text.contains("copy_saves") && text.contains("-windowed"), "{text}");
         let _ = fs::remove_dir_all(&dir);
@@ -494,6 +664,105 @@ mod tests {
         for (stored, read) in [(100, 12), (7, 8), (0, 3), (45, 45)] {
             fs::write(&path, format!(r#"{{"ui_version": {UI_VERSION}, "second_delay": {stored}}}"#)).unwrap();
             assert_eq!(Settings::load_from(&path).second_delay, read, "{stored}");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A game's own answers go over the settings for every game; the rest follow them.
+    #[test]
+    fn a_games_own_answers_go_on_top() {
+        let p = Prefs { auto_accept: false, voice: true, overlay_scale: 1.25, ..Prefs::default() };
+        let game = GameOptions { auto_accept: Some(true), voice: Some(false), ..GameOptions::default() };
+        let e = p.effective_for(&game);
+        assert!(e.auto_accept && !e.voice && e.overlay && e.steam_saves);
+        assert_eq!(e.overlay_scale, 1.25);
+        assert!(p.effective_for(&GameOptions::default()) == p);
+    }
+
+    /// What an overlay changed goes over the file; a game's own answers stay as they
+    /// were on disk (and the global ones under them), and what the overlay didn't change
+    /// (an answer only `--set` gave this run, a change the window made since) stays too.
+    #[test]
+    fn an_overlays_edit_keeps_a_games_own_answers_and_other_changes() {
+        let mut s = Settings::default();
+        s.prefs.auto_accept = false;
+        s.prefs.voice = true;
+        s.games.insert("game".into(), GameOptions { auto_accept: Some(true), ..Default::default() });
+        // The overlay's prefs: this game's (its own answer on top) with `--set voice=off`.
+        let base = Prefs { voice: false, ..s.prefs.effective_for(&s.options("game")) };
+        // Meanwhile the window changed the name.
+        s.prefs.name = "Robin".into();
+        let mut edited = base.clone();
+        edited.auto_accept = false;
+        edited.overlay_scale = 1.5;
+        s.apply_overlay_edit("game", &base, &edited);
+        assert!(!s.prefs.auto_accept, "the game has its own answer: the global one stays");
+        assert!(s.prefs.voice, "the overlay didn't change voice: --set's answer stays this run's");
+        assert_eq!(s.prefs.overlay_scale, 1.5);
+        assert_eq!(s.prefs.name, "Robin", "the window's change stays");
+        // Another game's overlay changes the global answer.
+        let base = s.prefs.clone();
+        let edited = Prefs { auto_accept: true, ..base.clone() };
+        s.apply_overlay_edit("other", &base, &edited);
+        assert!(s.prefs.auto_accept);
+    }
+
+    #[test]
+    fn a_three_way_merge_keeps_both_sides_changes() {
+        let v = |t: &str| serde_json::from_str::<Value>(t).unwrap();
+        let base = v(r#"{"a": 1, "b": {"x": 1, "y": 1}, "list": [1], "gone": 1}"#);
+        let ours = v(r#"{"a": 2, "b": {"x": 2, "y": 1}, "list": [1], "new": 1}"#);
+        let theirs = v(r#"{"a": 1, "b": {"x": 1, "y": 3}, "list": [1, 2], "gone": 1, "theirs": 1}"#);
+        assert_eq!(merge3(&base, &ours, &theirs), v(r#"{"a": 2, "b": {"x": 2, "y": 3}, "list": [1, 2], "new": 1, "theirs": 1}"#));
+        // The same field changed on both sides: ours, the later save, wins.
+        assert_eq!(merge3(&v("1"), &v("2"), &v("3")), v("2"));
+    }
+
+    /// The window and several overlays saving at once, each from what it read before the
+    /// others wrote: every one's change is in the file afterwards, and the file always
+    /// reads whole.
+    #[test]
+    fn saves_at_once_keep_every_change() {
+        let dir = std::env::temp_dir().join(format!("peerparty-locked-save-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ui.json");
+        let first = Settings { onboarded: true, ..Settings::default() };
+        first.save_over_at(&path, &first);
+        let start = std::sync::Barrier::new(8);
+        std::thread::scope(|sc| {
+            for t in 0..4 {
+                let (path, start) = (&path, &start);
+                // The window: a game's options each time, from a base read before them all.
+                sc.spawn(move || {
+                    let mut base = Settings::load_from(path);
+                    start.wait();
+                    for i in 0..10 {
+                        let mut ours = base.clone();
+                        ours.games.insert(format!("game-{t}-{i}"), GameOptions { players: 2, ..GameOptions::default() });
+                        base = ours.save_over_at(path, &base);
+                    }
+                });
+                // An overlay: one setting of its own.
+                sc.spawn(move || {
+                    let base = Settings::load_from(path).prefs;
+                    start.wait();
+                    for i in 0..10 {
+                        let mut edited = base.clone();
+                        edited.modes.insert(format!("sdk-{t}"), format!("mode-{i}"));
+                        Settings::update_at(path, |s| s.apply_overlay_edit("k", &base, &edited));
+                        assert!(Settings::read(path).is_ok(), "a reader sees a whole file");
+                    }
+                });
+            }
+        });
+        let s = Settings::load_from(&path);
+        assert!(s.onboarded);
+        for t in 0..4 {
+            for i in 0..10 {
+                assert_eq!(s.options(&format!("game-{t}-{i}")).players, 2, "game-{t}-{i} lost");
+            }
+            assert_eq!(s.prefs.modes.get(&format!("sdk-{t}")).map(String::as_str), Some("mode-9"), "overlay {t} lost");
         }
         let _ = fs::remove_dir_all(&dir);
     }

@@ -244,7 +244,7 @@ unsafe extern "system" fn set_custom_invite(_h: usize, o: *const SetCustomInvite
         return INVALID_PARAMETERS;
     }
     trace("EOS_CustomInvites_SetCustomInvite", || format!("payload={payload:?}"));
-    S.lock().unwrap().payload = Some(payload);
+    crate::sys::lock(&S).payload = Some(payload);
     SUCCESS
 }
 
@@ -260,7 +260,7 @@ unsafe extern "system" fn send_custom_invite(_h: usize, o: *const SendCustomInvi
         };
         (o.LocalUserId, targets)
     };
-    let payload = S.lock().unwrap().payload.clone();
+    let payload = crate::sys::lock(&S).payload.clone();
     let r = match payload {
         _ if targets.is_empty() => INVALID_PARAMETERS,
         // The SDK wants SetCustomInvite first.
@@ -293,7 +293,7 @@ unsafe extern "system" fn finalize_invite(_h: usize, o: *const FinalizeInviteOpt
         return INVALID_PARAMETERS;
     }
     let id = unsafe { text((*o).CustomInviteId) }.unwrap_or_default();
-    if S.lock().unwrap().received.remove(&id).is_some() { SUCCESS } else { NOT_FOUND }
+    if crate::sys::lock(&S).received.remove(&id).is_some() { SUCCESS } else { NOT_FOUND }
 }
 
 fn local_target(o: *const LocalTargetOptions) -> (usize, usize) {
@@ -316,7 +316,7 @@ unsafe extern "system" fn send_request_to_join(_h: usize, o: *const LocalTargetO
     let (local, target) = local_target(o);
     let r = match ids::peer_of_puid(target) {
         Some(peer) if send_to(peer, RTJ) => {
-            S.lock().unwrap().ask(peer, Instant::now());
+            crate::sys::lock(&S).ask(peer, Instant::now());
             SUCCESS
         }
         Some(_) => NOT_FOUND,
@@ -328,7 +328,7 @@ unsafe extern "system" fn send_request_to_join(_h: usize, o: *const LocalTargetO
 
 /// Answers a request to join we received; false if there was none from that player.
 fn answer(peer: PeerId, accept: bool) -> bool {
-    if !S.lock().unwrap().requests.remove(&peer) {
+    if !crate::sys::lock(&S).requests.remove(&peer) {
         return false;
     }
     send_to(peer, if accept { RTJ_ACCEPT } else { RTJ_REJECT })
@@ -360,7 +360,7 @@ unsafe extern "system" fn reject_request_to_join(_h: usize, o: *const LocalTarge
 }
 
 unsafe extern "system" fn disable_request_to_join(_h: usize, _o: usize) -> i32 {
-    S.lock().unwrap().rtj_disabled = true;
+    crate::sys::lock(&S).rtj_disabled = true;
     SUCCESS
 }
 
@@ -402,7 +402,7 @@ fn receive_invite(from: PeerId, connect: &str, payload: &str) {
         return;
     }
     let decision = crate::invite::decision(from, connect, None);
-    let id = S.lock().unwrap().keep_received(from, payload);
+    let id = crate::sys::lock(&S).keep_received(from, payload);
     trace("CustomInviteReceived", || format!("{id} from {from}: {payload:?}"));
     let info = |cd| CustomInviteInfo {
         ClientData: cd,
@@ -430,11 +430,11 @@ fn receive_invite(from: PeerId, connect: &str, payload: &str) {
 fn receive_request(from: PeerId, connect: &str) {
     let decision = crate::invite::decision(from, connect, None);
     let Some(me) = me() else { return };
-    if S.lock().unwrap().rtj_disabled {
+    if crate::sys::lock(&S).rtj_disabled {
         trace("RequestToJoinReceived", || format!("from {from}: ignored, the game disabled requests to join"));
         return;
     }
-    S.lock().unwrap().requests.insert(from);
+    crate::sys::lock(&S).requests.insert(from);
     trace("RequestToJoinReceived", || format!("from {from}"));
     for (f, cd) in listeners(Kind::RequestToJoinReceived, None).into_iter().filter(|_| decision.received()) {
         let info = RequestToJoinReceivedInfo {
@@ -461,7 +461,7 @@ fn receive_request(from: PeerId, connect: &str) {
 
 fn receive_response(from: PeerId, accepted: bool) {
     let Some(me) = me() else { return };
-    if !S.lock().unwrap().answered_by(from, Instant::now()) {
+    if !crate::sys::lock(&S).answered_by(from, Instant::now()) {
         trace("RequestToJoinResponseReceived", || format!("from {from}: dropped, we didn't ask them"));
         return;
     }

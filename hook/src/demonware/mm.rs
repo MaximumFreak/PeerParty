@@ -27,8 +27,8 @@ pub struct Reader<'a> {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-const STRING: u8 = 0x10;
-const BLOB: u8 = 0x13;
+pub(crate) const STRING: u8 = 0x10;
+pub(crate) const BLOB: u8 = 0x13;
 
 impl<'a> Reader<'a> {
     pub fn new(b: &'a [u8]) -> Self {
@@ -170,7 +170,7 @@ fn publish() {
 
 /// Every session of this title on the LAN, this copy's first.
 fn all_sessions() -> Vec<Session> {
-    let mut out: Vec<Session> = MINE.lock().unwrap().values().cloned().collect();
+    let mut out: Vec<Session> = crate::sys::lock(&MINE).values().cloned().collect();
     let Some(lan) = crate::net::lan_if_started() else { return out };
     let prefix = key_prefix();
     for (peer, _) in lan.peers() {
@@ -201,7 +201,7 @@ pub fn together(a: u64, b: u64) -> bool {
 
 /// A new session id.
 fn new_id() -> [u8; 8] {
-    crate::photon::crypto::random_bytes(8).try_into().unwrap()
+    crate::util::crypto::random_bytes(8).try_into().unwrap()
 }
 
 /// Answers a bdMatchMaking task: Some(results) when it's handled here.
@@ -221,7 +221,7 @@ pub fn answer(task: u8, args: &[u8]) -> Option<Vec<Vec<u8>>> {
                 hex(&s.addr),
                 s.ids()
             );
-            MINE.lock().unwrap().insert(id, s);
+            crate::sys::lock(&MINE).insert(id, s);
             publish();
             let mut out = Vec::new();
             blob(&mut out, &id);
@@ -233,7 +233,7 @@ pub fn answer(task: u8, args: &[u8]) -> Option<Vec<Vec<u8>>> {
             if task == 12 {
                 r.u32()?;
             }
-            let mut mine = MINE.lock().unwrap();
+            let mut mine = crate::sys::lock(&MINE);
             if mine.contains_key(&id) {
                 if let Some(s) = Session::from_info(id, r.rest()) {
                     mine.insert(id, s);
@@ -246,7 +246,7 @@ pub fn answer(task: u8, args: &[u8]) -> Option<Vec<Vec<u8>>> {
         // deleteSession(id).
         3 => {
             let id: [u8; 8] = r.blob()?.try_into().ok()?;
-            if MINE.lock().unwrap().remove(&id).is_some() {
+            if crate::sys::lock(&MINE).remove(&id).is_some() {
                 log!("demonware mm: session {} deleted", hex(&id));
                 publish();
             }
@@ -329,11 +329,11 @@ mod tests {
         typed::u64(&mut i, 0x0110_0001_0000_0a02);
         typed::u64(&mut i, 0);
         let s = Session::from_info([0xa0; 8], &i).unwrap();
-        MINE.lock().unwrap().insert(s.id, s);
+        crate::sys::lock(&MINE).insert(s.id, s);
         assert!(together(0x0110_0001_0000_0a01, 0x0110_0001_0000_0a02));
         assert!(!together(0x0110_0001_0000_0a01, 0x0110_0001_0000_0a03));
         assert!(!together(0x0110_0001_0000_0a01, 0x0110_0001_0000_0a01));
-        MINE.lock().unwrap().remove(&[0xa0; 8]);
+        crate::sys::lock(&MINE).remove(&[0xa0; 8]);
     }
 
     #[test]
@@ -348,6 +348,6 @@ mod tests {
         let mut del = Vec::new();
         blob(&mut del, &id);
         answer(3, &del).unwrap();
-        assert!(!MINE.lock().unwrap().contains_key(&id));
+        assert!(!crate::sys::lock(&MINE).contains_key(&id));
     }
 }

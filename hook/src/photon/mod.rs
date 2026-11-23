@@ -89,11 +89,14 @@ pub fn is_photon_host(host: &str) -> bool {
         .any(|d| h == *d || h.ends_with(&format!(".{d}")))
 }
 
+/// Lookups of Photon Cloud's hosts go to the LAN's Photon servers.
+pub static DNS: crate::net::dns::DnsService = crate::net::dns::DnsService { layer: "photon", is_host: is_photon_host, redirect };
+
 fn wanted() -> bool {
     crate::net::enabled()
         && !crate::net::skip("photon")
-        && std::env::var("PEERPARTY_PHOTON").ok().as_deref() != Some("0")
-        && !crate::modes::official("photon")
+        && crate::config::HookConfig::global().photon != Some(false)
+        && !crate::config::modes::official("photon")
 }
 
 /// Whether this game has looked up Photon (it joins rooms by code).
@@ -110,23 +113,23 @@ static LOCAL_ROOM: Mutex<Option<(String, i32)>> = Mutex::new(None);
 
 /// The room this PC's game is in on PeerParty's Photon servers, if any.
 pub fn local_room() -> Option<String> {
-    LOCAL_ROOM.lock().unwrap().as_ref().map(|(r, _)| r.clone())
+    crate::sys::lock(&LOCAL_ROOM).as_ref().map(|(r, _)| r.clone())
 }
 
 /// Whether a client is this PC's own game: from loopback, and not another PC's
 /// traffic the forwarder delivers from there.
 pub(crate) fn from_this_pc(addr: SocketAddr) -> bool {
-    addr.ip().is_loopback() && crate::ipfwd::forwarded_peer(addr).is_none()
+    addr.ip().is_loopback() && crate::net::ipfwd::forwarded_peer(addr).is_none()
 }
 
 /// A client from this PC (loopback) joined `room` as actor `nr` (server.rs).
 pub(crate) fn joined_locally(room: &str, nr: i32) {
-    *LOCAL_ROOM.lock().unwrap() = Some((room.to_string(), nr));
+    *crate::sys::lock(&LOCAL_ROOM) = Some((room.to_string(), nr));
 }
 
 /// Actor `nr` left `room` (server.rs): if it was this PC's game, it's in no room now.
 pub(crate) fn left(room: &str, nr: i32) {
-    let mut r = LOCAL_ROOM.lock().unwrap();
+    let mut r = crate::sys::lock(&LOCAL_ROOM);
     if r.as_ref().is_some_and(|(name, actor)| name == room && *actor == nr) {
         *r = None;
     }
@@ -160,7 +163,7 @@ pub struct RoomView {
 /// player (through the forwarder), or a LAN peer by its address.
 fn peer_at(lan: &peerparty_core::Lan, addr: SocketAddr) -> Option<PeerId> {
     // First: the forwarder's deliveries come from loopback too.
-    if let Some(p) = crate::ipfwd::forwarded_peer(addr) {
+    if let Some(p) = crate::net::ipfwd::forwarded_peer(addr) {
         return Some(p);
     }
     if addr.ip().is_loopback() {
@@ -172,7 +175,7 @@ fn peer_at(lan: &peerparty_core::Lan, addr: SocketAddr) -> Option<PeerId> {
 /// Who is in a room of ours now (server.rs). Empty `addrs`: the room is gone.
 pub(crate) fn room_changed(code: &str, addrs: Vec<SocketAddr>, max: u8) {
     {
-        let mut r = ROOMS.lock().unwrap();
+        let mut r = crate::sys::lock(&ROOMS);
         r.retain(|x| x.code != code);
         if !addrs.is_empty() {
             r.push(RoomSnap { code: code.to_string(), addrs, max });
@@ -195,7 +198,7 @@ fn members_of(lan: &peerparty_core::Lan, r: &RoomSnap) -> Vec<PeerId> {
 
 /// The room to show: ours with this PC's game in it, else any of ours.
 fn hosted_room(lan: &peerparty_core::Lan) -> Option<(RoomSnap, Vec<PeerId>)> {
-    let rooms = ROOMS.lock().unwrap().clone();
+    let rooms = crate::sys::lock(&ROOMS).clone();
     let all: Vec<(RoomSnap, Vec<PeerId>)> = rooms.into_iter().map(|r| { let m = members_of(lan, &r); (r, m) }).collect();
     let me = lan.me();
     all.iter().find(|(_, m)| m.contains(&me)).or_else(|| all.first()).cloned()
@@ -324,11 +327,11 @@ fn peer_host() -> Option<Chosen> {
             Candidate { id, name, direct, shown: lan.peer_ip(id), public }
         })
         .collect();
-    pick_host(hosts, crate::ipfwd::active())
+    pick_host(hosts, crate::net::ipfwd::active())
 }
 
 fn target() -> Option<(IpAddr, String)> {
-    let mut st = STATE.lock().unwrap();
+    let mut st = crate::sys::lock(&STATE);
     let lan = crate::net::lan();
     if !st.waited {
         st.waited = true;
@@ -349,13 +352,17 @@ fn target() -> Option<(IpAddr, String)> {
         }
     }
     if st.host.is_some() {
-        return Some((IpAddr::V4(Ipv4Addr::LOCALHOST), "PeerParty's Photon servers".into()));
+        return Some((IpAddr::V4(own_ip()), "PeerParty's Photon servers".into()));
     }
     if st.failed {
         return None;
     }
+    let bind = crate::config::HookConfig::global().photon_ip.unwrap_or_else(peerparty_core::bind_ip);
+    if bind != peerparty_core::bind_ip() {
+        log!("photon: serving on {bind} (PEERPARTY_PHOTON_IP)");
+    }
     let opts = host::Options::standard(
-        IpAddr::V4(peerparty_core::bind_ip()),
+        IpAddr::V4(bind),
         Box::new(advertise),
         Box::new(|addr| crate::net::lan().and_then(|lan| peer_at(lan, addr)).map(|p| p.0)),
         Arc::new(|addr: SocketAddr| addr.ip().is_loopback() || crate::net::lan().and_then(|lan| peer_at(lan, addr)).is_some()),
@@ -366,13 +373,13 @@ fn target() -> Option<(IpAddr, String)> {
             st.host = Some(h);
             crate::net::set_presence(PRESENCE, vec![(PRESENCE.into(), "host".into())]);
             log!("photon servers started; Photon lookups resolve here (LAN peers come to this PC)");
-            Some((IpAddr::V4(Ipv4Addr::LOCALHOST), "PeerParty's Photon servers".into()))
+            Some((IpAddr::V4(own_ip()), "PeerParty's Photon servers".into()))
         }
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
             // Another copy on this PC (or a local Photon server) has the ports.
             st.failed = true;
             log!("photon ports already in use on this PC ({e}); using the servers already there");
-            Some((IpAddr::V4(Ipv4Addr::LOCALHOST), "Photon servers already on this PC".into()))
+            Some((IpAddr::V4(own_ip()), "Photon servers already on this PC".into()))
         }
         Err(e) => {
             st.failed = true;
@@ -382,10 +389,16 @@ fn target() -> Option<(IpAddr, String)> {
     }
 }
 
+/// The loopback address this PC's own clients reach the servers at: 127.0.0.1, or
+/// `PEERPARTY_PHOTON_IP`'s.
+fn own_ip() -> Ipv4Addr {
+    crate::config::HookConfig::global().photon_ip.unwrap_or(Ipv4Addr::LOCALHOST)
+}
+
 /// The address of this PC that a client at `client` reaches.
 fn advertise(client: SocketAddr) -> String {
     let me = crate::net::lan().map(|l| l.me());
-    advertise_for(client, crate::ipfwd::forwarded_peer(client).and(me))
+    advertise_for(client, crate::net::ipfwd::forwarded_peer(client).and(me))
 }
 
 /// `forwarded_for` is our own id when the client is an internet peer coming through the
@@ -398,7 +411,7 @@ fn advertise_for(client: SocketAddr, forwarded_for: Option<PeerId>) -> String {
     }
     let client = client.ip();
     if client.is_loopback() {
-        return "127.0.0.1".into();
+        return own_ip().to_string();
     }
     UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
         .and_then(|s| {

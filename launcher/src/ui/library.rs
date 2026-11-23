@@ -33,7 +33,7 @@ fn top_bar_fit(available: f32) -> (f32, bool) {
 
 impl App {
     pub(super) fn library(&mut self, ui: &mut egui::Ui) {
-        self.top_bar_ids.clear();
+        self.lib.top_bar_ids.clear();
         ui.add_space(20.0);
         self.top_bar(ui);
         ui.add_space(10.0);
@@ -54,7 +54,7 @@ impl App {
             let (w, compact) = top_bar_fit(ui.available_width());
             let hint = if w >= SEARCH_HINT_MIN { t!("library.search") } else { "" };
             let search = ui.add(
-                egui::TextEdit::singleline(&mut self.search)
+                egui::TextEdit::singleline(&mut self.lib.search)
                     .hint_text(egui::RichText::new(hint).color(TEXT3))
                     .desired_width(w)
                     .margin(Margin { left: 36, right: 12, top: 9, bottom: 9 })
@@ -64,17 +64,17 @@ impl App {
                 fx::glow(ui.painter(), search.rect, 6.0, ACCENT.gamma_multiply(0.25), 8.0);
             }
             Icon::Search.paint(ui.painter(), search.rect.left_center() + vec2(18.0, 0.0), 15.0, if search.has_focus() { ACCENT_HI } else { TEXT3 });
-            self.top_bar_ids.insert(search.id);
-            if std::mem::take(&mut self.focus_search) {
+            self.lib.top_bar_ids.insert(search.id);
+            if std::mem::take(&mut self.lib.focus_search) {
                 search.request_focus();
             }
-            if self.scanning {
+            if self.lib.scanning {
                 ui.add(egui::Spinner::new().size(16.0).color(TEXT3));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let add = widgets::button(ui, Some(Icon::Add), if compact { "" } else { t!("library.add") }, widgets::Kind::Primary);
                 let add = if compact { add.on_hover_text(t!("library.add")) } else { add };
-                self.top_bar_ids.insert(add.id);
+                self.lib.top_bar_ids.insert(add.id);
                 egui::Popup::menu(&add).show(|ui| {
                     ui.set_min_width(240.0);
                     if ui.button(t!("library.add_game")).clicked() {
@@ -85,13 +85,13 @@ impl App {
                     }
                 });
                 let r = widgets::icon_button(ui, Icon::Refresh, t!("library.rescan"));
-                self.top_bar_ids.insert(r.id);
+                self.lib.top_bar_ids.insert(r.id);
                 if r.clicked() {
                     self.rescan();
                 }
                 let (icon, tip) = if self.settings.list_view { (Icon::Grid, t!("library.grid_view")) } else { (Icon::List, t!("library.list_view")) };
                 let r = widgets::icon_button(ui, icon, tip);
-                self.top_bar_ids.insert(r.id);
+                self.lib.top_bar_ids.insert(r.id);
                 if r.clicked() {
                     self.settings.list_view = !self.settings.list_view;
                     self.save_settings();
@@ -102,8 +102,8 @@ impl App {
 
     fn chips(&mut self, ui: &mut egui::Ui) {
         let cats = self.categories();
-        if !cats.contains(&self.category) {
-            self.category = Category::All;
+        if !cats.contains(&self.lib.category) {
+            self.lib.category = Category::All;
         }
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
@@ -115,14 +115,14 @@ impl App {
                     Category::Source(s) => super::source_name(s),
                 };
                 let n = self.count(c);
-                let lit = self.shown() == c;
+                let lit = self.lib.shown() == c;
                 let r = widgets::chip(ui, label, Some(n), lit);
-                self.top_bar_ids.insert(r.id);
+                self.lib.top_bar_ids.insert(r.id);
                 if lit {
-                    first_focus(&r, &mut self.focus_first);
+                    first_focus(&r, &mut self.nav.focus_first);
                 }
                 if r.clicked() {
-                    self.pick_category(c);
+                    self.lib.pick_category(c);
                 }
             }
         });
@@ -149,13 +149,13 @@ impl App {
         }
         let width = ui.available_width();
         let cols = (((width + GAP) / (CARD_W + GAP)).floor() as usize).max(1);
-        self.grid_cols = cols;
+        self.lib.grid_cols = cols;
         let rows = visible.len().div_ceil(cols);
         let mut actions = Vec::new();
         let mut need = Vec::new();
         let mut area = egui::ScrollArea::vertical().id_salt("grid").auto_shrink([false, false]);
-        if std::mem::take(&mut self.scroll_to_selected) {
-            let at = self.selected.as_ref().and_then(|k| visible.iter().position(|&i| store::key_of(&self.entries[i].exe) == *k));
+        if std::mem::take(&mut self.lib.scroll_to_selected) {
+            let at = self.lib.selected.as_ref().and_then(|k| visible.iter().position(|&i| store::key_of(&self.lib.entries[i].exe) == *k));
             if let Some(o) = at.and_then(|a| self.offset_for(ui, ui.make_persistent_id("grid"), a / cols, CARD_H + GAP, ui.available_height())) {
                 area = area.vertical_scroll_offset(o);
             }
@@ -186,7 +186,7 @@ impl App {
             return;
         }
         let p = ui.painter_at(rect);
-        let glow = self.glow_of(g, key);
+        let glow = self.icons.glow_of(g, key);
         let base = theme::tint_for(&g.name);
         let r = round.nw as f32;
         fx::gradient(&p, rect, r, true, &[(0.0, theme::mix(base, glow, 0.10)), (1.0, theme::mix(base, Color32::BLACK, 0.6))]);
@@ -202,7 +202,7 @@ impl App {
         }
         let side = (rect.width() * 0.46).min(96.0);
         let icon_rect = Rect::from_center_size(rect.center() - vec2(0.0, rect.height() * 0.1), Vec2::splat(side));
-        match self.icons.get(key) {
+        match self.icons.icons.get(key) {
             Some(IconSlot::Ready(tex)) => {
                 p.image(tex.id(), icon_rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
             }
@@ -215,22 +215,22 @@ impl App {
     }
 
     fn card(&self, ui: &mut egui::Ui, i: usize, actions: &mut Vec<Action>, need: &mut Vec<String>) {
-        let g = &self.entries[i];
+        let g = &self.lib.entries[i];
         let key = store::key_of(&g.exe);
         let (rect, resp) = ui.allocate_exact_size(vec2(CARD_W, CARD_H), Sense::click());
         if !ui.is_rect_visible(rect) {
             return;
         }
-        if g.cover.is_none() && !self.icons.contains_key(&key) {
+        if g.cover.is_none() && !self.icons.icons.contains_key(&key) {
             need.push(key.clone());
         }
-        let selected = self.selected.as_deref() == Some(key.as_str());
+        let selected = self.lib.selected.as_deref() == Some(key.as_str());
         let hot = theme::anim(ui.ctx(), resp.id.with("hot"), resp.hovered());
         let sel = theme::anim(ui.ctx(), resp.id.with("sel"), selected);
         let rect = rect.expand(2.5 * hot.max(sel));
         let r = 12.0;
         let p = ui.painter().clone();
-        let glow = self.glow_of(g, &key);
+        let glow = self.icons.glow_of(g, &key);
         fx::shadow(&p, rect, r, 18 + (10.0 * hot) as u8, 6, 110);
         if sel > 0.0 {
             fx::glow(&p, rect, r, ACCENT.gamma_multiply(0.5 * sel), 18.0);
@@ -245,7 +245,7 @@ impl App {
         let galley = p.layout_job(job);
         p.galley(pos2(rect.left() + 12.0, rect.bottom() - 12.0 - galley.size().y), galley, TEXT);
         widgets::badge(&p, rect.left_top() + vec2(10.0, 10.0), self.origin(g, &key), TEXT, true);
-        if !self.running(&key).is_empty() {
+        if !self.sessions.running(&key).is_empty() {
             fx::dot(&p, rect.right_top() + vec2(-16.0, 20.0), 5.0, theme::GOOD);
         }
         if let Some(at) = hover_in(ui, rect).filter(|_| self.welcome.is_none()) {
@@ -297,18 +297,18 @@ impl App {
         let mut actions = Vec::new();
         let mut need = Vec::new();
         let mut area = egui::ScrollArea::vertical().id_salt("list").auto_shrink([false, false]);
-        if std::mem::take(&mut self.scroll_to_selected) {
-            let at = self.selected.as_ref().and_then(|k| visible.iter().position(|&i| store::key_of(&self.entries[i].exe) == *k));
+        if std::mem::take(&mut self.lib.scroll_to_selected) {
+            let at = self.lib.selected.as_ref().and_then(|k| visible.iter().position(|&i| store::key_of(&self.lib.entries[i].exe) == *k));
             if let Some(o) = at.and_then(|a| self.offset_for(ui, ui.make_persistent_id("list"), a, ROW_H, ui.available_height())) {
                 area = area.vertical_scroll_offset(o);
             }
         }
         area.show_rows(ui, ROW_H, visible.len(), |ui, range| {
             for &i in &visible[range] {
-                let g = &self.entries[i];
+                let g = &self.lib.entries[i];
                 let key = store::key_of(&g.exe);
                 let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width() - 8.0, ROW_H - 6.0), Sense::click());
-                let selected = self.selected.as_deref() == Some(key.as_str());
+                let selected = self.lib.selected.as_deref() == Some(key.as_str());
                 let hot = theme::anim(ui.ctx(), resp.id.with("hot"), resp.hovered());
                 let p = ui.painter().clone();
                 if selected {
@@ -322,7 +322,7 @@ impl App {
                 }
                 p.rect_stroke(rect, 10.0, Stroke::new(1.0, if selected { ACCENT_HI.gamma_multiply(0.6) } else { theme::line() }), StrokeKind::Inside);
                 let icon = Rect::from_min_size(rect.min + vec2(10.0, 7.0), Vec2::splat(rect.height() - 14.0));
-                match self.icons.get(&key) {
+                match self.icons.icons.get(&key) {
                     Some(IconSlot::Ready(tex)) => {
                         p.image(tex.id(), icon, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
                     }
@@ -338,7 +338,7 @@ impl App {
                 let origin = self.origin(g, &key);
                 let bw = p.layout_no_wrap(origin.to_string(), theme::strong(11.0), TEXT).size().x + 14.0;
                 widgets::badge(&p, pos2(rect.right() - 14.0 - bw, rect.center().y - 10.0), origin, TEXT2, false);
-                if !self.running(&key).is_empty() {
+                if !self.sessions.running(&key).is_empty() {
                     fx::dot(&p, pos2(rect.right() - 30.0 - bw, rect.center().y), 4.5, theme::GOOD);
                 }
                 if resp.clicked() {
@@ -360,14 +360,14 @@ impl App {
             let (r, _) = ui.allocate_exact_size(vec2(84.0, 84.0), Sense::hover());
             let p = ui.painter();
             fx::light(p, r.center(), Vec2::splat(90.0), ACCENT.gamma_multiply(0.16));
-            let icon = if self.scanning { Icon::Refresh } else if self.search.is_empty() { Icon::Library } else { Icon::Search };
+            let icon = if self.lib.scanning { Icon::Refresh } else if self.lib.search.is_empty() { Icon::Library } else { Icon::Search };
             icon.paint(p, r.center(), 38.0, TEXT2);
             ui.add_space(8.0);
-            let (title, sub) = if self.scanning {
+            let (title, sub) = if self.lib.scanning {
                 (t!("library.scanning").to_string(), String::new())
-            } else if !self.search.is_empty() {
-                (t!("library.no_match", text = self.search), t!("library.no_match_sub").to_string())
-            } else if self.shown() == Category::Recent {
+            } else if !self.lib.search.is_empty() {
+                (t!("library.no_match", text = self.lib.search), t!("library.no_match_sub").to_string())
+            } else if self.lib.shown() == Category::Recent {
                 (t!("library.no_recent").to_string(), t!("library.no_recent_sub").to_string())
             } else {
                 (t!("library.empty").to_string(), t!("library.empty_sub").to_string())
@@ -376,7 +376,7 @@ impl App {
             if !sub.is_empty() {
                 ui.label(egui::RichText::new(sub).color(TEXT2));
             }
-            if !self.scanning && self.search.is_empty() && self.shown() != Category::Recent {
+            if !self.lib.scanning && self.lib.search.is_empty() && self.lib.shown() != Category::Recent {
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     let w = 2.0 * 160.0 + 8.0;

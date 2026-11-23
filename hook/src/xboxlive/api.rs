@@ -8,7 +8,7 @@
 //! presence_record.cpp, presence_device_record.cpp, Privacy/privacy_service.cpp,
 //! permission_check_result.cpp). XUIDs travel as decimal strings.
 
-use crate::json::Json;
+use crate::util::json::Json;
 
 /// A player the game may ask about.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -68,7 +68,7 @@ fn xuid_json(x: u64) -> Json {
 fn xuids(v: &Json) -> Vec<u64> {
     v.as_arr()
         .iter()
-        .filter_map(|x| x.as_str().and_then(|s| s.parse().ok()).or_else(|| x.as_f64().map(|n| n as u64)))
+        .filter_map(|x| x.as_str().and_then(|s| s.parse().ok()).or_else(|| x.as_u64()))
         .collect()
 }
 

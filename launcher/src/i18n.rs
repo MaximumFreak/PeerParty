@@ -110,6 +110,13 @@ pub fn tr(key: &'static str) -> &'static str {
     table(i).get(key).or_else(|| table(0).get(key)).copied().unwrap_or(key)
 }
 
+/// A key made at run time (`layer.<id>`): its text in the language in use, else English;
+/// None when English hasn't it either.
+pub fn tr_key(key: &str) -> Option<&'static str> {
+    let i = CURRENT.load(Ordering::Relaxed);
+    table(i).get(key).or_else(|| table(0).get(key)).copied()
+}
+
 /// The plural form a language uses for `n` (CLDR's rules for whole numbers).
 pub fn plural(lang: &str, n: i64) -> &'static str {
     let n = n.unsigned_abs();

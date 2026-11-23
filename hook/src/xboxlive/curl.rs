@@ -19,9 +19,8 @@ use std::sync::{LazyLock, Mutex, OnceLock};
 
 use retour::GenericDetour;
 
-use crate::hook::with_lock;
 use crate::log;
-use crate::pe::Export;
+use crate::sys::pe::Export;
 
 // curl/curl.h option numbers: LONG = 0, OBJECTPOINT = 10000, FUNCTIONPOINT = 20000.
 const OPT_WRITEDATA: u32 = 10001;
@@ -98,7 +97,7 @@ pub fn active() -> bool {
 
 pub fn bodies() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PEERPARTY_XBL_TRACE").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| crate::config::HookConfig::global().xbl_trace)
 }
 
 /// XCurl.dll loaded (watch.rs). The number of functions hooked.
@@ -123,19 +122,7 @@ fn arm<T>(slot: &OnceLock<GenericDetour<T>>, target: T, detour: T, label: &str) 
 where
     T: retour::Function + Copy + Send + Sync + 'static,
 {
-    with_lock(|| {
-        let hook = match unsafe { GenericDetour::new(target, detour) } {
-            Ok(h) => h,
-            Err(e) => {
-                log!("xboxlive {label} not hooked: {e}");
-                return false;
-            }
-        };
-        if slot.set(hook).is_err() {
-            return false;
-        }
-        unsafe { slot.get().unwrap().enable() }.is_ok()
-    })
+    crate::sys::detour::arm(slot, target, detour, "xboxlive", label)
 }
 
 /// The host and path of an `https://host/path?query` URL.
@@ -165,7 +152,7 @@ fn body_option(slot: &'static Slot, write: bool, func: bool, value: usize) -> (u
     } else {
         (&slot.read, read_wrap as DataFn as usize, OPT_READFUNCTION, OPT_READDATA)
     };
-    let mut s = side.lock().unwrap();
+    let mut s = crate::sys::lock(side);
     let was = s.wrapped();
     if func {
         s.func = value;
@@ -195,11 +182,11 @@ unsafe extern "C" fn setopt(h: usize, option: u32, value: usize, high: usize) ->
     let mut value = value;
     let mut also = None;
     {
-        let mut calls = CALLS.lock().unwrap();
+        let mut calls = crate::sys::lock(&CALLS);
         let c = &mut *calls;
         match option {
             OPT_URL if value != 0 => {
-                let url = crate::read::cstr(value).unwrap_or_default();
+                let url = crate::sys::read::cstr(value).unwrap_or_default();
                 let call = c.by_handle.entry(h).or_default();
                 if call.method.is_empty() {
                     call.method = "GET";
@@ -207,7 +194,7 @@ unsafe extern "C" fn setopt(h: usize, option: u32, value: usize, high: usize) ->
                 call.url = url;
             }
             OPT_CUSTOMREQUEST if value != 0 => {
-                let m = crate::read::cstr(value).unwrap_or_default().to_ascii_uppercase();
+                let m = crate::sys::read::cstr(value).unwrap_or_default().to_ascii_uppercase();
                 c.by_handle.entry(h).or_default().method = match m.as_str() {
                     "DELETE" => "DELETE",
                     "PUT" => "PUT",
@@ -243,12 +230,12 @@ fn original(data: usize, write: bool) -> Option<(usize, DataFn, usize)> {
         return None;
     }
     let slot = unsafe { &*(data as *const Slot) };
-    let s = *if write { &slot.write } else { &slot.read }.lock().unwrap();
+    let s = *crate::sys::lock(if write { &slot.write } else { &slot.read });
     (s.func != 0).then(|| (slot.handle, unsafe { std::mem::transmute::<usize, DataFn>(s.func) }, s.data))
 }
 
 fn keep(h: usize, bytes: &[u8], write: bool) {
-    let mut calls = CALLS.lock().unwrap();
+    let mut calls = crate::sys::lock(&CALLS);
     if let Some(call) = calls.by_handle.get_mut(&h) {
         let buf = if write { &mut call.got } else { &mut call.sent };
         let room = BODY_MAX.saturating_sub(buf.len());
@@ -281,7 +268,7 @@ unsafe extern "C" fn write_wrap(buf: *mut u8, size: usize, n: usize, data: usize
 /// `curl_easy_reset`: every option back to curl's default, so nothing is wrapped.
 unsafe extern "C" fn reset(h: usize) {
     {
-        let mut calls = CALLS.lock().unwrap();
+        let mut calls = crate::sys::lock(&CALLS);
         if let Some(slot) = calls.slots.get(&h) {
             *slot.read.lock().unwrap() = Side::default();
             *slot.write.lock().unwrap() = Side::default();
@@ -300,8 +287,11 @@ fn text(bytes: &[u8]) -> String {
 
 unsafe extern "C" fn cleanup(h: usize) {
     let call = {
-        // The handle's slot stays as it is: a copy made of this handle may still use it.
-        let mut calls = CALLS.lock().unwrap();
+        // The slot itself stays (never freed): a copy made of this handle may still
+        // point at it. Only the handle's claim on it goes, since curl_easy_init can
+        // hand the same address out again, and a new handle starts with nothing wrapped.
+        let mut calls = crate::sys::lock(&CALLS);
+        calls.slots.remove(&h);
         calls.by_handle.remove(&h)
     };
     if let Some(call) = call.filter(|c| is_xbox(&c.url)) {

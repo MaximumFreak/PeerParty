@@ -30,7 +30,8 @@
 //! here they're connections on socket indexes 6-8 (TCP) and 9-11 (WebSocket) whose
 //! redirects name TCP ports, or `ws://` addresses.
 
-use super::crypto::{random_bytes, Aes256, Dh};
+use super::crypto::Dh;
+use crate::util::crypto::{random_bytes, Aes256};
 use super::enet::{self, Peer, State};
 use super::message::{parse_hello, Proto};
 use super::sql;
@@ -627,7 +628,7 @@ pub type Player = [u8; 16];
 /// the log (for finding why a game leaves a room).
 fn trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PEERPARTY_PHOTON_TRACE").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| crate::config::HookConfig::global().photon_trace)
 }
 
 /// Fusion's packets are logged without the variable too, the first 80 of a run: a
@@ -2183,9 +2184,7 @@ fn apply_room_options(g: &mut Game, p: &Params) {
 
 /// A room name for rooms created without one (Photon uses a GUID string).
 fn uuid_like() -> String {
-    let b = random_bytes(16);
-    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
-    format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..])
+    crate::util::encoding::uuid()
 }
 
 #[cfg(test)]

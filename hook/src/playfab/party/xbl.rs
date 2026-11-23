@@ -1,0 +1,578 @@
+//! PlayFab Party's Xbox Live helper (`PartyXboxLive.dll`), shipped by Microsoft Store
+//! (GDK) builds of Party games. It turns Xbox
+//! users into Party chat users and PlayFab entities, asking Xbox Live for tokens and
+//! privacy settings. On the LAN every `PartyXbl*` export is PeerParty's:
+//!
+//! - Chat users are local handles; a local one's PlayFab sign-in (`LoginToPlayFab`)
+//!   completes with this copy's LAN entity (the one party.rs and the PlayFab service
+//!   use), and its Xbox user id goes out in LAN presence (`peerparty:xuid`).
+//! - `GetEntityIdsFromXboxLiveUserIds` maps an Xbox user id to the LAN player whose
+//!   presence carries it.
+//! - Chat permissions are what the real Xbox Live privacy service said about the game's
+//!   own privacy requests (xboxlive/real.rs): a blocked player gets no chat, a muted one
+//!   isn't heard, refused voice or text is off, each with its reason (privilege for the
+//!   account's own limits, a child account's; privacy for the rest). Without such an
+//!   answer everything is allowed. When what's known changes, each local and remote
+//!   chat user pair gets a REQUIRED_CHAT_PERMISSION_INFO_CHANGED. No token is ever
+//!   requested from the game.
+//!
+//! Layouts: PartyXboxLive_c.h (PlayFab's Unreal plugin, Platforms/GDK/Include). State
+//! changes are boxed and handed out by `PartyXblStartProcessingStateChanges`, freed at
+//! Finish, as in party.rs.
+
+use std::collections::{HashSet, VecDeque};
+use std::ffi::{CString, c_char, c_void};
+use std::sync::Mutex;
+
+use crate::log;
+use crate::sys::pe::Export;
+
+type PartyError = u32;
+const OK: PartyError = 0;
+const BAD: PartyError = 1;
+
+/// The one PARTY_XBL_HANDLE handed out.
+static HANDLE_MARK: u8 = 0;
+
+fn handle() -> usize {
+    &HANDLE_MARK as *const u8 as usize
+}
+
+struct ChatUser {
+    xuid: u64,
+    local: bool,
+    context: usize,
+}
+
+/// A state change and what it points at, kept until the game finishes with it.
+struct Change {
+    ptr: *const u32,
+    free: Box<dyn FnOnce() + Send>,
+}
+
+unsafe impl Send for Change {}
+
+#[derive(Default)]
+struct State {
+    users: Vec<Box<ChatUser>>,
+    handles: Vec<usize>,
+    queue: VecDeque<Change>,
+    /// Batches handed out and not yet returned in full: each one's array (the game reads
+    /// it until it finishes) and the changes in it still unreturned. The game may start
+    /// again before finishing, and return changes from several batches at once.
+    out: VecDeque<(Vec<*const u32>, Vec<Change>)>,
+    /// Chat user lists handed out by PartyXblGetChatUsers, kept until the next Start (as
+    /// party.rs keeps its Get* arrays): creating a user mustn't move one the game reads.
+    lists: Vec<Vec<usize>>,
+}
+
+/// Unfinished batches kept before the oldest is let go (a game that never finishes).
+const MAX_BATCHES: usize = 16;
+
+unsafe impl Send for State {}
+
+static S: Mutex<Option<State>> = Mutex::new(None);
+
+fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
+    let mut g = crate::sys::lock(&S);
+    f(g.get_or_insert_with(State::default))
+}
+
+pub fn attach(base: usize, module_name: &str, exports: &[Export]) -> HashSet<usize> {
+    // The generic answers (one body for any number of arguments) are only right where
+    // the caller cleans the stack (x64); in a 32-bit game's stdcall they would unbalance
+    // it. Until those have exact signatures, a 32-bit game keeps its own SDK.
+    if cfg!(target_arch = "x86") {
+        log!("party-xbl: off in 32-bit games (its stand-ins are x64-only for now): {module_name} runs as it is");
+        return HashSet::new();
+    }
+    crate::sys::swap::register(base, module_name, resolve);
+    let n = exports.iter().filter(|e| e.name.starts_with("PartyXbl")).count();
+    log!("party-xbl on for {module_name}: {n} PartyXbl functions are PeerParty's (Xbox users sign in to the LAN)");
+    HashSet::new()
+}
+
+fn resolve(name: &str) -> Option<usize> {
+    Some(match name {
+        "PartyXblInitialize" => initialize as *const () as usize,
+        "PartyXblCleanup" => ok1 as *const () as usize,
+        "PartyXblStartProcessingStateChanges" => start as *const () as usize,
+        "PartyXblFinishProcessingStateChanges" => finish as *const () as usize,
+        "PartyXblCreateLocalChatUser" => create_local as *const () as usize,
+        "PartyXblCreateRemoteChatUser" => create_remote as *const () as usize,
+        "PartyXblDestroyChatUser" => destroy as *const () as usize,
+        "PartyXblGetChatUsers" => get_users as *const () as usize,
+        "PartyXblLoginToPlayFab" => login as *const () as usize,
+        "PartyXblGetEntityIdsFromXboxLiveUserIds" => entity_ids as *const () as usize,
+        "PartyXblChatUserIsLocal" => is_local as *const () as usize,
+        "PartyXblChatUserGetXboxUserId" => xuid as *const () as usize,
+        "PartyXblChatUserSetCustomContext" => set_context as *const () as usize,
+        "PartyXblChatUserGetCustomContext" => get_context as *const () as usize,
+        "PartyXblLocalChatUserGetAccessibilitySettings" => accessibility as *const () as usize,
+        "PartyXblLocalChatUserGetRequiredChatPermissionInfo" => permission as *const () as usize,
+        "PartyXblLocalChatUserGetCrossNetworkCommunicationPrivacySetting" => privacy as *const () as usize,
+        "PartyXblGetErrorMessage" => error_message as *const () as usize,
+        "PartyXblCompleteGetTokenAndSignatureRequest" => ok5 as *const () as usize,
+        "PartyXblSetMemoryCallbacks" | "PartyXblSetProfilingCallbacksForMethodEntryExit" => ok2 as *const () as usize,
+        "PartyXblGetMemoryCallbacks" | "PartyXblGetProfilingCallbacksForMethodEntryExit" => get_two as *const () as usize,
+        "PartyXblSetThreadAffinityMask" => ok_affinity as *const () as usize,
+        "PartyXblGetThreadAffinityMask" => get_affinity as *const () as usize,
+        _ => return None,
+    })
+}
+
+fn push<T: Send + 'static>(change: T) {
+    let b = Box::new(change);
+    let ptr = Box::into_raw(b);
+    let addr = ptr as usize;
+    with(|s| {
+        s.queue.push_back(Change {
+            ptr: ptr as *const u32,
+            free: Box::new(move || drop(unsafe { Box::from_raw(addr as *mut T) })),
+        })
+    });
+}
+
+fn user_ptr(u: &ChatUser) -> usize {
+    u as *const ChatUser as usize
+}
+
+fn find(h: usize) -> bool {
+    with(|s| s.users.iter().any(|u| user_ptr(u) == h))
+}
+
+unsafe extern "system" fn initialize(_party: usize, _title: *const c_char, out: *mut usize) -> PartyError {
+    if out.is_null() {
+        return BAD;
+    }
+    unsafe { *out = handle() };
+    log!("party-xbl initialized");
+    OK
+}
+
+unsafe extern "system" fn ok1(_a: usize) -> PartyError {
+    OK
+}
+
+unsafe extern "system" fn ok2(_a: usize, _b: usize) -> PartyError {
+    OK
+}
+
+unsafe extern "system" fn ok5(_h: usize, _id: u32, _ok: u8, _token: usize, _sig: usize) -> PartyError {
+    OK
+}
+
+unsafe extern "system" fn ok_affinity(_thread: u32, _mask: u64) -> PartyError {
+    OK
+}
+
+unsafe extern "system" fn get_two(a: *mut usize, b: *mut usize) -> PartyError {
+    for p in [a, b] {
+        if !p.is_null() {
+            unsafe { *p = 0 };
+        }
+    }
+    OK
+}
+
+unsafe extern "system" fn get_affinity(_thread: u32, mask: *mut u64) -> PartyError {
+    if !mask.is_null() {
+        unsafe { *mask = 0 };
+    }
+    OK
+}
+
+/// PARTY_XBL_REQUIRED_CHAT_PERMISSION_INFO_CHANGED_STATE_CHANGE.
+#[repr(C)]
+struct PermissionChanged {
+    kind: u32,
+    local: usize,
+    target: usize,
+}
+
+/// The real service's word as last told to the game (`xboxlive::real::generation`).
+static TOLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Each local and remote chat user pair hears that its permissions may have changed.
+fn permissions_changed() {
+    let g = crate::hub::accounts::xbox_privacy_generation();
+    if TOLD.swap(g, std::sync::atomic::Ordering::Relaxed) == g {
+        return;
+    }
+    let pairs: Vec<(usize, usize)> = with(|s| {
+        let live = |u: &ChatUser| s.handles.contains(&user_ptr(u));
+        let locals: Vec<usize> = s.users.iter().filter(|u| u.local && live(u)).map(|u| user_ptr(u)).collect();
+        let remotes: Vec<usize> = s.users.iter().filter(|u| !u.local && live(u)).map(|u| user_ptr(u)).collect();
+        locals.iter().flat_map(|l| remotes.iter().map(move |r| (*l, *r))).collect()
+    });
+    for (local, target) in pairs {
+        push(PermissionChanged { kind: 2, local, target });
+    }
+}
+
+unsafe extern "system" fn start(_h: usize, count: *mut u32, changes: *mut *const *const u32) -> PartyError {
+    if count.is_null() || changes.is_null() {
+        return BAD;
+    }
+    permissions_changed();
+    let dropped = with(|s| {
+        s.lists.clear();
+        let batch: Vec<Change> = s.queue.drain(..).collect();
+        let ptrs: Vec<*const u32> = batch.iter().map(|c| c.ptr).collect();
+        unsafe {
+            *count = ptrs.len() as u32;
+            *changes = if ptrs.is_empty() { std::ptr::null() } else { ptrs.as_ptr() };
+        }
+        if batch.is_empty() {
+            return Vec::new();
+        }
+        // Moving the Vec into the deque keeps its heap array where the game was told.
+        s.out.push_back((ptrs, batch));
+        if s.out.len() > MAX_BATCHES { s.out.pop_front().map(|(_, c)| c).unwrap_or_default() } else { Vec::new() }
+    });
+    for c in dropped {
+        (c.free)();
+    }
+    OK
+}
+
+/// The game returns `count` changes it got, from one batch or several; each is freed
+/// once, and pointers it never got are ignored.
+unsafe extern "system" fn finish(_h: usize, count: u32, changes: *const *const u32) -> PartyError {
+    if count == 0 {
+        return OK;
+    }
+    let done = with(|s| {
+        let held: usize = s.out.iter().map(|(_, c)| c.len()).sum();
+        if changes.is_null() || count as usize > held {
+            return None;
+        }
+        let returned: Vec<*const u32> = (0..count as usize).map(|i| unsafe { changes.add(i).read_unaligned() }).collect();
+        let mut done = Vec::new();
+        for p in returned {
+            for (_, b) in s.out.iter_mut() {
+                if let Some(i) = b.iter().position(|c| c.ptr == p) {
+                    done.push(b.swap_remove(i));
+                    break;
+                }
+            }
+        }
+        s.out.retain(|(_, b)| !b.is_empty());
+        Some(done)
+    });
+    let Some(done) = done else { return BAD };
+    for c in done {
+        (c.free)();
+    }
+    OK
+}
+
+#[repr(C)]
+struct CreateLocalCompleted {
+    kind: u32,
+    result: u32,
+    error: u32,
+    async_id: usize,
+    user: usize,
+}
+
+unsafe extern "system" fn create_local(_h: usize, xuid: u64, async_id: usize, out: *mut usize) -> PartyError {
+    let h = with(|s| {
+        let u = Box::new(ChatUser { xuid, local: true, context: 0 });
+        let h = user_ptr(&u);
+        s.users.push(u);
+        s.handles.push(h);
+        h
+    });
+    if !out.is_null() {
+        unsafe { *out = h };
+    }
+    publish_xuid(xuid);
+    push(CreateLocalCompleted { kind: 0, result: 0, error: 0, async_id, user: h });
+    log!("party-xbl local chat user for Xbox user {xuid}");
+    OK
+}
+
+unsafe extern "system" fn create_remote(_h: usize, xuid: u64, out: *mut usize) -> PartyError {
+    let h = with(|s| {
+        if let Some(u) = s.users.iter().find(|u| u.xuid == xuid && !u.local) {
+            // One destroyed earlier is kept alive but forgotten: made again, it is listed
+            // again (and hears permission changes) like a new one.
+            let h = user_ptr(u);
+            if !s.handles.contains(&h) {
+                s.handles.push(h);
+            }
+            return h;
+        }
+        let u = Box::new(ChatUser { xuid, local: false, context: 0 });
+        let h = user_ptr(&u);
+        s.users.push(u);
+        s.handles.push(h);
+        h
+    });
+    if !out.is_null() {
+        unsafe { *out = h };
+    }
+    OK
+}
+
+unsafe extern "system" fn destroy(_h: usize, user: usize) -> PartyError {
+    // Kept alive (a game may read a handle in the same batch); just forgotten.
+    with(|s| s.handles.retain(|h| *h != user));
+    OK
+}
+
+unsafe extern "system" fn get_users(_h: usize, count: *mut u32, users: *mut *const usize) -> PartyError {
+    if count.is_null() || users.is_null() {
+        return BAD;
+    }
+    with(|s| {
+        if s.lists.len() >= 64 {
+            s.lists.remove(0);
+        }
+        let list = s.handles.clone();
+        unsafe {
+            *count = list.len() as u32;
+            *users = list.as_ptr();
+        }
+        s.lists.push(list);
+    });
+    OK
+}
+
+#[repr(C)]
+struct LoginCompleted {
+    kind: u32,
+    result: u32,
+    error: u32,
+    user: usize,
+    async_id: usize,
+    entity: *const c_char,
+    token: *const c_char,
+    expires: i64,
+    _keep: (CString, CString),
+}
+
+unsafe impl Send for LoginCompleted {}
+
+unsafe extern "system" fn login(user: usize, async_id: usize) -> PartyError {
+    if !find(user) {
+        return BAD;
+    }
+    let entity = CString::new(crate::playfab::entity_id()).unwrap_or_default();
+    let token = CString::new(format!("peerparty-{}", crate::playfab::entity_id())).unwrap_or_default();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    push(LoginCompleted {
+        kind: 4,
+        result: 0,
+        error: 0,
+        user,
+        async_id,
+        entity: entity.as_ptr(),
+        token: token.as_ptr(),
+        expires: now + 86_400,
+        _keep: (entity, token),
+    });
+    log!("party-xbl LoginToPlayFab: signed in as the LAN entity");
+    OK
+}
+
+#[repr(C)]
+struct Mapping {
+    xuid: u64,
+    entity: *const c_char,
+}
+
+#[repr(C)]
+struct EntityIdsCompleted {
+    kind: u32,
+    result: u32,
+    error: u32,
+    sandbox: *const c_char,
+    user: usize,
+    async_id: usize,
+    count: u32,
+    mappings: *const Mapping,
+    _keep: (Vec<Mapping>, Vec<CString>),
+}
+
+unsafe impl Send for EntityIdsCompleted {}
+
+const XUID_KEY: &str = "peerparty:xuid";
+
+fn publish_xuid(xuid: u64) {
+    crate::net::set_presence("xbl", vec![(XUID_KEY.into(), xuid.to_string())]);
+}
+
+/// The LAN player whose presence carries this Xbox user id.
+fn peer_of_xuid(xuid: u64) -> Option<peerparty_core::PeerId> {
+    let lan = crate::net::lan()?;
+    let want = xuid.to_string();
+    lan.peers().into_iter().map(|(p, _)| p).find(|p| lan.presence(*p).iter().any(|(k, v)| k == XUID_KEY && *v == want))
+}
+
+unsafe extern "system" fn entity_ids(_h: usize, count: u32, xuids: *const u64, user: usize, async_id: usize) -> PartyError {
+    let ids: Vec<u64> = if xuids.is_null() { Vec::new() } else { unsafe { std::slice::from_raw_parts(xuids, count as usize) }.to_vec() };
+    let mut strings = Vec::new();
+    let mut maps = Vec::new();
+    let mine = with(|s| s.users.iter().find(|u| u.local).map(|u| u.xuid));
+    for x in &ids {
+        let entity = if Some(*x) == mine {
+            Some(crate::playfab::entity_id())
+        } else {
+            peer_of_xuid(*x).map(crate::playfab::entity_of)
+        };
+        if let Some(e) = entity {
+            let c = CString::new(e).unwrap_or_default();
+            maps.push(Mapping { xuid: *x, entity: c.as_ptr() });
+            strings.push(c);
+        }
+    }
+    log!("party-xbl entity ids for {} Xbox users: {} on the LAN", ids.len(), maps.len());
+    push(EntityIdsCompleted {
+        kind: 5,
+        result: 0,
+        error: 0,
+        sandbox: c"RETAIL".as_ptr(),
+        user,
+        async_id,
+        count: maps.len() as u32,
+        mappings: maps.as_ptr(),
+        _keep: (maps, strings),
+    });
+    OK
+}
+
+unsafe extern "system" fn is_local(user: usize, out: *mut u8) -> PartyError {
+    let local = with(|s| s.users.iter().find(|u| user_ptr(u) == user).map(|u| u.local));
+    match (local, out.is_null()) {
+        (Some(l), false) => {
+            unsafe { *out = u8::from(l) };
+            OK
+        }
+        _ => BAD,
+    }
+}
+
+unsafe extern "system" fn xuid(user: usize, out: *mut u64) -> PartyError {
+    let x = with(|s| s.users.iter().find(|u| user_ptr(u) == user).map(|u| u.xuid));
+    match (x, out.is_null()) {
+        (Some(x), false) => {
+            unsafe { *out = x };
+            OK
+        }
+        _ => BAD,
+    }
+}
+
+unsafe extern "system" fn set_context(user: usize, ctx: usize) -> PartyError {
+    with(|s| match s.users.iter_mut().find(|u| user_ptr(u) == user) {
+        Some(u) => {
+            u.context = ctx;
+            OK
+        }
+        None => BAD,
+    })
+}
+
+unsafe extern "system" fn get_context(user: usize, out: *mut usize) -> PartyError {
+    let c = with(|s| s.users.iter().find(|u| user_ptr(u) == user).map(|u| u.context));
+    match (c, out.is_null()) {
+        (Some(c), false) => {
+            unsafe { *out = c };
+            OK
+        }
+        _ => BAD,
+    }
+}
+
+/// PARTY_XBL_ACCESSIBILITY_SETTINGS: two PartyBools, the language (84 + 1 chars), gender.
+unsafe extern "system" fn accessibility(user: usize, out: *mut u8) -> PartyError {
+    if out.is_null() || !find(user) {
+        return BAD;
+    }
+    unsafe {
+        std::ptr::write_bytes(out, 0, 2 + 85 + 1 + 4);
+        let lang = b"en-US";
+        std::ptr::copy_nonoverlapping(lang.as_ptr(), out.add(2), lang.len());
+    }
+    OK
+}
+
+/// PARTY_XBL_CHAT_PERMISSION_INFO: what the real service allows with the target (see
+/// the module comment), everything when it hasn't said.
+unsafe extern "system" fn permission(user: usize, target: usize, out: *mut u32) -> PartyError {
+    if out.is_null() || !find(user) {
+        return BAD;
+    }
+    let xuid = with(|s| s.users.iter().find(|u| user_ptr(u) == target).map(|u| u.xuid));
+    let (mask, reason) = xuid.map_or((crate::hub::accounts::XBOX_ALL_CHAT, 0), crate::hub::accounts::xbox_chat_permission);
+    unsafe {
+        *out = mask;
+        *out.add(1) = reason;
+    }
+    OK
+}
+
+unsafe extern "system" fn privacy(user: usize, out: *mut u32) -> PartyError {
+    if out.is_null() || !find(user) {
+        return BAD;
+    }
+    unsafe { *out = 0 };
+    OK
+}
+
+unsafe extern "system" fn error_message(error: u32, out: *mut *const c_char) -> PartyError {
+    if out.is_null() {
+        return BAD;
+    }
+    unsafe { *out = if error == OK { c"Success".as_ptr() } else { c"peerparty: the call failed".as_ptr() } };
+    let _: *const c_void = std::ptr::null();
+    OK
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(target_pointer_width = "64")]
+    use std::mem::offset_of;
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn layouts_follow_the_header() {
+        // x64: PARTY_XBL_LOGIN_TO_PLAYFAB_COMPLETED_STATE_CHANGE.
+        assert_eq!(offset_of!(LoginCompleted, user), 16);
+        assert_eq!(offset_of!(LoginCompleted, entity), 32);
+        assert_eq!(offset_of!(LoginCompleted, expires), 48);
+        assert_eq!(offset_of!(CreateLocalCompleted, async_id), 16);
+        assert_eq!(offset_of!(EntityIdsCompleted, mappings), 48);
+        assert_eq!(size_of::<Mapping>(), 16);
+    }
+
+    #[test]
+    fn chat_users_and_state_changes() {
+        unsafe {
+            let mut h = 0usize;
+            assert_eq!(initialize(0, std::ptr::null(), &mut h), OK);
+            let mut u = 0usize;
+            assert_eq!(create_local(h, 42, 7, &mut u), OK);
+            let mut local = 0u8;
+            assert_eq!(is_local(u, &mut local), OK);
+            assert_eq!(local, 1);
+            let mut x = 0u64;
+            assert_eq!(xuid(u, &mut x), OK);
+            assert_eq!(x, 42);
+            let mut perm = [0u32; 2];
+            assert_eq!(permission(u, 0, perm.as_mut_ptr()), OK);
+            assert_eq!(perm[0], 0x1f);
+            let (mut n, mut list) = (0u32, std::ptr::null::<*const u32>());
+            assert_eq!(start(h, &mut n, &mut list), OK);
+            assert_eq!(n, 1);
+            let first = &*(*list as *const CreateLocalCompleted);
+            assert_eq!((first.kind, first.result, first.async_id, first.user), (0, 0, 7, u));
+            assert_eq!(finish(h, n, list), OK);
+            assert_eq!(start(h, &mut n, &mut list), OK);
+            assert_eq!(n, 0);
+        }
+    }
+}

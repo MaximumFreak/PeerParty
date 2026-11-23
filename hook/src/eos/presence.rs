@@ -197,7 +197,7 @@ fn from_keys(kv: &[(String, String)]) -> Mine {
 
 /// Our join info, for invites from games that join through presence.
 pub fn my_join_info() -> String {
-    MINE.lock().unwrap().join.clone().unwrap_or_default()
+    crate::sys::lock(&MINE).join.clone().unwrap_or_default()
 }
 
 /// Whether the game takes a "join game" from presence.
@@ -208,7 +208,7 @@ pub fn takes_joins() -> bool {
 fn presence_of(peer: PeerId) -> Option<Mine> {
     let lan = lan()?;
     if peer == lan.me() {
-        return Some(MINE.lock().unwrap().clone());
+        return Some(crate::sys::lock(&MINE).clone());
     }
     lan.peer_name(peer)?;
     Some(from_keys(&lan.presence(peer)))
@@ -298,15 +298,15 @@ unsafe extern "system" fn create_modification(_h: usize, _o: usize, out: *mut us
         return INVALID_PARAMETERS;
     }
     // Starts from what we have: a modification only changes what it sets.
-    let m = Box::new(MINE.lock().unwrap().clone());
+    let m = Box::new(crate::sys::lock(&MINE).clone());
     let k = &*m as *const Mine as usize;
-    EDITS.lock().unwrap().insert(k, m);
+    crate::sys::lock(&EDITS).insert(k, m);
     unsafe { *out = k };
     SUCCESS
 }
 
 fn with_edit(h: usize, f: impl FnOnce(&mut Mine) -> i32) -> i32 {
-    match EDITS.lock().unwrap().get_mut(&h) {
+    match crate::sys::lock(&EDITS).get_mut(&h) {
         Some(m) => f(m),
         None => INVALID_PARAMETERS,
     }
@@ -410,19 +410,19 @@ unsafe extern "system" fn mod_ignore(h: usize, _o: usize) -> i32 {
 }
 
 unsafe extern "system" fn mod_release(h: usize) {
-    EDITS.lock().unwrap().remove(&h);
+    crate::sys::lock(&EDITS).remove(&h);
 }
 
 unsafe extern "system" fn set_presence(_h: usize, o: *const SetPresenceOptions, cd: usize, cb: usize) {
     let (local, edit) = if o.is_null() { (0, 0) } else { unsafe { ((*o).LocalUserId, (*o).Modification) } };
-    let new = EDITS.lock().unwrap().get(&edit).map(|m| (**m).clone());
+    let new = crate::sys::lock(&EDITS).get(&edit).map(|m| (**m).clone());
     let r = match new {
         Some(m) => {
             trace("EOS_Presence_SetPresence", || {
                 format!("status={:?} rich={:?} join={:?} data={}", m.status, m.rich, m.join, m.data.len())
             });
             crate::net::set_presence("eos", to_keys(&m));
-            *MINE.lock().unwrap() = m;
+            *crate::sys::lock(&MINE) = m;
             SUCCESS
         }
         None => INVALID_PARAMETERS,

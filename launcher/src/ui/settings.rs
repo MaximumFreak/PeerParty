@@ -5,7 +5,7 @@
 use eframe::egui::{self, RichText};
 
 use super::icons::Icon;
-use super::store::{Hotkeys, Prefs, SDK_MODES};
+use super::store::{Hotkeys, Prefs, sdk_modes};
 use super::theme::{self, TEXT, TEXT2, TEXT3};
 use super::widgets::{self, Kind};
 use super::{App, Category, View, first_focus};
@@ -39,27 +39,10 @@ impl Tab {
     }
 }
 
-/// PeerParty layers a game can turn off (`PEERPARTY_SKIP`), with what each does.
-pub fn layers() -> [(&'static str, &'static str); 17] {
-    [
-        ("steam", t!("layer.steam")),
-        ("eos", t!("layer.eos")),
-        ("party", t!("layer.party")),
-        ("pfmp", t!("layer.pfmp")),
-        ("playfab", t!("layer.playfab")),
-        ("galaxy", t!("layer.galaxy")),
-        ("photon", t!("layer.photon")),
-        ("ugs", t!("layer.ugs")),
-        ("vivox", t!("layer.vivox")),
-        ("xboxlive", t!("layer.xboxlive")),
-        ("xgameui", t!("layer.xgameui")),
-        ("invite", t!("layer.invite")),
-        ("padblock", t!("layer.padblock")),
-        ("present", t!("layer.present")),
-        ("ipfwd", t!("layer.ipfwd")),
-        ("swap", t!("layer.swap")),
-        ("dns", t!("layer.dns")),
-    ]
+/// PeerParty layers a game can turn off (`PEERPARTY_SKIP`), with what each does: the
+/// game page's (`catalog::game_page_layers`), each with its `layer.<id>` text.
+pub fn layers() -> Vec<(&'static str, &'static str)> {
+    peerparty_protocol::catalog::game_page_layers().map(|l| (l.id, crate::i18n::tr_key(&format!("layer.{}", l.id)).unwrap_or(l.id))).collect()
 }
 
 /// A layer's name as the game page lists it; a name it doesn't list (one only
@@ -71,26 +54,7 @@ pub fn layer_name(layer: &str) -> String {
 /// What a turned-off layer costs while it's off, for the overlay (None for a layer the
 /// game page doesn't list).
 pub fn layer_off_effect(layer: &str) -> Option<&'static str> {
-    Some(match layer {
-        "steam" => t!("off.steam"),
-        "eos" => t!("off.eos"),
-        "party" => t!("off.party"),
-        "pfmp" => t!("off.pfmp"),
-        "playfab" => t!("off.playfab"),
-        "galaxy" => t!("off.galaxy"),
-        "photon" => t!("off.photon"),
-        "ugs" => t!("off.ugs"),
-        "vivox" => t!("off.vivox"),
-        "xboxlive" => t!("off.xboxlive"),
-        "xgameui" => t!("off.xgameui"),
-        "invite" => t!("off.invite"),
-        "padblock" => t!("off.padblock"),
-        "present" => t!("off.present"),
-        "ipfwd" => t!("off.ipfwd"),
-        "swap" => t!("off.swap"),
-        "dns" => t!("off.dns"),
-        _ => return None,
-    })
+    peerparty_protocol::catalog::game_page_layers().find(|l| l.id == layer).and_then(|l| crate::i18n::tr_key(&format!("off.{}", l.id)))
 }
 
 /// The modes a service can be in, in the order the labels list them.
@@ -135,7 +99,7 @@ impl App {
             ui.set_max_width((ui.available_width() - 26.0).min(860.0));
             match self.settings_tab {
                 Tab::General => self.general(ui),
-                Tab::Overlay => overlay(ui, &mut self.settings.prefs, &mut self.focus_first),
+                Tab::Overlay => overlay(ui, &mut self.settings.prefs, &mut self.nav.focus_first),
                 Tab::Library => self.library_settings(ui),
                 Tab::Advanced => self.advanced_settings(ui),
                 Tab::About => self.about(ui),
@@ -152,7 +116,7 @@ impl App {
         widgets::card(ui, |ui| {
             ui.set_width(ui.available_width());
             let p = &mut self.settings.prefs;
-            let focus = &mut self.focus_first;
+            let focus = &mut self.nav.focus_first;
             widgets::setting(ui, t!("settings.language"), t!("settings.language_sub"), |ui| {
                 let mut labels = vec![t!("settings.language_auto").to_string()];
                 labels.extend(crate::i18n::LANGS.iter().map(|l| l.1.to_string()));
@@ -212,7 +176,7 @@ impl App {
                 ui.horizontal(|ui| {
                     let r = widgets::icon_button(ui, Icon::Close, t!("settings.folder_remove"));
                     if i == 0 {
-                        first_focus(&r, &mut self.focus_first);
+                        first_focus(&r, &mut self.nav.focus_first);
                     }
                     if r.clicked() {
                         remove = Some(i);
@@ -226,7 +190,7 @@ impl App {
             ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
                 let r = widgets::button(ui, Some(Icon::Add), t!("library.add_folder"), Kind::Primary);
-                first_focus(&r, &mut self.focus_first);
+                first_focus(&r, &mut self.nav.focus_first);
                 add = r.clicked();
                 rescan = widgets::button(ui, Some(Icon::Refresh), t!("library.rescan"), Kind::Secondary).clicked();
             });
@@ -255,7 +219,7 @@ impl App {
         }
         if show_hidden {
             self.view = View::Library;
-            self.category = Category::Hidden;
+            self.lib.category = Category::Hidden;
         }
     }
 
@@ -268,13 +232,13 @@ impl App {
             ui.set_width(ui.available_width());
             widgets::card_title(ui, Icon::Wifi, theme::VIOLET, t!("settings.services"), t!("settings.services_sub"));
             let p = &mut self.settings.prefs;
-            for (n, (sdk, label, default)) in SDK_MODES.iter().enumerate() {
+            for (n, (sdk, label, default)) in sdk_modes().enumerate() {
                 if n > 0 {
                     widgets::divider(ui);
                 }
-                let focus = &mut self.focus_first;
+                let focus = &mut self.nav.focus_first;
                 widgets::setting(ui, sdk_name(sdk, label), "", |ui| {
-                    let cur = p.modes.get(*sdk).cloned().unwrap_or_else(|| default.to_string());
+                    let cur = p.modes.get(sdk).cloned().unwrap_or_else(|| default.to_string());
                     let labels: Vec<String> = mode_labels(sdk).iter().map(|s| s.to_string()).collect();
                     let mut i = mode_values().iter().position(|m| *m == cur).unwrap_or(0);
                     let r = widgets::stepper(ui, sdk, &labels, &mut i, 250.0);
@@ -282,8 +246,8 @@ impl App {
                         first_focus(&r, focus);
                     }
                     if r.changed() {
-                        if mode_values()[i] == *default {
-                            p.modes.remove(*sdk);
+                        if mode_values()[i] == default {
+                            p.modes.remove(sdk);
                         } else {
                             p.modes.insert(sdk.to_string(), mode_values()[i].to_string());
                         }
@@ -336,15 +300,18 @@ impl App {
         if reset {
             self.reset_undo = Some(self.settings.prefs.clone());
             reset_to_recommended(&mut self.settings.prefs);
+            theme::set_effects(self.settings.prefs.effects);
             self.say(t!("settings.reset_done"), true);
         }
         if undo && let Some(before) = self.reset_undo.take() {
             undo_reset(&mut self.settings.prefs, &before);
+            theme::set_effects(self.settings.prefs.effects);
         }
     }
 
     fn about(&mut self, ui: &mut egui::Ui) {
         let mut data = false;
+        let mut portable = None;
         widgets::card(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -361,8 +328,21 @@ impl App {
             ui.add(egui::Label::new(RichText::new(t!("settings.about_text")).color(TEXT2)).wrap());
             ui.add_space(8.0);
             let r = widgets::button(ui, Some(Icon::Folder), t!("settings.data_folder"), Kind::Secondary);
-            first_focus(&r, &mut self.focus_first);
+            first_focus(&r, &mut self.nav.focus_first);
             data = r.clicked();
+            // A test run's own folder (PEERPARTY_DATA_DIR) has nothing to switch to.
+            if crate::portable::mode() != crate::portable::Mode::Named {
+                ui.add_space(4.0);
+                widgets::divider(ui);
+                let was = crate::portable::mode() == crate::portable::Mode::Portable;
+                let mut on = was;
+                widgets::setting(ui, t!("settings.portable"), &t!("settings.portable_sub", folder = crate::portable::FOLDER), |ui| {
+                    widgets::switch(ui, &mut on);
+                });
+                if on != was {
+                    portable = Some(on);
+                }
+            }
         });
         ui.add_space(12.0);
         self.updates_card(ui);
@@ -370,6 +350,29 @@ impl App {
             let dir = super::store::data_dir();
             let _ = std::fs::create_dir_all(&dir);
             crate::platform::reveal(&dir);
+        }
+        if let Some(on) = portable {
+            self.switch_portable(ui.ctx(), on);
+        }
+    }
+
+    /// The portable switch: PeerParty's files move (portable.rs) and the window starts
+    /// again, which finds them where they went.
+    fn switch_portable(&mut self, ctx: &egui::Context, on: bool) {
+        use crate::portable::SwitchError;
+        if !self.sessions.sessions.is_empty() || !self.sessions.pending.is_empty() {
+            eprintln!("peerparty: portable: games are running from the window: nothing moved");
+            self.say(t!("settings.portable_close_games"), false);
+            return;
+        }
+        self.save_settings();
+        match crate::portable::switch(on) {
+            Ok(dir) => match crate::portable::restart() {
+                Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                Err(e) => self.say(t!("settings.portable_restart", folder = dir.display(), error = e), false),
+            },
+            Err(SwitchError::InUse(program)) => self.say(t!("settings.portable_in_use", program = program), false),
+            Err(SwitchError::Failed(dir, error)) => self.say(t!("settings.portable_failed", folder = dir.display(), error = error), false),
         }
     }
 }
@@ -391,13 +394,9 @@ fn overlay(ui: &mut egui::Ui, p: &mut Prefs, focus: &mut bool) {
             ui.set_width(ui.available_width());
             widgets::card_title(ui, Icon::Keyboard, theme::ACCENT, t!("settings.open_with"), t!("settings.open_with_sub"));
             let hk: &mut Hotkeys = &mut p.hotkeys;
-            for (k, label, sub) in [
-                (&mut hk.shift_tab, "Shift+Tab", t!("settings.key_steam")),
-                (&mut hk.shift_f3, "Shift+F3", t!("settings.key_epic")),
-                (&mut hk.shift_f1, "Shift+F1", t!("settings.key_ea")),
-                (&mut hk.shift_f2, "Shift+F2", t!("settings.key_ubisoft")),
-            ] {
-                widgets::setting(ui, label, sub, |ui| {
+            let keys = [&mut hk.shift_tab, &mut hk.shift_f3, &mut hk.shift_f1, &mut hk.shift_f2];
+            for (k, (label, sub_key)) in keys.into_iter().zip(super::shared::HOTKEY_LABELS) {
+                widgets::setting(ui, label, crate::i18n::tr_key(sub_key).unwrap_or(""), |ui| {
                     widgets::switch(ui, k);
                 });
                 widgets::divider(ui);
@@ -419,7 +418,7 @@ fn overlay(ui: &mut egui::Ui, p: &mut Prefs, focus: &mut bool) {
             ui.set_width(ui.available_width());
             widgets::card_title(ui, Icon::Brush, theme::VIOLET, t!("settings.look"), "");
             widgets::setting(ui, t!("settings.size"), "", |ui| {
-                let sizes = [0.75f32, 0.875, 1.0, 1.125, 1.25, 1.375, 1.5];
+                let sizes = super::shared::OVERLAY_SCALES;
                 let labels: Vec<String> = sizes.iter().map(|s| format!("{:.0}%", s * 100.0)).collect();
                 let mut i = sizes.iter().position(|s| (s - p.overlay_scale).abs() < 0.01).unwrap_or(2);
                 if widgets::stepper(ui, "size", &labels, &mut i, 160.0).changed() {
@@ -428,8 +427,8 @@ fn overlay(ui: &mut egui::Ui, p: &mut Prefs, focus: &mut bool) {
             });
             widgets::divider(ui);
             widgets::setting(ui, t!("settings.glyphs"), t!("settings.glyphs_sub"), |ui| {
-                let values = ["auto", "xbox", "playstation", "nintendo"];
-                let labels = vec![t!("settings.glyphs_auto").to_string(), "Xbox".into(), "PlayStation".into(), "Nintendo".into()];
+                let values = super::shared::GLYPH_VALUES;
+                let labels: Vec<String> = values.iter().map(|v| super::shared::glyph_label(v).to_string()).collect();
                 let mut i = values.iter().position(|v| *v == p.glyphs).unwrap_or(0);
                 if widgets::stepper(ui, "glyphs", &labels, &mut i, 220.0).changed() {
                     p.glyphs = values[i].to_string();
@@ -465,7 +464,9 @@ fn undo_reset(p: &mut Prefs, before: &Prefs) {
     take_resettable(p, before);
 }
 
-/// The settings "Reset to recommended" covers, taken from `from`.
+/// The settings "Reset to recommended" covers, taken from `from`. Only `p` changes:
+/// `differs_from_recommended` runs this on a copy every frame, so the effects setting
+/// is applied by the buttons that change it.
 fn take_resettable(p: &mut Prefs, from: &Prefs) {
     p.modes = from.modes.clone();
     p.hotkeys = from.hotkeys.clone();
@@ -477,7 +478,6 @@ fn take_resettable(p: &mut Prefs, from: &Prefs) {
     p.steam_saves = from.steam_saves;
     p.toasts = from.toasts;
     p.effects = from.effects;
-    theme::set_effects(p.effects);
 }
 
 #[cfg(test)]
@@ -494,6 +494,35 @@ mod tests {
         assert!(!differs_from_recommended(&p));
         assert_eq!((p.name.as_str(), p.room.as_str(), p.public, p.auto_accept, p.voice), ("Kim", "PP1-x", true, true, false));
         assert!(p.modes.is_empty() && p.overlay_scale == 1.0);
+    }
+
+    /// The game page lists the catalog's layers in its order, each with its name and
+    /// what turning it off costs; the services' modes include every one the hook reads.
+    #[test]
+    fn layers_and_modes_come_from_the_catalog() {
+        let en = crate::i18n::parse(crate::i18n::LANGS[0].2);
+        let ids: Vec<&str> = layers().iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            ids,
+            ["steam", "eos", "party", "pfmp", "playfab", "galaxy", "photon", "ugs", "vivox", "xboxlive", "xgameui", "invite", "padblock", "present", "ipfwd", "swap", "dns"]
+        );
+        for id in ids {
+            let (name, effect) = (format!("layer.{id}"), format!("off.{id}"));
+            assert!(en.contains_key(name.as_str()) && en.contains_key(effect.as_str()), "{id} has its texts in en.txt");
+            // In the language in use (other tests may change it meanwhile).
+            assert_eq!(Some(layer_name(id).as_str()), crate::i18n::tr_key(&name));
+            assert_eq!(layer_off_effect(id), crate::i18n::tr_key(&effect));
+        }
+        // A layer only `PEERPARTY_SKIP` reaches is named as written.
+        assert_eq!(layer_name("calls"), "calls");
+        assert_eq!(layer_off_effect("calls"), None);
+        let modes: Vec<(&str, &str)> = sdk_modes().map(|(id, _, default)| (id, default)).collect();
+        assert_eq!(
+            modes,
+            [("photon", "lan"), ("eos", "lan"), ("ugs", "lan"), ("playfab", "lan"), ("demonware", "lan"), ("steam", "lan"), ("galaxy", "lan"), ("steamid", "auto")]
+        );
+        assert_eq!(sdk_name("demonware", "Demonware"), "Demonware");
+        assert_eq!(Prefs::default().mode(&Default::default(), "steamid"), "auto");
     }
 
     /// Undo puts back exactly what Reset changed, the controller buttons too.

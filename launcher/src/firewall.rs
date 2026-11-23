@@ -20,11 +20,21 @@
 //! inbound Block rules and adds an inbound Allow rule for it on private and domain
 //! networks (public ones too only with `--public`). If the prompt is declined or the
 //! fix fails, the firewall's own settings open instead, for the player to do it there.
+//!
+//! Other systems have no Windows Firewall: there the rules read as none, the firewall
+//! as off for every network (nothing blocks), and asking for the fix says so. Only the
+//! rule matching, which has tests, is built there.
 
-use std::ffi::OsStr;
-use std::os::windows::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+// The rules' matching is built everywhere; only Windows reads and changes them.
+#![cfg_attr(not(windows), allow(dead_code))]
+
+use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+#[cfg(windows)]
+use crate::backend::windows::{Guid, owner_and, vcall, wide};
 
 pub const DOMAIN: u32 = 1;
 pub const PRIVATE: u32 = 2;
@@ -200,13 +210,15 @@ pub fn assess(rules: &[Rule], exe: &Path, p: Profiles) -> Verdict {
         r.inbound && r.active && !r.narrowed && r.profiles & on != 0 && r.app.as_deref() == Some(target.as_str()) && r.protocol.is_none_or(|x| x == 6 || x == 17)
     };
     let blocks: Vec<Rule> = rules.iter().filter(ours).filter(|r| !r.allow).cloned().collect();
-    let lets_in = |proto: u8| rules.iter().filter(ours).any(|r| r.allow && r.protocol.is_none_or(|x| x == proto));
-    let defaults_open = on & !p.default_block == on;
+    // Every profile in use that drops what isn't allowed needs its own allow rules, for
+    // TCP and UDP: one for Private alone leaves the game deaf on a Public network.
+    let need = on & p.default_block;
+    let covered = |proto: u8| rules.iter().filter(ours).filter(|r| r.allow && r.protocol.is_none_or(|x| x == proto)).fold(0, |m, r| m | r.profiles);
     Verdict {
         exe: name,
         blocks,
         block_all: p.block_all & on != 0,
-        allowed: defaults_open || (lets_in(6) && lets_in(17)),
+        allowed: need & covered(6) == need && need & covered(17) == need,
         public: on & PUBLIC != 0,
     }
 }
@@ -218,6 +230,7 @@ pub fn on_public_network() -> bool {
 }
 
 /// Every firewall rule: the local store's, then Group Policy's.
+#[cfg(windows)]
 pub fn rules() -> Vec<Rule> {
     let mut out = Vec::new();
     for (key, policy) in [(RULES_KEY, false), (POLICY_RULES_KEY, true)] {
@@ -232,6 +245,7 @@ pub fn rules() -> Vec<Rule> {
 
 /// The firewall's profiles, from `INetFwPolicy2` (or, failing that, the registry, with
 /// every profile taken as in use).
+#[cfg(windows)]
 pub fn profiles() -> Profiles {
     com_profiles().unwrap_or_else(|| {
         let mut enabled = 0;
@@ -340,6 +354,7 @@ const IMPORT: &str = r"$ErrorActionPreference='Stop'; $m = Join-Path $PSHOME 'Mo
 /// `peerparty --remove-firewall`, run elevated: every rule PeerParty added (its group),
 /// for every game. Block rules it turned off stay off (they were the game's own prompt
 /// answers, and turning them back on would lock the players out again). How many went.
+#[cfg(windows)]
 pub fn remove_all() -> Result<String, String> {
     let script = format!("{IMPORT}$r = @(Get-NetFirewallRule -Group 'peerparty' -ErrorAction SilentlyContinue); if ($r.Count) {{ $r | Remove-NetFirewallRule }}; $r.Count");
     let out = std::process::Command::new(powershell())
@@ -367,6 +382,7 @@ pub fn plan<'a>(rules: &'a [Rule], exe: &Path, profiles: u32) -> (Vec<&'a str>, 
 }
 
 /// `peerparty --fix-firewall <exe> [--public]`, run elevated.
+#[cfg(windows)]
 pub fn fix(exe: &Path, public: bool) -> Result<String, String> {
     let profiles = PRIVATE | DOMAIN | if public { PUBLIC } else { 0 };
     let all = rules();
@@ -392,6 +408,7 @@ pub fn fix(exe: &Path, public: bool) -> Result<String, String> {
 /// Windows PowerShell, by its full path in the system folder: a bare `powershell.exe` is
 /// looked for beside peerparty.exe first (a Downloads folder, often), and this runs as
 /// administrator.
+#[cfg(windows)]
 fn powershell() -> PathBuf {
     use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
     let mut buf = [0u16; 260];
@@ -400,10 +417,12 @@ fn powershell() -> PathBuf {
     system.join("WindowsPowerShell").join("v1.0").join("powershell.exe")
 }
 
+#[cfg(windows)]
 trait NoWindow {
     fn creation_flags_no_window(&mut self) -> &mut Self;
 }
 
+#[cfg(windows)]
 impl NoWindow for std::process::Command {
     fn creation_flags_no_window(&mut self) -> &mut Self {
         use std::os::windows::process::CommandExt;
@@ -427,17 +446,24 @@ pub enum Outcome {
 const REPORT_PIPE: &str = r"\\.\pipe\peerparty-fix-";
 
 /// The launcher's end of that pipe.
+#[cfg(windows)]
 struct Report(windows_sys::Win32::Foundation::HANDLE, String);
 
+#[cfg(windows)]
 impl Report {
+    /// Only this user and the administrators (the fix runs as one, which may be another
+    /// account when a standard user is given an administrator's password) may open it:
+    /// another user's program can't write the reason the window shows.
     fn new() -> Option<Report> {
         use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
         use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_INBOUND};
         use windows_sys::Win32::System::Pipes::{CreateNamedPipeW, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE};
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
         let name = format!("{REPORT_PIPE}{}-{nanos}", std::process::id());
+        let sd = owner_and(&["BA"])?;
+        let sa = sd.attributes();
         let h = unsafe {
-            CreateNamedPipeW(wide(&name).as_ptr(), PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_TYPE_BYTE | PIPE_REJECT_REMOTE_CLIENTS, 1, 0, 4096, 0, std::ptr::null())
+            CreateNamedPipeW(wide(&name).as_ptr(), PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_TYPE_BYTE | PIPE_REJECT_REMOTE_CLIENTS, 1, 0, 4096, 0, &sa)
         };
         (h != INVALID_HANDLE_VALUE).then(|| Report(h, name))
     }
@@ -460,6 +486,7 @@ impl Report {
     }
 }
 
+#[cfg(windows)]
 impl Drop for Report {
     fn drop(&mut self) {
         unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
@@ -468,6 +495,7 @@ impl Drop for Report {
 
 /// `--fix-firewall ... --report PIPE`: the elevated fix tells the launcher why it
 /// failed. Only to a pipe the launcher made (`REPORT_PIPE`), never a file.
+#[cfg(windows)]
 pub fn report(pipe: &str, why: &str) -> bool {
     use std::io::Write;
     pipe.starts_with(REPORT_PIPE)
@@ -477,12 +505,13 @@ pub fn report(pipe: &str, why: &str) -> bool {
 
 /// Runs `peerparty --fix-firewall` elevated (Windows shows its administrator prompt) and
 /// waits for it. Blocks: call it off the UI thread.
+#[cfg(windows)]
 pub fn fix_elevated(peerparty: &Path, exe: &Path, public: bool) -> Outcome {
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
     use windows_sys::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
     use windows_sys::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
     let verb = wide("runas");
-    let file = wide(&peerparty.to_string_lossy());
+    let file = wide(peerparty);
     let mut params = format!("--fix-firewall \"{}\"", exe.display());
     if public {
         params.push_str(" --public");
@@ -522,10 +551,12 @@ pub fn fix_elevated(peerparty: &Path, exe: &Path, public: bool) -> Outcome {
 }
 
 /// Opens the firewall's "Allowed apps" settings (or, failing that, its full rules).
+#[cfg(windows)]
 pub fn open_settings() -> bool {
     shell_open("control.exe", "/name Microsoft.WindowsFirewall /page pageConfigureApps") || shell_open("wf.msc", "")
 }
 
+#[cfg(windows)]
 fn shell_open(file: &str, params: &str) -> bool {
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
     let (verb, file, params) = (wide("open"), wide(file), wide(params));
@@ -536,6 +567,7 @@ fn shell_open(file: &str, params: &str) -> bool {
 /// The fix as the player's click does it: elevated, else the firewall's settings (not
 /// when the player said no to the administrator prompt: that's their answer). Returns
 /// what to tell the player, and whether it was fixed.
+#[cfg(windows)]
 pub fn fix_or_open(peerparty: &Path, exe: &Path, public: bool) -> (String, bool) {
     let name = exe.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     // The network in use is always covered: on one Windows calls public, a fix for
@@ -572,25 +604,7 @@ pub fn fix_or_open(peerparty: &Path, exe: &Path, public: bool) -> (String, bool)
     }
 }
 
-/// The exe a running process was started from.
-pub fn process_exe(pid: u32) -> Option<PathBuf> {
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW};
-    let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if h.is_null() {
-        return None;
-    }
-    let mut buf = vec![0u16; 1024];
-    let mut len = buf.len() as u32;
-    let ok = unsafe { QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len) } != 0;
-    unsafe { CloseHandle(h) };
-    ok.then(|| PathBuf::from(String::from_utf16_lossy(&buf[..len as usize])))
-}
-
-fn wide(s: &str) -> Vec<u16> {
-    OsStr::new(s).encode_wide().chain(Some(0)).collect()
-}
-
+#[cfg(windows)]
 fn hklm(key: &str) -> Option<windows_sys::Win32::System::Registry::HKEY> {
     use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY, RegOpenKeyExW};
     let k = wide(key);
@@ -599,6 +613,7 @@ fn hklm(key: &str) -> Option<windows_sys::Win32::System::Registry::HKEY> {
 }
 
 /// A key's string values, as (name, text).
+#[cfg(windows)]
 fn reg_values(key: &str) -> Vec<(String, String)> {
     use windows_sys::Win32::System::Registry::{REG_EXPAND_SZ, REG_SZ, RegCloseKey, RegEnumValueW};
     let Some(h) = hklm(key) else { return Vec::new() };
@@ -625,6 +640,7 @@ fn reg_values(key: &str) -> Vec<(String, String)> {
     out
 }
 
+#[cfg(windows)]
 fn reg_dword(key: &str, value: &str) -> Option<u32> {
     use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_SUBKEY_WOW6464KEY, RegGetValueW};
     let (k, v) = (wide(key), wide(value));
@@ -634,21 +650,12 @@ fn reg_dword(key: &str, value: &str) -> Option<u32> {
     (r == 0).then_some(out)
 }
 
-#[repr(C)]
-struct Guid(u32, u16, u16, [u8; 8]);
-
+#[cfg(windows)]
 const CLSID_NET_FW_POLICY2: Guid = Guid(0xE2B3C97F, 0x6AE1, 0x41AC, [0x81, 0x7A, 0xF6, 0xF9, 0x21, 0x66, 0xD7, 0xDD]);
+#[cfg(windows)]
 const IID_INET_FW_POLICY2: Guid = Guid(0x98325047, 0xC671, 0x4174, [0x8D, 0x81, 0xDE, 0xFC, 0xD3, 0xF0, 0x31, 0x86]);
 
-/// Calls method `slot` of a COM object.
-macro_rules! vcall {
-    ($obj:expr, $slot:expr, fn($($t:ty),*) -> $r:ty $(, $arg:expr)*) => {{
-        let vt = unsafe { *($obj as *const *const usize) };
-        let f: unsafe extern "system" fn(usize $(, $t)*) -> $r = unsafe { std::mem::transmute(*vt.add($slot)) };
-        unsafe { f($obj $(, $arg)*) }
-    }};
-}
-
+#[cfg(windows)]
 fn com_profiles() -> Option<Profiles> {
     use windows_sys::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize};
     let init = unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) };
@@ -694,10 +701,46 @@ fn com_profiles() -> Option<Profiles> {
     result
 }
 
+/// Off Windows: no rules, and a firewall that is off for every network.
+#[cfg(not(windows))]
+pub fn rules() -> Vec<Rule> {
+    Vec::new()
+}
+
+#[cfg(not(windows))]
+pub fn profiles() -> Profiles {
+    Profiles { current: 0, enabled: 0, block_all: 0, default_block: 0 }
+}
+
+#[cfg(not(windows))]
+const NOT_HERE: &str = "Windows Firewall is Windows' own: there's nothing to change on this system";
+
+#[cfg(not(windows))]
+pub fn fix(_exe: &Path, _public: bool) -> Result<String, String> {
+    Err(NOT_HERE.into())
+}
+
+#[cfg(not(windows))]
+pub fn remove_all() -> Result<String, String> {
+    Err(NOT_HERE.into())
+}
+
+#[cfg(not(windows))]
+pub fn report(_pipe: &str, _why: &str) -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+pub fn fix_or_open(_peerparty: &Path, exe: &Path, _public: bool) -> (String, bool) {
+    let name = exe.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    (format!("{name}: {NOT_HERE}"), false)
+}
+
 #[cfg(test)]
 mod tests {
     /// The elevated fix's reason reaches the launcher through its pipe, and nothing but
     /// one of those pipes is written to.
+    #[cfg(windows)]
     #[test]
     fn a_failed_fix_says_why() {
         let r = super::Report::new().expect("pipe");
@@ -855,6 +898,7 @@ mod tests {
     }
 
     /// Runs `script` in Windows PowerShell the way the fix does; what it printed.
+    #[cfg(windows)]
     fn run_ps(script: &str) -> String {
         let out = std::process::Command::new(powershell())
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
@@ -869,6 +913,7 @@ mod tests {
     /// in, as one string. The typographic quotes are the point: PowerShell ends a
     /// single-quoted string at those too, and a path with one would otherwise run
     /// whatever followed it, as administrator.
+    #[cfg(windows)]
     #[test]
     fn powershell_reads_quoted_strings_back_whole() {
         assert!(powershell().is_file(), "{}", powershell().display());
@@ -888,6 +933,7 @@ mod tests {
     }
 
     /// `-Name` takes wildcards: an escaped name matches itself and nothing else.
+    #[cfg(windows)]
     #[test]
     fn powershell_takes_escaped_rule_names_literally() {
         for (pattern, text, matches) in [("a[bc]d", "a[bc]d", true), ("a[bc]d", "abd", false), ("x*y?z`", "x*y?z`", true), ("x*y", "xAAy", false)] {
@@ -898,6 +944,7 @@ mod tests {
 
     /// This PC's own firewall, read only (no rule is changed): the parser takes every
     /// rule the store has, and the profile read agrees with what PowerShell says.
+    #[cfg(windows)]
     #[test]
     fn reads_this_pcs_firewall() {
         let rules = rules();

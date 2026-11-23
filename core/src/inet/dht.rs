@@ -509,17 +509,20 @@ impl Dht {
 /// A tiny DHT node for tests: answers `get_peers` with every node it knows and the
 /// peers announced so far, and records `announce_peer` (with `implied_port`). One node
 /// is the whole DHT, so lookups settle after one round.
+#[cfg(any(test, feature = "test-util"))]
 pub struct TestNode {
     pub id: [u8; 20],
     peers: HashMap<[u8; 20], Vec<SocketAddr>>,
 }
 
+#[cfg(any(test, feature = "test-util"))]
 impl Default for TestNode {
     fn default() -> Self {
         TestNode { id: super::crypto::random_array(), peers: HashMap::new() }
     }
 }
 
+#[cfg(any(test, feature = "test-util"))]
 impl TestNode {
     /// The reply to one datagram, if it's a query we answer.
     pub fn answer(&mut self, from: SocketAddr, d: &[u8]) -> Option<Vec<u8>> {

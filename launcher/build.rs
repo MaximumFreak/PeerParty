@@ -39,6 +39,20 @@ const HOOKS: [(&str, &str); 2] = [
 /// `PEERPARTY_HOOKS=x64` skips the 32-bit hook (the test suite, unless a test DLL is
 /// 32-bit). The exe still compiles: that half is a stub, and a 32-bit game won't run
 /// with it. Unset builds both, which is what a shipping exe needs.
+///
+/// `PEERPARTY_HOOKS=none` builds neither: both are stubs (a launcher that starts no game,
+/// or a check). `PEERPARTY_HOOK_DIR` names a folder of hooks built elsewhere
+/// (`peerparty_hook64.dll`, and `peerparty_hook32.dll` if there is one), embedded as they
+/// are: how a build for Linux, which can't compile the Windows DLLs, gets them. A build
+/// for another OS without it embeds stubs.
+const HOOK_FILES: [&str; 2] = ["peerparty_hook64.dll", "peerparty_hook32.dll"];
+
+/// An empty file for a hook that isn't embedded.
+fn stub(out: &Path, key: &str) {
+    let stub = out.join(format!("{}-stub.dll", key.to_ascii_lowercase()));
+    std::fs::write(&stub, []).expect("writing a hook stub");
+    println!("cargo:rustc-env={key}={}", stub.display());
+}
 
 fn main() {
     let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
@@ -46,17 +60,97 @@ fn main() {
         .unwrap()
         .to_path_buf();
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+    println!("cargo:rerun-if-env-changed=PEERPARTY_HOOK_RUSTFLAGS");
+    println!("cargo:rerun-if-env-changed=PEERPARTY_HOOKS");
+    println!("cargo:rerun-if-env-changed=PEERPARTY_HOOK_DIR");
+    // Everything the hook is built from, the LAN core and the shared protocol included.
+    // Not the launcher's own sources: a change there needs no new hook (cargo rebuilds
+    // the launcher itself), and watching them ran the nested build on every edit.
+    // Only what the DLL is compiled from: not core's integration tests or examples,
+    // which a test run edits most and the hook doesn't contain.
+    for p in [
+        "hook/src",
+        "hook/Cargo.toml",
+        "core/src",
+        "core/Cargo.toml",
+        "protocol/src",
+        "protocol/Cargo.toml",
+        "vendor",
+        "Cargo.toml",
+        "Cargo.lock",
+        ".cargo/config.toml",
+    ] {
+        println!(
+            "cargo:rerun-if-changed={}",
+            Path::new(&root).join(p).display()
+        );
+    }
+    let windows = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
+    let hook_dir = env::var_os("PEERPARTY_HOOK_DIR").map(PathBuf::from).filter(|d| !d.as_os_str().is_empty());
+    if env::var("PEERPARTY_HOOKS").ok().as_deref() == Some("none") {
+        for (_, key) in HOOKS {
+            stub(&out, key);
+        }
+    } else if let Some(dir) = hook_dir {
+        // The folder too, so a hook added to it later is seen (a missing path would
+        // rerun every build).
+        println!("cargo:rerun-if-changed={}", dir.display());
+        for ((_, key), file) in HOOKS.into_iter().zip(HOOK_FILES) {
+            let dll = dir.join(file);
+            if dll.is_file() {
+                println!("cargo:rerun-if-changed={}", dll.display());
+                println!("cargo:rustc-env={key}={}", dll.display());
+            } else if key == "PEERPARTY_HOOK32" {
+                println!("cargo:warning=no {} in PEERPARTY_HOOK_DIR: 32-bit games won't run with this build", dll.display());
+                stub(&out, key);
+            } else {
+                panic!("PEERPARTY_HOOK_DIR has no {}", dll.display());
+            }
+        }
+    } else if !windows {
+        println!("cargo:warning=no hook DLLs for this target (set PEERPARTY_HOOK_DIR to embed ones built for Windows): games won't get the hook");
+        for (_, key) in HOOKS {
+            stub(&out, key);
+        }
+    } else {
+        build_hooks(&root, &out);
+    }
+
+    version_resource(&root, &out);
+    // Where the exe's DLLs come from (see `only_system_dlls` in main.rs for why). The
+    // ones it names are looked for in System32 only (0x800, LOAD_LIBRARY_SEARCH_SYSTEM32).
+    // That flag doesn't reach the DLLs those load in turn, so the ones Windows doesn't
+    // always take from System32 (all but its "known DLLs") are loaded on first use,
+    // by which time `main` has said where DLLs may come from. A new one that a
+    // dependency starts to name belongs in this list: tools/dll-search-check.ps1 says so.
+    if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rustc-link-arg-bins=/DEPENDENTLOADFLAG:0x800");
+        // advapi32 is a known DLL itself, but its random number function is another
+        // DLL's under its name, and that one is fetched when the name is looked up.
+        for dll in ["dwmapi", "uxtheme", "opengl32", "hid", "iphlpapi", "bcrypt", "bcryptprimitives", "advapi32"] {
+            println!("cargo:rustc-link-arg-bins=/DELAYLOAD:{dll}.dll");
+        }
+        println!("cargo:rustc-link-arg-bins=delayimp.lib");
+        // The flags reach the launcher's unit-test exe too, which imports none of some of
+        // them: "/DELAYLOAD ignored" (LNK4199) says only that, and rustc shows linker
+        // output as warnings since 1.100.
+        println!("cargo:rustc-link-arg-bins=/IGNORE:4199");
+    }
+}
+
+/// Builds the hook DLLs with a nested cargo, for the exe to embed.
+fn build_hooks(root: &Path, out: &Path) {
     // The outer target directory, from OUT_DIR's layout (CACHEDIR.TAG can't say: cargo
     // marks only some of its folders with it). Without the config's `..` hops: cl.exe
     // and link.exe, which the hook's build runs, can't open a file whose path as written
     // passes MAX_PATH, and those hops did once the nested build sat deeper.
-    let nested = target_dir_of(&out).map(|t| normalized(&t).join("hook")).unwrap_or_else(|| normalized(&out).join("hook"));
+    let nested = target_dir_of(out).map(|t| normalized(&t).join("hook")).unwrap_or_else(|| normalized(out).join("hook"));
     let profile = env::var("PROFILE").unwrap();
     let cargo = env::var("CARGO").unwrap();
     // PROFILE is `debug` for dev and test, and `release` for every profile that
     // inherits release, testexe included. The directory under target/ is the real
     // name (debug, release, testexe), and that is the hook build we want.
-    let profile_dir = profile_dir_of(&out).unwrap_or(profile);
+    let profile_dir = profile_dir_of(out).unwrap_or(profile);
     let x64_only = env::var("PEERPARTY_HOOKS").ok().as_deref() == Some("x64");
 
     let built: Vec<(&str, &str)> = HOOKS.into_iter().filter(|(triple, _)| !(x64_only && triple.starts_with("i686"))).collect();
@@ -64,7 +158,7 @@ fn main() {
     // other, each hook's single-unit link-time optimization kept most cores idle).
     let mut cmd = Command::new(&cargo);
     no_window(&mut cmd);
-    cmd.current_dir(&root).args(["build", "-p", "peerparty_hook"]);
+    cmd.current_dir(root).args(["build", "-p", "peerparty_hook"]);
     for (triple, _) in &built {
         cmd.args(["--target", triple]);
     }
@@ -90,45 +184,12 @@ fn main() {
     );
     for (triple, key) in HOOKS {
         if x64_only && triple.starts_with("i686") {
-            let stub = out.join("hook32-stub.dll");
-            std::fs::write(&stub, []).expect("writing the 32-bit hook stub");
-            println!("cargo:rustc-env={key}={}", stub.display());
+            stub(out, key);
             continue;
         }
         let dll = nested.join(triple).join(&profile_dir).join("peerparty_hook.dll");
         assert!(dll.is_file(), "{} missing", dll.display());
         println!("cargo:rustc-env={key}={}", dll.display());
-    }
-
-    version_resource(&root, &out);
-    // Where the exe's DLLs come from (see `only_system_dlls` in main.rs for why). The
-    // ones it names are looked for in System32 only (0x800, LOAD_LIBRARY_SEARCH_SYSTEM32).
-    // That flag doesn't reach the DLLs those load in turn, so the ones Windows doesn't
-    // always take from System32 (all but its "known DLLs") are loaded on first use,
-    // by which time `main` has said where DLLs may come from. A new one that a
-    // dependency starts to name belongs in this list: tools/dll-search-check.ps1 says so.
-    if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
-        println!("cargo:rustc-link-arg-bins=/DEPENDENTLOADFLAG:0x800");
-        // advapi32 is a known DLL itself, but its random number function is another
-        // DLL's under its name, and that one is fetched when the name is looked up.
-        for dll in ["dwmapi", "uxtheme", "opengl32", "hid", "iphlpapi", "bcrypt", "bcryptprimitives", "advapi32"] {
-            println!("cargo:rustc-link-arg-bins=/DELAYLOAD:{dll}.dll");
-        }
-        println!("cargo:rustc-link-arg-bins=delayimp.lib");
-        // The flags reach the launcher's unit-test exe too, which imports none of some of
-        // them: "/DELAYLOAD ignored" (LNK4199) says only that, and rustc shows linker
-        // output as warnings since 1.100.
-        println!("cargo:rustc-link-arg-bins=/IGNORE:4199");
-    }
-    println!("cargo:rerun-if-env-changed=PEERPARTY_HOOK_RUSTFLAGS");
-    println!("cargo:rerun-if-env-changed=PEERPARTY_HOOKS");
-
-    // Everything the hook is built from, the LAN core included.
-    for p in ["hook", "core", "vendor", "Cargo.lock", ".cargo/config.toml"] {
-        println!(
-            "cargo:rerun-if-changed={}",
-            Path::new(&root).join(p).display()
-        );
     }
 }
 
@@ -178,15 +239,14 @@ fn profile_dir_of(out: &Path) -> Option<String> {
 /// and git's whole description of the build ("" without).
 fn build_number(root: &Path, version: &str) -> (u32, String) {
     // Rerun when HEAD moves or a tag appears (a missing path would rerun every build).
+    // Not for every change to the working tree, though `--dirty` would see it: watching
+    // the launcher's sources ran this script, and the nested hook build, on every edit
+    // to them. A build's "-dirty" is brought up to date by the next commit or hook change.
+    // Nor git's index: `git status`, a commit and the `git describe` below rewrite it
+    // whenever file times have moved, so the build after nearly any git command ran this
+    // script again and relinked the exe (a minute) with nothing changed.
     let git = root.join(".git");
-    // And when the working tree may have changed (`--dirty`): the launcher's own sources
-    // (the hook's are watched already). Not git's index: `git status`, a commit and the
-    // `git describe` below rewrite it whenever file times have moved, so the build after
-    // nearly any git command ran this script again and relinked the exe (a minute) with
-    // nothing changed.
     let mut watch: Vec<PathBuf> = ["HEAD", "refs/tags", "packed-refs"].iter().map(|p| git.join(p)).collect();
-    watch.push(root.join("launcher").join("src"));
-    watch.push(root.join("launcher").join("locales"));
     if let Ok(head) = std::fs::read_to_string(git.join("HEAD")) {
         if let Some(r) = head.trim().strip_prefix("ref: ") {
             watch.push(git.join(r));
@@ -271,10 +331,23 @@ END
     );
     let path = out.join("version.rc");
     std::fs::write(&path, rc).expect("writing version.rc");
+    compile_resource(&path);
+}
+
+/// rc.exe from the Windows SDK, through winresource: a build dependency only where the
+/// build itself runs on Windows (build.rs is built for the building system).
+#[cfg(windows)]
+fn compile_resource(path: &Path) {
     winresource::WindowsResource::new()
         .set_resource_file(path.to_str().unwrap())
         .compile()
         .expect("compiling the version resource (rc.exe from the Windows SDK)");
+}
+
+/// Built for Windows elsewhere: no resource compiler here, so no icon or version info.
+#[cfg(not(windows))]
+fn compile_resource(_path: &Path) {
+    println!("cargo:warning=peerparty.exe built off Windows has no icon or version resource");
 }
 
 /// Runs as the user who started it (never asks for elevation, and Windows' installer

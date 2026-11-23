@@ -36,10 +36,9 @@ use std::time::{Duration, Instant};
 use peerparty_core::{Event, Lan, Lobby, PeerId};
 use retour::GenericDetour;
 
-use crate::hook::with_lock;
 use crate::log;
 use crate::net::{self, Front};
-use crate::pe::Export;
+use crate::sys::pe::Export;
 
 pub fn enabled() -> bool {
     net::enabled()
@@ -56,7 +55,7 @@ static LATER: Mutex<Vec<Later>> = Mutex::new(Vec::new());
 
 /// Runs `f` on the next tick, the way EOS completes every async call.
 pub(crate) fn later(f: impl FnOnce() + Send + 'static) {
-    LATER.lock().unwrap().push(Box::new(f));
+    crate::sys::lock(&LATER).push(Box::new(f));
 }
 
 static DUE: Mutex<Vec<(Instant, Later)>> = Mutex::new(Vec::new());
@@ -64,7 +63,7 @@ static DUE: Mutex<Vec<(Instant, Later)>> = Mutex::new(Vec::new());
 /// Runs `f` on the first tick after `wait`. For calls a LAN finishes so much faster than
 /// Epic's servers that games racing their own UI against them break.
 pub(crate) fn later_after(wait: Duration, f: impl FnOnce() + Send + 'static) {
-    DUE.lock().unwrap().push((Instant::now() + wait, Box::new(f)));
+    crate::sys::lock(&DUE).push((Instant::now() + wait, Box::new(f)));
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,7 +125,7 @@ pub(crate) fn add_listener(
         return 0;
     }
     let id = fail::NEXT_NOTIFY.fetch_add(1, Ordering::Relaxed);
-    LISTENERS.lock().unwrap().insert(
+    crate::sys::lock(&LISTENERS).insert(
         id,
         Listener {
             kind,
@@ -139,7 +138,12 @@ pub(crate) fn add_listener(
 }
 
 pub(crate) fn remove_listener(id: u64) {
-    LISTENERS.lock().unwrap().remove(&id);
+    crate::sys::lock(&LISTENERS).remove(&id);
+}
+
+/// Whether listener `id` is still registered (not removed since it was added).
+pub(crate) fn listener_registered(id: u64) -> bool {
+    crate::sys::lock(&LISTENERS).contains_key(&id)
 }
 
 /// (function, client data) for each listener of `kind` that wants `socket`.
@@ -186,7 +190,7 @@ static OWNED: LazyLock<Mutex<BTreeMap<usize, Owned>>> = LazyLock::new(Mutex::def
 pub(crate) fn hand_out<T: 'static>(value: T, strings: Vec<std::ffi::CString>) -> usize {
     let b = Box::new(value);
     let p = &*b as *const T as usize;
-    OWNED.lock().unwrap().insert(
+    crate::sys::lock(&OWNED).insert(
         p,
         Owned {
             len: std::mem::size_of::<T>().max(1),
@@ -199,7 +203,7 @@ pub(crate) fn hand_out<T: 'static>(value: T, strings: Vec<std::ffi::CString>) ->
 
 /// Frees the handed-out value `p` points into (the game's `*_Release`).
 pub(crate) fn release(p: usize) {
-    let mut owned = OWNED.lock().unwrap();
+    let mut owned = crate::sys::lock(&OWNED);
     let start = owned.range(..=p).next_back().filter(|(s, o)| p < **s + o.len).map(|(s, _)| *s);
     if let Some(s) = start {
         owned.remove(&s);
@@ -237,7 +241,7 @@ static TICKS: AtomicU32 = AtomicU32::new(0);
 
 fn pump() {
     if TICKS.fetch_add(1, Ordering::Relaxed) % 256 == 0 {
-        crate::swap::patch_imports();
+        crate::sys::swap::patch_imports();
     }
     run_later();
     if let Some(lan) = lan() {
@@ -252,8 +256,8 @@ fn pump() {
 fn run_later() {
     {
         let now = Instant::now();
-        let mut due = DUE.lock().unwrap();
-        let mut ready = LATER.lock().unwrap();
+        let mut due = crate::sys::lock(&DUE);
+        let mut ready = crate::sys::lock(&LATER);
         let mut i = 0;
         while i < due.len() {
             if due[i].0 <= now {
@@ -265,7 +269,7 @@ fn run_later() {
     }
     // A callback may queue more; bound the rounds so a loop can't stall the frame.
     for _ in 0..8 {
-        let batch = std::mem::take(&mut *LATER.lock().unwrap());
+        let batch = std::mem::take(&mut *crate::sys::lock(&LATER));
         if batch.is_empty() {
             return;
         }
@@ -292,7 +296,7 @@ fn dispatch(lan: &Lan, ev: Event) {
 /// The EOS lobby or session we're in, for "invite everyone to where I am".
 pub fn current_lobby() -> Option<Lobby> {
     lan()?
-        .my_lobbies("eos.lobby")
+        .my_lobbies(lobby::NS)
         .into_iter()
         .next()
         .or_else(sessions::current)
@@ -308,12 +312,6 @@ pub fn is_custom_invite(connect: &str) -> bool {
     custominvites::is_ours(connect)
 }
 
-/// Whether a LAN invite waits for the player's answer: everything but the answer to a
-/// request to join (which is a reply, not an invite).
-pub fn needs_answer(connect: &str) -> bool {
-    !custominvites::is_response(connect)
-}
-
 /// Whether a LAN invite is an EOS request to join us.
 pub fn is_request_to_join(connect: &str) -> bool {
     custominvites::is_request(connect)
@@ -326,11 +324,42 @@ pub fn reject_request_to_join(from: PeerId) {
 
 /// PeerParty's overlay opened or closed: games listening for EOS's display settings
 /// hear it as Epic's overlay.
-pub fn overlay_visible(on: bool) {
-    if enabled() {
-        ui::overlay_visible(on);
-    }
-}
+pub static OVERLAY: crate::overlay::OverlayListener = crate::overlay::OverlayListener {
+    on_overlay_visible: |on| {
+        if enabled() {
+            ui::overlay_visible(on);
+        }
+    },
+};
+
+/// EOS lobbies, sessions and presence carry invites; its custom invites and requests to
+/// join are EOS's alone (custominvites.rs).
+pub static INVITES: crate::invite::InviteCarrier = crate::invite::InviteCarrier {
+    front: Front::Eos,
+    namespaces: &[lobby::NS, sessions::NS],
+    current_lobby,
+    my_connect: || Some(join_info()).filter(|c| !c.is_empty()),
+    in_our_session: |_| false,
+    accept_invite: |connect, ns| {
+        use crate::invite::Claim;
+        if is_custom_invite(connect) {
+            Claim::Sole
+        } else if match ns {
+            Some(n) => n == lobby::NS || n == sessions::NS,
+            None => !connect.is_empty() && takes_presence_joins(),
+        } {
+            Claim::Fallback
+        } else {
+            Claim::No
+        }
+    },
+    join_requests: Some(crate::invite::JoinRequests {
+        is_request: is_request_to_join,
+        is_reply: custominvites::is_response,
+        decline: reject_request_to_join,
+    }),
+    diagnosis: || None,
+};
 
 /// Whether the game takes a "join game" through EOS presence.
 pub fn takes_presence_joins() -> bool {
@@ -425,11 +454,11 @@ fn interface_of(name: &str) -> Option<&str> {
 fn lan_interface(name: &str) -> bool {
     static OURS: LazyLock<Mutex<std::collections::HashMap<String, bool>>> = LazyLock::new(Mutex::default);
     let Some(prefix) = interface_of(name) else { return false };
-    if let Some(v) = OURS.lock().unwrap().get(prefix) {
+    if let Some(v) = crate::sys::lock(&OURS).get(prefix) {
         return *v;
     }
     let v = table::TABLE.iter().filter(|(n, _, _)| n.starts_with(prefix)).any(|(n, _, _)| lan_answer(n).is_some());
-    OURS.lock().unwrap().insert(prefix.to_string(), v);
+    crate::sys::lock(&OURS).insert(prefix.to_string(), v);
     v
 }
 
@@ -450,7 +479,7 @@ fn guess(name: &str) -> (fail::Class, u8) {
 static NOTED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
 
 fn note(name: &str, what: &str) {
-    if NOTED.lock().unwrap().insert(name.to_string()) {
+    if crate::sys::lock(&NOTED).insert(name.to_string()) {
         log!("eos-lan {name}: {what}");
     }
 }
@@ -487,29 +516,13 @@ fn arm<T>(slot: &OnceLock<GenericDetour<T>>, target: T, detour: T, label: &str) 
 where
     T: retour::Function + Copy + Send + Sync + 'static,
 {
-    with_lock(|| {
-        let hook = match unsafe { GenericDetour::new(target, detour) } {
-            Ok(h) => h,
-            Err(e) => {
-                log!("eos-lan {label} not hooked: {e}");
-                return false;
-            }
-        };
-        if slot.set(hook).is_err() {
-            return false;
-        }
-        if let Err(e) = unsafe { slot.get().unwrap().enable() } {
-            log!("eos-lan {label} enable failed: {e}");
-            return false;
-        }
-        true
-    })
+    crate::sys::detour::arm(slot, target, detour, "eos-lan", label)
 }
 
 /// The game's EOS SDK just loaded. Returns the exports hooked here, which the generic
 /// logging pass must leave alone.
 pub fn attach(base: usize, module_name: &str, exports: &[Export]) -> HashSet<usize> {
-    crate::swap::register(base, module_name, resolve);
+    crate::sys::swap::register(base, module_name, resolve);
     net::subscribe(Front::Eos);
     let mut skip = HashSet::new();
     if let Some(e) = exports.iter().find(|e| e.name == "EOS_Platform_Create") {
@@ -549,7 +562,7 @@ unsafe extern "system" fn detour_create(options: *const abi::PlatformOptions) ->
         let _ = PRODUCT.set(p.clone());
     }
     lan();
-    crate::swap::patch_imports();
+    crate::sys::swap::patch_imports();
     let Some(hook) = CREATE.get() else { return 0 };
     let platform = unsafe { hook.call(options) };
     log!(
@@ -610,7 +623,7 @@ mod tests {
             data: [u64; 4],
             info: u32,
         }
-        let held = |p: usize| OWNED.lock().unwrap().contains_key(&p);
+        let held = |p: usize| crate::sys::lock(&OWNED).contains_key(&p);
         let p = hand_out(Pair { data: [0; 4], info: 1 }, Vec::new());
         let info = unsafe { &(*(p as *const Pair)).info } as *const u32 as usize;
         assert_ne!(info, p);

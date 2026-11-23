@@ -32,16 +32,15 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
-use std::os::windows::fs::OpenOptionsExt;
-use std::os::windows::io::{AsRawSocket, FromRawSocket};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::id::PeerId;
+use crate::sys::keepalive;
 use crate::wire::{Beacon, MAX_FRAME, Msg, VERSION};
 
 pub const DISCOVERY_PORT: u16 = 47590;
@@ -167,16 +166,29 @@ pub struct Conn {
     /// Ending with a goodbye (`bye`): the writer shuts the connection once the queue
     /// has gone out.
     ending: Arc<AtomicBool>,
-    /// A public stranger's connection: addresses in what we send it (lobby, member and
-    /// presence attributes, invites) become this, our stand-in (see `lan::scrub_public`).
-    scrub: std::sync::OnceLock<Ipv4Addr>,
+    /// A public stranger's connection: what we send it goes through the engine's policy
+    /// first (addresses in lobby, member and presence attributes and invites become our
+    /// stand-in, see `lan::policy`).
+    scrub: std::sync::OnceLock<Scrub>,
+}
+
+/// An outgoing message as a connection's policy has it: a changed copy, or `None` to send
+/// it as it is.
+pub(crate) type ScrubFn = fn(&Msg, Ipv4Addr) -> Option<Msg>;
+
+/// A connection's outgoing policy (`Conn::scrub_as`) and the address it puts in.
+#[derive(Clone, Copy)]
+pub(crate) struct Scrub {
+    pub with: Ipv4Addr,
+    pub f: ScrubFn,
 }
 
 impl Conn {
-    /// From now on, addresses in lobby data, presence and invites sent on this
-    /// connection are replaced with `with` (set for public sessions).
-    pub fn scrub_as(&self, with: Ipv4Addr) {
-        let _ = self.scrub.set(with);
+    /// From now on, what is sent on this connection goes through `f` with `with` (the
+    /// engine's public-session policy: addresses become our stand-in). It also caps the
+    /// connection's frames (`frame_max`).
+    pub(crate) fn scrub_as(&self, with: Ipv4Addr, f: ScrubFn) {
+        let _ = self.scrub.set(Scrub { with, f });
     }
 
     /// The biggest frame this connection carries: PUBLIC_FRAME_MAX for a public
@@ -203,13 +215,9 @@ impl Conn {
     }
 
     fn send_after(&self, head: Vec<u8>, msg: &Msg) -> bool {
-        let frame = match self.scrub.get() {
-            Some(with) if crate::lan::may_carry_addresses(msg) => {
-                let mut m = msg.clone();
-                crate::lan::scrub_public(&mut m, *with);
-                m.encode_onto(head)
-            }
-            _ => msg.encode_onto(head),
+        let frame = match self.scrub.get().and_then(|s| (s.f)(msg, s.with)) {
+            Some(m) => m.encode_onto(head),
+            None => msg.encode_onto(head),
         };
         // The peer closes the connection on a frame over its limit (`read_frame_max`),
         // losing everything queued behind it; drop just this one instead.
@@ -297,17 +305,59 @@ impl Conn {
             return;
         }
         self.tx.lock().unwrap().take();
-        let conn = self.clone();
-        let _ = thread::Builder::new()
-            .name("peerparty-retire".into())
-            .spawn(move || {
-                thread::sleep(RETIRE_GRACE);
-                let _ = conn.stream.shutdown(std::net::Shutdown::Both);
-            });
+        Reaper::cut_later(self.clone(), Instant::now() + RETIRE_GRACE);
     }
 
     pub fn retired(&self) -> bool {
         self.retired.load(Ordering::Relaxed)
+    }
+}
+
+/// Retired connections waiting out RETIRE_GRACE before they are cut: one thread for all
+/// of them, asleep until the next one is due or a new one comes (no thread per retire).
+struct Reaper {
+    due: Mutex<Vec<(Instant, Arc<Conn>)>>,
+    wake: Condvar,
+}
+
+impl Reaper {
+    fn cut_later(conn: Arc<Conn>, at: Instant) {
+        static REAPER: OnceLock<Option<&'static Reaper>> = OnceLock::new();
+        let reaper = *REAPER.get_or_init(|| {
+            let r: &'static Reaper = Box::leak(Box::new(Reaper { due: Mutex::new(Vec::new()), wake: Condvar::new() }));
+            thread::Builder::new().name("peerparty-retire".into()).spawn(move || r.run()).ok().map(|_| r)
+        });
+        match reaper {
+            Some(r) => {
+                r.due.lock().unwrap().push((at, conn));
+                r.wake.notify_one();
+            }
+            // No thread to wait with: cut now rather than never.
+            None => {
+                let _ = conn.stream.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+
+    fn run(&self) {
+        let mut due = self.due.lock().unwrap();
+        loop {
+            let now = Instant::now();
+            let (cut, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut *due).into_iter().partition(|(at, _)| *at <= now);
+            *due = keep;
+            if !cut.is_empty() {
+                drop(due);
+                for (_, conn) in cut {
+                    let _ = conn.stream.shutdown(std::net::Shutdown::Both);
+                }
+                due = self.due.lock().unwrap();
+                continue;
+            }
+            due = match due.iter().map(|(at, _)| *at).min() {
+                Some(next) => self.wake.wait_timeout(due, next.saturating_duration_since(now)).unwrap().0,
+                None => self.wake.wait(due).unwrap(),
+            };
+        }
     }
 }
 
@@ -457,7 +507,7 @@ pub(crate) struct Config {
     pub game: String,
     pub me: PeerId,
     /// The key `me` is the hash of: what our hello is proved with.
-    pub key: Arc<crate::inet::public::IdentityKey>,
+    pub key: Arc<crate::identity_key::IdentityKey>,
     pub name: String,
     pub discovery_port: u16,
     /// Extra beacon targets for networks broadcast doesn't cross (VPNs, other subnets).
@@ -612,7 +662,7 @@ fn parse_datagram(d: &[u8]) -> Option<(u8, PeerId, &[u8])> {
 impl Mesh {
     /// Dials a peer at a port on this PC (an internet tunnel's end), as for a beacon.
     pub fn dial_local(&self, port: u16, id: PeerId) {
-        dial(Ipv4Addr::LOCALHOST.into(), port, id, &self.cfg, &self.sink, &self.dialing, &self.data, &self.upgrades);
+        dial(Ipv4Addr::LOCALHOST.into(), port, id, false, &self.cfg, &self.sink, &self.dialing, &self.data, &self.upgrades);
     }
 
     /// Turns LAN beacons and the same-PC board on or off while running.
@@ -672,8 +722,8 @@ pub(crate) fn start(cfg: Config, sink: Arc<dyn Sink>) -> io::Result<Mesh> {
                         if foreign <= 3 || foreign.is_power_of_two() {
                             sink.log(&format!(
                                 "lan ignored a datagram for {peer} from {} (connected from {}; {foreign} so far)",
-                                crate::inet::redact::lan(from),
-                                crate::inet::redact::lan(conn.addr)
+                                crate::redact::lan(from),
+                                crate::redact::lan(conn.addr)
                             ));
                         }
                         continue;
@@ -707,7 +757,7 @@ pub(crate) fn start(cfg: Config, sink: Arc<dyn Sink>) -> io::Result<Mesh> {
                                 continue;
                             }
                             if !conn.udp_ok.swap(true, Ordering::Relaxed) {
-                                sink.log(&format!("lan udp to {peer} works ({})", crate::inet::redact::lan(from)));
+                                sink.log(&format!("lan udp to {peer} works ({})", crate::redact::lan(from)));
                             }
                             if let Some((caps, epoch, echo)) = caps {
                                 conn.seq_in.lock().unwrap().set_epoch(epoch);
@@ -775,7 +825,7 @@ pub(crate) fn start(cfg: Config, sink: Arc<dyn Sink>) -> io::Result<Mesh> {
                     let data = data.clone();
                     let waiting = waiting.clone();
                     thread::spawn(move || {
-                        let result = handshake(stream, &cfg, &sink, &data, None);
+                        let result = handshake(stream, &cfg, &sink, &data, None, false);
                         waiting.fetch_sub(1, Ordering::Relaxed);
                         if let Err(e) = result {
                             sink.log(&format!("lan accept failed: {e}"));
@@ -839,7 +889,7 @@ pub(crate) fn start(cfg: Config, sink: Arc<dyn Sink>) -> io::Result<Mesh> {
                         let others = board.others(&cfg);
                         for &(id, tcp) in &others {
                             if wanted(id, &cfg, &sink, &upgrades) {
-                                dial(Ipv4Addr::LOCALHOST.into(), tcp, id, &cfg, &sink, &dialing, &data, &upgrades);
+                                dial(Ipv4Addr::LOCALHOST.into(), tcp, id, true, &cfg, &sink, &dialing, &data, &upgrades);
                             }
                         }
                         // A beacon sent to this PC's address (an extra target) reaches
@@ -857,7 +907,7 @@ pub(crate) fn start(cfg: Config, sink: Arc<dyn Sink>) -> io::Result<Mesh> {
                         }
                         for (id, ip, tcp) in board.heard_by(&others) {
                             if id != cfg.me && wanted(id, &cfg, &sink, &upgrades) {
-                                dial(ip, tcp, id, &cfg, &sink, &dialing, &data, &upgrades);
+                                dial(ip, tcp, id, true, &cfg, &sink, &dialing, &data, &upgrades);
                             }
                         }
                     }
@@ -899,7 +949,7 @@ pub(crate) fn start(cfg: Config, sink: Arc<dyn Sink>) -> io::Result<Mesh> {
                     if !cfg.lan() || b.id == cfg.me || b.game != cfg.game || upgrades.backing_off(b.id) || !wanted(b.id, &cfg, &sink, &upgrades) {
                         continue;
                     }
-                    dial(from.ip(), b.port, b.id, &cfg, &sink, &dialing, &data, &upgrades);
+                    dial(from.ip(), b.port, b.id, true, &cfg, &sink, &dialing, &data, &upgrades);
                 }
             })?;
     }
@@ -913,12 +963,16 @@ pub(crate) fn start(cfg: Config, sink: Arc<dyn Sink>) -> io::Result<Mesh> {
 type Dialing = Arc<Mutex<HashSet<(PeerId, SocketAddr)>>>;
 
 /// Dials a peer we heard about, unless a dial to it at that address is already under
-/// way.
+/// way. `lan`: found by LAN discovery (a beacon, the board), not an internet tunnel's
+/// end: LAN discovery turned off meanwhile (a pass of the beacon thread that had already
+/// looked, a dial still connecting) drops it, so a link cut just after can't come back
+/// on the LAN in place of its tunnel.
 #[allow(clippy::too_many_arguments)]
 fn dial(
     ip: IpAddr,
     port: u16,
     id: PeerId,
+    lan: bool,
     cfg: &Arc<Config>,
     sink: &Arc<dyn Sink>,
     dialing: &Dialing,
@@ -934,6 +988,11 @@ fn dial(
     }
     let (cfg, sink, dialing, data, upgrades) = (cfg.clone(), sink.clone(), dialing.clone(), data.clone(), upgrades.clone());
     thread::spawn(move || {
+        if lan && !cfg.lan() {
+            sink.log(&format!("lan dial {} dropped: LAN discovery was turned off", crate::redact::lan(addr)));
+            dialing.lock().unwrap().remove(&(id, addr));
+            return;
+        }
         let connected = TcpStream::connect_timeout(&addr, cfg.handshake_timeout);
         // A connect that times out (rather than being refused) is what a firewall that
         // drops connections looks like; this PC's own loopback never has one.
@@ -941,9 +1000,9 @@ fn dial(
         if connected.is_ok() || timed_out {
             upgrades.dialed(id, timed_out);
         }
-        let result = connected.and_then(|s| handshake(s, &cfg, &sink, &data, Some(id)));
+        let result = connected.and_then(|s| handshake(s, &cfg, &sink, &data, Some(id), lan));
         if let Err(e) = result {
-            sink.log(&format!("lan dial {} failed: {e}", crate::inet::redact::lan(addr)));
+            sink.log(&format!("lan dial {} failed: {e}", crate::redact::lan(addr)));
         }
         dialing.lock().unwrap().remove(&(id, addr));
     });
@@ -958,11 +1017,7 @@ struct Board {
 
 impl Board {
     fn dir() -> PathBuf {
-        std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
-            .join("peerparty")
-            .join("peers")
+        crate::sys::data_dir_or_temp().join("peers")
     }
 
     fn open(cfg: &Config, tcp: u16) -> Option<Board> {
@@ -970,14 +1025,8 @@ impl Board {
         std::fs::create_dir_all(&dir).ok()?;
         // Per game too: one player can be in two games at once.
         let path = dir.join(format!("{}.{}.peer", cfg.me.hex(), crate::id::game_tag(&cfg.game)));
-        // FILE_SHARE_READ only: others may read it, nobody may delete it while we run.
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .share_mode(1)
-            .open(&path)
-            .ok()?;
+        // Others may read it; nobody may delete it while we run.
+        let mut file = crate::sys::open_board(&path).ok()?;
         writeln!(file, "{}
 {}
 {}", cfg.game, cfg.discovery_port, tcp).ok()?;
@@ -1049,7 +1098,7 @@ impl Board {
                 continue;
             };
             // Deletable means its copy is gone.
-            if std::fs::remove_file(&path).is_ok() {
+            if crate::sys::remove_if_unheld(&path) {
                 continue;
             }
             let Ok(text) = std::fs::read_to_string(&path) else {
@@ -1081,20 +1130,7 @@ impl Drop for Board {
 /// The broadcast address of each IPv4 network this PC is on (not loopback, not a
 /// single-address one), from its address and mask.
 fn subnet_broadcasts() -> Vec<Ipv4Addr> {
-    use windows_sys::Win32::NetworkManagement::IpHelper::{GetIpAddrTable, MIB_IPADDRTABLE};
-    let mut size = 0u32;
-    unsafe { GetIpAddrTable(std::ptr::null_mut(), &mut size, 0) };
-    if size == 0 {
-        return Vec::new();
-    }
-    let mut buf = vec![0u64; (size as usize).div_ceil(8)];
-    if unsafe { GetIpAddrTable(buf.as_mut_ptr().cast(), &mut size, 0) } != 0 {
-        return Vec::new();
-    }
-    let table = buf.as_ptr() as *const MIB_IPADDRTABLE;
-    let n = unsafe { (*table).dwNumEntries } as usize;
-    let rows = unsafe { std::slice::from_raw_parts((*table).table.as_ptr(), n) };
-    let mut out: Vec<Ipv4Addr> = rows.iter().filter_map(|r| directed_broadcast(r.dwAddr.to_ne_bytes(), r.dwMask.to_ne_bytes())).collect();
+    let mut out: Vec<Ipv4Addr> = crate::sys::ipv4_networks().into_iter().filter_map(|(a, m)| directed_broadcast(a, m)).collect();
     out.sort();
     out.dedup();
     out
@@ -1118,14 +1154,18 @@ fn handshake(
     sink: &Arc<dyn Sink>,
     data: &Arc<UdpSocket>,
     expect: Option<PeerId>,
+    lan: bool,
 ) -> io::Result<()> {
+    // A LAN dial (see `dial`) gives up once LAN discovery is off: before saying who we
+    // are, and again before the connection becomes the peer's.
+    let lan_off = || lan && !cfg.lan();
     let addr = stream.peer_addr()?;
     stream.set_nodelay(true)?;
     if let Err(e) = keepalive(&stream, KEEPALIVE_IDLE, KEEPALIVE_EVERY) {
         sink.log(&format!("lan: no TCP keepalive on a connection: {e}"));
     }
     stream.set_read_timeout(Some(cfg.handshake_timeout))?;
-    let nonce: [u8; 16] = crate::inet::crypto::random_array();
+    let nonce: [u8; 16] = crate::crypto::random_array();
     let hello = Msg::Hello {
         version: VERSION,
         game: cfg.game.clone(),
@@ -1140,6 +1180,9 @@ fn handshake(
     // turns out to be a copy of this game: its Hello carries this player's name and id,
     // which aren't for whatever connects to the port and waits.
     if expect.is_some() {
+        if lan_off() {
+            return Err(io::Error::other("LAN discovery was turned off"));
+        }
         write_frame(&mut writer, &hello.encode())?;
     }
     let mut reader = stream.try_clone()?;
@@ -1178,11 +1221,11 @@ fn handshake(
     let proof = cfg.key.sign_hello(&cfg.game, (cfg.me, &nonce), (id, &their_nonce));
     write_frame(&mut writer, &Msg::Proof { sig: proof }.encode())?;
     let proved = match Msg::decode(&read_frame_max(&mut reader, HELLO_MAX)?) {
-        Some(Msg::Proof { sig }) => crate::inet::public::hello_proves(&their_key, &sig, &cfg.game, (id, &their_nonce), (cfg.me, &nonce)),
+        Some(Msg::Proof { sig }) => crate::identity_key::hello_proves(&their_key, &sig, &cfg.game, (id, &their_nonce), (cfg.me, &nonce)),
         _ => false,
     };
     if !proved {
-        sink.log(&format!("lan: a connection from {} said it was {id} and couldn't prove it: dropped", crate::inet::redact::lan(addr)));
+        sink.log(&format!("lan: a connection from {} said it was {id} and couldn't prove it: dropped", crate::redact::lan(addr)));
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "the peer didn't prove its id"));
     }
     // A cloned handle keeps its own receive timeout; the reader is the one that matters.
@@ -1217,6 +1260,9 @@ fn handshake(
         ending: Arc::new(AtomicBool::new(false)),
         scrub: std::sync::OnceLock::new(),
     });
+    if lan_off() {
+        return Err(io::Error::other("LAN discovery was turned off while connecting"));
+    }
     let queued = conn.queued.clone();
     let ending = conn.ending.clone();
     // A duplicate that lost the tie-break still runs its threads, retired: the peer may
@@ -1353,82 +1399,11 @@ fn read_frame_max(r: &mut impl Read, max: usize) -> io::Result<Vec<u8>> {
     Ok(body)
 }
 
-/// Turns on TCP keepalive with our timings (SIO_KEEPALIVE_VALS: Windows' default waits
-/// two hours before the first probe).
-pub(crate) fn keepalive(stream: &TcpStream, idle: Duration, every: Duration) -> io::Result<()> {
-    use windows_sys::Win32::Networking::WinSock::{SIO_KEEPALIVE_VALS, SOCKET, WSAIoctl};
-    #[repr(C)]
-    struct Vals {
-        onoff: u32,
-        time_ms: u32,
-        interval_ms: u32,
-    }
-    let v = Vals { onoff: 1, time_ms: idle.as_millis() as u32, interval_ms: every.as_millis() as u32 };
-    let mut ret = 0u32;
-    let r = unsafe {
-        WSAIoctl(
-            stream.as_raw_socket() as SOCKET,
-            SIO_KEEPALIVE_VALS,
-            &v as *const Vals as *const core::ffi::c_void,
-            size_of::<Vals>() as u32,
-            std::ptr::null_mut(),
-            0,
-            &mut ret,
-            std::ptr::null_mut(),
-            None,
-        )
-    };
-    if r != 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
-}
-
 /// A UDP socket on the discovery port that every copy on this machine can share.
-/// std can't set SO_REUSEADDR before bind, so this builds the socket with winsock.
 fn discovery_socket(port: u16) -> io::Result<UdpSocket> {
-    use windows_sys::Win32::Networking::WinSock::{
-        AF_INET, IN_ADDR, INVALID_SOCKET, IPPROTO_UDP, SO_BROADCAST, SO_REUSEADDR, SOCK_DGRAM,
-        SOCKADDR, SOCKADDR_IN, SOL_SOCKET, WSADATA, WSAStartup, bind, closesocket, setsockopt,
-        socket,
-    };
-    unsafe {
-        let mut data: WSADATA = std::mem::zeroed();
-        // Returns the error itself (WSAGetLastError isn't usable before it succeeds).
-        let ret = WSAStartup(0x0202, &mut data);
-        if ret != 0 {
-            return Err(io::Error::from_raw_os_error(ret));
-        }
-        let s = socket(AF_INET as i32, SOCK_DGRAM, IPPROTO_UDP);
-        if s == INVALID_SOCKET {
-            return Err(io::Error::last_os_error());
-        }
-        let on: i32 = 1;
-        for opt in [SO_REUSEADDR, SO_BROADCAST] {
-            if setsockopt(s, SOL_SOCKET, opt, &on as *const i32 as *const u8, 4) != 0 {
-                let e = io::Error::last_os_error();
-                closesocket(s);
-                return Err(e);
-            }
-        }
-        let mut addr: SOCKADDR_IN = std::mem::zeroed();
-        addr.sin_family = AF_INET;
-        addr.sin_port = port.to_be();
-        addr.sin_addr = IN_ADDR {
-            S_un: std::mem::zeroed(),
-        };
-        addr.sin_addr.S_un.S_addr = u32::from(crate::bind_ip()).to_be();
-        if bind(
-            s,
-            &addr as *const SOCKADDR_IN as *const SOCKADDR,
-            std::mem::size_of::<SOCKADDR_IN>() as i32,
-        ) != 0
-        {
-            let e = io::Error::last_os_error();
-            closesocket(s);
-            return Err(e);
-        }
-        let udp = UdpSocket::from_raw_socket(s as std::os::windows::io::RawSocket);
-        udp.set_read_timeout(Some(Duration::from_millis(500)))?;
-        Ok(udp)
-    }
+    let udp = crate::sys::shared_udp_socket(crate::bind_ip(), port)?;
+    udp.set_read_timeout(Some(Duration::from_millis(500)))?;
+    Ok(udp)
 }
 
 #[cfg(test)]

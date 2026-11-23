@@ -379,7 +379,7 @@ impl<'a> R<'a> {
         let owner = self.id()?;
         let bucket = self.str()?;
         let max_members = self.u32()?;
-        let permission = Permission::from_u8(self.u8()?);
+        let permission = Permission::from_u8(self.u8()?)?;
         let flags = self.u8()?;
         let attrs = self.attrs()?;
         let n = self.count()?;
@@ -471,6 +471,25 @@ fn join_result(v: u8) -> Option<JoinResult> {
 }
 
 impl Msg {
+    /// Whether a message is numbered in a session (see `link`): everything on the
+    /// ordered stream except what is about the stream itself, and unreliable channel
+    /// data, which may travel as a datagram instead (`Conn::send_unreliable`) and may be
+    /// lost anyway.
+    pub(crate) fn is_counted(&self) -> bool {
+        !matches!(
+            self,
+            Msg::Hello { .. }
+                | Msg::Proof { .. }
+                | Msg::Moved
+                | Msg::Session { .. }
+                | Msg::Ack { .. }
+                | Msg::Bye
+                | Msg::Numbered { .. }
+                | Msg::Resend { .. }
+                | Msg::ChanData { reliable: false, .. }
+        )
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         self.encode_onto(Vec::new())
     }
@@ -729,7 +748,7 @@ impl Msg {
                     return None;
                 }
                 let msg = Msg::decode(inner)?;
-                if !crate::link::counted(&msg) {
+                if !msg.is_counted() {
                     return None;
                 }
                 return Some(Msg::Numbered { n, msg: Box::new(msg) });
@@ -914,6 +933,26 @@ mod tests {
         assert!(!c.holds("other", PeerId([1; 16])));
         assert!(!Claim { term: 4, ..c }.holds("lobby", PeerId([1; 16])));
         assert!(!Claim::default().holds("lobby", PeerId::default()));
+    }
+
+    /// A lobby whose permission is a number we don't know is refused, not taken as public.
+    #[test]
+    fn unknown_permissions_are_dropped() {
+        let state = |permission| {
+            let mut lobby = Lobby::new("eos.lobby");
+            lobby.id = "x".into();
+            lobby.permission = permission;
+            Msg::State { lobby, secret: [0; 32] }.encode()
+        };
+        let (public, unlisted) = (state(Permission::Public), state(Permission::Unlisted));
+        let at: Vec<usize> = (0..public.len()).filter(|&i| public[i] != unlisted[i]).collect();
+        assert_eq!(at.len(), 1, "one byte holds the permission");
+        assert!(Msg::decode(&unlisted).is_some());
+        for bad in [5, 0x80, u8::MAX] {
+            let mut m = public.clone();
+            m[at[0]] = bad;
+            assert!(Msg::decode(&m).is_none(), "permission {bad}");
+        }
     }
 
     #[test]

@@ -15,10 +15,9 @@ use std::sync::OnceLock;
 use retour::GenericDetour;
 use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 
-use crate::hook::with_lock;
 use crate::log;
-use crate::pe::Export;
-use crate::read;
+use crate::sys::pe::Export;
+use crate::sys::read;
 
 type CreateMutexW = unsafe extern "system" fn(*const core::ffi::c_void, i32, *const u16) -> isize;
 type CreateMutexExW =
@@ -58,7 +57,7 @@ fn stem() -> &'static str {
 }
 
 pub fn enabled() -> bool {
-    std::env::var_os("PEERPARTY_MULTI_INSTANCE").is_some()
+    crate::config::HookConfig::global().multi_instance
 }
 
 /// Hooks kernelbase's mutex entry points. kernel32's exports forward here.
@@ -80,35 +79,14 @@ pub fn attach_kernelbase(exports: &[Export]) -> usize {
 }
 
 fn hook_one(exports: &[Export], name: &str, install: impl FnOnce(*const ()) -> bool) -> usize {
-    let Some(export) = exports.iter().find(|e| e.name == name) else {
-        log!("instance {name} not exported");
-        return 0;
-    };
-    usize::from(install(export.addr))
+    crate::sys::detour::hook_one(exports, "instance", name, install)
 }
 
 fn arm<T>(slot: &OnceLock<GenericDetour<T>>, target: T, detour: T, label: &str) -> bool
 where
     T: retour::Function + Copy + Send + Sync + 'static,
 {
-    with_lock(|| {
-        let hook = match unsafe { GenericDetour::new(target, detour) } {
-            Ok(h) => h,
-            Err(e) => {
-                log!("instance {label} not hooked: {e}");
-                return false;
-            }
-        };
-        if slot.set(hook).is_err() {
-            log!("instance {label} already hooked");
-            return false;
-        }
-        if let Err(e) = unsafe { slot.get().unwrap().enable() } {
-            log!("instance {label} enable failed: {e}");
-            return false;
-        }
-        true
-    })
+    crate::sys::detour::arm(slot, target, detour, "instance", label)
 }
 
 /// The per-process name for a single-instance mutex, or None to leave `name` alone.
@@ -259,9 +237,7 @@ unsafe extern "system" fn detour_find_ex_a(parent: isize, after: isize, class: *
 mod tests {
     use super::*;
 
-    fn wide(s: &str) -> Vec<u16> {
-        s.encode_utf16().chain(Some(0)).collect()
-    }
+    use crate::sys::win::wide;
 
     #[test]
     fn renames_only_single_instance_mutexes_once() {

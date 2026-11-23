@@ -49,7 +49,8 @@ players on one PC, directly with friends, and after its online services have clo
 
 ## What it changes on your PC
 
-PeerParty's own files live under `%LOCALAPPDATA%\peerparty`, and its logs under
+PeerParty's own files live under `%LOCALAPPDATA%\peerparty` (or in a `peerparty-data`
+folder beside `peerparty.exe` when portable mode is on), and its logs under
 `%TEMP%\peerparty\logs`. Outside those it writes only: copies of a game's saves under a
 PeerParty player's identity, next to the originals, which are only read; Windows Firewall rules for a
 game, when you press **Fix** and approve Windows' prompt; the key of its local
@@ -79,7 +80,7 @@ Code taken from other projects keeps its licence beside it:
 |---|---|---|
 | `vendor/retour` | retour (crates.io), with local fixes | BSD-2-Clause |
 | `hook/src/photon` (protocol layer) | Luxon and Luxon Server | BSD-3-Clause (`hook/src/photon/LICENSE-Luxon`) |
-| `hook/src/present/vkshaders.rs` | Dear ImGui's precompiled Vulkan shaders | MIT |
+| `hook/src/video/vkshaders.rs` | Dear ImGui's precompiled Vulkan shaders | MIT |
 
 Every dependency's licence, and the notices those licences require, are in
 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md), which also ships with each release.

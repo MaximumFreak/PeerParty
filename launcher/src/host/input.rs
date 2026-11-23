@@ -193,6 +193,9 @@ fn run(tx: std::sync::mpsc::Sender<u32>) {
                 unsafe { GetCursorPos(&mut p) };
                 ANCHOR_X.store(p.x, Ordering::Relaxed);
                 ANCHOR_Y.store(p.y, Ordering::Relaxed);
+                // Alt is only followed while the overlay takes keys: a release missed
+                // while it was closed (Alt+Tab away) mustn't leave it held.
+                ALT.store(false, Ordering::Relaxed);
                 mouse = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), module, 0) };
             }
             INSTALL_KEYS if kb.is_null() => {

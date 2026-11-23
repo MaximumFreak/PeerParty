@@ -11,3 +11,6 @@ rustflags = ["-C", "target-feature=+crt-static"]
 # rebuilt test binary. peerparty.exe started directly isn't affected.
 [env]
 PEERPARTY_LOOPBACK = "1"
+# ... and keeps its PeerParty files (identity slots, the same-PC peer board, settings)
+# out of the player's own PeerParty folder.
+PEERPARTY_DATA_DIR = { value = "target/peerparty-test-data", relative = true }

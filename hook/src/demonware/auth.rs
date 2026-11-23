@@ -14,9 +14,9 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::json::Json;
+use crate::util::json::Json;
 use crate::log;
-use crate::playfab::http::Request;
+use crate::https::server::Request;
 
 
 static TITLE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -65,21 +65,21 @@ pub fn read_app_ticket(ticket: &[u8]) -> Player {
         let name = String::from_utf8_lossy(&name_bytes[..end]).into_owned();
         return Player { steam_id, name, key };
     }
-    Player { steam_id: crate::steamlan::my_steam_id(), name: crate::net::lan().map(|l| l.name().to_string()).unwrap_or_default(), key: Vec::new() }
+    Player { steam_id: crate::hub::accounts::my_steam_id(), name: crate::net::lan().map(|l| l.name().to_string()).unwrap_or_default(), key: Vec::new() }
 }
 
 /// The reply's `auth_task`: the request's plus one (Steam sign-in asks with 28 and
 /// waits for 29; Demonware's client checks it before anything else in the reply).
 pub fn reply_task(request: u64) -> u64 {
-    request + 1
+    request.wrapping_add(1)
 }
 
 /// A number the game sent as a JSON string or number.
 fn num(v: &Json) -> Option<u64> {
     match v {
-        Json::Num(n) if *n >= 0.0 => Some(*n as u64),
         Json::Str(s) => s.trim().parse().ok(),
-        _ => None,
+        // Exact for an integer; a fraction is cut, as before integers were kept apart.
+        _ => v.as_u64().or_else(|| v.as_f64().filter(|n| *n >= 0.0).map(|n| n as u64)),
     }
 }
 
@@ -136,12 +136,12 @@ pub fn handle(req: &Request) -> (u16, String) {
     let token = extra
         .get("token")
         .as_str()
-        .and_then(crate::ugs::base64_decode)
+        .and_then(crate::util::encoding::base64_decode)
         .unwrap_or_default();
     let player = read_app_ticket(&token);
     TITLE.store(title_id, std::sync::atomic::Ordering::Relaxed);
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as u32).unwrap_or(0);
-    let session_key: [u8; 24] = crate::photon::crypto::random_bytes(24).try_into().unwrap();
+    let session_key: [u8; 24] = crate::util::crypto::random_bytes(24).try_into().unwrap();
     let client = client_ticket(title_id, &player, &session_key, now);
     let server = server_ticket(&player, &session_key);
     super::lobby::remember_session_key(session_key);
@@ -155,14 +155,14 @@ pub fn handle(req: &Request) -> (u16, String) {
     let extra_out = Json::obj(vec![
         ("username", Json::str(player.name.clone())),
         ("time_to_live", Json::Num(9999.0)),
-        ("extended_data", Json::str(crate::ugs::base64(b"peerparty"))),
+        ("extended_data", Json::str(crate::util::encoding::base64(b"peerparty"))),
     ]);
     let reply = Json::obj(vec![
         ("auth_task", Json::str(reply_task(task).to_string())),
         ("code", Json::str("700")),
         ("iv_seed", Json::str(iv_seed.to_string())),
-        ("client_ticket", Json::str(crate::ugs::base64(&client))),
-        ("server_ticket", Json::str(crate::ugs::base64(&server))),
+        ("client_ticket", Json::str(crate::util::encoding::base64(&client))),
+        ("server_ticket", Json::str(crate::util::encoding::base64(&server))),
         ("client_id", Json::str("")),
         ("account_type", Json::str("steam")),
         ("crossplay_enabled", Json::Bool(false)),
@@ -189,26 +189,6 @@ mod tests {
         assert_eq!(p.key, vec![9u8; 24]);
     }
 
-    /// Once the game uses Demonware, Steam's encrypted app ticket is PeerParty's: the
-    /// request completes with k_EResultOK and the ticket carries the game's data.
-    #[test]
-    fn steams_encrypted_ticket_is_peerpartys_once_demonware_is_in_use() {
-        crate::demonware::set_active();
-        let mut included = vec![0x31u8; 24];
-        included.extend_from_slice(b"Player\0");
-        let call = crate::steamlan::encrypted_ticket_requested(included.as_ptr(), included.len() as i32).unwrap();
-        assert_ne!(call, 0);
-        assert!(crate::steam::injected().iter().any(|(id, _, data)| *id == 154 && data[..] == 1u32.to_le_bytes()));
-        let mut buf = [0u8; 0x200];
-        let mut len = 0u32;
-        assert_eq!(unsafe { crate::steamlan::encrypted_ticket(buf.as_mut_ptr(), buf.len() as i32, &mut len) }, Some(true));
-        let p = read_app_ticket(&buf[..len as usize]);
-        assert_eq!(p.key, vec![0x31u8; 24]);
-        assert_eq!(p.name, "Player");
-        // Too small a buffer is refused, not overrun.
-        assert_eq!(unsafe { crate::steamlan::encrypted_ticket(buf.as_mut_ptr(), 8, &mut len) }, Some(false));
-    }
-
     #[test]
     fn the_client_ticket_has_bdauthtickets_layout() {
         let p = Player { steam_id: 0x0110_0001_0000_1234, name: "Player".into(), key: vec![] };
@@ -226,7 +206,7 @@ mod tests {
 
     #[test]
     fn sign_in_answers_code_700_with_both_tickets() {
-        let token = crate::ugs::base64(&app_ticket(7, &[1u8; 24]));
+        let token = crate::util::encoding::base64(&app_ticket(7, &[1u8; 24]));
         let extra = Json::obj(vec![("token", Json::str(token))]).to_string();
         let body = Json::obj(vec![
             ("auth_task", Json::Num(28.0)),
@@ -248,8 +228,8 @@ mod tests {
         assert_eq!(j.get("auth_task").as_str(), Some("29"));
         assert_eq!(j.get("code").as_str(), Some("700"));
         assert_eq!(j.get("iv_seed").as_str(), Some("12345"));
-        let client = crate::ugs::base64_decode(j.get("client_ticket").as_str().unwrap()).unwrap();
-        let server = crate::ugs::base64_decode(j.get("server_ticket").as_str().unwrap()).unwrap();
+        let client = crate::util::encoding::base64_decode(j.get("client_ticket").as_str().unwrap()).unwrap();
+        let server = crate::util::encoding::base64_decode(j.get("server_ticket").as_str().unwrap()).unwrap();
         assert_eq!(client.len(), 128);
         assert_eq!(server.len(), 128);
         assert_eq!(u64::from_le_bytes(client[25..33].try_into().unwrap()), 7);

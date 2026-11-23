@@ -36,8 +36,10 @@ The sidebar has three places:
 - **Library**: the games, as covers or a list, with filters (All, Recent, each store,
   Games folder, Added, Hidden) and a search (Ctrl+F) that looks through All whichever
   filter is picked (from Hidden, through the hidden games). A game's panel has Play, the
-  number of players on this PC (at 2: **Second instance starts after**), **Copy Player
-  1's saves to Player N** (shown at 2 players, or at 1 once an instance runs and Play
+  number of players on this PC (at 2–4: **Split screen** to keep every player in one
+  shared window with a layout picker, or separate windows at 2 players with **Second
+  instance starts after**), **Copy Player
+  1's saves to Player N** (or to the other players in split screen; shown at 2–4 players, or at 1 once an instance runs and Play
   has become **Start another instance**, and not while an instance counts down; for
   the next instance only: it turns itself
   off once used, when no instance is left at 1 player, and every time the launcher
@@ -101,6 +103,15 @@ Settings live in `%LOCALAPPDATA%\peerparty\ui.json` (one that can't be read as
 settings is kept as `ui.json.bad` before defaults replace it). The window is egui (Rust,
 `launcher/src/ui/`); what it asks of the operating system goes through
 `launcher/src/platform/`, and nothing in it is specific to one PC.
+
+**Portable.** A `peerparty-data` folder beside peerparty.exe holds everything that
+would go in `%LOCALAPPDATA%\peerparty` (`~/.local/share/peerparty` on Linux): settings,
+players' identities, the stand-ins' saves, the hook DLLs. Settings > About > Keep
+PeerParty's files beside peerparty.exe moves them there (or back) and restarts the
+window; it refuses while a game PeerParty started still runs. Making an empty
+`peerparty-data` folder by hand works too: PeerParty then starts fresh there. Games
+started by a portable PeerParty keep their saves there as well (under Proton too: the
+hook is given the folder as Wine sees it). Logs stay in the temp folder.
 
 peerparty.exe is a Windows (GUI) program, so double-clicking it opens no console. From
 a prompt it prints to that console; .bat files and Steam wait for it and get the
@@ -212,6 +223,12 @@ both.
   as a single-instance check (Unity's, or one whose name says "instance" or holds the
   game's program name; stores' and Windows' own are left alone) is made per copy, and
   FindWindow doesn't find the other copy's windows.
+- `--split-screen` (`--instances 2..4`, `--layout horizontal|vertical|grid`): start two to
+  four copies on this PC in one shared split-screen window. Each pane gets its own
+  controller (assigned when a controller is first used, and kept across unplugging), its
+  own in-game overlay when that player presses the overlay button, and its own audio and
+  rumble; `Ctrl+Alt+L` cycles the layout, `Ctrl+Alt+Z` zooms the focused pane, and
+  `Ctrl+Alt+1`–`4` focuses a pane for the keyboard and mouse.
 - `--copy-saves`: this copy starts from player 1's progress, for games that don't
   offer multiplayer from a fresh save. A second copy plays under LAN ids (SteamID, EOS
   id, PlayFab id); the first time the game touches a path that contains one, the same
@@ -297,6 +314,9 @@ both.
   `official`), also swap 32-bit account ids in game packets, not only whole SteamIDs.
   Off by default: a shared account id is usually a small number, and swapping it can
   mangle ordinary game data.
+- `PEERPARTY_STEAM_WEB=0`: Steam's Web API host (`api.steampowered.com`) goes to Steam
+  as it is, instead of PeerParty answering whether Steam is up; `=1` answers it in games
+  that aren't Unity games too (only if the game's TLS trusts the system's roots).
 - `PEERPARTY_STEAM_DUMP=1` (or a number of packets, default 400): log Steam game
   packets, lobby chat and lobby data each way in hex (the first 160 bytes), naming every
   SteamID or account id found in them and how it's encoded (`u64le`, `u64be`, `dec`,
@@ -514,8 +534,8 @@ In a game started through PeerParty, Photon (hook/src/photon/):
   (event 101), and the server keeps every networked object, takes updates only from an
   object's state authority, forwards RPCs, grants authority requests, follows the master
   client's scene and tells everyone who joined and left. No interest management (every
-  player gets every object), and reliable data (`SendReliableDataToPlayer`) isn't
-  carried. Photon Chat is served by the master server (chat.rs) and TCP connections by
+  player gets every object); Fusion 2 reliable data (`SendReliableDataToPlayer` /
+  `SendReliableDataToServer`) is relayed (Fusion 1's isn't). Photon Chat is served by the master server (chat.rs) and TCP connections by
   host.rs (each becomes an ENet peer of the server's own), and so are WebSocket (`ws://`)
   connections (ws.rs). SQL lobby filters (WHERE and ORDER BY) are evaluated (sql.rs), and
   rooms with a PlayerTTL keep a dropped player inactive until it rejoins. Secure
@@ -566,7 +586,10 @@ Offline (no internet at all, or the online services shut down):
 
 - Steam: lobbies, P2P, NetworkingSockets, friends and invites are all LAN. Steam in
   offline mode is enough: `BLoggedOn` reports signed in in a game started through
-  PeerParty.
+  PeerParty, and in Unity games the Web API's "is Steam up" question
+  (`api.steampowered.com/ISteamWebAPIUtil/GetServerInfo`) is answered by PeerParty, so
+  a game that asks it every few seconds doesn't drop out of a LAN match when Steam is
+  slow or the PC is offline. Other Web API requests still go to Steam.
 - EOS: sign-in, lobbies, sessions, presence and P2P are PeerParty's; Epic's servers are
   never needed.
 - PlayFab: answered locally as above, also for games that only use PlayFab's web API
@@ -577,6 +600,23 @@ Offline (no internet at all, or the online services shut down):
 - Finding each other: by UDP broadcast on the LAN, and copies on one PC also through a
   peer board (`%LOCALAPPDATA%\peerparty\peers`), which needs no network adapter at
   all.
+
+When a player drops out of a match, the game's logs say whose side gave up:
+
+- `lan traffic over the last 30.0 s with <peer> (...)`: every 30 s while the copies
+  talk, what went each way on each channel (sent, got, read by the game, and when last),
+  what waits unread, and the connection itself (UDP or TCP only, bytes queued to send,
+  stale datagrams dropped).
+- `lan: the game leaves lobby ... their links as it did:` and `steam-lan
+  CloseSessionWithUser ...: the link as it did`: the same, at the moment the game itself
+  leaves. A link still carrying packets a few milliseconds before means the game chose
+  to leave (a check of its own failed); one that had gone quiet means the other copy
+  stopped sending.
+- `lan peer ... lost its connection` / `didn't come back within 10s`: PeerParty's own
+  connection to that player dropped.
+- `steam-web ...`: what PeerParty answered on Steam's Web API host, what it passed on to
+  Steam and how long Steam took, and `steam-web: the game looks up api.steampowered.com,
+  which goes to Steam as it is` when it isn't answered here.
 
 ### Internet play
 

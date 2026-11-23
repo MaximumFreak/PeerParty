@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::abi::result::*;
+use crate::util::crypto::md5_hex;
 use super::{call, hand_out, ids, lan, later, owned_str, release, trace};
 
 const CANCELED: i32 = 17;
@@ -72,19 +73,23 @@ enum Store {
 }
 
 fn dir(store: Store) -> Option<PathBuf> {
-    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from)?;
     let product = super::product_id();
     let product = if product.is_empty() { "unknown".to_string() } else { product };
-    let root = base.join("peerparty").join("eos-storage").join(product);
+    let root = crate::util::local_store::sdk_dir("eos-storage")?.join(local_store_name(&product)?);
     Some(match store {
         Store::Title => root.join("title"),
         Store::Player => root.join("player").join(lan()?.me().hex()),
     })
 }
 
-/// A file name the game gave, kept to one ordinary file (`saves::file_name`).
+/// A file name the game gave, kept to one ordinary file (`local_store::file_name`).
 fn safe_name(name: &str) -> Option<String> {
-    crate::saves::file_name(name)
+    crate::util::local_store::file_name(name)
+}
+
+/// The product id as one folder's name (it's the game's to say).
+fn local_store_name(product: &str) -> Option<String> {
+    crate::util::local_store::file_name(product)
 }
 
 fn path(store: Store, name: &str) -> Option<PathBuf> {
@@ -354,7 +359,7 @@ static REQUESTS: std::sync::Mutex<Vec<std::sync::Arc<Request>>> = std::sync::Mut
 
 fn new_request(filename: &str) -> std::sync::Arc<Request> {
     let r = std::sync::Arc::new(Request { filename: filename.to_string(), done: AtomicBool::new(false), canceled: AtomicBool::new(false) });
-    REQUESTS.lock().unwrap().push(r.clone());
+    crate::sys::lock(&REQUESTS).push(r.clone());
     r
 }
 
@@ -363,7 +368,7 @@ fn handle_of(r: &std::sync::Arc<Request>) -> usize {
 }
 
 fn request(h: usize) -> Option<std::sync::Arc<Request>> {
-    REQUESTS.lock().unwrap().iter().find(|r| handle_of(r) == h).cloned()
+    crate::sys::lock(&REQUESTS).iter().find(|r| handle_of(r) == h).cloned()
 }
 
 fn read(store: Store, o: *const TransferOptions, cd: usize, cb: usize) -> usize {
@@ -555,47 +560,9 @@ unsafe extern "system" fn request_cancel(h: usize) -> i32 {
 }
 
 unsafe extern "system" fn request_release(h: usize) {
-    REQUESTS.lock().unwrap().retain(|r| handle_of(r) != h);
+    crate::sys::lock(&REQUESTS).retain(|r| handle_of(r) != h);
 }
 
-/// MD5, hex (the metadata's MD5Hash).
-pub(crate) fn md5_hex(data: &[u8]) -> String {
-    const S: [u32; 64] = [
-        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11,
-        16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
-    ];
-    let k: Vec<u32> = (0..64).map(|i| ((i as f64 + 1.0).sin().abs() * 4294967296.0) as u32).collect();
-    let (mut a0, mut b0, mut c0, mut d0) = (0x67452301u32, 0xefcdab89u32, 0x98badcfeu32, 0x10325476u32);
-    let mut msg = data.to_vec();
-    let bits = (data.len() as u64).wrapping_mul(8);
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
-    }
-    msg.extend_from_slice(&bits.to_le_bytes());
-    for block in msg.chunks(64) {
-        let m: Vec<u32> = block.chunks(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect();
-        let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
-        for i in 0..64 {
-            let (f, g) = match i / 16 {
-                0 => ((b & c) | (!b & d), i),
-                1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
-                2 => (b ^ c ^ d, (3 * i + 5) % 16),
-                _ => (c ^ (b | !d), (7 * i) % 16),
-            };
-            let f = f.wrapping_add(a).wrapping_add(k[i]).wrapping_add(m[g]);
-            a = d;
-            d = c;
-            c = b;
-            b = b.wrapping_add(f.rotate_left(S[i]));
-        }
-        a0 = a0.wrapping_add(a);
-        b0 = b0.wrapping_add(b);
-        c0 = c0.wrapping_add(c);
-        d0 = d0.wrapping_add(d);
-    }
-    [a0, b0, c0, d0].iter().flat_map(|v| v.to_le_bytes()).map(|b| format!("{b:02x}")).collect()
-}
 
 #[cfg(test)]
 mod tests {
@@ -623,10 +590,4 @@ mod tests {
         assert_eq!(req.filename, "save.dat");
     }
 
-    #[test]
-    fn md5_matches_rfc_1321() {
-        assert_eq!(super::md5_hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
-        assert_eq!(super::md5_hex(b"abc"), "900150983cd24fb0d6963f7d28e17f72");
-        assert_eq!(super::md5_hex(&[b'a'; 1000]), "cabe45dcc9ae5b66ba86600cca6b8ba8");
-    }
 }

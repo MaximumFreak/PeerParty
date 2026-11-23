@@ -51,12 +51,25 @@ pub fn is_host(host: &str) -> bool {
     h.ends_with(HOST_SUFFIX)
 }
 
+/// Demonware's sign-in hosts on the local HTTPS server.
+pub static HTTPS: crate::https::HttpsService = crate::https::HttpsService {
+    name: "demonware",
+    cert_names: || vec!["*.prod.demonware.net", "*.demonware.net"],
+    is_host,
+    handle: auth::handle,
+    upgrade: None,
+    reads_root_early: || false,
+};
+
+/// Lookups of Demonware's hosts.
+pub static DNS: crate::net::dns::DnsService = crate::net::dns::DnsService { layer: "demonware", is_host, redirect };
+
 /// Whether the stand-in is on for this game (see the module comment).
 pub fn wanted() -> bool {
     crate::net::enabled()
         && !crate::net::skip("demonware")
-        && std::env::var("PEERPARTY_DEMONWARE").ok().as_deref() != Some("0")
-        && !crate::modes::official("demonware")
+        && crate::config::HookConfig::global().demonware != Some(false)
+        && !crate::config::modes::official("demonware")
 }
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -78,7 +91,7 @@ pub fn redirect(host: &str) -> Option<String> {
         return None;
     }
     let h = host.trim_end_matches('.').to_ascii_lowercase();
-    let ip = crate::playfab::server()?;
+    let ip = crate::https::server()?;
     start(ip);
     ACTIVE.store(true, Ordering::Relaxed);
     crate::log::throttled(&format!("demonware redirect {h}"), 2, |n| {

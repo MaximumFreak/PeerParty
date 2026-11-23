@@ -1,27 +1,26 @@
 //! The hook DLLs are embedded in `peerparty.exe` (see build.rs) and written out on
-//! demand to `%LOCALAPPDATA%\peerparty\hooks\<content hash>\`. A new build lands in a
-//! new folder, so a game still running with the old DLL never blocks it.
+//! demand to `hooks\<content hash>\` in PeerParty's folder (`platform::data_dir`). A new
+//! build lands in a new folder, so a game still running with the old DLL never blocks it.
 
 use std::env;
 use std::fs;
+#[cfg(windows)]
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 static HOOK64: &[u8] = include_bytes!(env!("PEERPARTY_HOOK64"));
 static HOOK32: &[u8] = include_bytes!(env!("PEERPARTY_HOOK32"));
 
-/// Path of the hook DLL for a game of that bitness, written out if needed.
+/// Path of the hook DLL for a game of that bitness, written out if needed. (On Linux the
+/// Windows peerparty.exe that starts the game inside Proton writes out its own.)
+#[cfg(windows)]
 pub fn extract(x86: bool) -> Result<PathBuf, String> {
     let (bytes, name) = if x86 {
         (HOOK32, "peerparty_hook32.dll")
     } else {
         (HOOK64, "peerparty_hook.dll")
     };
-    let base = env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(env::temp_dir);
-    let dir = base
-        .join("peerparty")
+    let dir = crate::platform::data_dir()
         .join("hooks")
         .join(format!("{:016x}", fnv1a(bytes)));
     let path = dir.join(name);
@@ -51,7 +50,7 @@ const KEEP_LOGS: Duration = Duration::from_secs(30 * 24 * 3600);
 /// copy of PeerParty of a different build writes its own again when it needs it) and
 /// logs in the usual log folder older than a month.
 pub fn clean_up() {
-    let hooks = env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(env::temp_dir).join("peerparty").join("hooks");
+    let hooks = crate::platform::data_dir().join("hooks");
     let current = [format!("{:016x}", fnv1a(HOOK64)), format!("{:016x}", fnv1a(HOOK32))];
     let logs = crate::platform::logs_dir();
     std::thread::spawn(move || {
@@ -73,6 +72,7 @@ pub fn clean_up() {
     });
 }
 
+#[cfg(windows)]
 fn matches(path: &PathBuf, bytes: &[u8]) -> bool {
     fs::read(path).is_ok_and(|on_disk| on_disk == bytes)
 }

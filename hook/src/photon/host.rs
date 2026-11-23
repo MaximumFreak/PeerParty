@@ -196,6 +196,9 @@ fn read_ws(sock: usize, from: SocketAddr, mut s: TcpStream, tx: mpsc::Sender<Inp
     let _ = tx.send(Input::TcpClosed(sock, from));
 }
 
+/// Frames a TCP client may send before its connection to the server is up.
+const QUEUED_MAX: usize = 256;
+
 /// Hands the server's datagrams to UDP sockets or to TCP adapters, and the adapters'
 /// answers back to the server, until nothing is left to move.
 fn route(server: &mut Server, adapters: &mut HashMap<(usize, SocketAddr), Adapter>, senders: &[Option<UdpSocket>], outs: Vec<Out>, now: i64) {
@@ -452,14 +455,14 @@ impl Host {
                         route(&mut server, &mut adapters, &senders, outs, t);
                     }
                     Some(Input::TcpOpen(sock, from, stream)) => {
-                        let challenge = u32::from_le_bytes(super::crypto::random_bytes(4).try_into().unwrap());
+                        let challenge = u32::from_le_bytes(crate::util::crypto::random_bytes(4).try_into().unwrap());
                         let mut a = Adapter::new(Peer::connect(challenge, 32, t), stream, false, false);
                         let dgs = a.peer.flush(t);
                         adapters.insert((sock, from), a);
                         feed(&mut server, &mut adapters, &senders, (sock, from), dgs, t);
                     }
                     Some(Input::WsOpen(sock, from, stream, made_init)) => {
-                        let challenge = u32::from_le_bytes(super::crypto::random_bytes(4).try_into().unwrap());
+                        let challenge = u32::from_le_bytes(crate::util::crypto::random_bytes(4).try_into().unwrap());
                         let mut a = Adapter::new(Peer::connect(challenge, 32, t), stream, is_ws(sock), made_init);
                         let dgs = a.peer.flush(t);
                         adapters.insert((sock, from), a);
@@ -471,11 +474,18 @@ impl Host {
                         }
                     }
                     Some(Input::TcpFrame(sock, from, channel, reliable, msg)) => {
+                        // A client the server has let go of is hung up on: what it sends
+                        // goes nowhere, and kept for later it would pile up unbounded.
                         let dgs = match adapters.get_mut(&(sock, from)) {
+                            Some(a) if matches!(a.peer.state, State::Disconnected | State::TimedOut) => {
+                                let _ = a.stream.shutdown(std::net::Shutdown::Both);
+                                adapters.remove(&(sock, from));
+                                Vec::new()
+                            }
                             Some(a) => {
                                 if a.peer.state == State::Connected {
                                     a.peer.send(channel, &msg, reliable, false);
-                                } else {
+                                } else if a.queued.len() < QUEUED_MAX {
                                     a.queued.push((channel, reliable, msg));
                                 }
                                 a.peer.flush(t)

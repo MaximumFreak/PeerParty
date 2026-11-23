@@ -109,10 +109,17 @@ fn side(enumerator: usize, flow: u32) -> Side {
 }
 
 fn refresh() {
-    let Some(e) = com::enumerator() else { return };
+    let Some(e) = com::enumerator() else {
+        // No device list to be had (an audio stack without MMDevice, as under some
+        // Wine setups): that's the look, so nobody waits for one that never comes.
+        if TAKEN.fetch_add(1, Ordering::Relaxed) == 0 {
+            log!("voice: Windows won't list its sound devices{}; voice uses the default devices", crate::sys::wine::tag());
+        }
+        return;
+    };
     let (input, output) = (side(e, CAPTURE), side(e, RENDER));
     release(e);
-    let mut s = SNAP.lock().unwrap();
+    let mut s = crate::sys::lock(&SNAP);
     if TAKEN.load(Ordering::Relaxed) == 0 || s.input != input || s.output != output {
         let version = s.version + 1;
         if TAKEN.load(Ordering::Relaxed) > 0 {
@@ -141,7 +148,7 @@ pub fn start() {
 
 /// The snapshot's version (0 before the first look), without waiting.
 pub fn version() -> u64 {
-    SNAP.lock().unwrap().version
+    crate::sys::lock(&SNAP).version
 }
 
 /// The devices as last seen (waits briefly for the first look).
@@ -151,11 +158,11 @@ pub fn snapshot() -> Arc<Snapshot> {
     while TAKEN.load(Ordering::Relaxed) == 0 && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(5));
     }
-    SNAP.lock().unwrap().clone()
+    crate::sys::lock(&SNAP).clone()
 }
 
 pub fn choose(output: bool, c: Choice) {
-    let mut ch = CHOICE.lock().unwrap();
+    let mut ch = crate::sys::lock(&CHOICE);
     if ch[output as usize] != c {
         log!("voice: {} set to {c:?}", if output { "speakers" } else { "microphone" });
         ch[output as usize] = c;
@@ -163,7 +170,7 @@ pub fn choose(output: bool, c: Choice) {
 }
 
 pub fn chosen(output: bool) -> Choice {
-    CHOICE.lock().unwrap()[output as usize].clone()
+    crate::sys::lock(&CHOICE)[output as usize].clone()
 }
 
 /// The endpoint voice uses now each way, by the game's choice.

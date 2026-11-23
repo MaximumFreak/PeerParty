@@ -113,7 +113,7 @@ pub(crate) fn lobby_voice_for(lobby: &str, options: usize) {
     if !LOBBY_VOICE.swap(true, Ordering::Relaxed) {
         log_once("lobby voice rooms on");
     }
-    let mut w = LOBBY_WISHES.lock().unwrap();
+    let mut w = crate::sys::lock(&LOBBY_WISHES);
     if w.len() < 256 || w.contains_key(lobby) {
         w.insert(lobby.to_string(), RoomWish::of(options));
     }
@@ -354,7 +354,7 @@ fn notify_room(kind: Kind, o: *const RoomOptions, cd: usize, cb: usize) -> u64 {
 
 unsafe extern "system" fn notify_participant_status(_h: usize, o: *const RoomOptions, cd: usize, cb: usize) -> u64 {
     let id = notify_room(Kind::RtcParticipantStatus, o, cd, cb);
-    replay_members(o, move |me, name, puid| {
+    replay_members(o, id, move |me, name, puid| {
         let info = ParticipantStatusInfo {
             ClientData: cd,
             LocalUserId: me,
@@ -372,8 +372,9 @@ unsafe extern "system" fn notify_participant_status(_h: usize, o: *const RoomOpt
 
 /// A LAN room fills within a tick, long before Epic's would have: a listener added
 /// after that hears, on the next tick, who is already there (only it; earlier
-/// listeners heard the joins as they happened).
-fn replay_members(o: *const RoomOptions, f: impl Fn(usize, *const c_char, usize) + Send + 'static) {
+/// listeners heard the joins as they happened). Not once it's removed: its client data
+/// may be freed by then.
+fn replay_members(o: *const RoomOptions, id: u64, f: impl Fn(usize, *const c_char, usize) + Send + 'static) {
     let Some((_, room)) = room_of(o) else { return };
     let members = voice::members(&key(&room));
     if members.is_empty() {
@@ -382,6 +383,9 @@ fn replay_members(o: *const RoomOptions, f: impl Fn(usize, *const c_char, usize)
     let name = intern(&room) as usize;
     later(move || {
         for p in members {
+            if !super::listener_registered(id) {
+                return;
+            }
             f(local(), name as *const c_char, ids::puid(p));
         }
     });
@@ -625,7 +629,7 @@ fn device_by_index(o: *const IndexOptions, output: bool) -> usize {
         return 0;
     }
     let Some((e, default)) = device_list(output).into_iter().nth(unsafe { (*o).DeviceIndex } as usize) else { return 0 };
-    let mut kept = KEPT.lock().unwrap();
+    let mut kept = crate::sys::lock(&KEPT);
     *kept.entry((output, e.id.clone(), e.name.clone(), default)).or_insert_with(|| {
         let info = Box::leak(Box::new(Kept(DeviceInfo {
             ApiVersion: 1,
@@ -783,7 +787,7 @@ unsafe extern "system" fn notify_data(_h: usize, o: *const RoomOptions, cd: usiz
 
 unsafe extern "system" fn notify_data_participant(_h: usize, o: *const RoomOptions, cd: usize, cb: usize) -> u64 {
     let id = notify_room(Kind::RtcDataParticipant, o, cd, cb);
-    replay_members(o, move |me, name, puid| {
+    replay_members(o, id, move |me, name, puid| {
         let info = DataParticipantInfo {
             ClientData: cd,
             LocalUserId: me,
@@ -881,8 +885,9 @@ unsafe extern "system" fn join_lobby_room(_h: usize, o: *const LobbyRoomOptions,
         return lobby_done(cb, cd, NOT_FOUND, &lobby);
     }
     lobby_voice_for(&lobby, o.LocalRTCOptions);
-    LOBBY_ROOMS.lock().unwrap().remove(&lobby);
-    sync_lobby_rooms();
+    crate::sys::lock(&LOBBY_ROOMS).remove(&lobby);
+    // Now, not when the tick's throttle next lets it: the game hears it's in.
+    sync_lobby_rooms_now();
     lobby_done(cb, cd, SUCCESS, &lobby);
 }
 
@@ -894,7 +899,7 @@ unsafe extern "system" fn leave_lobby_room(_h: usize, o: *const LobbyRoomOptions
     let Some(lan) = lan() else { return lobby_done(cb, cd, NOT_FOUND, &lobby) };
     let left = voice::leave(lan, &key(&lobby_room(&lobby)));
     if left {
-        LOBBY_ROOMS.lock().unwrap().insert(lobby.clone(), false);
+        crate::sys::lock(&LOBBY_ROOMS).insert(lobby.clone(), false);
         fire_lobby_room(&lobby, false);
     }
     lobby_done(cb, cd, if left { SUCCESS } else { NOT_FOUND }, &lobby);
@@ -930,18 +935,22 @@ fn sync_lobby_rooms() {
     // Every tick: looked at four times a second at most.
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     {
-        let mut last = LAST.lock().unwrap();
+        let mut last = crate::sys::lock(&LAST);
         if last.is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(250)) {
             return;
         }
         *last = Some(std::time::Instant::now());
     }
+    sync_lobby_rooms_now();
+}
+
+fn sync_lobby_rooms_now() {
     let Some(lan) = lan() else { return };
     // Only lobbies with a voice room: each joined as the game asked for it.
     let lobbies: Vec<String> = lan.my_lobbies("eos.lobby").into_iter().filter(lobby_has_room).map(|l| l.id).collect();
     let mut changes = Vec::new();
     {
-        let mut rooms = LOBBY_ROOMS.lock().unwrap();
+        let mut rooms = crate::sys::lock(&LOBBY_ROOMS);
         for l in &lobbies {
             if !rooms.contains_key(l) {
                 rooms.insert(l.clone(), true);
@@ -958,13 +967,13 @@ fn sync_lobby_rooms() {
     for (l, join) in changes {
         let room = key(&lobby_room(&l));
         if join {
-            let wish = LOBBY_WISHES.lock().unwrap().get(&l).copied().unwrap_or_default();
+            let wish = crate::sys::lock(&LOBBY_WISHES).get(&l).copied().unwrap_or_default();
             voice::join(lan, &room, !wish.manual_in, !wish.manual_out);
             if wish.muted {
                 voice::set_sending(&room, false);
             }
         } else {
-            LOBBY_WISHES.lock().unwrap().remove(&l);
+            crate::sys::lock(&LOBBY_WISHES).remove(&l);
             voice::leave(lan, &room);
         }
         fire_lobby_room(&l, join);

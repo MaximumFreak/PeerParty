@@ -2,10 +2,10 @@
 //! Lobby (with its Wire events) and Relay, for Unity games played on the LAN.
 //!
 //! The game's own UGS SDKs keep running. In a game started through PeerParty, lookups of the hosts below
-//! resolve to this process's loopback address (127.80.x.y), where the PlayFab
-//! service's HTTPS server (playfab/http.rs, playfab/tls.rs) answers. Requests whose
-//! `Host` is a Unity one come here instead of PlayFab's API. The certificate is
-//! PeerParty's own, trusted inside the game only, two ways (playfab/tls.rs): UnityTls
+//! resolve to this process's loopback address (127.80.x.y), where PeerParty's HTTPS
+//! server (https/) answers. Requests whose `Host` is a Unity one come here
+//! (`HTTPS`). The certificate is PeerParty's own, trusted inside the game only, two
+//! ways (https/tls.rs): UnityTls
 //! reads the Windows ROOT store and verifies the chain itself on MbedTLS
 //! (discussions.unity.com/t/836095), so the ROOT store the game opens (crypt32's
 //! `CertOpenStore`, hooked from crypt32's load for games that ship Lobby / Relay) comes
@@ -41,14 +41,14 @@ pub mod relay;
 pub mod wire;
 
 use std::sync::{Condvar, LazyLock, Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use peerparty_core::{Event, JoinResult, Lobby, PeerId};
 
-use crate::json::Json;
+use crate::util::json::Json;
 use crate::log;
 use crate::net::{self, Front};
-use crate::playfab::http::Request;
+use crate::https::server::Request;
 
 /// The hosts PeerParty answers. Others (QoS, Analytics, Matchmaker, Vivox, Cloud Code,
 /// Economy) are left alone.
@@ -68,16 +68,30 @@ pub fn is_host(host: &str) -> bool {
     HOSTS.contains(&h.as_str())
 }
 
+/// Unity's services on the local HTTPS server; Wire's WebSocket upgrade takes the
+/// connection over.
+pub static HTTPS: crate::https::HttpsService = crate::https::HttpsService {
+    name: "ugs",
+    cert_names: || vec!["*.services.api.unity.com", "wire.unity3d.com", "config.unity3d.com"],
+    is_host,
+    handle,
+    upgrade: Some(wire::serve),
+    // UnityTls reads the ROOT store itself, maybe long before the first lookup.
+    reads_root_early: wanted,
+};
+
+/// Lookups of Unity's hosts.
+pub static DNS: crate::net::dns::DnsService = crate::net::dns::DnsService { layer: "ugs", is_host, redirect };
+
 /// Whether the stand-in is on for this game (see the module comment).
 pub fn wanted() -> bool {
     net::enabled()
         && !net::skip("ugs")
-        && match std::env::var("PEERPARTY_UGS").ok().as_deref() {
-            Some("0") => false,
-            Some("1") => true,
-            _ => ships_multiplayer(),
+        && match crate::config::HookConfig::global().ugs {
+            Some(on) => on,
+            None => ships_multiplayer(),
         }
-        && !crate::modes::official("ugs")
+        && !crate::config::modes::official("ugs")
 }
 
 /// Names whose presence says the game uses Lobby or Relay.
@@ -118,7 +132,7 @@ pub fn redirect(host: &str) -> Option<String> {
     if !HOSTS.contains(&h.as_str()) || !wanted() {
         return None;
     }
-    let ip = crate::playfab::server()?;
+    let ip = crate::https::server()?;
     start_pump();
     crate::log::throttled(&format!("ugs redirect {h}"), 2, |n| {
         log!("ugs {h} -> {ip} (PeerParty's Unity Gaming Services) n={n}")
@@ -183,109 +197,6 @@ pub fn peer_of(player: &str) -> Option<PeerId> {
     std::iter::once(lan.me())
         .chain(lan.peers().into_iter().map(|(p, _)| p))
         .find(|p| player_id(*p).eq_ignore_ascii_case(player))
-}
-
-/// Random text from `alphabet`.
-pub fn random_text(len: usize, alphabet: &[u8]) -> String {
-    let mut out = String::with_capacity(len);
-    while out.len() < len {
-        for b in PeerId::random().0 {
-            if out.len() < len {
-                out.push(alphabet[b as usize % alphabet.len()] as char);
-            }
-        }
-    }
-    out
-}
-
-/// Random bytes from the OS's secure random source.
-pub fn random_bytes(len: usize) -> Vec<u8> {
-    let mut out = vec![0u8; len];
-    peerparty_core::inet::crypto::random(&mut out);
-    out
-}
-
-// ---- encodings ----
-
-const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-/// Base64 (RFC 4648 section 4), padded.
-pub fn base64(data: &[u8]) -> String {
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let n = (chunk[0] as u32) << 16 | (*chunk.get(1).unwrap_or(&0) as u32) << 8 | *chunk.get(2).unwrap_or(&0) as u32;
-        for i in 0..4 {
-            if i <= chunk.len() {
-                out.push(B64[(n >> (18 - 6 * i)) as usize & 63] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
-}
-
-/// Base64url without padding (RFC 4648 section 5), as JWTs use.
-pub fn base64url(data: &[u8]) -> String {
-    base64(data).trim_end_matches('=').replace('+', "-").replace('/', "_")
-}
-
-pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut acc = 0u32;
-    let mut bits = 0;
-    for c in text.bytes() {
-        let v = match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'+' | b'-' => 62,
-            b'/' | b'_' => 63,
-            b'=' | b'\r' | b'\n' => continue,
-            _ => return None,
-        };
-        acc = acc << 6 | v as u32;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-        }
-    }
-    Some(out)
-}
-
-// ---- time ----
-
-pub fn unix_now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
-}
-
-/// UTC time as ISO 8601 with milliseconds, the way Unity's services write it.
-pub fn iso(t: SystemTime) -> String {
-    let d = t.duration_since(UNIX_EPOCH).unwrap_or_default();
-    let secs = d.as_secs() as i64;
-    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
-    // Civil date from days since 1970-01-01 (Howard Hinnant's days_from_civil, inverted).
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
-        rem / 3600,
-        rem / 60 % 60,
-        rem % 60,
-        d.subsec_millis()
-    )
-}
-
-pub fn now_iso() -> String {
-    iso(SystemTime::now())
 }
 
 // ---- the LAN's events ----
@@ -392,31 +303,14 @@ pub fn wait_join(lobby: &str, wait: Duration) -> JoinResult {
 
 /// Forgets a stale join result before a new join (a retried join must not see it).
 pub fn clear_join(lobby: &str) {
-    WAITS.0.lock().unwrap().joins.remove(lobby);
+    crate::sys::lock(&WAITS.0).joins.remove(lobby);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn base64_matches_rfc_4648_vectors() {
-        for (plain, enc) in [("", ""), ("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"), ("foob", "Zm9vYg=="), ("fooba", "Zm9vYmE="), ("foobar", "Zm9vYmFy")] {
-            assert_eq!(base64(plain.as_bytes()), enc);
-            assert_eq!(base64_decode(enc).unwrap(), plain.as_bytes());
-        }
-        assert_eq!(base64url(&[0xfb, 0xff]), "-_8");
-        assert_eq!(base64_decode("-_8").unwrap(), vec![0xfb, 0xff]);
-    }
 
-    #[test]
-    fn iso_times_are_utc_with_milliseconds() {
-        assert_eq!(iso(UNIX_EPOCH), "1970-01-01T00:00:00.000Z");
-        let t = UNIX_EPOCH + Duration::from_millis(1_793_437_200_123);
-        assert_eq!(iso(t), "2026-10-31T09:00:00.123Z");
-        let leap = UNIX_EPOCH + Duration::from_secs(951_782_400); // 2000-02-29
-        assert_eq!(iso(leap), "2000-02-29T00:00:00.000Z");
-    }
 
     #[test]
     fn player_ids_are_28_characters_and_found_by_host_name() {
@@ -428,10 +322,4 @@ mod tests {
         assert!(!is_host("a3cac.playfabapi.com"));
     }
 
-    #[test]
-    fn random_text_uses_the_alphabet() {
-        let t = random_text(40, b"AB");
-        assert_eq!(t.len(), 40);
-        assert!(t.bytes().all(|b| b == b'A' || b == b'B'));
-    }
 }

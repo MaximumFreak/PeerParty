@@ -334,6 +334,14 @@ has no game or SDK code in it.
     lobby chat and lobby data in hex with every SteamID or account id found in them and
     its encoding, and what `GetLobbyMemberByIndex`/`GetLobbyOwner` answered (on change),
     to see how a game that still mixes players up names or orders them.
+  - Steam's Web API (`steam/web.rs`): `api.steampowered.com` resolves to the local
+    HTTPS service in Unity games whose Steam is PeerParty's. `ISteamWebAPIUtil/GetServerInfo`,
+    which some games poll every few seconds to see Steam is up (and leave the match on
+    the first miss), is answered there with the server time as Steam writes it; any
+    other request is passed on unchanged to the real host (`https/client.rs`
+    `pass_on`), a 503 when it can't be reached. Not Unity: left alone, since a game
+    with its own TLS roots wouldn't trust the certificate (`PEERPARTY_STEAM_WEB=1`
+    overrides).
   - The other services mint per-player ids from the LAN id (EOS ProductUserIds, PlayFab
     entities, UGS player ids, Galaxy ids), so they can't clash unless a PeerParty
     identity folder is cloned between PCs. Xbox Live lists a player under a stand-in XUID
@@ -651,7 +659,8 @@ hand, attaching `peerparty.exe` (that exact name) is enough.
 - Licence, DLC, entitlement and purchase queries go to the SDK the game loaded, or come
   back empty or offline; sign-in is answered locally (LEGAL.md).
 - Game files are never changed; PeerParty's own files live under
-  `%LOCALAPPDATA%\peerparty` (logs under `%TEMP%\peerparty\logs`). Elsewhere it writes only
+  `%LOCALAPPDATA%\peerparty`, or a `peerparty-data` folder beside peerparty.exe when it is
+  portable (launcher/src/portable.rs; logs under `%TEMP%\peerparty\logs`). Elsewhere it writes only
   save copies under a PeerParty identity (originals only read), a second copy's own save
   folder beside the game's (`Saves.peerparty-2`, see usage.md), firewall rules when the
   player asks for the fix, its local certificate's key in the user's key store, and an

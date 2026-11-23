@@ -1,21 +1,14 @@
-//! The little of COM that the sound devices need (aec.rs, endpoints.rs): GUIDs, calls
-//! through a vtable, and Windows' audio endpoint enumerator (MMDevice API).
+//! The little of COM that the sound devices need (aec.rs, endpoints.rs): sys/com.rs's
+//! GUIDs and vtable calls, and Windows' audio endpoint enumerator (MMDevice API).
 
 use std::ffi::c_void;
 
 pub type Hresult = i32;
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct Guid(pub u32, pub u16, pub u16, pub [u8; 8]);
+pub(crate) use crate::sys::com::vcall;
+pub use crate::sys::com::{Guid, IID_UNKNOWN, release};
+pub use crate::sys::win::wide;
 
-impl Guid {
-    pub fn same(&self, o: &Guid) -> bool {
-        self.0 == o.0 && self.1 == o.1 && self.2 == o.2 && self.3 == o.3
-    }
-}
-
-pub const IID_UNKNOWN: Guid = Guid(0, 0, 0, [0xC0, 0, 0, 0, 0, 0, 0, 0x46]);
 const CLSID_MM_ENUMERATOR: Guid = Guid(0xBCDE0395, 0xE52F, 0x467C, [0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E]);
 const IID_MM_ENUMERATOR: Guid = Guid(0xA95664D2, 0x9614, 0x4F35, [0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6]);
 
@@ -32,22 +25,6 @@ unsafe extern "system" {
     pub fn CoCreateInstance(clsid: *const Guid, outer: *const c_void, ctx: u32, iid: *const Guid, out: *mut usize) -> Hresult;
     pub fn CoTaskMemFree(p: *const c_void);
     fn PropVariantClear(v: *mut PropVariant) -> Hresult;
-}
-
-/// Calls slot `$slot` of a COM object's vtable.
-macro_rules! vcall {
-    ($obj:expr, $slot:expr, fn($($t:ty),*) -> $r:ty $(, $a:expr)*) => {{
-        let obj = $obj;
-        let f: unsafe extern "system" fn(usize $(, $t)*) -> $r = unsafe { std::mem::transmute(*(*(obj as *const *const usize)).add($slot)) };
-        unsafe { f(obj $(, $a)*) }
-    }};
-}
-pub(crate) use vcall;
-
-pub fn release(obj: usize) {
-    if obj != 0 {
-        vcall!(obj, 2, fn() -> u32);
-    }
 }
 
 #[repr(C)]
@@ -78,10 +55,6 @@ pub fn take_wide(p: *mut u16) -> Option<String> {
     let s = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(p, n) });
     unsafe { CoTaskMemFree(p as *const c_void) };
     Some(s)
-}
-
-pub fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// IMMDevice::GetId.

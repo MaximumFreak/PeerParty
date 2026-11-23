@@ -14,7 +14,7 @@ param(
     [string]$Work = ''
 )
 $ErrorActionPreference = 'Stop'
-$pp = if ($PeerParty) { $PeerParty } else { "$env:TEMP\cargo-target\peerparty\testexe\peerparty.exe" }
+$pp = if ($PeerParty) { $PeerParty } elseif ($env:CARGO_TARGET_DIR) { Join-Path $env:CARGO_TARGET_DIR 'testexe\peerparty.exe' } else { "$env:TEMP\cargo-target\peerparty\testexe\peerparty.exe" }
 $dir = if ($Work) { $Work } else { Join-Path $env:TEMP ("ppwork\run-" + [IO.Path]::GetFileNameWithoutExtension($Test)) }
 Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
 New-Item -ItemType Directory $dir | Out-Null
@@ -40,13 +40,44 @@ $procs = foreach ($role in $Roles) {
         -RedirectStandardError "$dir\$role.err" -PassThru -NoNewWindow -WorkingDirectory (Split-Path $Test)
     foreach ($kv in $mine) { $k, $v = $kv -split '=', 2; Remove-Item "env:$k" -ErrorAction SilentlyContinue }
 }
-$procs | Wait-Process -Timeout 120 -ErrorAction SilentlyContinue
-# A copy that hung (a build that stops on a dialog, say) mustn't outlive its test.
-# Only the copies this pair's peerparty processes started: other pairs may run the same
-# test at the same time (-AllBuilds).
+# Everything this pair's peerparty processes started, and what those started in turn (a
+# starter's game), now: once a copy exits its children's parent is gone, and they could
+# no longer be told from another pair's.
+# Each is kept with its start time: a process id seen once may belong to another program
+# by the end.
+function Get-Tree([int[]]$top) {
+    $all = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, CreationDate)
+    $mine = @{}
+    foreach ($id in $top) { $mine[$id] = $null }
+    $grew = $true
+    while ($grew) {
+        $grew = $false
+        foreach ($p in $all) {
+            if ($mine.ContainsKey([int]$p.ParentProcessId) -and -not $mine.ContainsKey([int]$p.ProcessId)) {
+                $mine[[int]$p.ProcessId] = $p.CreationDate
+                $grew = $true
+            }
+        }
+    }
+    foreach ($id in $top) { $mine.Remove($id) }
+    $mine
+}
 $ours = @($procs | ForEach-Object { $_.Id })
-Get-CimInstance Win32_Process -Filter "Name = 'python.exe' OR Name = 'pythonw.exe'" |
-    Where-Object { $ours -contains $_.ParentProcessId -and $_.CommandLine -like "*$Test*" } |
-    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-$procs | Where-Object { -not $_.HasExited } | Stop-Process -Force -ErrorAction SilentlyContinue
+$tree = @{}
+$deadline = (Get-Date).AddSeconds(120)
+while ((Get-Date) -lt $deadline -and @($procs | Where-Object { -not $_.HasExited }).Count) {
+    $now = Get-Tree $ours
+    foreach ($id in @($now.Keys)) { $tree[$id] = $now[$id] }
+    Start-Sleep -Seconds 2
+}
+# A copy that hung (a build that stops on a dialog, say) mustn't outlive its test, nor
+# anything it started.
+$procs | Where-Object { -not $_.HasExited } | ForEach-Object { & taskkill.exe /PID $_.Id /T /F 2>&1 | Out-Null }
+if ($tree.Count) {
+    foreach ($p in @(Get-CimInstance Win32_Process -Property ProcessId, CreationDate)) {
+        if ($tree.ContainsKey([int]$p.ProcessId) -and $tree[[int]$p.ProcessId] -eq $p.CreationDate) {
+            Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
 foreach ($role in $Roles) { "---- $role (exit $((Get-Content "$dir\$role.result" -ErrorAction SilentlyContinue)))"; Get-Content "$dir\$role.log" -ErrorAction SilentlyContinue }

@@ -293,10 +293,17 @@ fn array_payload(w: &mut Vec<u8>, v: &Value, depth: usize) -> R<()> {
         }
         Value::Jagged(l) => {
             len16(w, l.len())?;
-            if !l.is_empty() && l.iter().all(|x| matches!(x, Value::Bytes(_))) {
+            // byte[][] and object[][] are arrays of those types, as they're read.
+            let same = |f: fn(&Value) -> bool| !l.is_empty() && l.iter().all(f);
+            if same(|x| matches!(x, Value::Bytes(_))) {
                 w.push(BYTES);
                 for x in l {
                     payload(w, BYTES, x, depth + 1)?;
+                }
+            } else if same(|x| matches!(x, Value::Objects(_))) {
+                w.push(OBJECTS);
+                for x in l {
+                    payload(w, OBJECTS, x, depth + 1)?;
                 }
             } else {
                 w.push(ARRAY);

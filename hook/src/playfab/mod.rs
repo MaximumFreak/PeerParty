@@ -6,7 +6,7 @@
 //!
 //! The game's own PlayFab SDK keeps running. Lookups of `<title>.playfabapi.com` resolve
 //! to a loopback address of this process (127.80.x.y, from the process id), where
-//! PeerParty answers HTTPS (tls.rs) with PlayFab's JSON (api.rs): sign-in, entity
+//! PeerParty answers HTTPS (https/) with PlayFab's JSON (api.rs): sign-in, entity
 //! tokens, title data, profiles, CloudScript and telemetry succeed locally, and
 //! matchmaking tickets are matched between copies of the game on the LAN.
 //!
@@ -22,22 +22,50 @@
 //! Generated/AuthenticationTypes.cpp `LoginResult::FromJson`), which api.rs sends. Loading
 //! PlayFabCore turns the service on, as Party does.
 //!
-//! The same HTTPS server answers Unity Gaming Services' hosts for ugs/ (its certificate
-//! carries their names too); http.rs routes by the request's Host header.
+//! The same HTTPS server (https/) answers the other web stand-ins (ugs/, demonware/,
+//! xboxlive/); requests are routed by their Host header, and PlayFab's API takes any
+//! request no other service claims.
+//!
+//! - api.rs: the web API.
+//! - party/: PlayFab Party (networks, chat, Xbox Live chat permissions).
+//! - mp.rs: PlayFab Multiplayer's Lobby & Matchmaking.
 
 pub(crate) mod api;
-pub(crate) mod http;
-pub(crate) mod tls;
+pub(crate) mod mp;
+pub(crate) mod party;
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, ToSocketAddrs};
+use std::net::ToSocketAddrs;
 use std::sync::OnceLock;
 
 use crate::log;
-use crate::pe::Export;
 
 pub use api::{entity_id, entity_of};
+
+pub const HOST_SUFFIX: &str = ".playfabapi.com";
+
+/// Whether `host` (a lookup or a Host header, port and case aside) is PlayFab's.
+pub fn is_host(host: &str) -> bool {
+    let h = host.split(':').next().unwrap_or_default().trim_end_matches('.').to_ascii_lowercase();
+    h.ends_with(HOST_SUFFIX) || h == "playfabapi.com"
+}
+
+/// PlayFab's web API on the local HTTPS server: the last service, so it answers any
+/// request no other one claims (as PlayFab's SDKs always name its host, that's theirs).
+pub static HTTPS: crate::https::HttpsService = crate::https::HttpsService {
+    name: "playfab",
+    cert_names: || vec!["*.playfabapi.com", "playfabapi.com"],
+    is_host,
+    handle: api::handle,
+    upgrade: None,
+    // PlayFab's Unity SDK calls through UnityWebRequest: UnityTls reads the ROOT store
+    // itself, maybe long before the first lookup.
+    reads_root_early: || game_wants() == Some(true),
+};
+
+/// Lookups of PlayFab's hosts.
+pub static DNS: crate::net::dns::DnsService = crate::net::dns::DnsService { layer: "playfab", is_host, redirect };
 
 /// Whether lookups of `host` come here. `PEERPARTY_PLAYFAB=0` turns it off, `=1` on
 /// for any game; otherwise it's on when the game ships or has loaded PlayFab Party,
@@ -47,15 +75,14 @@ pub fn wanted(host: &str) -> bool {
 }
 
 /// Whether the setting or the game's PlayFab SDKs decide that lookups come here; None
-/// leaves it to whether the real host answers.
+/// leaves it to whether the real host answers. `PEERPARTY_SKIP=playfab` turns it off.
 fn game_wants() -> Option<bool> {
-    if !crate::net::enabled() || crate::modes::official("playfab") {
+    if !crate::net::enabled() || crate::net::skip("playfab") || crate::config::modes::official("playfab") {
         return Some(false);
     }
-    match std::env::var("PEERPARTY_PLAYFAB").ok().as_deref() {
-        Some("0") => Some(false),
-        Some("1") => Some(true),
-        _ => (crate::party::loaded() || crate::pfmp::loaded() || CORE.load(Ordering::Relaxed) || ships_sdk()).then_some(true),
+    match crate::config::HookConfig::global().playfab {
+        Some(on) => Some(on),
+        None => (crate::playfab::party::loaded() || crate::playfab::mp::loaded() || CORE.load(Ordering::Relaxed) || ships_sdk()).then_some(true),
     }
 }
 
@@ -112,182 +139,20 @@ fn unreachable(host: &str) -> bool {
     })
 }
 
-/// This process's loopback address for the service.
-/// The loopback addresses this process may listen on, its own first: 127.80-95.x.y from
-/// its process id (unique for ids below 2^20, Windows' are far below that), then the
-/// ones after it, in case another process has it (an id wrapped round, or .0 taken as
-/// .1).
-fn addresses() -> impl Iterator<Item = Ipv4Addr> {
-    let pid = std::process::id();
-    let first = ((pid & 0xF_FFFF) as u32).max(1);
-    (0..64u32).map(move |i| {
-        let n = (first + i) & 0xF_FFFF;
-        let n = if n & 0xFF == 0 { n | 1 } else { n };
-        Ipv4Addr::new(127, 80 + (n >> 16) as u8, (n >> 8) as u8, n as u8)
-    })
-}
-
-/// Connections served at once: only this process's game connects, a few at a time;
-/// one more than this waits to be accepted until one ends.
-const MAX_CONNECTIONS: usize = 64;
-
-static SERVER: OnceLock<Option<Ipv4Addr>> = OnceLock::new();
-
-/// Starts the service (once) and returns its address. Unity Gaming Services' stand-in
-/// (ugs/) shares it: requests are told apart by their Host header (http.rs).
-/// Whether this game's PlayFab is PeerParty's (its service is up): then every player's
-/// entity is the one their PeerParty id gives (`api::entity_of`), whatever they say.
-pub(crate) fn serving() -> bool {
-    SERVER.get().is_some_and(|s| s.is_some())
-}
-
-pub(crate) fn server() -> Option<Ipv4Addr> {
-    *SERVER.get_or_init(|| {
-        if !tls::ready() {
-            return None;
-        }
-        if tls::arm_crypt32() == 1 {
-            log!("playfab certificate check hooked (the game's PlayFab comes here now)");
-        }
-        // Unity's own TLS (UnityTls) checks against the ROOT store it reads, not crypt32's verdict.
-        if tls::arm_root_store() == 1 {
-            log!("playfab ROOT store reads hooked (PeerParty's certificate is listed in this game only)");
-        }
-        let mut last = None;
-        let Some((ip, listener)) = addresses().find_map(|ip| match TcpListener::bind(SocketAddrV4::new(ip, 443)) {
-            Ok(l) => Some((ip, l)),
-            Err(e) => {
-                last = Some((ip, e));
-                None
-            }
-        }) else {
-            if let Some((ip, e)) = last {
-                log!("playfab service could not listen on {ip}:443 (or the addresses before it): {e}");
-            }
-            return None;
-        };
-        // This game's alone: it answers as the player's own PlayFab and Unity services
-        // (their saved data too), so the typed-IP forwarder never brings another
-        // player's connection to it.
-        peerparty_core::own::tcp(443).forever();
-        log!("playfab service on https://{ip}:443 (PlayFab's hosts resolve here)");
-        std::thread::spawn(move || {
-            static OPEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            use std::sync::atomic::Ordering::SeqCst;
-            for conn in listener.incoming() {
-                let Ok(conn) = conn else { continue };
-                while OPEN.load(SeqCst) >= MAX_CONNECTIONS {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                OPEN.fetch_add(1, SeqCst);
-                let started = std::thread::Builder::new().name("peerparty-playfab-conn".into()).spawn(move || {
-                    struct Done;
-                    impl Drop for Done {
-                        fn drop(&mut self) {
-                            OPEN.fetch_sub(1, SeqCst);
-                        }
-                    }
-                    let _done = Done;
-                    http::serve(conn)
-                });
-                if started.is_err() {
-                    OPEN.fetch_sub(1, SeqCst);
-                }
-            }
-        });
-        Some(ip)
-    })
-}
-
 /// The address a lookup of `host` should resolve to instead, as text, or None to
 /// leave the lookup alone.
 pub fn redirect(host: &str) -> Option<String> {
     let h = host.trim_end_matches('.').to_ascii_lowercase();
-    if !(h.ends_with(tls::HOST_SUFFIX) || h == "playfabapi.com")
+    if !is_host(&h)
         || PROBING.with(|p| p.get())
         || !wanted(&h)
     {
         return None;
     }
-    let ip = server()?;
+    let ip = crate::https::server()?;
     crate::log::throttled(&format!("playfab redirect {h}"), 2, |n| {
         log!("playfab {h} -> {ip} (PeerParty's PlayFab service) n={n}")
     });
     Some(ip.to_string())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The service answers .NET Framework's HttpClient (what PlayFab's C#
-    /// SDK uses) over TLS 1.2, Expect: 100-continue and all. The certificate
-    /// check is waved through here; tls.rs tests the real trust path.
-    #[test]
-    fn answers_dotnet_httpclient_over_https() {
-        let ip = server().expect("service started");
-        let script = format!(
-            r#"Add-Type -TypeDefinition 'public static class PpTrust {{ public static void On() {{ System.Net.ServicePointManager.ServerCertificateValidationCallback = (a, b, c, d) => true; }} }}'
-[PpTrust]::On()
-[Net.ServicePointManager]::SecurityProtocol = 'Tls12'
-Add-Type -AssemblyName System.Net.Http
-$c = New-Object System.Net.Http.HttpClient
-foreach ($i in 1..2) {{
-  $body = New-Object System.Net.Http.StringContent('{{"CustomId":"test"}}', [Text.Encoding]::UTF8, 'application/json')
-  try {{
-    $r = $c.PostAsync([Uri]'https://{ip}/Client/LoginWithCustomID?sdk=test', $body).GetAwaiter().GetResult()
-    Write-Output ([int]$r.StatusCode)
-    Write-Output $r.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-  }} catch {{ Write-Output $_.Exception.ToString() }}
-}}
-"#
-        );
-        let file = std::env::temp_dir().join(format!("peerparty-playfab-test-{}.ps1", std::process::id()));
-        std::fs::write(&file, script).unwrap();
-        use std::os::windows::process::CommandExt;
-        let out = std::process::Command::new("powershell")
-            // No console window of its own (tests mustn't flash one on screen).
-            .creation_flags(0x0800_0000)
-            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
-            .arg(&file)
-            .output()
-            .expect("powershell");
-        let _ = std::fs::remove_file(&file);
-        let text = String::from_utf8_lossy(&out.stdout);
-        let err = String::from_utf8_lossy(&out.stderr);
-        // Without a LAN the answer is PlayFab's "unavailable" error; with one (another
-        // test may have started it), a sign-in. Either way twice, over one kept-alive
-        // connection.
-        let statuses: Vec<&str> = text
-            .lines()
-            .map(str::trim)
-            .filter(|l| *l == "200" || *l == "503")
-            .collect();
-        assert_eq!(statuses.len(), 2, "stdout: {text}
-stderr: {err}");
-        let wanted = if statuses[0] == "200" {
-            "\"Type\":\"title_player_account\""
-        } else {
-            "PeerParty's LAN isn't running"
-        };
-        assert_eq!(text.matches(wanted).count(), 2, "{text}");
-    }
-}
-
-/// crypt32 just loaded: trust checks for the service's certificate go through here.
-/// crypt32 loaded: note its certificate check, to hook when the service starts.
-pub fn attach(exports: &[Export]) -> bool {
-    if !crate::net::enabled() {
-        return false;
-    }
-    let noted = tls::note_crypt32(exports);
-    tls::note_open_store(exports);
-    // A Unity game with Lobby / Relay (ugs/), or one whose PlayFab comes here (PlayFab's
-    // Unity SDK calls through UnityWebRequest): UnityTls reads the ROOT store itself, maybe
-    // long before the first lookup, so PeerParty's certificate is listed in it from now on
-    // (in this process only; tls.rs).
-    if (crate::ugs::wanted() || game_wants() == Some(true)) && tls::arm_root_store() == 1 {
-        log!("tls: ROOT store reads hooked (PeerParty's certificate is listed in this game only)");
-    }
-    noted
-}

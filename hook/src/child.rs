@@ -32,9 +32,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use retour::GenericDetour;
 
-use crate::hook::with_lock;
+use crate::sys::hook::with_lock;
 use crate::log;
-use crate::pe::Export;
+use crate::sys::win::wide;
+use crate::sys::pe::Export;
 
 type CreateInternal = unsafe extern "system" fn(
     usize,
@@ -134,7 +135,7 @@ fn scrubbed_env(env: usize, unicode: bool) -> Option<Block> {
 }
 
 fn follow_all() -> bool {
-    std::env::var("PEERPARTY_FOLLOW").is_ok_and(|v| v == "1")
+    crate::config::HookConfig::global().follow
 }
 
 /// Whether this process's children get the hook.
@@ -164,7 +165,7 @@ fn norm_path(s: &str) -> String {
 /// The game's install folder, as the launcher found it (`PEERPARTY_GAME_ROOT`).
 fn game_root() -> Option<&'static str> {
     static ROOT: OnceLock<Option<String>> = OnceLock::new();
-    ROOT.get_or_init(|| std::env::var("PEERPARTY_GAME_ROOT").ok().and_then(|r| norm_dir(&r))).as_deref()
+    ROOT.get_or_init(|| crate::config::HookConfig::global().game_root.as_deref().and_then(norm_dir)).as_deref()
 }
 
 /// Set once this process loads a game SDK: it is the game, so what it starts from then
@@ -180,7 +181,7 @@ pub fn sdk_seen() -> bool {
 /// here, and a program it started (and peerparty followed) hasn't yet said whether it
 /// is the game.
 pub fn starter_pending() -> bool {
-    !sdk_seen() && !GRANTS.lock().unwrap().is_empty()
+    !sdk_seen() && !crate::sys::lock(&GRANTS).is_empty()
 }
 
 /// A game SDK loaded here (watch.rs).
@@ -242,11 +243,15 @@ pub fn is_helper() -> bool {
 /// Where this process's package is installed, lower case with a trailing backslash:
 /// the package's path as Windows reports it, and the folder of the helper or starter
 /// (`C:\Program Files\WindowsApps\<package>\`; an Xbox app install shows through there).
-/// Empty for a process without package identity.
+/// Empty for a process without package identity, and under Wine, which installs no
+/// packages (its package functions are stubs; wine.rs).
 fn package_roots() -> &'static [String] {
     static ROOTS: OnceLock<Vec<String>> = OnceLock::new();
     ROOTS.get_or_init(|| {
         use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+        if crate::sys::wine::is_wine() {
+            return Vec::new();
+        }
         let k32: Vec<u16> = "kernel32.dll".encode_utf16().chain(Some(0)).collect();
         let Some(f) = (unsafe { GetProcAddress(GetModuleHandleW(k32.as_ptr()), c"GetCurrentPackagePath".as_ptr().cast()) }) else {
             return Vec::new();
@@ -399,7 +404,7 @@ fn never_followed(path: &str) -> Option<&'static str> {
 /// Whether a child started as `image` gets the hook, and if not, why.
 fn follow_verdict(image: &str) -> Result<(), &'static str> {
     let path = norm_path(image);
-    if is_peerparty(&path, std::env::var("PEERPARTY_EXE").ok().map(|e| norm_path(&e)).as_deref()) {
+    if is_peerparty(&path, crate::config::HookConfig::global().exe.as_deref().map(norm_path).as_deref()) {
         return Err("PeerParty itself");
     }
     verdict(&path, follow_all(), package_roots(), game_root().or(unreal_root()), SDK_SEEN.load(Ordering::Relaxed))
@@ -458,11 +463,6 @@ fn full_image(image: &str, dir: *const u16) -> String {
         None => image.to_string(),
     }
 }
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(Some(0)).collect()
-}
-
 /// The event a parent makes for a child it followed; the child signals it when it turns
 /// out to be the game.
 fn follow_event(pid: u32) -> Vec<u16> {
@@ -484,13 +484,13 @@ fn make_follow_event(pid: u32) -> Option<usize> {
         log!("child: no grant event for pid {pid}: {}", std::io::Error::last_os_error());
         return None;
     }
-    GRANTS.lock().unwrap().push((pid, grant as usize));
+    crate::sys::lock(&GRANTS).push((pid, grant as usize));
     let event = unsafe { windows_sys::Win32::System::Threading::CreateEventW(std::ptr::null(), 1, 0, follow_event(pid).as_ptr()) };
     if event.is_null() {
         log!("child: no hand-over event for pid {pid}: {}", std::io::Error::last_os_error());
         // Nothing will hand over to this child, so nothing would ever take its grant
         // back: left listed, a starter would look pending for the whole run.
-        GRANTS.lock().unwrap().retain(|&(p, _)| p != pid);
+        crate::sys::lock(&GRANTS).retain(|&(p, _)| p != pid);
         unsafe { windows_sys::Win32::Foundation::CloseHandle(grant) };
         return None;
     }
@@ -512,7 +512,7 @@ fn hand_over_when_claimed(event: usize, process: usize, pid: u32, image: &str) {
         let handles: Vec<HANDLE> = [event, child].into_iter().filter(|&h| h != 0).map(|h| h as HANDLE).collect();
         let claimed = unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, INFINITE) } == 0;
         let grant = {
-            let mut g = GRANTS.lock().unwrap();
+            let mut g = crate::sys::lock(&GRANTS);
             let at = g.iter().position(|(p, _)| *p == pid);
             at.map(|i| g.remove(i).1)
         };
@@ -571,7 +571,13 @@ fn parent_process() -> Option<usize> {
     if unsafe { query(GetCurrentProcess() as isize, 0, &mut info, std::mem::size_of::<BasicInfo>() as u32, std::ptr::null_mut()) } != 0 {
         return None;
     }
-    let h = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, info.parent as u32) };
+    // Query rights too: `claim_later` asks the handle for the parent's id, and
+    // GetProcessId answers 0 on a handle that can only be waited on.
+    use windows_sys::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
+    let mut h = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, info.parent as u32) };
+    if h.is_null() {
+        h = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, info.parent as u32) };
+    }
     (!h.is_null()).then_some(h as usize)
 }
 
@@ -735,7 +741,7 @@ fn is_x86(process: usize) -> Option<bool> {
 /// packaged game's first process.
 fn attach_from_outside(pi: &ProcessInformation, keep_suspended: bool) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
-    let exe = std::env::var_os("PEERPARTY_EXE").ok_or("a child of the other bitness, and no PEERPARTY_EXE to inject it")?;
+    let exe = crate::config::HookConfig::global().exe.clone().ok_or("a child of the other bitness, and no PEERPARTY_EXE to inject it")?;
     let mut cmd = std::process::Command::new(exe);
     cmd.args(["--attach", "-p", &pi.pid.to_string(), "-tid", &pi.tid.to_string()]);
     if keep_suspended {
@@ -806,7 +812,7 @@ unsafe extern "system" fn create_hook(
         // A program left alone gets no PeerParty variables: they mean nothing to it, and
         // the room code and pipe name shouldn't travel on in a crash report's copy of its
         // environment. PeerParty's own program keeps them (its `--attach` needs them).
-        let ours = is_peerparty(&norm_path(&image), std::env::var("PEERPARTY_EXE").ok().map(|e| norm_path(&e)).as_deref());
+        let ours = is_peerparty(&norm_path(&image), crate::config::HookConfig::global().exe.as_deref().map(norm_path).as_deref());
         if !ours && let Some(block) = scrubbed_env(env, flags & CREATE_UNICODE_ENVIRONMENT != 0) {
             let (env, flags) = match &block {
                 Block::Wide(b) => (b.as_ptr() as usize, flags | CREATE_UNICODE_ENVIRONMENT),

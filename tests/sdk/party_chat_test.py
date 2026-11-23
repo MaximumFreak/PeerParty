@@ -162,18 +162,31 @@ if ROLE == "A":
         fh.write(INVITATION)
     text = C.create_string_buffer(449)
     fn("PartySerializeNetworkDescriptor", P, C.c_char_p)(C.byref(desc), text)
-    with open(os.path.join(DIR, "network.txt"), "w") as fh:
+    # Whole or not at all: B reads it as soon as it's there.
+    with open(os.path.join(DIR, "network.txt.tmp"), "w") as fh:
         fh.write(text.value.decode())
+    os.replace(os.path.join(DIR, "network.txt.tmp"), os.path.join(DIR, "network.txt"))
 else:
     path = os.path.join(DIR, "network.txt")
     wait(lambda: os.path.exists(path) and os.path.getsize(path) > 0, 30, "the network descriptor")
     r = fn("PartyDeserializeNetworkDescriptor", C.c_char_p, P)(open(path).read().strip().encode(), C.byref(desc))
     check("PartyDeserializeNetworkDescriptor", r == 0, r)
     INVITATION = open(os.path.join(DIR, "invitation.txt"), "rb").read()
-r = fn("PartyConnectToNetwork", P, P, P, C.POINTER(P))(H, C.byref(desc), None, C.byref(net))
+CONNECT = fn("PartyConnectToNetwork", P, P, P, C.POINTER(P))
+# A copy started under load may not have met the network's owner yet when it joins: the
+# join then times out (NetworkNoLongerExists) and, as a game would, B tries again.
+end = time.time() + 40
+while True:
+    net = P()
+    r = CONNECT(H, C.byref(desc), None, C.byref(net))
+    done = r == 0 and wait(lambda: find(3, network=net.value), 30, "ConnectToNetworkCompleted")
+    if ROLE == "A" or r != 0 or (done and done["result"] == 0) or time.time() > end:
+        break
+    log("ConnectToNetwork didn't connect, trying again:", done)
+    time.sleep(1)
 check("PartyConnectToNetwork", r == 0, r)
 NET = net.value
-check("network connects", wait(lambda: find(3, network=NET, result=0), 30, "ConnectToNetworkCompleted"))
+check("network connects", done and done["result"] == 0, done)
 AUTH = fn("PartyNetworkAuthenticateLocalUser", P, P, C.c_char_p, P)
 if ROLE == "B":
     # The owner's copy checks the invitation: a made-up one is refused there.
@@ -361,8 +374,13 @@ if ROLE == "A":
     SUBMIT = fn("PartyAudioManipulationSinkStreamSubmitBuffer", P, C.POINTER(DataBuffer))
     samples = (C.c_float * 960)(*[0.3 * math.sin(2 * math.pi * 440 * i / 24000) for i in range(960)])
     talking = False
-    for _ in range(40):
+    # 40 ms frames until B has heard enough (at least 40, at most 15 s): voice is
+    # unreliable, and a fixed burst can come while B is held up on a loaded PC.
+    heard = os.path.join(DIR, f"{OTHER}.voice-got")
+    sent, end = 0, time.time() + 15
+    while sent < 40 or (not os.path.exists(heard) and time.time() < end):
         r = SUBMIT(stream.value, C.byref(DataBuffer(C.cast(samples, P), 960 * 4)))
+        sent += 1
         fn("PartyChatControlGetLocalChatIndicator", P, C.POINTER(U32))(CHAT, C.byref(ind))
         talking |= ind.value == 1
         pump()
@@ -402,6 +420,7 @@ else:
                 peak = max(peak, max(abs(x) for x in pcm))
                 RETURN(stream.value, b.buffer)
         time.sleep(0.02)
+    flag("voice-got")
     # A's 0.3 sine (peak 9830) through Opus, which is lossy and may overshoot a little.
     check("A's voice comes out of the voice stream", got >= 10 and sizes == {1920} and 7000 < peak < 16000, (got, sizes, peak))
     check("A shows as talking", talking)

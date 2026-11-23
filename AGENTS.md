@@ -7,18 +7,22 @@ it does and docs/usage.md how to use it; this file is about how changes get in.
 
 - `core`: the LAN engine, with no game or SDK code. `mesh.rs` finds peers (UDP beacons,
   the same-PC peer board) and keeps one TCP connection per peer, with UDP for unreliable
-  data; `lan.rs` is the engine games talk to (lobbies, presence, invites, channels);
+  data; `lan/` is the engine games talk to (lobbies, presence, invites, channels);
   `wire.rs` the messages between copies; `fwd.rs` the typed-IP forwarder; `inet/` internet
   play (room codes, STUN, the BitTorrent DHT, hole punching, the encrypted tunnel, public
   sessions, port mapping).
-- `hook`: the DLL injected into the game. `watch.rs` sees SDK modules load and hooks them;
-  one module or folder per SDK (`steam*.rs`, `eos/`, `party.rs` and `party/`, `pfmp.rs`,
-  `playfab/`, `galaxy*`, `photon/`, `ugs/`, `xboxlive/`); `padblock/` holds controllers
-  still while the overlay shows; `present/` draws the overlay inside a game's frames;
-  `ipfwd.rs` redirects typed-IP sockets; `*vt.rs` are generated vtable layouts.
-- `launcher`: `peerparty.exe`. `main.rs` starts a game with the hook; `ui/` is the
-  launcher window; `host/` runs beside the game and draws the overlay. `build.rs` builds
-  the hook for x64 and x86 and embeds both.
+- `protocol`: the IPC messages, shared-memory input and frame rings, and SDK catalog shared
+  between `launcher` and `hook`.
+- `hook`: the DLL injected into the game. `watch/` sees SDK modules load and hooks them;
+  one module or folder per SDK (`steam/`, `eos/`, `playfab/`, `galaxy/`, `photon/`, `ugs/`,
+  `demonware/`, `xboxlive/`); `input/` routes controllers, keyboard and mouse per copy and
+  holds them still while the overlay shows; `video/` draws the overlay inside a game's
+  frames and captures frames for split screen; `net/` runs the shared LAN, DNS and the
+  typed-IP forwarder.
+- `launcher`: `peerparty.exe`. `main.rs` and `launch.rs` start a game (or a split-screen
+  session) with the hook; `ui/` is the launcher window; `host/` runs beside the game,
+  draws the overlay and composites split-screen frames. `build.rs` builds the hook for
+  x64 and x86 and embeds both.
 - `tools`: generators for the vtable and EOS tables (`*_vtables.py`, `eos_table.py`). They
   read an SDK's headers from a folder you point them at; never commit those.
 - `docs`: how it works (`design.md`), how to use it (`usage.md`), internet play
@@ -67,7 +71,7 @@ it does and docs/usage.md how to use it; this file is about how changes get in.
   New code that logs or shows an address goes through `redact`.
 - **Strangers are hostile.** Anything from a public-session player is untrusted until
   checked: bound its size, rate and count, and add it to the fuzz tests
-  (`core/src/fuzz_tests.rs`, `core/tests/public.rs`). A parser that calls itself needs a
+  (`core/src/fuzz_tests.rs`, `core/tests/integration/public.rs`). A parser that calls itself needs a
   depth limit (a stack overflow ends the game), and a test on a small stack. What isn't
   open to everyone (a lobby that isn't public, a voice room) asks `Lan::knows` first.
 - **PeerParty's own sockets register with `core/src/own.rs`.** The typed-IP forwarder

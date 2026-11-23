@@ -38,7 +38,7 @@ static REG: LazyLock<Mutex<Registry>> = LazyLock::new(Mutex::default);
 
 /// The handle for a peer's id of that kind.
 pub fn handle(kind: Kind, peer: PeerId) -> usize {
-    let mut r = REG.lock().unwrap();
+    let mut r = crate::sys::lock(&REG);
     if let Some(p) = r.by_peer.get(&(kind, peer)) {
         return *p;
     }
@@ -64,7 +64,7 @@ pub fn epic(peer: PeerId) -> usize {
 
 /// The peer behind a handle we minted, if it is one and of that kind.
 pub fn peer(kind: Kind, handle: usize) -> Option<PeerId> {
-    let r = REG.lock().unwrap();
+    let r = crate::sys::lock(&REG);
     r.by_ptr
         .get(&handle)
         .filter(|(k, _)| *k == kind)
@@ -82,7 +82,7 @@ pub fn peer_of_epic(handle: usize) -> Option<PeerId> {
 /// A NUL-terminated copy that lives for the rest of the process. For strings handed to
 /// callbacks (lobby ids), which a game may keep.
 pub fn intern(s: &str) -> *const c_char {
-    let mut r = REG.lock().unwrap();
+    let mut r = crate::sys::lock(&REG);
     if let Some(p) = r.strings.get(s) {
         return *p as *const c_char;
     }

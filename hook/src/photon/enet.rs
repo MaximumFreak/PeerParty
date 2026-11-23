@@ -537,6 +537,9 @@ impl Peer {
         if !(0..=self.rtt * 4).contains(&rtt) {
             rtt = self.rtt * 4;
         }
+        // Never past the disconnect timeout: acks with made-up times would otherwise grow
+        // it by a quarter each until the timer arithmetic overflows.
+        rtt = rtt.min(DISCONNECT_TIMEOUT);
         let unseq = c.ty == ct::ACK_UNSEQUENCED;
         let Some(i) = self.sent.iter().position(|s| {
             s.cmd.seq == c.ack_seq && s.cmd.ch == c.ch && s.cmd.unsequenced() == unseq

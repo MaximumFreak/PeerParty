@@ -146,21 +146,8 @@ pub fn switch(ui: &mut Ui, on: &mut bool) -> Response {
     }
     let t = theme::anim(ui.ctx(), resp.id, *on);
     let hot = resp.hovered() || focused(&resp);
-    let p = ui.painter();
-    let r = rect.height() / 2.0;
-    if t > 0.0 {
-        fx::glow(p, rect, r, ACCENT.gamma_multiply(0.30 * t), 8.0);
-    }
-    p.rect_filled(rect, r, theme::mix(FIELD, ACCENT, t));
-    if t > 0.0 {
-        fx::gradient(p, rect, r, false, &[(0.0, ACCENT.gamma_multiply(t)), (1.0, theme::mix(ACCENT, VIOLET, 0.5).gamma_multiply(t))]);
-    }
-    p.rect_stroke(rect, r, Stroke::new(1.0, if hot { theme::line_strong() } else { theme::line() }), StrokeKind::Inside);
-    let x = egui::lerp(rect.left() + r..=rect.right() - r, t);
-    let knob = pos2(x, rect.center().y);
-    p.circle_filled(knob + vec2(0.0, 1.0), r - 3.0, Color32::from_black_alpha(70));
-    p.circle_filled(knob, r - 3.5, theme::mix(Color32::from_gray(200), Color32::WHITE, t));
-    ring(ui, &resp, r);
+    super::shared::paint_switch(ui.painter(), rect, t, hot);
+    ring(ui, &resp, rect.height() / 2.0);
     resp
 }
 

@@ -13,9 +13,8 @@ use std::sync::{LazyLock, Mutex, OnceLock};
 
 use retour::GenericDetour;
 
-use crate::hook::with_lock;
 use crate::log;
-use crate::pe::Export;
+use crate::sys::pe::Export;
 
 type Connect = unsafe extern "system" fn(usize, *const u16, u16, u32) -> usize;
 type OpenRequest = unsafe extern "system" fn(usize, *const u16, *const u16, *const u16, *const u16, usize, u32) -> usize;
@@ -43,7 +42,7 @@ struct Handles {
 static H: LazyLock<Mutex<Handles>> = LazyLock::new(Mutex::default);
 
 fn wstr(p: *const u16) -> String {
-    if p.is_null() { String::new() } else { crate::read::wstr(p as usize).unwrap_or_default() }
+    if p.is_null() { String::new() } else { crate::sys::read::wstr(p as usize).unwrap_or_default() }
 }
 
 /// winhttp.dll loaded (watch.rs). The number of functions hooked.
@@ -71,19 +70,7 @@ fn arm<T>(slot: &OnceLock<GenericDetour<T>>, target: T, detour: T, label: &str) 
 where
     T: retour::Function + Copy + Send + Sync + 'static,
 {
-    with_lock(|| {
-        let hook = match unsafe { GenericDetour::new(target, detour) } {
-            Ok(h) => h,
-            Err(e) => {
-                log!("xboxlive {label} not hooked: {e}");
-                return false;
-            }
-        };
-        if slot.set(hook).is_err() {
-            return false;
-        }
-        unsafe { slot.get().unwrap().enable() }.is_ok()
-    })
+    crate::sys::detour::arm(slot, target, detour, "xboxlive", label)
 }
 
 unsafe extern "system" fn connect(session: usize, server: *const u16, port: u16, reserved: u32) -> usize {
@@ -91,7 +78,7 @@ unsafe extern "system" fn connect(session: usize, server: *const u16, port: u16,
     if h != 0 {
         let host = wstr(server).to_ascii_lowercase();
         if host.ends_with(".xboxlive.com") {
-            let mut s = H.lock().unwrap();
+            let mut s = crate::sys::lock(&H);
             if s.hosts.len() >= KEEP {
                 s.hosts.clear();
             }
@@ -111,7 +98,7 @@ unsafe extern "system" fn open(
     flags: u32,
 ) -> usize {
     let h = unsafe { OPEN.get().unwrap().call(connection, verb, object, version, referrer, accept, flags) };
-    let Some(host) = H.lock().unwrap().hosts.get(&connection).cloned() else { return h };
+    let Some(host) = crate::sys::lock(&H).hosts.get(&connection).cloned() else { return h };
     let verb = Some(wstr(verb)).filter(|v| !v.is_empty()).unwrap_or_else(|| "GET".into()).to_ascii_uppercase();
     let path = Some(wstr(object)).filter(|p| !p.is_empty()).unwrap_or_else(|| "/".into());
     if let Some(x) = super::own_xuid_in(&host, &path) {
@@ -121,7 +108,7 @@ unsafe extern "system" fn open(
         return h;
     }
     if super::curl::bodies() {
-        let mut s = H.lock().unwrap();
+        let mut s = crate::sys::lock(&H);
         if s.requests.len() >= KEEP {
             s.requests.clear();
         }
@@ -136,7 +123,7 @@ unsafe extern "system" fn open(
 }
 
 fn trace_body(request: usize, data: *const u8, len: u32, what: &str) {
-    let Some(call) = H.lock().unwrap().requests.get(&request).cloned() else { return };
+    let Some(call) = crate::sys::lock(&H).requests.get(&request).cloned() else { return };
     let len = (len as usize).min(BODY_MAX);
     let body = if data.is_null() || len == 0 {
         String::new()

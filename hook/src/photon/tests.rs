@@ -2,7 +2,7 @@
 //! (Luxon doc/gp_binary_v18.md) plus round trips of
 //! every value shape in both protocols.
 
-use super::crypto::Aes256;
+use crate::util::crypto::Aes256;
 use super::message::*;
 use super::value::*;
 use super::{gp16, gp18};
@@ -387,8 +387,8 @@ fn fuzz_fusion_messages_and_plugin() {
     use super::fusion::*;
     let v = Version { protocol: 6, fusion: (2, 0, 6) };
     let seeds: Vec<Vec<u8>> = [
-        Body::Join { kind: 1, game_mode: CLIENT_SERVER, peer_mode: PEER_SERVER, requests: 6, unique_id: Some(vec![1; 8]) },
-        Body::Join { kind: 1, game_mode: SHARED, peer_mode: PEER_CLIENT, requests: 0, unique_id: None },
+        Body::Join { kind: 1, game_mode: CLIENT_SERVER, peer_mode: PEER_SERVER, requests: 6, unique_id: Some(vec![1; 8]), player_ref: -1 },
+        Body::Join { kind: 1, game_mode: SHARED, peer_mode: PEER_CLIENT, requests: 0, unique_id: None, player_ref: -1 },
         Body::NetworkConfig { kind: 1, config: Some("{\"Simulation\":{\"TickRate\":60,\"PlayerCount\":4}}".into()) },
         Body::ReflexiveInfo { actor: 2, public: [1, 2, 3], private: [4, 5, 6], nat: 2, unique_id: Some(vec![2; 8]) },
         Body::Disconnect { reason: 5 },

@@ -13,48 +13,21 @@
 //! - With a token it sends TCP's framed Init (`0xFB`, length, channel, mode, then the
 //!   HTTP-style Init with the token), which goes to the server as it is.
 //!
-//! WebSocket framing per RFC 6455: the handshake's `Sec-WebSocket-Accept` is the
-//! base64 SHA-1 of the key and the RFC's GUID; client frames are masked, ours aren't.
+//! WebSocket framing per RFC 6455 is util/ws.rs's (shared with Unity's Wire).
 
 use super::message::Proto;
 use super::value::{Msg, Response, Value};
 use std::io::{self, Read, Write};
 
-const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const MAX_MESSAGE: usize = super::enet::MAX_MESSAGE;
 
-/// Text frames aren't sent (only binary ones); kept to document the opcode.
-#[allow(dead_code)]
-pub const OP_TEXT: u8 = 1;
-pub const OP_BINARY: u8 = 2;
-pub const OP_CLOSE: u8 = 8;
-pub const OP_PING: u8 = 9;
-pub const OP_PONG: u8 = 10;
+pub use crate::util::ws::{frame, OP_BINARY, OP_CLOSE, OP_PING, OP_PONG};
 
 /// What the client asked for in its handshake.
 pub struct Handshake {
     pub proto: Proto,
     /// The Init to hand the server, unless the client sends its own (token).
     pub init: Option<Vec<u8>>,
-}
-
-/// One frame from the server: unmasked, final.
-pub fn frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
-    let mut f = Vec::with_capacity(payload.len() + 10);
-    f.push(0x80 | opcode);
-    match payload.len() {
-        n if n < 126 => f.push(n as u8),
-        n if n <= 0xFFFF => {
-            f.push(126);
-            f.extend_from_slice(&(n as u16).to_be_bytes());
-        }
-        n => {
-            f.push(127);
-            f.extend_from_slice(&(n as u64).to_be_bytes());
-        }
-    }
-    f.extend_from_slice(payload);
-    f
 }
 
 fn query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
@@ -101,7 +74,7 @@ pub fn accept(s: &mut (impl Read + Write)) -> io::Result<Handshake> {
     };
     let offered: Vec<&str> = protocols.split(',').map(str::trim).filter(|p| !p.is_empty()).collect();
     let chosen = ["GpBinaryV18", "GpBinaryV16"].into_iter().find(|p| offered.contains(p));
-    let accept = crate::ugs::base64(&crate::ugs::wire::sha1(format!("{key}{GUID}").as_bytes()));
+    let accept = crate::util::ws::accept_key(&key);
     let mut reply = format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n");
     if let Some(p) = chosen {
         reply += &format!("Sec-WebSocket-Protocol: {p}\r\n");
@@ -122,39 +95,9 @@ pub fn accept(s: &mut (impl Read + Write)) -> io::Result<Handshake> {
     Ok(Handshake { proto, init })
 }
 
-/// Reads one frame: (fin, opcode, payload, unmasked).
+/// Reads one frame: (fin, opcode, unmasked payload), no longer than a Photon message.
 pub fn read_frame(s: &mut impl Read) -> io::Result<(bool, u8, Vec<u8>)> {
-    let mut h = [0u8; 2];
-    s.read_exact(&mut h)?;
-    let (fin, opcode, masked) = (h[0] & 0x80 != 0, h[0] & 0x0F, h[1] & 0x80 != 0);
-    let len = match h[1] & 0x7F {
-        126 => {
-            let mut b = [0u8; 2];
-            s.read_exact(&mut b)?;
-            u16::from_be_bytes(b) as usize
-        }
-        127 => {
-            let mut b = [0u8; 8];
-            s.read_exact(&mut b)?;
-            u64::from_be_bytes(b) as usize
-        }
-        n => n as usize,
-    };
-    if len > MAX_MESSAGE {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too big"));
-    }
-    let mut mask = [0u8; 4];
-    if masked {
-        s.read_exact(&mut mask)?;
-    }
-    let mut payload = vec![0u8; len];
-    s.read_exact(&mut payload)?;
-    if masked {
-        for (i, b) in payload.iter_mut().enumerate() {
-            *b ^= mask[i % 4];
-        }
-    }
-    Ok((fin, opcode, payload))
+    crate::util::ws::read_frame(s, MAX_MESSAGE)
 }
 
 /// What one whole client message is for the server.

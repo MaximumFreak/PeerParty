@@ -21,7 +21,7 @@
 //! - Rate limits and caps against floods (`RateLimit`, and the caps in `mod.rs`).
 //! - Names are cleaned up (`sanitize_name`), and never the Windows user name.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io;
 use std::net::IpAddr;
@@ -29,13 +29,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use sha2::{Digest, Sha256};
+use ed25519_dalek::{Signature, VerifyingKey};
 
 use crate::id::PeerId;
+use crate::{hex, unhex};
 
-pub const KEY_LEN: usize = 32;
-pub const SIG_LEN: usize = 64;
+pub use crate::identity_key::{IdentityKey, KEY_LEN, SIG_LEN, fingerprint, hello_proves, normalize_fingerprint, relay_proves, ticket_proves, verify_bytes};
+fn local_dir() -> Option<PathBuf> {
+    crate::sys::data_dir()
+}
+
 const CONFIRM_CONTEXT: &[u8] = b"peerparty public v1 confirm";
 /// Longest name shown for a public player, in characters.
 pub const MAX_NAME: usize = 32;
@@ -43,175 +46,6 @@ const MAX_BLOCKED: usize = 10_000;
 const MAX_PINS: usize = 4096;
 /// Keys remembered in memory for this session once the file is full.
 const MAX_SESSION_PINS: usize = 65536;
-/// What a copy signs to prove its key to the copy it shakes hands with on the mesh.
-const HELLO_CONTEXT: &[u8] = b"peerparty mesh hello v3";
-const TICKET_CONTEXT: &[u8] = b"peerparty auth ticket v1";
-/// What a copy signs to set up a connection through another player (`lan::relay`).
-const RELAY_CONTEXT: &[u8] = b"peerparty relay v1\0";
-
-fn local_dir() -> Option<PathBuf> {
-    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("peerparty"))
-}
-
-/// A player's long-term signing key.
-pub struct IdentityKey {
-    key: SigningKey,
-}
-
-impl fmt::Debug for IdentityKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "IdentityKey({})", self.fingerprint())
-    }
-}
-
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
-fn unhex<const N: usize>(s: &str) -> Option<[u8; N]> {
-    let s = s.trim();
-    if s.len() != N * 2 || !s.is_ascii() {
-        return None;
-    }
-    let mut out = [0u8; N];
-    for (i, x) in out.iter_mut().enumerate() {
-        *x = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
-    }
-    Some(out)
-}
-
-impl IdentityKey {
-    pub fn generate() -> IdentityKey {
-        IdentityKey::from_seed(super::crypto::random_array())
-    }
-
-    pub fn from_seed(seed: [u8; 32]) -> IdentityKey {
-        IdentityKey { key: SigningKey::from_bytes(&seed) }
-    }
-
-    /// The key in a key file's text (its 32-byte seed in hex), as `load_or_create`
-    /// reads it.
-    pub fn from_text(text: &str) -> Option<IdentityKey> {
-        unhex::<32>(text).map(IdentityKey::from_seed)
-    }
-
-    /// Loads the key at `path`, or makes one and saves it there. A key that can't be
-    /// saved still works for this run.
-    ///
-    /// A player's id is this key's hash, and games keep saves under ids made from it, so
-    /// a key is never written over while it might still be read: a file that is there but
-    /// can't be read now (another program has it open) gets a key for this run only. One
-    /// that reads as something else is kept beside it as `.bad`. A new key is written
-    /// whole or not at all.
-    pub fn load_or_create(path: &Path) -> IdentityKey {
-        match std::fs::read_to_string(path) {
-            Ok(s) => {
-                if let Some(k) = IdentityKey::from_text(&s) {
-                    return k;
-                }
-                let _ = std::fs::rename(path, path.with_extension("bad"));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return IdentityKey::generate(),
-        }
-        let k = IdentityKey::generate();
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let tmp = path.with_extension(format!("new-{}", std::process::id()));
-        if std::fs::write(&tmp, hex(k.key.as_bytes())).is_ok() && std::fs::rename(&tmp, path).is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        k
-    }
-
-    /// Proof for the mesh's hello that the signer holds this key: its signature over
-    /// the game, and over both sides' ids and the numbers each made up for this one
-    /// connection (so it is no use on another connection, or to anyone but `to`).
-    pub fn sign_hello(&self, game: &str, mine: (PeerId, &[u8; 16]), to: (PeerId, &[u8; 16])) -> [u8; SIG_LEN] {
-        self.sign(&hello_transcript(game, mine, to))
-    }
-
-    pub fn public(&self) -> [u8; KEY_LEN] {
-        self.key.verifying_key().to_bytes()
-    }
-
-    /// A game's sign-in ticket's proof (`Lan::auth_ticket`): this key's signature over
-    /// the game and a number made up for this ticket.
-    pub fn sign_ticket(&self, game: &str, nonce: &[u8; 16]) -> [u8; SIG_LEN] {
-        self.sign(&ticket_transcript(game, nonce))
-    }
-
-    /// A relayed connection's offer or answer (`lan::relay`): this key's signature over
-    /// `t`, under a context nothing else is signed with.
-    pub fn sign_relay(&self, t: &[u8]) -> [u8; SIG_LEN] {
-        self.sign(&[RELAY_CONTEXT, t].concat())
-    }
-
-    pub fn fingerprint(&self) -> String {
-        fingerprint(&self.public())
-    }
-
-    fn sign(&self, msg: &[u8]) -> [u8; SIG_LEN] {
-        self.key.sign(msg).to_bytes()
-    }
-}
-
-fn hello_transcript(game: &str, signer: (PeerId, &[u8; 16]), verifier: (PeerId, &[u8; 16])) -> Vec<u8> {
-    let mut t = Vec::with_capacity(HELLO_CONTEXT.len() + 4 + game.len() + 64);
-    t.extend_from_slice(HELLO_CONTEXT);
-    t.extend_from_slice(&(game.len() as u32).to_le_bytes());
-    t.extend_from_slice(game.as_bytes());
-    for (id, nonce) in [signer, verifier] {
-        t.extend_from_slice(&id.0);
-        t.extend_from_slice(nonce);
-    }
-    t
-}
-
-fn ticket_transcript(game: &str, nonce: &[u8; 16]) -> Vec<u8> {
-    let mut t = Vec::with_capacity(TICKET_CONTEXT.len() + 4 + game.len() + 16);
-    t.extend_from_slice(TICKET_CONTEXT);
-    t.extend_from_slice(&(game.len() as u32).to_le_bytes());
-    t.extend_from_slice(game.as_bytes());
-    t.extend_from_slice(nonce);
-    t
-}
-
-/// Whether `sig` is `IdentityKey::sign_ticket` by the holder of `key`; the id it proves
-/// is `PeerId::of_key(key)`.
-pub fn ticket_proves(key: &[u8; KEY_LEN], sig: &[u8; SIG_LEN], game: &str, nonce: &[u8; 16]) -> bool {
-    VerifyingKey::from_bytes(key).is_ok_and(|vk| vk.verify_strict(&ticket_transcript(game, nonce), &Signature::from_bytes(sig)).is_ok())
-}
-
-/// Whether `sig` is `IdentityKey::sign_hello` by the holder of `key`, as `signer`, for
-/// `verifier` (us), and `key` is the one `signer`'s id comes from.
-pub fn hello_proves(key: &[u8; KEY_LEN], sig: &[u8; SIG_LEN], game: &str, signer: (PeerId, &[u8; 16]), verifier: (PeerId, &[u8; 16])) -> bool {
-    PeerId::of_key(key) == signer.0
-        && VerifyingKey::from_bytes(key).is_ok_and(|vk| vk.verify_strict(&hello_transcript(game, signer, verifier), &Signature::from_bytes(sig)).is_ok())
-}
-
-/// Whether `sig` is `IdentityKey::sign_relay` of `t` by the holder of `key`.
-pub fn relay_proves(key: &[u8; KEY_LEN], sig: &[u8; SIG_LEN], t: &[u8]) -> bool {
-    VerifyingKey::from_bytes(key).is_ok_and(|vk| vk.verify_strict(&[RELAY_CONTEXT, t].concat(), &Signature::from_bytes(sig)).is_ok())
-}
-
-/// A public key's short, shareable form: "3fa9-c1d2-0b7e-55aa" (64 bits of a hash).
-pub fn fingerprint(key: &[u8; KEY_LEN]) -> String {
-    let h = Sha256::new().chain_update(b"peerparty public id").chain_update(key).finalize();
-    let s = hex(&h[..8]);
-    format!("{}-{}-{}-{}", &s[..4], &s[4..8], &s[8..12], &s[12..16])
-}
-
-/// A fingerprint as typed (any case, with or without dashes), in its usual form.
-pub fn normalize_fingerprint(s: &str) -> Option<String> {
-    let h: String = s.chars().filter(|c| !matches!(c, '-' | ' ' | ':')).collect::<String>().to_ascii_lowercase();
-    if h.len() != 16 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    Some(format!("{}-{}-{}-{}", &h[..4], &h[4..8], &h[8..12], &h[12..16]))
-}
-
 fn transcript(room_id: &[u8; 8], sender: &[u8; 48], receiver: &[u8; 48], info: &[u8]) -> Vec<u8> {
     let mut t = Vec::with_capacity(CONFIRM_CONTEXT.len() + 8 + 96 + 4 + info.len());
     t.extend_from_slice(CONFIRM_CONTEXT);
@@ -289,18 +123,13 @@ pub fn sanitize_name(s: &str) -> String {
     if out.is_empty() || super::redact::has_address(&out) { "Player".into() } else { out }
 }
 
-/// The name public players see for us: `PEERPARTY_PUBLIC_NAME`, else the name chosen in
-/// Settings (`PEERPARTY_NAME`), else "Player-" and the start of our key's fingerprint.
+/// The name public players see for us: the one chosen (`PublicCfg::name`, which
+/// `Config::public_from_env` fills from `PEERPARTY_PUBLIC_NAME`, else the name chosen in
+/// Settings, `PEERPARTY_NAME`), else "Player-" and the start of our key's fingerprint.
 /// Never the Windows user name.
 pub fn our_name(chosen: Option<&str>, fp: &str) -> String {
-    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
-    let pick = chosen
-        .map(String::from)
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| var("PEERPARTY_PUBLIC_NAME"))
-        .or_else(|| var("PEERPARTY_NAME"));
-    match pick {
-        Some(n) => sanitize_name(&n),
+    match chosen.filter(|v| !v.trim().is_empty()) {
+        Some(n) => sanitize_name(n),
         None => format!("Player-{}", &fp[..4.min(fp.len())]),
     }
 }
@@ -362,11 +191,18 @@ impl Blocklist {
         Blocklist::open(None)
     }
 
+    /// Reads the file again. One that's there but can't be read just now (another copy
+    /// or an editor holding it) keeps the list as it was, and is tried again next time.
     fn reload(&self, st: &mut BlockState) {
         let Some(p) = &self.path else { return };
-        st.stamp = mtime(p);
+        let stamp = mtime(p);
+        let text = match std::fs::read_to_string(p) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(_) => return,
+        };
+        st.stamp = stamp;
         st.set.clear();
-        let Ok(text) = std::fs::read_to_string(p) else { return };
         for line in text.lines() {
             let (fp, note) = line.split_once('#').unwrap_or((line, ""));
             if let Some(fp) = normalize_fingerprint(fp)
@@ -469,7 +305,32 @@ impl Blocklist {
 /// to first.
 pub struct Pins {
     path: Option<PathBuf>,
-    map: Mutex<Option<HashMap<PeerId, [u8; KEY_LEN]>>>,
+    /// Read from the file once, when opened, and again when it changes (`refresh`, never
+    /// under the sessions' lock): what a handshake asks (`knows_key`) is answered from
+    /// memory, and what it learns (`remember`) is written once that lock is let go.
+    st: Mutex<PinState>,
+}
+
+#[derive(Default)]
+struct PinState {
+    /// The file's pins (its first `MAX_PINS` lines) and this session's.
+    map: HashMap<PeerId, [u8; KEY_LEN]>,
+    keys: HashSet<[u8; KEY_LEN]>,
+    /// Pins the file holds, as far as we know: what it had when read, and what we added.
+    in_file: usize,
+    stamp: Option<SystemTime>,
+    checked: Option<Instant>,
+}
+
+impl PinState {
+    fn add(&mut self, id: PeerId, key: [u8; KEY_LEN]) -> bool {
+        if self.map.contains_key(&id) || self.map.len() >= MAX_SESSION_PINS {
+            return false;
+        }
+        self.map.insert(id, key);
+        self.keys.insert(key);
+        true
+    }
 }
 
 impl fmt::Debug for Pins {
@@ -478,59 +339,91 @@ impl fmt::Debug for Pins {
     }
 }
 
+/// A pins file's entries, from its first `MAX_PINS` lines.
+fn read_pins(p: &Path) -> Vec<(PeerId, [u8; KEY_LEN])> {
+    let Ok(text) = std::fs::read_to_string(p) else { return Vec::new() };
+    text.lines()
+        .take(MAX_PINS)
+        .filter_map(|l| {
+            let (i, k) = l.trim().split_once(' ')?;
+            Some((PeerId::from_hex(i)?, unhex::<KEY_LEN>(k)?))
+        })
+        .collect()
+}
+
 impl Pins {
     pub fn default_path() -> Option<PathBuf> {
         local_dir().map(|d| d.join("public-keys.txt"))
     }
 
     pub fn open(path: Option<PathBuf>) -> Pins {
-        Pins { path, map: Mutex::new(None) }
+        let pins = Pins { path, st: Mutex::new(PinState::default()) };
+        pins.reload();
+        pins
     }
 
     pub fn in_memory() -> Pins {
         Pins::open(None)
     }
 
-    /// Whether we've seen `key` before (pinned for some id).
+    /// Takes in what the file holds now (another copy of the game adds to it too),
+    /// read with no lock held. Pins only ever join: none is forgotten.
+    fn reload(&self) {
+        let Some(p) = &self.path else { return };
+        let stamp = mtime(p);
+        let read = read_pins(p);
+        let mut st = self.st.lock().unwrap();
+        st.stamp = stamp;
+        st.in_file = st.in_file.max(read.len());
+        for (id, key) in read {
+            st.add(id, key);
+        }
+    }
+
+    /// Re-reads the file if it changed (looked at every 2 s at most). True when it did.
+    /// It touches the disk: never under the sessions' lock.
+    pub fn refresh(&self) -> bool {
+        let Some(p) = &self.path else { return false };
+        {
+            let mut st = self.st.lock().unwrap();
+            if st.checked.is_some_and(|t| t.elapsed() < Duration::from_secs(2)) {
+                return false;
+            }
+            st.checked = Some(Instant::now());
+        }
+        let stamp = mtime(p);
+        if stamp == self.st.lock().unwrap().stamp {
+            return false;
+        }
+        self.reload();
+        true
+    }
+
+    /// Whether we've seen `key` before (pinned for some id). From memory, so it may be
+    /// asked under the sessions' lock.
     pub fn knows_key(&self, key: &[u8; KEY_LEN]) -> bool {
-        let g = self.map.lock().unwrap();
-        g.as_ref().is_some_and(|m| m.values().any(|k| k == key)) || self.path.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).is_some_and(|t| {
-            let h = hex(key);
-            t.lines().take(MAX_PINS).any(|l| l.trim().split_once(' ').is_some_and(|(_, k)| k == h))
-        })
+        self.st.lock().unwrap().keys.contains(key)
     }
 
     /// Remembers `key` (in the file for the first `MAX_PINS`, then in memory for this
-    /// session, then not at all: a list that is full never keeps a player out).
+    /// session, then not at all: a list that is full never keeps a player out). It
+    /// writes the file: never under the sessions' lock (see `Act::RememberPin`).
     pub fn remember(&self, id: PeerId, key: &[u8; KEY_LEN]) {
-        let mut g = self.map.lock().unwrap();
-        let map = g.get_or_insert_with(|| {
-            let mut m = HashMap::new();
-            if let Some(text) = self.path.as_ref().and_then(|p| std::fs::read_to_string(p).ok()) {
-                for l in text.lines().take(MAX_PINS) {
-                    if let Some((i, k)) = l.trim().split_once(' ')
-                        && let (Some(i), Some(k)) = (PeerId::from_hex(i), unhex::<KEY_LEN>(k))
-                    {
-                        m.entry(i).or_insert(k);
-                    }
-                }
+        let line = {
+            let mut st = self.st.lock().unwrap();
+            if !st.add(id, *key) || self.path.is_none() || st.in_file >= MAX_PINS {
+                return;
             }
-            m
-        });
-        if map.contains_key(&id) || map.len() >= MAX_SESSION_PINS {
-            return;
+            st.in_file += 1;
+            format!("{} {}", id.hex(), hex(key))
+        };
+        let Some(p) = &self.path else { return };
+        use std::io::Write;
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
         }
-        map.insert(id, *key);
-        if map.len() <= MAX_PINS {
-            if let Some(p) = &self.path {
-                use std::io::Write;
-                if let Some(dir) = p.parent() {
-                    let _ = std::fs::create_dir_all(dir);
-                }
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
-                    let _ = writeln!(f, "{} {}", id.hex(), hex(key));
-                }
-            }
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+            let _ = writeln!(f, "{line}");
         }
     }
 }
@@ -621,8 +514,8 @@ impl PublicCfg {
             pins: Arc::new(Pins::open(Pins::default_path())),
             name: None,
             friends: Arc::new(Blocklist::friends(Blocklist::friends_path())),
-            friends_only: std::env::var("PEERPARTY_PUBLIC_FRIENDS_ONLY")
-                .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "yes" | "true")),
+            // `Config::public_from_env` turns it on (PEERPARTY_PUBLIC_FRIENDS_ONLY).
+            friends_only: false,
         }
     }
 
@@ -695,15 +588,11 @@ mod tests {
     #[test]
     fn our_name_is_never_the_user_name() {
         let n = our_name(None, "abcd-ef01-2345-6789");
-        if std::env::var_os("PEERPARTY_PUBLIC_NAME").is_none() && std::env::var_os("PEERPARTY_NAME").is_none() {
-            assert_eq!(n, "Player-abcd");
-        }
-        if let Ok(u) = std::env::var("USERNAME")
-            && std::env::var_os("PEERPARTY_NAME").is_none()
-            && std::env::var_os("PEERPARTY_PUBLIC_NAME").is_none()
-        {
+        assert_eq!(n, "Player-abcd");
+        if let Some(u) = crate::sys::user_name() {
             assert_ne!(n, u);
         }
+        assert_eq!(our_name(Some("  "), "abcd"), "Player-abcd");
         assert_eq!(our_name(Some("1.2.3.4"), "abcd"), "Player");
     }
 
@@ -759,8 +648,9 @@ mod tests {
         assert!(!a.is_blocked(&fp));
         std::thread::sleep(Duration::from_millis(50));
         let _ = std::fs::write(&p, format!("garbage\n{fp} # hand-edited\n"));
-        std::thread::sleep(Duration::from_millis(2100));
-        b.refresh();
+        // As if the 2 s between looks at the file had passed.
+        b.st.lock().unwrap().checked = None;
+        assert!(b.refresh(), "the edit was seen");
         assert!(b.is_blocked(&fp), "{:?}", b.list());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -790,6 +680,40 @@ mod tests {
         assert!(p.knows_key(&late), "past the file's limit a key is still remembered for the session");
         let lines = std::fs::read_to_string(&path).unwrap().lines().count();
         assert_eq!(lines, MAX_PINS, "the file stops growing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pins come from memory once the file is read, and take in what another copy adds
+    /// to it when the file changes (`refresh`).
+    #[test]
+    fn pins_are_read_once_and_again_when_the_file_changes() {
+        let dir = std::env::temp_dir().join(format!("pp-pins-reload-{}", std::process::id()));
+        let path = dir.join("keys.txt");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (k1, k2, k3) = (IdentityKey::generate().public(), IdentityKey::generate().public(), IdentityKey::generate().public());
+        let line = |k: &[u8; KEY_LEN]| format!("{} {}\n", PeerId::of_key(k).hex(), hex(k));
+        std::fs::write(&path, line(&k1)).unwrap();
+        let p = Pins::open(Some(path.clone()));
+        assert!(p.knows_key(&k1));
+        // Another copy adds a key: not known until the file is looked at again.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(line(&k2).as_bytes()).unwrap();
+            f.set_modified(SystemTime::now() + Duration::from_secs(60)).unwrap();
+        }
+        assert!(!p.knows_key(&k2), "answered from memory, not the file");
+        assert!(p.refresh());
+        assert!(p.knows_key(&k1) && p.knows_key(&k2));
+        assert!(!p.refresh(), "looked at a moment ago");
+        // What we remember goes to the file, after what was there.
+        p.remember(PeerId::of_key(&k3), &k3);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, format!("{}{}{}", line(&k1), line(&k2), line(&k3)));
+        // And a file gone doesn't make us forget.
+        std::fs::remove_file(&path).unwrap();
+        assert!(p.knows_key(&k1) && p.knows_key(&k2) && p.knows_key(&k3));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

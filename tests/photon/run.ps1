@@ -9,7 +9,7 @@
 # Chat clients swap a channel message, a private message and a friend's status.
 # Exit code 0 = PHOTON_TEST_OK.
 
-param([string]$PeerParty = "$env:TEMP\cargo-target\peerparty\testexe\peerparty.exe")
+param([string]$PeerParty = $(if ($env:CARGO_TARGET_DIR) { Join-Path $env:CARGO_TARGET_DIR 'testexe\peerparty.exe' } else { "$env:TEMP\cargo-target\peerparty\testexe\peerparty.exe" }))
 $ErrorActionPreference = 'Stop'
 if (-not $env:PPTEST_PHOTON_DIR) { throw 'Set PPTEST_PHOTON_DIR to a folder with copies of the Photon DLLs.' }
 # One output folder per set of Photon DLLs (Chat or not, and which build). A later run
@@ -22,17 +22,28 @@ $out = Join-Path $env:TEMP "pp-photon-test\$stamp"
 $built = Join-Path $out 'PhotonTest.exe'
 $src = Get-ChildItem $PSScriptRoot -Recurse -File | Where-Object { $_.Extension -in '.cs', '.csproj', '.props' -and $_.FullName -notmatch '\\(bin|obj)\\' }
 $newest = ($src | Measure-Object LastWriteTimeUtc -Maximum).Maximum
-if (-not (Test-Path -LiteralPath $built) -or (Get-Item -LiteralPath $built).LastWriteTimeUtc -lt $newest) {
-    dotnet build (Join-Path $PSScriptRoot 'PhotonTest\PhotonTest.csproj') -c Release -o $out -p:PPTEST_PHOTON_DIR=$env:PPTEST_PHOTON_DIR | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw 'build failed' }
+# One build of a set at a time, across runs: another run may be building the same one.
+$lock = New-Object System.Threading.Mutex($false, "Local\PeerPartyPhotonBuild-$stamp")
+try { [void]$lock.WaitOne() } catch [System.Threading.AbandonedMutexException] {}
+try {
+    if (-not (Test-Path -LiteralPath $built) -or (Get-Item -LiteralPath $built).LastWriteTimeUtc -lt $newest) {
+        dotnet build (Join-Path $PSScriptRoot 'PhotonTest\PhotonTest.csproj') -c Release -o $out -p:PPTEST_PHOTON_DIR=$env:PPTEST_PHOTON_DIR -p:PPTEST_STAMP=$stamp | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'build failed' }
+    }
 }
-$start = Get-Date
+finally { $lock.ReleaseMutex(); $lock.Dispose() }
+# This run's own log folder (in PPTEST_DIR when tests\run_all.ps1 gives one), so a run
+# beside it can't hand us its log.
+$work = if ($env:PPTEST_DIR) { $env:PPTEST_DIR } else { Join-Path $env:TEMP ('pp-photon-run-' + [guid]::NewGuid().ToString('n')) }
+$logs = Join-Path $work 'logs'
+New-Item -ItemType Directory -Force -Path $logs | Out-Null
 # Loopback only: no Windows Firewall prompt for PhotonTest.exe.
 $env:PEERPARTY_LOOPBACK = '1'
 # peerparty reports on stderr; that isn't an error here.
 $ErrorActionPreference = 'Continue'
-& $PeerParty (Join-Path $out 'PhotonTest.exe') 2>&1 | ForEach-Object { "$_" }
+& $PeerParty --log-dir $logs (Join-Path $out 'PhotonTest.exe') 2>&1 | ForEach-Object { "$_" }
 $code = $LASTEXITCODE
-$log = Get-ChildItem "$env:TEMP\peerparty\logs" -Filter 'PhotonTest-*' | Where-Object LastWriteTime -gt $start | Sort-Object LastWriteTime | Select-Object -Last 1
+$log = Get-ChildItem $logs -Recurse -Filter 'PhotonTest-*' | Sort-Object LastWriteTime | Select-Object -Last 1
 if ($log) { Get-Content $log.FullName | Select-String 'photon' | ForEach-Object Line }
+if (-not $env:PPTEST_DIR) { Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue }
 if ($code -eq 0) { 'PHOTON_TEST_OK' } else { "PHOTON_TEST_FAIL (exit $code)"; exit 1 }

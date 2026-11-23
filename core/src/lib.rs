@@ -10,21 +10,32 @@
 //!
 //! Nothing here knows about any SDK.
 
+pub mod crypto;
 #[cfg(test)]
 mod fuzz_tests;
 pub mod fwd;
+mod hello;
+mod hex;
 mod id;
+pub mod identity_key;
 pub mod inet;
 mod lan;
 mod link;
 mod lobby;
 mod mesh;
 pub mod own;
-pub mod release;
+pub mod redact;
+mod sys;
+#[cfg(any(test, feature = "test-util"))]
+#[doc(hidden)]
+pub mod test_ports;
 mod wire;
 
-pub use id::{Identity, PeerId, take_slot_from};
-pub use lan::{ChanInfo, CloseReason, Event, JoinCheck, Lan, LobbyError, MemberStatus, Options, Packet, SendResult, TestIntervals, TestTiming, Trust, choose_internet, internet_wanted};
+pub use hex::{hex, unhex};
+pub use id::{Identity, PeerId, take_slot_from, want_slot};
+pub use lan::{ChanInfo, ChannelKind, CloseReason, Event, JoinCheck, Lan, LobbyError, MemberStatus, Options, Packet, SendResult, Trust, choose_internet, internet_wanted};
+#[cfg(any(test, feature = "test-util"))]
+pub use lan::{TestIntervals, TestTiming};
 pub use lobby::{
     Attr, Filter, Lobby, Member, Op, Permission, Query, Value, find_attr, remove_attr, set_attr,
 };
@@ -40,6 +51,7 @@ pub fn loopback_only() -> bool {
 
 /// A discovery beacon as a copy of `game` with `id` listening on TCP `port` sends it
 /// (tests: a peer that answers beacons but can't be reached).
+#[cfg(any(test, feature = "test-util"))]
 #[doc(hidden)]
 pub fn test_beacon(game: &str, id: PeerId, port: u16) -> Vec<u8> {
     wire::Beacon { game: game.into(), id, port }.encode()

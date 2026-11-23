@@ -15,6 +15,7 @@
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, Color32, CornerRadius, Pos2, Rect, Stroke, Vec2};
+use peerparty_protocol::ipc::{HostMsg, InviteBlock, Notice, NoticeCode};
 use serde_json::Value;
 
 use super::pad::Style;
@@ -47,7 +48,9 @@ pub struct GameState {
     pub can_invite: bool,
     /// The game joins rooms by code (Photon): copy and paste codes are offered.
     pub codes: bool,
-    /// Why there's nothing to invite to (empty when inviting works).
+    /// Why there's nothing to invite to (None when inviting works, or the hook didn't say
+    /// in a form this build knows), and the hook's English for it.
+    pub invite_block: Option<InviteBlock>,
     pub invite_note: String,
     pub sdks: Vec<String>,
     /// Other stores' overlays loaded in the game ("steam", "epic", "ea"): their hotkeys
@@ -194,7 +197,11 @@ pub struct PendingInvite {
 impl GameState {
     /// The invite rows' subtitle when there's nothing to invite to.
     pub fn why_no_invite(&self) -> String {
-        if self.invite_note.is_empty() { t!("overlay.host_first").into() } else { self.invite_note.clone() }
+        match &self.invite_block {
+            Some(b) => block_text(b),
+            None if self.invite_note.is_empty() => t!("overlay.host_first").into(),
+            None => self.invite_note.clone(),
+        }
     }
 
     pub fn from_json(v: &Value) -> GameState {
@@ -248,6 +255,7 @@ impl GameState {
                 .collect(),
             can_invite: v.get("can_invite").and_then(Value::as_bool).unwrap_or(false),
             codes: v.get("codes").and_then(Value::as_bool).unwrap_or(false),
+            invite_block: v.get("invite_block").and_then(|b| peerparty_protocol::json::Json::parse(&b.to_string())).and_then(|b| InviteBlock::from_json(&b)),
             invite_note: s(v, "invite_note"),
             sdks: arr(v, "sdks").iter().filter_map(|x| x.as_str().map(String::from)).collect(),
             foreign: arr(v, "foreign").iter().filter_map(|x| x.as_str().map(String::from)).collect(),
@@ -354,7 +362,7 @@ impl Nav {
 /// What the overlay asks of the host.
 pub enum Cmd {
     /// A command for the hook (ipc.rs).
-    Hook(Value),
+    Hook(HostMsg),
     Close,
     /// The global settings changed: save them and tell the hook what it needs.
     Prefs,
@@ -591,13 +599,6 @@ pub fn invite_text(name: &str, kind: &str) -> String {
     }
 }
 
-/// The hook's invite.rs note openings (its LAYERS_OFF, OFFICIAL_START / OFFICIAL_END,
-/// UNSUPPORTED_START): what follows them is filled into the translation.
-const HOOK_LAYERS_OFF: &str = "Turned off for this game in PeerParty: ";
-const HOOK_OFFICIAL_START: &str = "This game's online play goes through ";
-const HOOK_OFFICIAL_END: &str = "'s own servers, which PeerParty can't invite through: use the game's own invites or room codes, or set it to PeerParty's own in this game's page in PeerParty (Advanced, Online services)";
-const HOOK_UNSUPPORTED_START: &str = "Not supported for this game yet: PeerParty can't hand it an invite through ";
-
 /// A turned-off layer's overlay row: its name, then what that costs and where it's
 /// turned back on (the game's page, or `PEERPARTY_SKIP` for a layer the page doesn't list).
 pub fn layer_off_text(layer: &str) -> (String, String) {
@@ -609,54 +610,40 @@ pub fn layer_off_text(layer: &str) -> (String, String) {
     (title, detail)
 }
 
-/// The hook's own notes, translated where the words are known.
-pub fn hook_text(s: &str) -> String {
-    match s {
-        "Invite sent" => t!("hook.invite_sent").into(),
-        "Can't invite" => t!("hook.cant_invite").into(),
-        "Nobody to invite" => t!("hook.nobody").into(),
-        "No other player of this game is running, or they're all with you already"
-        | "No other player of this game is running on your network, or they're all with you already" => t!("hook.nobody_detail").into(),
-        "A player asked to join you" => t!("hook.asked_to_join").into(),
-        // The hook's invite.rs ALREADY_TOGETHER and CANT_JOIN, the answers to Join.
-        "Already playing together" => t!("hook.already_together").into(),
-        "Can't join" => t!("hook.cant_join").into(),
-        // Their details (invite.rs together_detail / nowhere_detail), with a name.
-        _ if s.starts_with("You're already in ") && s.ends_with("'s game") && s.len() > "You're already in 's game".len() => {
-            t!("hook.together_detail", name = &s["You're already in ".len()..s.len() - "'s game".len()])
+/// Why there's nothing to invite to, in the overlay's language. Service names are the
+/// hook's labels; layers are named as the game page names them.
+pub fn block_text(b: &InviteBlock) -> String {
+    match b {
+        InviteBlock::Official(names) => t!("hook.official", names = names.join(" and "), mode = t!("mode.lan")),
+        InviteBlock::PhotonRoom(room) => t!("hook.photon_room", room = room),
+        InviteBlock::LayersOff(layers) => t!("hook.layers_off", names = layers.iter().map(|l| layer_name(l)).collect::<Vec<_>>().join(", ")),
+        InviteBlock::Unsupported(names) => t!("hook.unsupported", names = names.join(" or ")),
+        InviteBlock::LearnFirst => t!("hook.learn_invite").into(),
+        InviteBlock::HostFirst => t!("overlay.host_first").into(),
+    }
+}
+
+/// A notice from the hook as its title and detail, in the overlay's language; free text
+/// (an older or newer hook's note) as the hook wrote it.
+pub fn notice_text(note: &Notice) -> (String, String) {
+    let name = note.name.clone().unwrap_or_default();
+    let reason = || note.reason.as_ref().map(block_text).unwrap_or_default();
+    match note.code {
+        NoticeCode::InviteSent => {
+            let to = match &note.name {
+                Some(one) => t!("hook.to_name", name = one),
+                None => t!("hook.to_players", n = note.count.unwrap_or(0)),
+            };
+            (t!("hook.invite_sent").into(), to)
         }
-        _ if s.ends_with(" isn't in a game you can join yet") && s.len() > " isn't in a game you can join yet".len() => {
-            t!("hook.nowhere_detail", name = &s[..s.len() - " isn't in a game you can join yet".len()])
-        }
-        "Achievement unlocked" => t!("hook.achievement").into(),
-        "Host or join a game first" => t!("overlay.host_first").into(),
-        // The hook's invite.rs LEARN_FIRST.
-        "Invite someone once from the game's friends list first. After that, Invite and Join work here" => t!("hook.learn_invite").into(),
-        // The hook's invite.rs PHOTON_NO_INVITES, with the room after it.
-        _ if s.starts_with("This game has no invites: players on your network join your session from the game's own menu (room ") => {
-            let room = s.rsplit("(room ").next().unwrap_or_default().trim_end_matches(')');
-            t!("hook.photon_room", room = room)
-        }
-        // The hook's invite.rs LAYERS_OFF, with the turned-off layers after it.
-        _ if s.starts_with(HOOK_LAYERS_OFF) => {
-            let names: Vec<String> = s[HOOK_LAYERS_OFF.len()..].split(", ").filter(|l| !l.is_empty()).map(layer_name).collect();
-            t!("hook.layers_off", names = names.join(", "))
-        }
-        // The hook's invite.rs OFFICIAL_START, the services, OFFICIAL_END.
-        _ if s.starts_with(HOOK_OFFICIAL_START) && s.ends_with(HOOK_OFFICIAL_END) && s.len() > HOOK_OFFICIAL_START.len() + HOOK_OFFICIAL_END.len() => {
-            let names = &s[HOOK_OFFICIAL_START.len()..s.len() - HOOK_OFFICIAL_END.len()];
-            t!("hook.official", names = names, mode = t!("mode.lan"))
-        }
-        // The hook's invite.rs UNSUPPORTED_START, with the services after it.
-        _ if s.starts_with(HOOK_UNSUPPORTED_START) => t!("hook.unsupported", names = &s[HOOK_UNSUPPORTED_START.len()..]),
-        _ => match s.strip_prefix("To ").and_then(|r| r.split(' ').next()).and_then(|n| n.parse::<u64>().ok()) {
-            Some(n) if s.ends_with("player") || s.ends_with("players") => t!("hook.to_players", n = n),
-            // invite.rs sent_detail: the one player invited, by name.
-            _ => match s.strip_prefix("To ") {
-                Some(name) if !name.is_empty() => t!("hook.to_name", name = name),
-                _ => s.to_string(),
-            },
-        },
+        NoticeCode::CantInvite => (t!("hook.cant_invite").into(), reason()),
+        NoticeCode::NobodyToInvite => (t!("hook.nobody").into(), t!("hook.nobody_detail").into()),
+        NoticeCode::JoinAsked => (t!("hook.asked_to_join").into(), reason()),
+        NoticeCode::AlreadyTogether => (t!("hook.already_together").into(), t!("hook.together_detail", name = name)),
+        NoticeCode::CantJoin => (t!("hook.cant_join").into(), t!("hook.nowhere_detail", name = name)),
+        NoticeCode::NoCodeToPaste => (t!("hook.no_code").into(), t!("hook.no_code_detail").into()),
+        NoticeCode::Achievement => (t!("hook.achievement").into(), name),
+        NoticeCode::Text => (note.title(), note.detail()),
     }
 }
 
@@ -714,9 +701,14 @@ impl Overlay {
         self.scroll_to_sel = true;
     }
 
+    /// The hook's result to show (`note`).
+    pub fn notice(&mut self, note: &Notice, visible: bool) {
+        let (title, detail) = notice_text(note);
+        self.note(title, detail, visible);
+    }
+
     /// A result to show: under the panel while it's open, else as a notification.
-    pub fn note(&mut self, title: &str, detail: &str, visible: bool) {
-        let (title, detail) = (hook_text(title), hook_text(detail));
+    pub fn note(&mut self, title: String, detail: String, visible: bool) {
         if visible {
             self.notice = Some((format!("{title}: {detail}"), Instant::now() + Duration::from_secs(6)));
         } else {
@@ -725,8 +717,9 @@ impl Overlay {
     }
 
     pub fn toast(&mut self, title: impl Into<String>, detail: impl Into<String>) {
-        self.toasts.retain(|t| t.until > Instant::now());
-        self.toasts.push(Toast { title: title.into(), detail: detail.into(), until: Instant::now() + Duration::from_secs(7) });
+        let now = Instant::now();
+        self.toasts.retain(|t| t.until > now);
+        self.toasts.push(Toast { title: title.into(), detail: detail.into(), until: now + Duration::from_secs(7) });
         if self.toasts.len() > 3 {
             self.toasts.remove(0);
         }
@@ -790,7 +783,7 @@ impl Overlay {
     fn invite_all(&self, detail_when_able: &str) -> Row {
         let st = &self.state;
         if !st.can_invite {
-            return Row::info(t!("overlay.invite_all"), hook_text(&st.why_no_invite())).icon(Icon::People, Tone::Plain);
+            return Row::info(t!("overlay.invite_all"), st.why_no_invite()).icon(Icon::People, Tone::Plain);
         }
         Row::action(t!("overlay.invite_all"), detail_when_able.to_string(), Action::InviteAll, t!("overlay.invite")).icon(Icon::People, Tone::Plain)
     }
@@ -1026,12 +1019,7 @@ impl Overlay {
                     Row::setting(
                         t!("together.invite_buttons"),
                         t!("overlay.s_invite_buttons_detail"),
-                        match prefs.invite_buttons.as_str() {
-                            "guide" => t!("together.ib_guide"),
-                            "combo" => t!("together.ib_combo"),
-                            "both" => t!("together.ib_both"),
-                            _ => t!("together.ib_none"),
-                        },
+                        crate::ui::shared::invite_button_label(&prefs.invite_buttons),
                         Action::CycleInviteButtons(1),
                         (Action::CycleInviteButtons(-1), Action::CycleInviteButtons(1)),
                     ),
@@ -1040,12 +1028,7 @@ impl Overlay {
                     Row::setting(
                         t!("settings.glyphs"),
                         "",
-                        match prefs.glyphs.as_str() {
-                            "xbox" => "Xbox",
-                            "playstation" => "PlayStation",
-                            "nintendo" => "Nintendo",
-                            _ => t!("settings.glyphs_auto"),
-                        },
+                        crate::ui::shared::glyph_label(&prefs.glyphs),
                         Action::Glyphs(1),
                         (Action::Glyphs(-1), Action::Glyphs(1)),
                     ),
@@ -1107,26 +1090,26 @@ impl Overlay {
 
     fn act(&mut self, a: Action, prefs: &mut Prefs, out: &mut Vec<Cmd>) {
         let st = &self.state;
-        let msg = |v: Value| Cmd::Hook(v);
+        let msg = Cmd::Hook;
         match a {
-            Action::InviteAll => out.push(msg(serde_json::json!({"t": "invite", "to": null}))),
+            Action::InviteAll => out.push(msg(HostMsg::Invite { to: None })),
             Action::CopyCode => {
                 if let Some(l) = st.lobby.as_ref().filter(|l| l.kind == "photon.room") {
-                    out.push(msg(serde_json::json!({"t": "copy", "text": l.id})));
+                    out.push(msg(HostMsg::Copy { text: l.id.clone() }));
                 }
             }
             Action::PasteCode => {
-                out.push(msg(serde_json::json!({"t": "paste"})));
+                out.push(msg(HostMsg::Paste));
                 out.push(Cmd::Close);
             }
             Action::Invite(i) => {
                 if let Some(p) = st.peers.get(i) {
-                    out.push(msg(serde_json::json!({"t": "invite", "to": p.id})));
+                    out.push(msg(HostMsg::Invite { to: Some(p.id.clone()) }));
                 }
             }
             Action::Join(i) => {
                 if let Some(p) = st.peers.get(i) {
-                    out.push(msg(serde_json::json!({"t": "join", "peer": p.id})));
+                    out.push(msg(HostMsg::Join { peer: p.id.clone() }));
                     out.push(Cmd::Close);
                 }
             }
@@ -1141,7 +1124,7 @@ impl Overlay {
                 if let Some(p) = st.peers.get(i).filter(|p| p.public()) {
                     let armed = self.block_armed.take().is_some_and(|(a, at)| a == p.id && at.elapsed() < BLOCK_ARMED);
                     if armed {
-                        out.push(msg(serde_json::json!({"t": "block", "peer": p.id})));
+                        out.push(msg(HostMsg::Block { peer: p.id.clone() }));
                         self.blocked = Some((p.id.clone(), p.name.clone(), Instant::now()));
                         self.open(Page::Players, false);
                     } else {
@@ -1152,28 +1135,28 @@ impl Overlay {
             Action::ToggleMic => {
                 let on = !self.state.mic_on;
                 self.state.mic_on = on;
-                out.push(msg(serde_json::json!({"t": "mic", "on": on})));
+                out.push(msg(HostMsg::Mic { on }));
             }
             Action::ToggleMute(i) => {
                 if let Some(p) = self.state.peers.get_mut(i) {
                     p.muted = !p.muted;
-                    out.push(msg(serde_json::json!({"t": "mute", "peer": p.id, "on": p.muted})));
+                    out.push(msg(HostMsg::Mute { peer: p.id.clone(), on: p.muted }));
                 }
             }
             Action::Unblock => {
                 if let Some((id, ..)) = self.blocked.take().filter(|b| b.2.elapsed() < BLOCK_UNDO) {
-                    out.push(msg(serde_json::json!({"t": "unblock", "peer": id})));
+                    out.push(msg(HostMsg::Unblock { peer: id }));
                 }
             }
             Action::Accept(i) => {
                 if let Some(p) = st.pending.get(i) {
-                    out.push(msg(serde_json::json!({"t": "accept", "id": p.id})));
+                    out.push(msg(HostMsg::Accept { id: p.id }));
                     out.push(Cmd::Close);
                 }
             }
             Action::Decline(i) => {
                 if let Some(p) = st.pending.get(i) {
-                    out.push(msg(serde_json::json!({"t": "decline", "id": p.id})));
+                    out.push(msg(HostMsg::Decline { id: p.id }));
                 }
             }
             Action::Open(to) => {
@@ -1190,9 +1173,9 @@ impl Overlay {
                 out.push(Cmd::Prefs);
             }
             Action::CycleInviteButtons(d) => {
-                let opts = ["", "guide", "combo", "both"];
+                let opts = crate::ui::shared::INVITE_BUTTON_VALUES;
                 let i = opts.iter().position(|o| *o == prefs.invite_buttons).unwrap_or(0) as i32;
-                prefs.invite_buttons = opts[(i + d).rem_euclid(4) as usize].to_string();
+                prefs.invite_buttons = opts[(i + d).rem_euclid(opts.len() as i32) as usize].to_string();
                 out.push(Cmd::Prefs);
             }
             Action::ToggleToasts => {
@@ -1205,17 +1188,17 @@ impl Overlay {
                 let on = !st.internet_on;
                 prefs.internet = on;
                 out.push(Cmd::Prefs);
-                out.push(msg(serde_json::json!({"t": "set", "key": "internet", "value": if on { "on" } else { "off" }})));
+                out.push(msg(HostMsg::Set { key: "internet".into(), value: if on { "on" } else { "off" }.into() }));
                 self.state.internet_on = on;
             }
             Action::Scale(d) => {
-                prefs.overlay_scale = (prefs.overlay_scale + d as f32 * 0.125).clamp(0.75, 1.5);
+                prefs.overlay_scale = crate::ui::shared::step_overlay_scale(prefs.overlay_scale, d);
                 out.push(Cmd::Prefs);
             }
             Action::Glyphs(d) => {
-                let opts = ["auto", "xbox", "playstation", "nintendo"];
+                let opts = crate::ui::shared::GLYPH_VALUES;
                 let i = opts.iter().position(|o| *o == prefs.glyphs).unwrap_or(0) as i32;
-                prefs.glyphs = opts[(i + d).rem_euclid(4) as usize].to_string();
+                prefs.glyphs = opts[(i + d).rem_euclid(opts.len() as i32) as usize].to_string();
                 out.push(Cmd::Prefs);
             }
             Action::Hotkey(i) => {
@@ -1268,7 +1251,9 @@ impl Overlay {
         if ui.ctx().current_pass_index() > 0 {
             nav = Nav::default();
         }
-        let rows = self.rows(prefs);
+        // The rows are built once a frame, and again only when something this frame
+        // changed them (another page opened, a row's action done).
+        let mut rows = self.rows(prefs);
         self.follow(&rows);
         if self.sel_moved.is_some_and(|t| t.elapsed() < MOVED_HOLD) {
             nav.select = false;
@@ -1277,7 +1262,6 @@ impl Overlay {
         // Left / right change the selected row's value when it has one, and switch pages
         // otherwise.
         if nav.left || nav.right {
-            let rows = self.rows(prefs);
             let changes = rows.get(self.sel).is_some_and(|r| r.selectable && r.change.is_some());
             if !changes {
                 nav.prev_tab |= nav.left;
@@ -1287,6 +1271,7 @@ impl Overlay {
             }
         }
         // Page switching and closing.
+        let (page_before, invite_before) = (self.page.clone(), self.invite_mode);
         let tab_i = TABS.iter().position(|p| *p == self.page.tab()).unwrap_or(0);
         if nav.next_tab || nav.prev_tab {
             let n = TABS.len() as i32;
@@ -1305,7 +1290,9 @@ impl Overlay {
                 None => out.push(Cmd::Close),
             }
         }
-        let rows = self.rows(prefs);
+        if self.page != page_before || self.invite_mode != invite_before {
+            rows = self.rows(prefs);
+        }
         let selectable: Vec<usize> = rows.iter().enumerate().filter(|(_, r)| r.selectable).map(|(i, _)| i).collect();
         if !selectable.contains(&self.sel) {
             self.sel = selectable.first().copied().unwrap_or(0);
@@ -1501,18 +1488,10 @@ impl Overlay {
                         rx -= 10.0;
                     }
                     if row.is_on() || row.value == t!("common.off") {
-                        // A switch, drawn as one.
+                        // A switch, drawn as one (shared with launcher/src/ui/widgets.rs).
                         let on = row.is_on();
                         let sw = Rect::from_min_size(Pos2::new(rx - 40.0, rect.center().y - 11.0), Vec2::new(40.0, 22.0));
-                        if on {
-                            fx::glow(p, sw, 11.0, ACCENT.gamma_multiply(0.35), 8.0);
-                            fx::gradient(p, sw, 11.0, false, &[(0.0, ACCENT), (1.0, theme::mix(ACCENT, theme::VIOLET, 0.5))]);
-                        } else {
-                            p.rect_filled(sw, 11.0, Color32::from_rgb(14, 15, 20));
-                            p.rect_stroke(sw, 11.0, Stroke::new(1.0, theme::line_strong()), egui::StrokeKind::Inside);
-                        }
-                        let k = Pos2::new(if on { sw.right() - 11.0 } else { sw.left() + 11.0 }, sw.center().y);
-                        p.circle_filled(k, 8.0, if on { Color32::WHITE } else { Color32::from_gray(190) });
+                        crate::ui::shared::paint_switch(p, sw, if on { 1.0 } else { 0.0 }, selected);
                     } else {
                         let g = p.text(Pos2::new(rx, rect.center().y), Align2::RIGHT_CENTER, &row.value, theme::strong(14.5), TEXT);
                         if selected && row.change.is_some() {
@@ -1630,8 +1609,7 @@ impl Overlay {
             fx::gradient(painter, r, 12.0, true, &[(0.0, Color32::from_rgba_unmultiplied(32, 36, 47, 246)), (1.0, Color32::from_rgba_unmultiplied(22, 24, 31, 246))]);
             painter.rect_stroke(r, 12.0, Stroke::new(1.0, theme::line_strong()), egui::StrokeKind::Inside);
             let tile = Rect::from_min_size(r.left_top() + Vec2::new(14.0, 14.0), Vec2::splat(28.0));
-            fx::gradient(painter, tile, 8.0, true, &[(0.0, ACCENT), (1.0, theme::VIOLET)]);
-            brand_lines(painter, tile);
+            crate::ui::shared::brand_mark(painter, tile);
             painter.text(Pos2::new(tile.right() + 12.0, r.top() + 15.0), Align2::LEFT_TOP, &t.title, theme::strong(15.0), TEXT);
             painter.galley(Pos2::new(tile.right() + 12.0, r.top() + 37.0), dg, DIM);
             area = area.union(r.expand(18.0));
@@ -1659,20 +1637,9 @@ pub fn background(panel: Rect) -> Vec<egui::Shape> {
     ]
 }
 
-/// PeerParty's mark: two nodes and their link on a lit tile.
+/// PeerParty's 3-node brand mark (shared with the launcher window).
 fn brand(p: &egui::Painter, r: Rect) {
-    fx::glow(p, r, 10.0, ACCENT.gamma_multiply(0.4), 12.0);
-    fx::gradient(p, r, 10.0, false, &[(0.0, ACCENT), (1.0, theme::VIOLET)]);
-    fx::gradient(p, r, 10.0, true, &[(0.0, Color32::from_white_alpha(46)), (0.55, Color32::TRANSPARENT)]);
-    brand_lines(p, r);
-}
-
-fn brand_lines(p: &egui::Painter, r: Rect) {
-    let k = r.width() / 38.0;
-    let (a, b) = (r.left_center() + Vec2::new(10.5 * k, 0.0), r.right_center() - Vec2::new(10.5 * k, 0.0));
-    p.line_segment([a, b], Stroke::new(2.6 * k, Color32::WHITE));
-    p.circle_filled(a, 4.6 * k, Color32::WHITE);
-    p.circle_filled(b, 4.6 * k, Color32::WHITE);
+    crate::ui::shared::brand_mark(p, r);
 }
 
 fn sdk_label(s: &str) -> &str {
@@ -1769,12 +1736,12 @@ mod tests {
         o.act(Action::Block(1), &mut prefs, &mut out);
         assert!(out.is_empty(), "one press blocked");
         o.act(Action::Block(1), &mut prefs, &mut out);
-        assert!(matches!(&out[..], [Cmd::Hook(v)] if v["t"] == "block" && v["peer"] == "cc"));
+        assert!(matches!(&out[..], [Cmd::Hook(HostMsg::Block { peer })] if peer == "cc"));
         let undo = o.rows(&prefs).into_iter().find(|r| r.main == Action::Unblock).expect("no Undo row");
         assert!(undo.title.contains(&o.state.peers[1].name), "{}", undo.title);
         out.clear();
         o.act(Action::Unblock, &mut prefs, &mut out);
-        assert!(matches!(&out[..], [Cmd::Hook(v)] if v["t"] == "unblock" && v["peer"] == "cc"));
+        assert!(matches!(&out[..], [Cmd::Hook(HostMsg::Unblock { peer })] if peer == "cc"));
     }
 
     /// A dedicated server is listed by its own name as a server: no version warning
@@ -1843,13 +1810,13 @@ mod tests {
         let mut out = Vec::new();
         let mut p = Prefs::default();
         o.act(Action::ToggleMic, &mut p, &mut out);
-        assert!(matches!(&out[..], [Cmd::Hook(v)] if v["t"] == "mic" && v["on"] == false));
+        assert!(matches!(&out[..], [Cmd::Hook(HostMsg::Mic { on: false })]));
         let id = o.state.peers[0].id.clone();
         o.open(Page::Profile(id.clone()), false);
         assert!(o.rows(&prefs).iter().any(|r| r.main == Action::ToggleMute(0)));
         out.clear();
         o.act(Action::ToggleMute(0), &mut p, &mut out);
-        assert!(matches!(&out[..], [Cmd::Hook(v)] if v["t"] == "mute" && v["peer"] == id.as_str() && v["on"] == true));
+        assert!(matches!(&out[..], [Cmd::Hook(HostMsg::Mute { peer, on: true })] if *peer == id));
     }
 
     /// With Steam's overlay loaded in the game, Shift+Tab is left to it: Settings lists
@@ -1887,7 +1854,7 @@ mod tests {
         let mut out = Vec::new();
         o.act(Action::ToggleInternet, &mut prefs, &mut out);
         assert!(!prefs.internet);
-        assert!(matches!(&out[..], [Cmd::Prefs, Cmd::Hook(v)] if v["t"] == "set" && v["key"] == "internet" && v["value"] == "off"));
+        assert!(matches!(&out[..], [Cmd::Prefs, Cmd::Hook(HostMsg::Set { key, value })] if key == "internet" && value == "off"));
         let rows = o.rows(&prefs);
         assert_eq!(rows.iter().find(|r| r.selectable).unwrap().value, "Off");
         assert!(!rows.iter().any(|r| r.title.starts_with("Your room")), "no status while off");
@@ -1901,7 +1868,7 @@ mod tests {
         let mut out = Vec::new();
         o.act(Action::ToggleInternet, &mut prefs, &mut out);
         assert!(prefs.internet && o.state.internet_on);
-        assert!(matches!(&out[..], [Cmd::Prefs, Cmd::Hook(v)] if v["value"] == "on"));
+        assert!(matches!(&out[..], [Cmd::Prefs, Cmd::Hook(HostMsg::Set { value, .. })] if value == "on"));
 
         o.state = GameState::from_json(&serde_json::json!({"t": "state", "internet_on": true, "internet_configured": false, "internet": []}));
         let rows = o.rows(&Prefs::default());
@@ -2051,13 +2018,17 @@ mod tests {
         let mut o = Overlay::new("Game".into());
         o.state = sample_state();
         o.state.can_invite = false;
-        o.state.invite_note = "This game has no invites: players on your network join your session from the game's own menu (room EUCSH)".into();
+        o.state.invite_block = Some(InviteBlock::PhotonRoom("EUCSH".into()));
         o.open(Page::Home, false);
         let rows = o.rows(&Prefs::default());
         let row = rows.iter().find(|r| r.title == t!("overlay.invite_all")).unwrap();
         assert!(!row.selectable, "nothing to press");
         assert!(row.detail.contains("game's own menu") && row.detail.ends_with("(room EUCSH)"), "{}", row.detail);
-        assert_eq!(hook_text(&o.state.invite_note), t!("hook.photon_room", room = "EUCSH"));
+        assert_eq!(row.detail, t!("hook.photon_room", room = "EUCSH"));
+        // The state carries it as the hook sends it.
+        let st = GameState::from_json(&serde_json::json!({"t": "state", "invite_block": InviteBlock::PhotonRoom("EUCSH".into()).to_json().to_string().parse::<Value>().unwrap()}));
+        assert_eq!(st.invite_block, Some(InviteBlock::PhotonRoom("EUCSH".into())));
+        assert_eq!(st.why_no_invite(), row.detail);
         if let Some(d) = std::env::var_os("PEERPARTY_PREVIEW_DIR") {
             let ctx = egui::Context::default();
             theme::install_fonts(&ctx);
@@ -2083,7 +2054,7 @@ mod tests {
         o.state.can_invite = false;
         o.state.layers_off = st.layers_off;
         // The hook's invite.rs LAYERS_OFF note.
-        o.state.invite_note = "Turned off for this game in PeerParty: steam".into();
+        o.state.invite_block = Some(InviteBlock::LayersOff(vec!["steam".into()]));
         o.open(Page::Home, false);
         let rows = o.rows(&Prefs::default());
         let steam = rows.iter().find(|r| r.title == t!("overlay.layer_off", name = t!("layer.steam"))).expect("a row for the Steam layer");
@@ -2096,28 +2067,60 @@ mod tests {
         assert_eq!(invite.detail, t!("hook.layers_off", names = t!("layer.steam")));
         assert!(invite.detail.contains("Steam lobbies") && !invite.detail.contains("Host or join"), "{}", invite.detail);
         assert_eq!(
-            hook_text("Turned off for this game in PeerParty: eos, galaxy"),
+            block_text(&InviteBlock::LayersOff(vec!["eos".into(), "galaxy".into()])),
             t!("hook.layers_off", names = format!("{}, {}", t!("layer.eos"), t!("layer.galaxy")))
         );
-        // The hook's invite.rs OFFICIAL_START + services + OFFICIAL_END, and UNSUPPORTED_START.
-        let official = "This game's online play goes through Steam and Photon's own servers, which PeerParty can't invite through: use the game's own invites or room codes, or set it to PeerParty's own in this game's page in PeerParty (Advanced, Online services)";
-        assert_eq!(hook_text(official), t!("hook.official", names = "Steam and Photon", mode = t!("mode.lan")));
-        let unsupported = "Not supported for this game yet: PeerParty can't hand it an invite through PlayFab Party";
-        assert_eq!(hook_text(unsupported), t!("hook.unsupported", names = "PlayFab Party"));
+        // The game's services left on their own servers, and ones without invites.
+        let official = InviteBlock::Official(vec!["Steam".into(), "Photon".into()]);
+        assert_eq!(block_text(&official), t!("hook.official", names = "Steam and Photon", mode = t!("mode.lan")));
+        assert_eq!(block_text(&InviteBlock::Unsupported(vec!["PlayFab Party".into()])), t!("hook.unsupported", names = "PlayFab Party"));
+        assert_eq!(block_text(&InviteBlock::LearnFirst), t!("hook.learn_invite"));
+        assert_eq!(block_text(&InviteBlock::HostFirst), t!("overlay.host_first"));
+        // A note this build can't read as a block shows as the hook wrote it; none at all
+        // asks to host first.
+        o.state.invite_block = None;
+        o.state.invite_note = "Something the hook said".into();
+        assert_eq!(o.state.why_no_invite(), "Something the hook said");
+        o.state.invite_note.clear();
+        assert_eq!(o.state.why_no_invite(), t!("overlay.host_first"));
     }
 
-    /// The hook's answers to Join and its invite note name the player (invite.rs
+    /// The hook's answers to Join and its invite notes name the player (invite.rs
     /// together_detail, nowhere_detail, sent_detail).
     #[test]
     fn notes_with_a_players_name_are_translated() {
         // The language stays English: it's global, and other tests run alongside.
-        assert_eq!(hook_text("Already playing together"), t!("hook.already_together"));
-        assert_eq!(hook_text("Can't join"), t!("hook.cant_join"));
-        assert_eq!(hook_text("You're already in Lola's game"), t!("hook.together_detail", name = "Lola"));
-        assert_eq!(hook_text("Lola isn't in a game you can join yet"), t!("hook.nowhere_detail", name = "Lola"));
-        assert_eq!(hook_text("To Lola"), t!("hook.to_name", name = "Lola"));
-        assert_eq!(hook_text("To 3 players"), t!("hook.to_players", n = 3));
-        assert_eq!(hook_text("To 1 player"), t!("hook.to_players", n = 1));
+        let text = |n: Notice| notice_text(&n);
+        assert_eq!(text(Notice::already_together("Lola")), (t!("hook.already_together").into(), t!("hook.together_detail", name = "Lola")));
+        assert_eq!(text(Notice::cant_join("Lola")), (t!("hook.cant_join").into(), t!("hook.nowhere_detail", name = "Lola")));
+        assert_eq!(text(Notice::invite_sent(&["Lola".into()])), (t!("hook.invite_sent").into(), t!("hook.to_name", name = "Lola")));
+        let three = ["Lola".to_string(), "Timber".into(), "Sam".into()];
+        assert_eq!(text(Notice::invite_sent(&three)).1, t!("hook.to_players", n = 3));
+        assert_eq!(text(Notice { name: None, ..Notice::invite_sent(&["Lola".into()]) }).1, t!("hook.to_players", n = 1));
+        assert_eq!(text(Notice::achievement("First steps")), (t!("hook.achievement").into(), "First steps".into()));
+        assert_eq!(text(Notice::nobody_to_invite()), (t!("hook.nobody").into(), t!("hook.nobody_detail").into()));
+        assert_eq!(text(Notice::cant_invite(InviteBlock::HostFirst)), (t!("hook.cant_invite").into(), t!("overlay.host_first").into()));
+        assert_eq!(text(Notice::join_asked(InviteBlock::LearnFirst)), (t!("hook.asked_to_join").into(), t!("hook.learn_invite").into()));
+    }
+
+    /// "Type a copied room code" with nothing code-like copied (invite.rs type_clipboard).
+    #[test]
+    fn nothing_to_paste_is_translated() {
+        assert_eq!(notice_text(&Notice::no_code_to_paste()), (t!("hook.no_code").into(), t!("hook.no_code_detail").into()));
+    }
+
+    /// A note without a code this build knows (an older hook's, a newer one's) shows its
+    /// own words, as they came.
+    #[test]
+    fn notes_without_a_known_code_show_their_text() {
+        assert_eq!(notice_text(&Notice::text("Something new", "from a newer hook")), ("Something new".into(), "from a newer hook".into()));
+        let future = peerparty_protocol::ipc::HookMsg::from_line(r#"{"t":"note","code":"from_the_future","title":"Saved","detail":"Your game was saved"}"#);
+        let Some(peerparty_protocol::ipc::HookMsg::Note(n)) = future else { panic!("{future:?}") };
+        assert_eq!(n.code, NoticeCode::Text);
+        assert_eq!(notice_text(&n), ("Saved".into(), "Your game was saved".into()));
+        let mut o = Overlay::new("Game".into());
+        o.notice(&n, true);
+        assert_eq!(o.notice.as_ref().map(|(s, _)| s.as_str()), Some("Saved: Your game was saved"));
     }
 
     /// A Photon room: Home says which room we're in and who is there (not "no lobby"),
@@ -2147,10 +2150,10 @@ mod tests {
         let mut out = Vec::new();
         let mut prefs = Prefs::default();
         o.act(paste.main, &mut prefs, &mut out);
-        assert!(out.iter().any(|c| matches!(c, Cmd::Hook(v) if v["t"] == "paste")) && out.iter().any(|c| matches!(c, Cmd::Close)));
+        assert!(out.iter().any(|c| matches!(c, Cmd::Hook(HostMsg::Paste))) && out.iter().any(|c| matches!(c, Cmd::Close)));
         out.clear();
         o.act(Action::Accept(0), &mut prefs, &mut out);
-        assert!(out.iter().any(|c| matches!(c, Cmd::Hook(v) if v["t"] == "accept" && v["id"] == 7)) && out.iter().any(|c| matches!(c, Cmd::Close)));
+        assert!(out.iter().any(|c| matches!(c, Cmd::Hook(HostMsg::Accept { id: 7 }))) && out.iter().any(|c| matches!(c, Cmd::Close)));
     }
 
     /// Draws one frame and returns what it asked for.
@@ -2169,7 +2172,7 @@ mod tests {
 
     fn accepted(cmds: &[Cmd]) -> Option<u64> {
         cmds.iter().find_map(|c| match c {
-            Cmd::Hook(v) if v["t"] == "accept" => v["id"].as_u64(),
+            Cmd::Hook(HostMsg::Accept { id }) => Some(*id),
             _ => None,
         })
     }

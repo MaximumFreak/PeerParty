@@ -12,11 +12,19 @@
 //!   sequence / ack header, split into fragments above 432 bytes;
 //! - a notify packet holds a state part (inputs, objects) and the reliable message list.
 //!
+//! That is Fusion 1's simulation layer (Fusion.Runtime 1.x, read from a 1.1.8 client). Fusion 2
+//! (2.0.x) keeps the sockets layer and the message envelope but lays
+//! out the packet, the objects and the server's own state anew: v2.rs. The plugin picks
+//! by the Fusion version the first peer's `Join` gives.
+//!
 //! Interest management isn't done: everyone gets every object.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use super::fusion::{BitReader, BitWriter};
+
+mod v2;
+pub use v2::resolve_rates;
 
 // ------------------------------------------------------------------ bits
 
@@ -213,18 +221,21 @@ struct Object {
     words: Vec<i32>,
     /// The server tick each word last changed at (0 = never).
     changed: Vec<i32>,
+    /// Where this Fusion version's header keeps the state authority and the flags.
+    authority_at: usize,
+    flags_at: usize,
 }
 
 impl Object {
     fn new(words: Vec<i32>) -> Object {
         let n = words.len();
-        Object { words, changed: vec![0; n] }
+        Object { words, changed: vec![0; n], authority_at: word::STATE_AUTHORITY, flags_at: word::FLAGS }
     }
     fn authority(&self) -> i32 {
-        self.words.get(word::STATE_AUTHORITY).copied().unwrap_or(0)
+        self.words.get(self.authority_at).copied().unwrap_or(0)
     }
     fn flags(&self) -> i32 {
-        self.words.get(word::FLAGS).copied().unwrap_or(0)
+        self.words.get(self.flags_at).copied().unwrap_or(0)
     }
     fn set(&mut self, i: usize, v: i32, tick: i32) {
         if i < self.words.len() && self.words[i] != v {
@@ -349,7 +360,8 @@ struct Envelope {
     objects: Vec<(u32, i32)>,
     destroys: Vec<u32>,
     messages: Vec<Message>,
-    globals: [i32; 32],
+    globals: Option<[i32; 32]>,
+    reliable: Option<v2::ReliableSlice>,
 }
 
 struct Conn {
@@ -376,6 +388,13 @@ struct Conn {
     input_offset: Ema,
     packet_interval: Ema,
     last_packet_ms: Option<i64>,
+    /// Fusion 2: this player's PlayerData object (0 = none yet).
+    player_data: u32,
+    /// Fusion 2: per-connection reliable data (NOTIFY_RELIABLE) reorder and send queues.
+    reliable_in_seq: u32,
+    reliable_in_waiting: BTreeMap<u32, v2::ReliableSlice>,
+    reliable_out_seq: u32,
+    reliable_out: VecDeque<v2::ReliableSlice>,
 }
 
 impl Conn {
@@ -414,10 +433,18 @@ pub struct Server {
     objects: BTreeMap<u32, Object>,
     globals: [i32; 32],
     last_status_ms: i64,
+    /// The room's master client (actor), as the last relayed packet gave it.
+    master: i32,
+    /// Player indices the plugin gave actors in their Join (Fusion 2 clients take theirs
+    /// from it, so their connection here must have the same one).
+    reserved: HashMap<i32, usize>,
+    /// Fusion 2's layout and the state that goes with it; None for Fusion 1.
+    v2: Option<v2::State>,
     pub log: Vec<String>,
 }
 
 impl Server {
+    /// Fusion 1's server.
     pub fn new(tick_rate: u32, players: usize) -> Server {
         let players = players.clamp(1, 255);
         let mut globals = [0i32; 32];
@@ -434,8 +461,16 @@ impl Server {
             objects: BTreeMap::new(),
             globals,
             last_status_ms: 0,
+            master: 0,
+            reserved: HashMap::new(),
+            v2: None,
             log: Vec::new(),
         }
+    }
+
+    /// `actor`'s player index, as its Join was given it.
+    pub fn reserve(&mut self, actor: i32, player: usize) {
+        self.reserved.insert(actor, player);
     }
 
     pub fn players(&self) -> usize {
@@ -457,6 +492,7 @@ impl Server {
     /// A relayed packet from `actor`.
     pub fn packet(&mut self, actor: i32, data: &[u8], now: i64, master: i32) -> Out {
         let mut out = Out::new();
+        self.master = master;
         let Some(&kind) = data.first() else { return out };
         if kind == packet::COMMAND {
             self.command(actor, data, now, &mut out);
@@ -487,7 +523,13 @@ impl Server {
                     return;
                 }
                 let used: Vec<usize> = self.conns.values().map(|c| c.player).collect();
-                let Some(player) = (0..self.players).find(|p| !used.contains(p)) else {
+                let reserved = self.reserved.get(&actor).copied().filter(|p| *p < self.players && !used.contains(p));
+                if let Some(r) = self.reserved.get(&actor).copied()
+                    && reserved.is_none()
+                {
+                    self.log.push(format!("photon: Fusion Shared: actor {actor}'s player {r} (from its Join) is taken or past the session's {}; it gets another", self.players));
+                }
+                let Some(player) = reserved.or_else(|| (0..self.players).find(|p| !used.contains(p) && !self.reserved.values().any(|r| r == p && self.reserved.get(&actor) != Some(r)))).or_else(|| (0..self.players).find(|p| !used.contains(p))) else {
                     self.log.push(format!("photon: Fusion Shared session is full ({}); refusing actor {actor}", self.players));
                     out.push((actor, vec![packet::COMMAND, packet::REFUSED, packet::SERVER_FULL]));
                     return;
@@ -517,6 +559,11 @@ impl Server {
                     input_offset: Ema::default(),
                     packet_interval: Ema::default(),
                     last_packet_ms: None,
+                    player_data: 0,
+                    reliable_in_seq: 0,
+                    reliable_in_waiting: BTreeMap::new(),
+                    reliable_out_seq: 0,
+                    reliable_out: VecDeque::new(),
                 };
                 out.push((actor, accepted(c.local_id, c.remote_id, c.counter)));
                 self.conns.insert(actor, c);
@@ -543,6 +590,10 @@ impl Server {
         let player = self.conns[&actor].player;
         let raw = player as i32 + 1;
         self.log.push(format!("photon: Fusion Shared player {player} is actor {actor}"));
+        if self.v2.is_some() {
+            self.joined_v2(actor);
+            return;
+        }
         self.globals[4 + player / 32] |= 1 << (player % 32);
         let words = word::HEADER + 2 * self.players;
         let players = self.players;
@@ -569,23 +620,42 @@ impl Server {
 
     /// `actor` left (its Disconnect, a timeout, or it left the room).
     pub fn left(&mut self, actor: i32) {
+        self.reserved.remove(&actor);
         let Some(c) = self.conns.remove(&actor) else { return };
         let raw = c.raw_player();
         self.log.push(format!("photon: Fusion Shared player {} (actor {actor}) left", c.player));
-        self.globals[4 + c.player / 32] &= !(1 << (c.player % 32));
         let tick = self.tick + 1;
+        // Both versions' DestroyWhenStateAuthorityLeaves flag is 2.
+        let owned: Vec<u32> = self.objects.iter().filter(|(_, o)| o.authority() == raw).map(|(id, _)| *id).collect();
+        let (mut gone, mut kept) = (0, 0);
+        for id in owned {
+            if self.objects[&id].flags() & flags::DESTROY_WHEN_STATE_AUTHORITY_LEAVES != 0 {
+                self.destroy(id, None);
+                gone += 1;
+            } else if let Some(o) = self.objects.get_mut(&id) {
+                let at = o.authority_at;
+                o.set(at, 0, tick);
+                kept += 1;
+            }
+        }
+        if gone + kept > 0 {
+            self.log.push(format!(
+                "photon: Fusion Shared player {}'s objects: {gone} destroyed with it, {kept} left without state authority",
+                c.player
+            ));
+        }
+        if self.v2.is_some() {
+            self.left_v2(&c);
+            if self.conns.is_empty() {
+                self.started_ms = None;
+            }
+            return;
+        }
+        self.globals[4 + c.player / 32] &= !(1 << (c.player % 32));
         let players = self.players;
         if let Some(s) = self.objects.get_mut(&INTERNAL_STATE) {
             s.set(word::HEADER + c.player, 0, tick);
             s.set(word::HEADER + players + c.player, 0, tick);
-        }
-        let owned: Vec<u32> = self.objects.iter().filter(|(_, o)| o.authority() == raw).map(|(id, _)| *id).collect();
-        for id in owned {
-            if self.objects[&id].flags() & flags::DESTROY_WHEN_STATE_AUTHORITY_LEAVES != 0 {
-                self.destroy(id, None);
-            } else if let Some(o) = self.objects.get_mut(&id) {
-                o.set(word::STATE_AUTHORITY, 0, tick);
-            }
         }
         let t = self.tick;
         for c in self.conns.values_mut() {
@@ -653,7 +723,9 @@ impl Server {
         c.recv_mask = if d >= 64 { 1 } else { (c.recv_mask << d) | 1 };
         self.acks(actor, h, now);
         if h.kind == packet::NOTIFY_RELIABLE {
-            // Reliable data (SendReliableDataToPlayer / ToServer) isn't served.
+            if self.v2.is_some() {
+                self.reliable_v2(actor, &whole[packet::HEADER..]);
+            }
             return;
         }
         self.body(actor, &whole[packet::HEADER..], now, master, out);
@@ -676,13 +748,16 @@ impl Server {
             }
         }
         for e in delivered {
-            c.acked_globals = e.globals;
+            if let Some(g) = e.globals {
+                c.acked_globals = g;
+            }
             for (id, _) in e.objects {
                 if let Some(s) = c.objects.get_mut(&id) {
                     s.create_unconfirmed = false;
                 }
             }
         }
+        let mut lost_reliable = Vec::new();
         for e in lost {
             for (id, reset) in e.objects {
                 if let Some(s) = c.objects.get_mut(&id) {
@@ -697,12 +772,22 @@ impl Server {
             for m in e.messages.into_iter().rev() {
                 c.out.push_front(m);
             }
+            if let Some(s) = e.reliable {
+                lost_reliable.push(s);
+            }
+        }
+        for s in lost_reliable.into_iter().rev() {
+            c.reliable_out.push_front(s);
         }
     }
 
     // -------------------------------------------------------------- what clients send
 
     fn body(&mut self, actor: i32, body: &[u8], now: i64, master: i32, out: &mut Out) {
+        if self.v2.is_some() {
+            self.body_v2(actor, body, now, master, out);
+            return;
+        }
         let mut r = BitReader::new(body);
         let Some(has_state) = r.bool() else { return };
         if has_state && self.state(actor, &mut r, now).is_none() {
@@ -805,7 +890,8 @@ impl Server {
             }
         }
         for id in destroys {
-            if self.objects.get(&id).is_some_and(|o| o.authority() == raw || o.authority() == 0) {
+            // The room's own state object is the server's: no player destroys it.
+            if id != INTERNAL_STATE && self.objects.get(&id).is_some_and(|o| o.authority() == raw || o.authority() == 0) {
                 self.destroy(id, Some(actor));
             }
         }
@@ -891,6 +977,10 @@ impl Server {
     }
 
     fn internal(&mut self, actor: i32, kind: i32, m: &Message, master: i32) {
+        if self.v2.is_some() {
+            self.internal_v2(actor, kind, m, master);
+            return;
+        }
         let raw = self.conns[&actor].raw_player();
         let player = self.conns[&actor].player;
         let tick = self.tick + 1;
@@ -964,23 +1054,55 @@ impl Server {
             return out;
         }
         self.tick = due;
+        if self.v2.is_some() {
+            self.sync_master_v2();
+        }
         if now - self.last_status_ms >= 10_000 {
             self.last_status_ms = now;
             let mut who: Vec<String> = self.conns.iter().map(|(a, c)| format!("{} (actor {a})", c.player)).collect();
             who.sort();
+            let scene = if self.v2.is_some() { self.scene_v2() } else { self.globals[0].to_string() };
             self.log.push(format!(
-                "photon: Fusion Shared tick {}: players {}, {} objects, scene {}",
+                "photon: Fusion Shared tick {}: players {}, {} objects, scene {scene}",
                 self.tick,
                 who.join(", "),
                 self.objects.len(),
-                self.globals[0]
             ));
         }
         let actors: Vec<i32> = self.conns.keys().copied().collect();
         for a in actors {
-            self.send_state(a, &mut out);
+            if self.v2.is_some() {
+                self.send_state_v2(a, &mut out);
+                self.send_reliable_v2(a, &mut out);
+            } else {
+                self.send_state(a, &mut out);
+            }
         }
         out
+    }
+
+    /// Sends a notify packet's `body` to `actor`, keeping what it carried for when it's
+    /// acknowledged or lost.
+    /// `carried` gets its sequence here.
+    fn send_notify(&mut self, actor: i32, body: &[u8], mut carried: Envelope, out: &mut Out) {
+        let c = self.conns.get_mut(&actor).unwrap();
+        carried.messages.retain(|m| m.flags & msg::UNRELIABLE == 0);
+        c.send_seq = c.send_seq.wrapping_add(1);
+        let h = Notify { kind: packet::NOTIFY_DATA, fragment: 0, seq: c.send_seq, ack: c.recv_seq, mask: c.recv_mask };
+        carried.seq = c.send_seq;
+        c.window.push_back(carried);
+        while c.window.len() > 1024 {
+            c.window.pop_front();
+        }
+        let mut bytes = h.bytes().to_vec();
+        bytes.extend_from_slice(body);
+        let parts = fragments(&bytes);
+        if parts.is_empty() {
+            self.log.push(format!("photon: Fusion Shared packet for actor {actor} too big to send ({} bytes)", bytes.len()));
+        }
+        for p in parts {
+            out.push((actor, p));
+        }
     }
 
     fn send_state(&mut self, actor: i32, out: &mut Out) {
@@ -1085,22 +1207,7 @@ impl Server {
         w.data[count_at / 8] = n as u8;
         w.data[count_at / 8 + 1] = (n >> 8) as u8;
         w.pad();
-        messages.retain(|m| m.flags & msg::UNRELIABLE == 0);
-        c.send_seq = c.send_seq.wrapping_add(1);
-        let h = Notify { kind: packet::NOTIFY_DATA, fragment: 0, seq: c.send_seq, ack: c.recv_seq, mask: c.recv_mask };
-        c.window.push_back(Envelope { seq: c.send_seq, objects: sent, destroys, messages, globals });
-        while c.window.len() > 1024 {
-            c.window.pop_front();
-        }
-        let mut bytes = h.bytes().to_vec();
-        bytes.extend_from_slice(&w.data);
-        let parts = fragments(&bytes);
-        if parts.is_empty() {
-            self.log.push(format!("photon: Fusion Shared packet for actor {actor} too big to send ({} bytes)", bytes.len()));
-        }
-        for p in parts {
-            out.push((actor, p));
-        }
+        self.send_notify(actor, &w.data, Envelope { seq: 0, objects: sent, destroys, messages, globals: Some(globals), reliable: None }, out);
     }
 }
 

@@ -1,14 +1,14 @@
-//! Finding installed games: Steam's app
-//! manifests, Epic's launcher manifests, GOG Galaxy's registry entries, and the
-//! subfolders of the player's game folders (`C:\Games` to begin with), whose program
-//! is picked by mainexe.rs. Nothing here is specific to one PC.
+//! Finding installed games: Steam's app manifests (here, from wherever the system keeps
+//! Steam), each store's own records (`platform::scan_installed_games`: Epic, GOG Galaxy
+//! and the Xbox app on Windows, Heroic and Lutris on Linux), and the subfolders of the
+//! player's game folders (`platform::default_games_dir` to begin with), whose program is
+//! picked by mainexe.rs. Nothing here is specific to one PC.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 
 use super::mainexe;
-use crate::platform::{self as win, Hive};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Source {
@@ -61,10 +61,7 @@ pub fn scan(folders: Vec<PathBuf>, tx: Sender<Found>) {
     let send = |g: Game| {
         let _ = tx.send(Found::Game(g));
     };
-    steam(&send);
-    epic(&send);
-    gog(&send);
-    xbox(&send);
+    crate::platform::scan_installed_games(&send);
     for root in folders {
         folder(&root, &send);
     }
@@ -89,14 +86,9 @@ pub fn clean_name(folder: &str) -> String {
 
 // ---- Steam ----
 
+/// Steam's own folder, where the system keeps it (`platform::steam_dir`).
 pub fn steam_dir() -> Option<PathBuf> {
-    win::reg_string(Hive::User, r"Software\Valve\Steam", "SteamPath")
-        .map(|p| PathBuf::from(p.replace('/', "\\")))
-        .filter(|p| p.is_dir())
-        .or_else(|| {
-            let d = PathBuf::from(r"C:\Program Files (x86)\Steam");
-            d.is_dir().then_some(d)
-        })
+    crate::platform::steam_dir()
 }
 
 /// A top-level `"key"  "value"` from a Steam .acf / .vdf (KeyValues) file.
@@ -152,9 +144,9 @@ fn steam_art(steam: &Path, id: &str) -> (Option<PathBuf>, Option<PathBuf>) {
     (cover, header)
 }
 
-fn steam(send: &impl Fn(Game)) {
-    let Some(steam) = steam_dir() else { return };
-    for lib in steam_libraries(&steam) {
+/// The games in Steam's libraries `libs` (`steam`: Steam's own folder, for the art).
+pub fn steam_games(steam: &Path, libs: &[PathBuf], send: &dyn Fn(Game)) {
+    for lib in libs {
         let Ok(entries) = fs::read_dir(&lib) else { continue };
         for e in entries.flatten() {
             let file = e.file_name().to_string_lossy().to_lowercase();
@@ -172,7 +164,7 @@ fn steam(send: &impl Fn(Game)) {
             }
             let dir = lib.join("common").join(&installdir);
             let Some(exe) = mainexe::find(&dir) else { continue };
-            let (cover, art) = steam_art(&steam, &id);
+            let (cover, art) = steam_art(steam, &id);
             send(Game {
                 name,
                 exe,
@@ -185,111 +177,9 @@ fn steam(send: &impl Fn(Game)) {
     }
 }
 
-// ---- Epic ----
-
-fn epic(send: &impl Fn(Game)) {
-    let data = win::reg_string(Hive::Machine, r"SOFTWARE\Epic Games\EpicGamesLauncher", "AppDataPath")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData\Epic\EpicGamesLauncher\Data"));
-    let Ok(entries) = fs::read_dir(data.join("Manifests")) else { return };
-    for e in entries.flatten() {
-        if !e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("item")) {
-            continue;
-        }
-        let Ok(text) = fs::read_to_string(e.path()) else { continue };
-        let Ok(m) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
-        let s = |k: &str| m.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
-        if m.get("bIsIncompleteInstall").and_then(|v| v.as_bool()) == Some(true) {
-            continue;
-        }
-        let (name, location, launch) = (s("DisplayName"), s("InstallLocation"), s("LaunchExecutable"));
-        if name.is_empty() || location.is_empty() || launch.is_empty() {
-            continue;
-        }
-        let dir = PathBuf::from(&location);
-        let exe = dir.join(launch.replace('/', "\\"));
-        if !exe.is_file() {
-            continue;
-        }
-        send(Game {
-            name,
-            exe,
-            dir,
-            source: Source::Epic,
-            cover: None,
-            art: None,
-        });
-    }
-}
-
-// ---- GOG Galaxy ----
-
-fn gog(send: &impl Fn(Game)) {
-    const KEY: &str = r"SOFTWARE\GOG.com\Games";
-    for id in win::reg_subkeys(Hive::Machine, KEY) {
-        let key = format!(r"{KEY}\{id}");
-        let get = |v: &str| win::reg_string(Hive::Machine, &key, v).unwrap_or_default();
-        let (name, exe, path) = (get("gameName"), get("exe"), get("path"));
-        if name.is_empty() || exe.is_empty() {
-            continue;
-        }
-        let exe = PathBuf::from(exe);
-        if !exe.is_file() {
-            continue;
-        }
-        let dir = if path.is_empty() { exe.parent().unwrap_or(Path::new("")).to_path_buf() } else { PathBuf::from(path) };
-        send(Game {
-            name,
-            exe,
-            dir,
-            source: Source::Gog,
-            cover: None,
-            art: None,
-        });
-    }
-}
-
-// ---- Xbox app (Microsoft Store, GDK) ----
-
-/// Games the Xbox app installed: `<drive>:\XboxGames\<game>\Content`, each a package
-/// (appxmanifest.xml) whose MicrosoftGame.config names the game's program. They start
-/// through packaged.rs.
-fn xbox(send: &impl Fn(Game)) {
-    for drive in b'C'..=b'Z' {
-        let root = PathBuf::from(format!(r"{}:\XboxGames", drive as char));
-        let Ok(entries) = fs::read_dir(&root) else { continue };
-        for e in entries.flatten() {
-            let content = e.path().join("Content");
-            let Ok(config) = fs::read_to_string(content.join("MicrosoftGame.config")).or_else(|_| fs::read_to_string(content.join("MicrosoftGame.Config"))) else {
-                continue;
-            };
-            let attr = |name: &str| {
-                let key = format!("{name}=\"");
-                let start = config.find(&key)? + key.len();
-                let end = config[start..].find('"')? + start;
-                Some(config[start..end].to_string())
-            };
-            let Some(exe) = config.find("<Executable ").and_then(|i| {
-                let tag = &config[i..i + config[i..].find('>')?];
-                let k = tag.find("Name=\"")? + 6;
-                let n = tag[k..].find('"')?;
-                Some(content.join(tag[k..k + n].replace('/', "\\")))
-            }) else {
-                continue;
-            };
-            if !exe.is_file() {
-                continue;
-            }
-            let name = e.file_name().to_string_lossy().into_owned();
-            let art = ["Square480x480Logo", "Square150x150Logo"].iter().find_map(|k| attr(k)).map(|p| content.join(p)).filter(|p| p.is_file());
-            send(Game { name, exe, dir: content, source: Source::Xbox, cover: None, art });
-        }
-    }
-}
-
 // ---- folders of games ----
 
-fn folder(root: &Path, send: &impl Fn(Game)) {
+fn folder(root: &Path, send: &dyn Fn(Game)) {
     let Ok(entries) = fs::read_dir(root) else { return };
     let mut dirs: Vec<PathBuf> = entries
         .flatten()

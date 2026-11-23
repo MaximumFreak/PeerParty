@@ -1,0 +1,1610 @@
+//! The session window drawing the copies' frames itself (compositor.rs), from the shared
+//! textures their hooks copy each frame into (`protocol::frame_ring`, hook/src/video/
+//! capture.rs).
+//!
+//! A thread of its own owns a Direct3D 11 device on the adapter the copies render on and
+//! a flip-model swap chain on the session's window. It sleeps until a copy publishes a
+//! frame (the session's frame event) or the panes change, waits for the swap chain to have
+//! room (frame latency 1), takes each copy's newest finished frame (`RingHeader::take`),
+//! has the GPU wait for its content fence, draws it scaled into the copy's pane, presents
+//! with vsync, and signals each copy's release fence after. The CPU never waits for a
+//! copy, and a copy never waits for it.
+//!
+//! A pane whose copy has no frame here yet (another adapter, a graphics API that doesn't
+//! share textures, or before its first frame) keeps its DWM thumbnail: `live` says which
+//! panes this draws, and the window hides only those thumbnails.
+//!
+//! Colour: each copy's frames come with the colour space its game set (`SurfaceMsg::
+//! color_space`): sRGB, scRGB (linear float) or HDR10 (PQ-encoded BT.2020). On a monitor
+//! Windows runs in HDR, the swap chain is 16-bit float scRGB: SDR panes are decoded to
+//! linear light at Windows' SDR white level (the "SDR content brightness" slider), scRGB
+//! ones go as they are, HDR10 ones are decoded from PQ to nits and BT.709 primaries, so
+//! mixed panes all look as they would on their own and Windows maps the result to the
+//! display. On an SDR monitor the swap chain is 8-bit sRGB: SDR panes go as they are and
+//! HDR ones are tone-mapped down (`roll_off`). Which one the monitor is gets looked at
+//! again when the window moves to another and once a second (HDR turned on or off, the
+//! SDR white level moved).
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+
+use peerparty_protocol::frame_ring::SLOTS;
+use peerparty_protocol::ipc::SurfaceMsg;
+use peerparty_protocol::session::PaneRect;
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND};
+use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects, WaitForSingleObjectEx};
+
+/// Calls method `slot` of COM object `obj` (stdcall, `this` first).
+macro_rules! vcall {
+    ($obj:expr, $slot:expr, fn($($t:ty),*) -> $r:ty $(, $arg:expr)* $(,)?) => {{
+        let obj = $obj as usize;
+        let vt = unsafe { *(obj as *const *const usize) };
+        let f: unsafe extern "system" fn(usize $(, $t)*) -> $r = unsafe { std::mem::transmute(*vt.add($slot)) };
+        unsafe { f(obj $(, $arg)*) }
+    }};
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Guid(u32, u16, u16, [u8; 8]);
+
+const IID_IDXGIFACTORY1: Guid = Guid(0x770aae78, 0xf26f, 0x4dba, [0xa8, 0x29, 0x25, 0x3c, 0x83, 0xd1, 0xb3, 0x87]);
+const IID_IDXGIFACTORY2: Guid = Guid(0x50c83a1c, 0xe072, 0x4c48, [0x87, 0xb0, 0x36, 0x30, 0xfa, 0x36, 0xa6, 0xd0]);
+const IID_IDXGIFACTORY4: Guid = Guid(0x1bc6ea02, 0xef36, 0x464f, [0xbf, 0x0c, 0x21, 0xca, 0x39, 0xe5, 0x16, 0x8a]);
+const IID_IDXGIADAPTER: Guid = Guid(0x2411e7e1, 0x12ac, 0x4ccf, [0xbd, 0x14, 0x97, 0x98, 0xe8, 0x53, 0x4d, 0xc0]);
+const IID_IDXGISWAPCHAIN2: Guid = Guid(0xa8be2ac4, 0x199f, 0x4946, [0xb3, 0x31, 0x79, 0x59, 0x9f, 0xb9, 0x8d, 0xe7]);
+const IID_ID3D11DEVICE1: Guid = Guid(0xa04bfb29, 0x08ef, 0x43d6, [0xa4, 0x9c, 0xa9, 0xbd, 0xbd, 0xcb, 0xe6, 0x86]);
+const IID_ID3D11DEVICE5: Guid = Guid(0x8ffde202, 0xa0e7, 0x45df, [0x9e, 0x01, 0xe8, 0x37, 0x80, 0x1b, 0x5e, 0xa0]);
+const IID_ID3D11DEVICECONTEXT4: Guid = Guid(0x917600da, 0xf58c, 0x4c33, [0x98, 0xd8, 0x3e, 0x15, 0xb3, 0x90, 0xfa, 0x24]);
+const IID_ID3D11FENCE: Guid = Guid(0xaffde9d1, 0x1df7, 0x4bb7, [0x8a, 0x34, 0x0f, 0x46, 0x25, 0x1d, 0xab, 0x80]);
+const IID_ID3D11TEXTURE2D: Guid = Guid(0x6f15aaf2, 0xd208, 0x4e89, [0x9a, 0xb4, 0x48, 0x95, 0x35, 0xd3, 0x4f, 0x9c]);
+
+fn release(obj: usize) {
+    if obj != 0 {
+        vcall!(obj, 2, fn() -> u32);
+    }
+}
+
+fn query(obj: usize, iid: &Guid) -> usize {
+    let mut out = 0usize;
+    if obj == 0 || vcall!(obj, 0, fn(*const Guid, *mut usize) -> i32, iid, &mut out) < 0 { 0 } else { out }
+}
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(Some(0)).collect()
+}
+
+/// A function of a DLL in System32 (main.rs `only_system_dlls`). Each DLL is loaded once
+/// and stays (the display is looked at every second; loading it each time added a
+/// reference every time).
+fn system_proc(dll: &str, name: &std::ffi::CStr) -> Option<usize> {
+    use std::collections::HashMap;
+    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW};
+    static LOADED: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+    let m = {
+        let mut l = LOADED.lock().unwrap_or_else(|e| e.into_inner());
+        let l = l.get_or_insert_with(HashMap::new);
+        match l.get(dll) {
+            Some(&m) => m,
+            None => {
+                let m = unsafe { LoadLibraryExW(wide(dll).as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) } as usize;
+                if m == 0 {
+                    return None;
+                }
+                l.insert(dll.to_string(), m);
+                m
+            }
+        }
+    };
+    unsafe { GetProcAddress(m as _, name.as_ptr().cast()) }.map(|f| f as usize)
+}
+
+/// A random suffix for the names nothing should guess.
+fn token() -> String {
+    peerparty_core::inet::crypto::random_array::<8>().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+// --- What the session and its copies' hooks share -------------------------------------
+
+pub use super::ring::RingBlock;
+
+/// One generation of a copy's textures and fences, duplicated into this process; or of
+/// its frames as pixels (`PEERPARTY_COMPOSITOR=pixels`, `ring::pixel_frames`), which the
+/// window uploads itself.
+pub struct SharedSurface {
+    pub generation: u32,
+    textures: [HANDLE; SLOTS],
+    content: HANDLE,
+    release: HANDLE,
+    pub format: u32,
+    pub color_space: u32,
+    /// The frames' width and height: what the pane is fitted to.
+    pub size: (u32, u32),
+    pixels: Option<super::ring::PixelFrames>,
+}
+
+unsafe impl Send for SharedSurface {}
+unsafe impl Sync for SharedSurface {}
+
+impl SharedSurface {
+    /// The handles of a `surface`, duplicated out of the copy's process `pid`.
+    pub fn duplicate(m: &SurfaceMsg) -> Option<SharedSurface> {
+        use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE};
+        if m.pixels.is_some() {
+            let p = super::ring::PixelFrames::open(m)?;
+            return Some(SharedSurface {
+                generation: m.generation,
+                textures: [std::ptr::null_mut(); SLOTS],
+                content: std::ptr::null_mut(),
+                release: std::ptr::null_mut(),
+                format: m.format,
+                color_space: m.color_space,
+                size: (m.width, m.height),
+                pixels: Some(p),
+            });
+        }
+        let process = unsafe { OpenProcess(PROCESS_DUP_HANDLE, 0, m.pid) };
+        if process.is_null() {
+            return None;
+        }
+        let dup = |h: u64| -> Option<HANDLE> {
+            let mut out: HANDLE = std::ptr::null_mut();
+            let ok = unsafe { DuplicateHandle(process, h as usize as HANDLE, GetCurrentProcess(), &mut out, 0, 0, DUPLICATE_SAME_ACCESS) } != 0;
+            (ok && !out.is_null()).then_some(out)
+        };
+        let mut s = SharedSurface {
+            generation: m.generation,
+            textures: [std::ptr::null_mut(); SLOTS],
+            content: std::ptr::null_mut(),
+            release: std::ptr::null_mut(),
+            format: m.format,
+            color_space: m.color_space,
+            size: (m.width, m.height),
+            pixels: None,
+        };
+        let mut ok = m.textures.len() == SLOTS;
+        for (i, h) in m.textures.iter().enumerate().take(SLOTS) {
+            match dup(*h) {
+                Some(d) => s.textures[i] = d,
+                None => ok = false,
+            }
+        }
+        match (dup(m.content), dup(m.release)) {
+            (Some(c), Some(r)) => (s.content, s.release) = (c, r),
+            (c, r) => {
+                ok = false;
+                for h in [c, r].into_iter().flatten() {
+                    unsafe { CloseHandle(h) };
+                }
+            }
+        }
+        unsafe { CloseHandle(process) };
+        ok.then_some(s)
+    }
+}
+
+impl Drop for SharedSurface {
+    fn drop(&mut self) {
+        for h in self.textures.into_iter().chain([self.content, self.release]) {
+            if !h.is_null() {
+                unsafe { CloseHandle(h) };
+            }
+        }
+    }
+}
+
+/// What a pane shows: where, from which ring, which textures.
+#[derive(Clone)]
+pub struct PaneDraw {
+    pub dest: PaneRect,
+    pub ring: Option<Arc<RingBlock>>,
+    pub surface: Option<Arc<SharedSurface>>,
+}
+
+impl PartialEq for PaneDraw {
+    fn eq(&self, o: &PaneDraw) -> bool {
+        let same = |a: &Option<Arc<RingBlock>>, b: &Option<Arc<RingBlock>>| match (a, b) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        let same_surface = match (&self.surface, &o.surface) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        self.dest == o.dest && same(&self.ring, &o.ring) && same_surface
+    }
+}
+
+struct Shared {
+    /// The panes wanted, and a count of changes.
+    want: Mutex<(u64, Vec<PaneDraw>)>,
+    /// Which panes the thread draws.
+    live: Mutex<Vec<bool>>,
+    quit: AtomicBool,
+}
+
+struct Handle(HANDLE);
+unsafe impl Send for Handle {}
+unsafe impl Sync for Handle {}
+
+/// The drawing thread of one session window.
+pub struct Gpu {
+    shared: Arc<Shared>,
+    wake: Arc<Handle>,
+    frames: Arc<Handle>,
+    /// The frame event's name, for the copies' hooks (`HostMsg::Capture`).
+    pub event_name: String,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Gpu {
+    /// The thread for window `hwnd`. Nothing is made on the GPU until a copy's textures
+    /// come.
+    pub fn start(hwnd: HWND) -> Option<Gpu> {
+        let event_name = format!(r"Local\peerparty-frames-{}-{}", std::process::id(), token());
+        // Auto-reset: one wake per burst of frames.
+        let frames = unsafe { CreateEventW(std::ptr::null(), 0, 0, wide(&event_name).as_ptr()) };
+        let wake = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+        if frames.is_null() || wake.is_null() {
+            for h in [frames, wake] {
+                if !h.is_null() {
+                    unsafe { CloseHandle(h) };
+                }
+            }
+            return None;
+        }
+        let shared = Arc::new(Shared { want: Mutex::new((0, Vec::new())), live: Mutex::new(Vec::new()), quit: AtomicBool::new(false) });
+        let (frames, wake) = (Arc::new(Handle(frames)), Arc::new(Handle(wake)));
+        let (s, f, w, h) = (shared.clone(), frames.clone(), wake.clone(), hwnd as usize);
+        let thread = std::thread::Builder::new().name("peerparty-compositor".into()).spawn(move || run(h, &s, f.0, w.0)).ok()?;
+        Some(Gpu { shared, wake, frames, event_name, thread: Some(thread) })
+    }
+
+    /// The panes to draw, by copy.
+    pub fn set(&self, panes: Vec<PaneDraw>) {
+        let mut w = self.shared.want.lock().unwrap_or_else(|e| e.into_inner());
+        if w.1 != panes {
+            w.0 += 1;
+            w.1 = panes;
+            drop(w);
+            unsafe { SetEvent(self.wake.0) };
+        }
+    }
+
+    /// Whether pane `i` is drawn here (its thumbnail hidden).
+    pub fn live(&self, i: usize) -> bool {
+        self.shared.live.lock().unwrap_or_else(|e| e.into_inner()).get(i).copied().unwrap_or(false)
+    }
+}
+
+impl Drop for Gpu {
+    fn drop(&mut self) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage};
+        self.shared.quit.store(true, Ordering::Release);
+        unsafe { SetEvent(self.wake.0) };
+        let Some(t) = self.thread.take() else { return };
+        // DXGI may be sending the window a message from that thread: this one (the
+        // window's) keeps answering them while it waits, for a few seconds at most.
+        let start = std::time::Instant::now();
+        while !t.is_finished() && start.elapsed() < std::time::Duration::from_secs(3) {
+            let mut msg: MSG = unsafe { std::mem::zeroed() };
+            while unsafe { PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) } != 0 {
+                unsafe {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        if t.is_finished() {
+            let _ = t.join();
+            unsafe {
+                CloseHandle(self.wake.0);
+                CloseHandle(self.frames.0);
+            }
+        }
+        // Else it's left to finish on its own, with its events.
+    }
+}
+
+// --- The drawing thread ----------------------------------------------------------------
+
+const HLSL: &str = r#"
+struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+V vs(uint id : SV_VertexID) {
+    V o;
+    float2 uv = float2(id & 1, id >> 1);
+    o.uv = uv;
+    o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    return o;
+}
+Texture2D t : register(t0);
+SamplerState s : register(s0);
+cbuffer Pane : register(b0) {
+    uint input;      // the frame's values: 0 sRGB-encoded, 1 scRGB (linear), 2 HDR10 (PQ, BT.2020)
+    uint output;     // the window's: 0 sRGB-encoded (an SDR display), 1 scRGB (an HDR one)
+    float sdr_white; // where SDR white goes on an HDR display, in scRGB (1.0 = 80 nits)
+    float hdr_white; // the nits of an HDR frame shown as white on an SDR display
+};
+float3 srgb_decode(float3 e) {
+    e = saturate(e);
+    return e <= 0.04045 ? e / 12.92 : pow((e + 0.055) / 1.055, 2.4);
+}
+float3 srgb_encode(float3 c) {
+    c = saturate(c);
+    return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+}
+// SMPTE ST 2084's EOTF: PQ code values to nits.
+float3 pq_nits(float3 p) {
+    float3 e = pow(saturate(p), 1.0 / 78.84375);
+    return 10000.0 * pow(max(e - 0.8359375, 0) / (18.8515625 - 18.6875 * e), 1.0 / 0.1593017578125);
+}
+// Linear BT.2020 to BT.709 primaries (out-of-gamut colour goes negative, which scRGB keeps).
+static const float3x3 BT2020_TO_709 = {
+     1.660491, -0.587641, -0.072850,
+    -0.124550,  1.132900, -0.008349,
+    -0.018151, -0.100579,  1.118730 };
+// HDR highlights brought under SDR white: untouched to 0.8, then rolled off toward 1.0,
+// by the brightest channel so hues don't shift.
+float3 roll_off(float3 c) {
+    float m = max(max(c.r, c.g), c.b);
+    if (m <= 0.8) return c;
+    float k = (m - 0.8) / 0.2;
+    return c * ((0.8 + 0.2 * k / (1 + k)) / m);
+}
+// A game's stray NaN pixel black, an infinite one the largest half (by bits: the
+// compiler may assume no NaN in float compares).
+float3 finite(float3 c) {
+    uint3 b = asuint(c) & 0x7fffffff;
+    c = b > 0x7f800000 ? 0 : c;
+    return clamp(c, -65504.0, 65504.0);
+}
+float4 ps(V i) : SV_Target {
+    float3 c = finite(t.Sample(s, i.uv).rgb);
+    if (input == 0) return float4(output == 1 ? srgb_decode(c) * sdr_white : c, 1);
+    float3 nits = input == 2 ? mul(BT2020_TO_709, pq_nits(c)) : c * 80.0;
+    if (output == 1) return float4(nits / 80.0, 1);
+    return float4(srgb_encode(roll_off(max(nits, 0) / hdr_white)), 1);
+}
+"#;
+
+/// A pane's `cbuffer Pane`.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct PaneParams {
+    input: u32,
+    output: u32,
+    sdr_white: f32,
+    hdr_white: f32,
+}
+
+/// The nits an HDR frame's white is shown at on an SDR display (BT.2408's reference white).
+const HDR_WHITE_NITS: f32 = 203.0;
+
+/// How a frame's values are encoded, for `cbuffer Pane`'s `input`: from its colour space,
+/// and its format (a float frame is linear light whatever it said).
+fn input_of(format: u32, color_space: u32) -> u32 {
+    use peerparty_protocol::frame_ring::{COLOR_SPACE_HDR10, COLOR_SPACE_SCRGB};
+    match (format, color_space) {
+        (_, COLOR_SPACE_HDR10) => 2,
+        (9 | 10, _) | (_, COLOR_SPACE_SCRGB) => 1,
+        _ => 0,
+    }
+}
+
+fn compile(entry: &std::ffi::CStr, target: &std::ffi::CStr) -> Option<Vec<u8>> {
+    type Compile = unsafe extern "system" fn(*const u8, usize, *const i8, usize, usize, *const i8, *const i8, u32, u32, *mut usize, *mut usize) -> i32;
+    let f: Compile = unsafe { std::mem::transmute(system_proc("d3dcompiler_47.dll", c"D3DCompile")?) };
+    let (mut code, mut errors) = (0usize, 0usize);
+    let hr = unsafe { f(HLSL.as_ptr(), HLSL.len(), std::ptr::null(), 0, 0, entry.as_ptr(), target.as_ptr(), 0, 0, &mut code, &mut errors) };
+    release(errors);
+    if hr < 0 || code == 0 {
+        return None;
+    }
+    // ID3DBlob: GetBufferPointer (3), GetBufferSize (4).
+    let p = vcall!(code, 3, fn() -> *const u8);
+    let n = vcall!(code, 4, fn() -> usize);
+    let out = unsafe { std::slice::from_raw_parts(p, n) }.to_vec();
+    release(code);
+    Some(out)
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Luid {
+    low: u32,
+    high: i32,
+}
+
+/// The format a typeless shared texture (or a pixel frame) is read as: UNORM, also for
+/// an sRGB one, so sRGB-encoded values stay so and the shader decodes them when it needs
+/// linear light (an sRGB view would decode them once more).
+fn view_format(format: u32) -> u32 {
+    match format {
+        27 | 29 => 28,
+        90 | 91 => 87,
+        92 | 93 => 88,
+        23 => 24,
+        9 => 10,
+        f => f,
+    }
+}
+
+/// A copy's textures opened on the device.
+struct Opened {
+    surface: Arc<SharedSurface>,
+    tex: [usize; SLOTS],
+    srv: [usize; SLOTS],
+    content: usize,
+    release: usize,
+    released: u64,
+    /// `cbuffer Pane`'s `input` for its frames.
+    input: u32,
+    /// Frames as pixels: uploaded into `tex[0]`, and the slot and sequence it holds.
+    pixels: bool,
+    uploaded: Option<(usize, u32)>,
+    /// The slot and sequence last drawn.
+    last: Option<(usize, u32)>,
+}
+
+impl Drop for Opened {
+    fn drop(&mut self) {
+        for o in self.srv.into_iter().chain(self.tex).chain([self.content, self.release]) {
+            release(o);
+        }
+    }
+}
+
+struct Renderer {
+    hwnd: HWND,
+    /// The adapter the device is on.
+    luid: Luid,
+    dev: usize,
+    dev1: usize,
+    dev5: usize,
+    ctx: usize,
+    ctx4: usize,
+    swap: usize,
+    waitable: HANDLE,
+    rtv: usize,
+    size: (u32, u32),
+    vs: usize,
+    ps: usize,
+    /// `cbuffer Pane`, and what it holds now.
+    cb: usize,
+    params: Option<PaneParams>,
+    sampler: usize,
+    /// The window's monitor as last looked at (the swap chain's format follows it), and
+    /// when that was.
+    display: Display,
+    monitor: usize,
+    display_checked: std::time::Instant,
+}
+
+unsafe impl Send for Renderer {}
+
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        if !self.waitable.is_null() {
+            unsafe { CloseHandle(self.waitable) };
+        }
+        if self.ctx != 0 {
+            vcall!(self.ctx, 110, fn() -> ()); // ClearState
+            vcall!(self.ctx, 111, fn() -> ()); // Flush
+        }
+        for o in [self.rtv, self.swap, self.sampler, self.cb, self.ps, self.vs, self.ctx4, self.ctx, self.dev5, self.dev1, self.dev] {
+            release(o);
+        }
+    }
+}
+
+/// What the window's monitor shows: HDR (Windows runs it in HDR10) or not, and Windows'
+/// SDR white level on it in scRGB (1.0 = 80 nits; what SDR content's white is shown at).
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Display {
+    hdr: bool,
+    sdr_white: f32,
+}
+
+impl Display {
+    const SDR: Display = Display { hdr: false, sdr_white: 1.0 };
+
+    /// The swap chain's format and colour space for it: 16-bit float scRGB on an HDR
+    /// display, 8-bit BGRA sRGB otherwise.
+    fn swap_format(&self) -> (u32, u32) {
+        if self.hdr { (10, peerparty_protocol::frame_ring::COLOR_SPACE_SCRGB) } else { (87, peerparty_protocol::frame_ring::COLOR_SPACE_SRGB) }
+    }
+
+    /// `cbuffer Pane` for a pane of frames encoded as `input`.
+    fn params(&self, input: u32) -> PaneParams {
+        PaneParams { input, output: u32::from(self.hdr), sdr_white: self.sdr_white, hdr_white: HDR_WHITE_NITS }
+    }
+}
+
+const IID_IDXGIOUTPUT6: Guid = Guid(0x068346e8, 0xaaec, 0x4b84, [0xad, 0xd7, 0x13, 0x7f, 0x51, 0x3f, 0x77, 0xa1]);
+const IID_IDXGISWAPCHAIN3: Guid = Guid(0x94d99bdb, 0xf1f8, 0x4ab0, [0xb2, 0x36, 0x7d, 0xa0, 0x17, 0x0e, 0xda, 0xb1]);
+
+/// DXGI_OUTPUT_DESC1.
+#[repr(C)]
+struct OutputDesc1 {
+    device_name: [u16; 32],
+    desktop: [i32; 4],
+    attached: i32,
+    rotation: u32,
+    monitor: usize,
+    bits_per_color: u32,
+    color_space: u32,
+    primaries: [f32; 8],
+    min_luminance: f32,
+    max_luminance: f32,
+    max_full_frame_luminance: f32,
+}
+
+/// What `monitor` shows, from a fresh factory (an old one's outputs keep the colour space
+/// they had when it was made).
+fn display_of(monitor: usize) -> Display {
+    let Some(f) = factory() else { return Display::SDR };
+    let mut found = None;
+    'adapters: for a in 0..16u32 {
+        let mut adapter = 0usize;
+        // IDXGIFactory1::EnumAdapters1 (12); IDXGIAdapter::EnumOutputs (7).
+        if vcall!(f, 12, fn(u32, *mut usize) -> i32, a, &mut adapter) < 0 {
+            break;
+        }
+        for o in 0..16u32 {
+            let mut output = 0usize;
+            if vcall!(adapter, 7, fn(u32, *mut usize) -> i32, o, &mut output) < 0 {
+                break;
+            }
+            let out6 = query(output, &IID_IDXGIOUTPUT6);
+            release(output);
+            if out6 == 0 {
+                continue;
+            }
+            let mut d: OutputDesc1 = unsafe { std::mem::zeroed() };
+            // IDXGIOutput6::GetDesc1 is slot 27.
+            let ok = vcall!(out6, 27, fn(*mut OutputDesc1) -> i32, &mut d) >= 0;
+            release(out6);
+            if ok && d.monitor == monitor {
+                found = Some(d);
+                release(adapter);
+                break 'adapters;
+            }
+        }
+        release(adapter);
+    }
+    release(f);
+    let Some(d) = found else { return Display::SDR };
+    // DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020: Windows' HDR mode.
+    let hdr = d.color_space == peerparty_protocol::frame_ring::COLOR_SPACE_HDR10;
+    // 200 nits when Windows won't say: about where it puts SDR content by default.
+    let sdr_white = if hdr { sdr_white_level(&d.device_name).unwrap_or(2.5) } else { 1.0 };
+    Display { hdr, sdr_white }
+}
+
+/// Windows' SDR white level on the display `device` (`\\.\DISPLAY1`), in scRGB.
+fn sdr_white_level(device: &[u16; 32]) -> Option<f32> {
+    use windows_sys::Win32::Devices::Display::{
+        DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL, DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
+        DISPLAYCONFIG_SDR_WHITE_LEVEL, DISPLAYCONFIG_SOURCE_DEVICE_NAME, DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS,
+        QueryDisplayConfig,
+    };
+    let (mut np, mut nm) = (0u32, 0u32);
+    if unsafe { GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm) } != 0 {
+        return None;
+    }
+    let mut paths: Vec<DISPLAYCONFIG_PATH_INFO> = vec![unsafe { std::mem::zeroed() }; np as usize];
+    let mut modes: Vec<DISPLAYCONFIG_MODE_INFO> = vec![unsafe { std::mem::zeroed() }; nm as usize];
+    if unsafe { QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &mut np, paths.as_mut_ptr(), &mut nm, modes.as_mut_ptr(), std::ptr::null_mut()) } != 0 {
+        return None;
+    }
+    let name = |n: &[u16]| n.iter().take_while(|c| **c != 0).copied().collect::<Vec<u16>>();
+    let want = name(device);
+    for p in paths.iter().take(np as usize) {
+        let mut source: DISPLAYCONFIG_SOURCE_DEVICE_NAME = unsafe { std::mem::zeroed() };
+        source.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        source.header.size = std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32;
+        source.header.adapterId = p.sourceInfo.adapterId;
+        source.header.id = p.sourceInfo.id;
+        if unsafe { DisplayConfigGetDeviceInfo(&mut source.header) } != 0 || name(&source.viewGdiDeviceName) != want {
+            continue;
+        }
+        let mut white: DISPLAYCONFIG_SDR_WHITE_LEVEL = unsafe { std::mem::zeroed() };
+        white.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+        white.header.size = std::mem::size_of::<DISPLAYCONFIG_SDR_WHITE_LEVEL>() as u32;
+        white.header.adapterId = p.targetInfo.adapterId;
+        white.header.id = p.targetInfo.id;
+        // SDRWhiteLevel: 1000 is 80 nits.
+        if unsafe { DisplayConfigGetDeviceInfo(&mut white.header) } == 0 && white.SDRWhiteLevel > 0 {
+            return Some(white.SDRWhiteLevel as f32 / 1000.0);
+        }
+    }
+    None
+}
+
+fn monitor_of(hwnd: HWND) -> usize {
+    use windows_sys::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
+    unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) as usize }
+}
+
+fn factory() -> Option<usize> {
+    type Create = unsafe extern "system" fn(*const Guid, *mut usize) -> i32;
+    let create: Create = unsafe { std::mem::transmute(system_proc("dxgi.dll", c"CreateDXGIFactory1")?) };
+    let mut f = 0usize;
+    (unsafe { create(&IID_IDXGIFACTORY1, &mut f) } >= 0).then_some(f)
+}
+
+/// The first adapter's (where frames read back as pixels are drawn).
+fn default_luid() -> Option<Luid> {
+    let f = factory()?;
+    let mut adapter = 0usize;
+    // IDXGIFactory1::EnumAdapters1 (12); IDXGIAdapter1::GetDesc1 (10).
+    let ok = vcall!(f, 12, fn(u32, *mut usize) -> i32, 0, &mut adapter) >= 0;
+    release(f);
+    if !ok {
+        return None;
+    }
+    // DXGI_ADAPTER_DESC1: the LUID comes after the description (128 wide chars), four
+    // u32s and three sizes.
+    let mut d = [0u8; 128 * 2 + 16 + 3 * 8 + 8 + 4 + 8];
+    let ok = vcall!(adapter, 10, fn(*mut u8) -> i32, d.as_mut_ptr()) >= 0;
+    release(adapter);
+    let at = 128 * 2 + 16 + 3 * std::mem::size_of::<usize>();
+    ok.then(|| Luid { low: u32::from_le_bytes(d[at..at + 4].try_into().unwrap()), high: i32::from_le_bytes(d[at + 4..at + 8].try_into().unwrap()) })
+}
+
+/// The adapter a shared texture lives on.
+fn luid_of(handle: HANDLE) -> Option<Luid> {
+    let f = factory()?;
+    let f2 = query(f, &IID_IDXGIFACTORY2);
+    release(f);
+    if f2 == 0 {
+        return None;
+    }
+    let mut l = Luid { low: 0, high: 0 };
+    // IDXGIFactory2::GetSharedResourceAdapterLuid is slot 17.
+    let hr = vcall!(f2, 17, fn(HANDLE, *mut Luid) -> i32, handle, &mut l);
+    release(f2);
+    (hr >= 0).then_some(l)
+}
+
+impl Renderer {
+    /// A device on the adapter `luid` and a swap chain on `hwnd`.
+    fn new(hwnd: HWND, luid: Luid) -> Option<Renderer> {
+        let f = factory()?;
+        let f4 = query(f, &IID_IDXGIFACTORY4);
+        let f2 = query(f, &IID_IDXGIFACTORY2);
+        let mut adapter = 0usize;
+        if f4 != 0 {
+            // IDXGIFactory4::EnumAdapterByLuid is slot 26.
+            vcall!(f4, 26, fn(Luid, *const Guid, *mut usize) -> i32, luid, &IID_IDXGIADAPTER, &mut adapter);
+        }
+        type Create = unsafe extern "system" fn(usize, u32, usize, u32, *const u32, u32, u32, *mut usize, *mut u32, *mut usize) -> i32;
+        let create: Option<Create> = system_proc("d3d11.dll", c"D3D11CreateDevice").map(|p| unsafe { std::mem::transmute(p) });
+        let mut r = Renderer {
+            hwnd,
+            luid,
+            dev: 0,
+            dev1: 0,
+            dev5: 0,
+            ctx: 0,
+            ctx4: 0,
+            swap: 0,
+            waitable: std::ptr::null_mut(),
+            rtv: 0,
+            size: (0, 0),
+            vs: 0,
+            ps: 0,
+            cb: 0,
+            params: None,
+            sampler: 0,
+            display: Display::SDR,
+            monitor: monitor_of(hwnd),
+            display_checked: std::time::Instant::now(),
+        };
+        r.display = display_of(r.monitor);
+        let mut fl = 0u32;
+        let ok = adapter != 0
+            && create.is_some_and(|c| unsafe { c(adapter, 0, 0, 0x20, std::ptr::null(), 0, 7, &mut r.dev, &mut fl, &mut r.ctx) } >= 0)
+            && r.setup(f2);
+        for o in [adapter, f2, f4, f] {
+            release(o);
+        }
+        if !ok {
+            eprintln!("peerparty: session: the window can't draw the copies' frames itself; their windows are shown instead");
+        }
+        ok.then_some(r)
+    }
+
+    fn setup(&mut self, f2: usize) -> bool {
+        self.dev1 = query(self.dev, &IID_ID3D11DEVICE1);
+        self.dev5 = query(self.dev, &IID_ID3D11DEVICE5);
+        self.ctx4 = query(self.ctx, &IID_ID3D11DEVICECONTEXT4);
+        if self.dev1 == 0 || self.dev5 == 0 || self.ctx4 == 0 || f2 == 0 {
+            return false;
+        }
+        let (Some(vs), Some(ps)) = (compile(c"vs", c"vs_4_0"), compile(c"ps", c"ps_4_0")) else { return false };
+        let ok = |hr: i32| hr >= 0;
+        // D3D11_BUFFER_DESC: 16 bytes, DEFAULT, CONSTANT_BUFFER.
+        let cb: [u32; 6] = [std::mem::size_of::<PaneParams>() as u32, 0, 0x4, 0, 0, 0];
+        if !ok(vcall!(self.dev, 12, fn(*const u8, usize, usize, *mut usize) -> i32, vs.as_ptr(), vs.len(), 0, &mut self.vs))
+            || !ok(vcall!(self.dev, 15, fn(*const u8, usize, usize, *mut usize) -> i32, ps.as_ptr(), ps.len(), 0, &mut self.ps))
+            || !ok(vcall!(self.dev, 3, fn(*const u32, usize, *mut usize) -> i32, cb.as_ptr(), 0, &mut self.cb))
+        {
+            return false;
+        }
+        // D3D11_SAMPLER_DESC: bilinear, clamped.
+        let mut sampler = [0u32; 13];
+        sampler[0] = 0x15;
+        sampler[1] = 3;
+        sampler[2] = 3;
+        sampler[3] = 3;
+        sampler[5] = 1;
+        sampler[6] = 1;
+        sampler[12] = f32::MAX.to_bits();
+        if !ok(vcall!(self.dev, 23, fn(*const u32, *mut usize) -> i32, sampler.as_ptr(), &mut self.sampler)) {
+            return false;
+        }
+        let (w, h) = client_size(self.hwnd);
+        // DXGI_SWAP_CHAIN_DESC1: the display's format, 2 buffers, flip-discard, its
+        // latency waitable.
+        let (format, space) = self.display.swap_format();
+        let desc: [u32; 12] = [w.max(1), h.max(1), format, 0, 1, 0, 0x20, 2, 0, 4, 0, 0x40];
+        // IDXGIFactory2::CreateSwapChainForHwnd is slot 15.
+        if !ok(vcall!(f2, 15, fn(usize, HWND, *const u32, usize, usize, *mut usize) -> i32, self.dev, self.hwnd, desc.as_ptr(), 0, 0, &mut self.swap)) {
+            return false;
+        }
+        self.set_color_space(space);
+        if self.display.hdr {
+            eprintln!("peerparty: session: the window's display is in HDR; it draws in scRGB (SDR white {:.0} nits)", self.display.sdr_white * 80.0);
+        }
+        // No Alt+Enter fullscreen of DXGI's own: the window manages itself.
+        vcall!(f2, 8, fn(HWND, u32) -> i32, self.hwnd, 0x1 | 0x2);
+        let swap2 = query(self.swap, &IID_IDXGISWAPCHAIN2);
+        if swap2 != 0 {
+            vcall!(swap2, 31, fn(u32) -> i32, 1); // SetMaximumFrameLatency
+            self.waitable = vcall!(swap2, 33, fn() -> HANDLE); // GetFrameLatencyWaitableObject
+            release(swap2);
+        }
+        self.size = (w.max(1), h.max(1));
+        true
+    }
+
+    /// IDXGISwapChain3::SetColorSpace1 (38), where the swap chain has it.
+    fn set_color_space(&self, space: u32) {
+        let swap3 = query(self.swap, &IID_IDXGISWAPCHAIN3);
+        if swap3 != 0 {
+            vcall!(swap3, 38, fn(u32) -> i32, space);
+            release(swap3);
+        }
+    }
+
+    /// Looks at the window's monitor again when it moved to another one or a second has
+    /// passed, and moves the swap chain to the format it wants. Whether anything changed
+    /// (everything is drawn again).
+    fn check_display(&mut self) -> bool {
+        let monitor = monitor_of(self.hwnd);
+        if monitor == self.monitor && self.display_checked.elapsed() < std::time::Duration::from_secs(1) {
+            return false;
+        }
+        self.monitor = monitor;
+        self.display_checked = std::time::Instant::now();
+        let d = display_of(monitor);
+        if d == self.display {
+            return false;
+        }
+        let was = std::mem::replace(&mut self.display, d);
+        self.params = None;
+        if was.hdr != d.hdr {
+            eprintln!("peerparty: session: the window's display is {}", if d.hdr { "in HDR now; it draws in scRGB" } else { "in SDR now" });
+            // Resized at the next `target`, in the new format.
+            self.size = (0, 0);
+        }
+        true
+    }
+
+    /// The back buffer's view, the buffers resized first if the window's client area was
+    /// (or the display wants another format).
+    fn target(&mut self) -> Option<usize> {
+        let (w, h) = client_size(self.hwnd);
+        if (w, h) != self.size && w > 0 && h > 0 {
+            release(self.rtv);
+            self.rtv = 0;
+            vcall!(self.ctx, 110, fn() -> ());
+            let (format, space) = self.display.swap_format();
+            // IDXGISwapChain::ResizeBuffers (13), same count, the display's format, the
+            // same flags.
+            if vcall!(self.swap, 13, fn(u32, u32, u32, u32, u32) -> i32, 0, w, h, format, 0x40) < 0 {
+                return None;
+            }
+            self.set_color_space(space);
+            self.size = (w, h);
+        }
+        if self.rtv == 0 {
+            let mut tex = 0usize;
+            if vcall!(self.swap, 9, fn(u32, *const Guid, *mut usize) -> i32, 0, &IID_ID3D11TEXTURE2D, &mut tex) < 0 {
+                return None;
+            }
+            vcall!(self.dev, 9, fn(usize, usize, *mut usize) -> i32, tex, 0, &mut self.rtv);
+            release(tex);
+        }
+        (self.rtv != 0).then_some(self.rtv)
+    }
+
+    /// Draws the frames `take` says (slot and content-fence value, by pane) into `rtv`:
+    /// black, then each pane's frame scaled into its destination. The panes drawn, with
+    /// their slots.
+    fn draw(&mut self, rtv: usize, panes: &[Pane], take: &[Option<(usize, u64)>]) -> Vec<(usize, usize)> {
+        let ctx = self.ctx;
+        vcall!(ctx, 50, fn(usize, *const f32) -> (), rtv, [0.0f32, 0.0, 0.0, 1.0].as_ptr());
+        vcall!(ctx, 33, fn(u32, *const usize, usize) -> (), 1, &rtv, 0);
+        vcall!(ctx, 17, fn(usize) -> (), 0); // IASetInputLayout
+        vcall!(ctx, 24, fn(u32) -> (), 5); // TRIANGLESTRIP
+        vcall!(ctx, 11, fn(usize, usize, u32) -> (), self.vs, 0, 0);
+        vcall!(ctx, 9, fn(usize, usize, u32) -> (), self.ps, 0, 0);
+        vcall!(ctx, 16, fn(u32, u32, *const usize) -> (), 0, 1, &self.cb); // PSSetConstantBuffers
+        vcall!(ctx, 10, fn(u32, u32, *const usize) -> (), 0, 1, &self.sampler);
+        let mut drawn = Vec::new();
+        for (i, p) in panes.iter().enumerate() {
+            let (Some(o), Some(&Some((slot, ready)))) = (p.shown(), take.get(i)) else { continue };
+            let d = p.draw.dest;
+            if d.width == 0 || d.height == 0 {
+                continue;
+            }
+            if ready > 0 && !o.pixels {
+                // ID3D11DeviceContext4::Wait (148): the GPU waits for the copy's frame.
+                vcall!(self.ctx4, 148, fn(usize, u64) -> i32, o.content, ready);
+            }
+            let vp: [f32; 6] = [d.x as f32, d.y as f32, d.width as f32, d.height as f32, 0.0, 1.0];
+            vcall!(ctx, 44, fn(u32, *const [f32; 6]) -> (), 1, &vp);
+            let params = self.display.params(o.input);
+            if self.params != Some(params) {
+                // ID3D11DeviceContext::UpdateSubresource is slot 48.
+                vcall!(ctx, 48, fn(usize, u32, usize, *const PaneParams, u32, u32) -> (), self.cb, 0, 0, &params, 0, 0);
+                self.params = Some(params);
+            }
+            vcall!(ctx, 8, fn(u32, u32, *const usize) -> (), 0, 1, &o.srv[if o.pixels { 0 } else { slot }]);
+            vcall!(ctx, 13, fn(u32, u32) -> (), 4, 0);
+            drawn.push((i, slot));
+        }
+        let null = 0usize;
+        vcall!(ctx, 8, fn(u32, u32, *const usize) -> (), 0, 1, &null);
+        drawn
+    }
+
+    /// A pixel pane's frame in `slot` (sequence `seq`) uploaded, unless it already is.
+    fn upload(&self, o: &mut Opened, slot: usize, seq: u32) {
+        let Some(p) = o.surface.pixels.as_ref().filter(|_| o.uploaded != Some((slot, seq))) else { return };
+        let mut mapped = [0usize; 2];
+        // ID3D11DeviceContext::Map (14), WRITE_DISCARD; Unmap (15).
+        if vcall!(self.ctx, 14, fn(usize, u32, u32, u32, *mut [usize; 2]) -> i32, o.tex[0], 0, 4, 0, &mut mapped) < 0 {
+            return;
+        }
+        let pitch = mapped[1] & 0xffff_ffff;
+        let rows = p.slot(slot);
+        let n = (p.width * peerparty_protocol::frame_ring::bytes_per_pixel(p.format).unwrap_or(4)) as usize;
+        for y in 0..p.height as usize {
+            let from = &rows[y * p.stride as usize..y * p.stride as usize + n];
+            unsafe { std::ptr::copy_nonoverlapping(from.as_ptr(), (mapped[0] + y * pitch) as *mut u8, n) };
+        }
+        vcall!(self.ctx, 15, fn(usize, u32) -> (), o.tex[0], 0);
+        o.uploaded = Some((slot, seq));
+    }
+
+    /// A copy's textures and fences, opened here; for pixels, a texture to upload them to.
+    fn open(&self, s: &Arc<SharedSurface>) -> Option<Opened> {
+        let format = view_format(s.format);
+        let input = input_of(format, s.color_space);
+        let mut o = Opened { surface: s.clone(), tex: [0; SLOTS], srv: [0; SLOTS], content: 0, release: 0, released: 0, input, pixels: false, uploaded: None, last: None };
+        if let Some(p) = &s.pixels {
+            // D3D11_TEXTURE2D_DESC: DYNAMIC, SHADER_RESOURCE, CPU_ACCESS_WRITE.
+            let desc: [u32; 11] = [p.width, p.height, 1, 1, format, 1, 0, 2, 0x8, 0x10000, 0];
+            if vcall!(self.dev, 5, fn(*const u32, usize, *mut usize) -> i32, desc.as_ptr(), 0, &mut o.tex[0]) < 0
+                || vcall!(self.dev, 7, fn(usize, usize, *mut usize) -> i32, o.tex[0], 0, &mut o.srv[0]) < 0
+            {
+                return None;
+            }
+            o.pixels = true;
+            return Some(o);
+        }
+        for i in 0..SLOTS {
+            // ID3D11Device1::OpenSharedResource1 is slot 48.
+            if vcall!(self.dev1, 48, fn(HANDLE, *const Guid, *mut usize) -> i32, s.textures[i], &IID_ID3D11TEXTURE2D, &mut o.tex[i]) < 0 {
+                return None;
+            }
+            // D3D11_SHADER_RESOURCE_VIEW_DESC: TEXTURE2D, mip 0, one level.
+            let desc: [u32; 6] = [format, 4, 0, 1, 0, 0];
+            if vcall!(self.dev, 7, fn(usize, *const u32, *mut usize) -> i32, o.tex[i], desc.as_ptr(), &mut o.srv[i]) < 0 {
+                return None;
+            }
+        }
+        // ID3D11Device5::OpenSharedFence is slot 67.
+        for (h, out) in [(s.content, &mut o.content), (s.release, &mut o.release)] {
+            if vcall!(self.dev5, 67, fn(HANDLE, *const Guid, *mut usize) -> i32, h, &IID_ID3D11FENCE, out) < 0 {
+                return None;
+            }
+        }
+        // Start where the release fence is (another device may have signalled it).
+        o.released = vcall!(o.release, 8, fn() -> u64);
+        Some(o)
+    }
+}
+
+fn client_size(hwnd: HWND) -> (u32, u32) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect;
+    let mut r = unsafe { std::mem::zeroed() };
+    if unsafe { GetClientRect(hwnd, &mut r) } == 0 {
+        return (0, 0);
+    }
+    ((r.right - r.left).max(0) as u32, (r.bottom - r.top).max(0) as u32)
+}
+
+/// A pane on the drawing thread.
+struct Pane {
+    draw: PaneDraw,
+    opened: Option<Opened>,
+    /// The set before `opened`, its last frame shown until `opened` has one of its own
+    /// (a copy's new set, after a resize, comes a frame or so before its first frame).
+    previous: Option<Opened>,
+    /// The surface couldn't be opened here (another adapter): not tried again.
+    failed: Option<Arc<SharedSurface>>,
+    /// The adapter that surface's textures are on, when it isn't the device's.
+    failed_on: Option<Luid>,
+}
+
+impl Default for Pane {
+    fn default() -> Pane {
+        Pane { draw: PaneDraw { dest: PaneRect { x: 0, y: 0, width: 0, height: 0 }, ring: None, surface: None }, opened: None, previous: None, failed: None, failed_on: None }
+    }
+}
+
+/// Forgets everything opened on the window's device (it's lost, or being replaced): the
+/// copies' textures are opened again on the next one. Nothing of the old device may be
+/// drawn or signalled on a new one.
+fn reset_gpu(panes: &mut [Pane]) {
+    for p in panes {
+        p.opened = None;
+        p.previous = None;
+        p.failed = None;
+        p.failed_on = None;
+    }
+}
+
+impl Pane {
+    /// The set drawn: the newest one with a frame (the previous one until the new one
+    /// has its first).
+    fn shown(&self) -> Option<&Opened> {
+        self.opened.as_ref().filter(|o| o.last.is_some()).or(self.previous.as_ref()).or(self.opened.as_ref())
+    }
+}
+
+fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE) {
+    let hwnd = hwnd as HWND;
+    let mut panes: Vec<Pane> = Vec::new();
+    let mut seen = u64::MAX;
+    let mut gpu: Option<Renderer> = None;
+    // The adapter no device could be made on, so it isn't retried every frame.
+    let mut failed_luid: Option<Luid> = None;
+    // The adapter the next device goes on, when a copy's frames moved to another one.
+    let mut prefer: Option<Luid> = None;
+    // How many times the device was given up (logged the first few).
+    let mut lost = 0u32;
+    let mut dirty = true;
+    loop {
+        let events = [frames, wake];
+        unsafe { WaitForMultipleObjects(2, events.as_ptr(), 0, 250) };
+        if shared.quit.load(Ordering::Acquire) {
+            break;
+        }
+        // What the session wants.
+        {
+            let w = shared.want.lock().unwrap_or_else(|e| e.into_inner());
+            if w.0 != seen {
+                seen = w.0;
+                panes.resize_with(w.1.len(), Pane::default);
+                for (p, d) in panes.iter_mut().zip(w.1.iter()) {
+                    let same_surface = match (&p.draw.surface, &d.surface) {
+                        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                        (None, None) => true,
+                        _ => false,
+                    };
+                    if !same_surface {
+                        // A new set: the old one's last frame stays up meanwhile.
+                        let old = p.opened.take().filter(|o| o.last.is_some());
+                        p.previous = if d.surface.is_some() { old.or(p.previous.take()) } else { None };
+                        p.failed = None;
+                        p.failed_on = None;
+                        if d.surface.is_none()
+                            && let Some(r) = &p.draw.ring
+                        {
+                            r.header().stop_reading();
+                        }
+                    }
+                    p.draw = d.clone();
+                }
+                dirty = true;
+            }
+        }
+        // A device on the copies' adapter, once there's something to draw.
+        if gpu.is_none()
+            && let Some(luid) = prefer.take().or_else(|| {
+                let s = panes.iter().find_map(|p| p.draw.surface.clone())?;
+                if s.pixels.is_some() { default_luid() } else { luid_of(s.textures[0]) }
+            })
+            && failed_luid != Some(luid)
+        {
+            gpu = Renderer::new(hwnd, luid);
+            if gpu.is_none() {
+                failed_luid = Some(luid);
+            }
+            dirty = true;
+        }
+        let Some(r) = gpu.as_mut() else {
+            set_live(shared, &panes);
+            continue;
+        };
+        if r.check_display() {
+            dirty = true;
+        }
+        for (i, p) in panes.iter_mut().enumerate() {
+            if p.opened.is_none()
+                && let Some(s) = p.draw.surface.clone()
+                && p.failed.as_ref().is_none_or(|f| !Arc::ptr_eq(f, &s))
+            {
+                p.opened = r.open(&s);
+                if p.opened.is_none() {
+                    let on = if s.pixels.is_some() { None } else { luid_of(s.textures[0]).filter(|l| *l != r.luid) };
+                    eprintln!(
+                        "peerparty: session: copy {}'s frames (set {}, format {}) can't be drawn by the window's device{}; its window is shown instead",
+                        i + 1,
+                        s.generation,
+                        s.format,
+                        if on.is_some() { " (they're on another graphics adapter)" } else { "" }
+                    );
+                    p.failed = Some(s);
+                    p.failed_on = on;
+                    // Not the old set's last frame forever: the thumbnail takes over.
+                    if p.previous.take().is_some() {
+                        dirty = true;
+                    }
+                    if let Some(ring) = &p.draw.ring {
+                        ring.header().stop_reading();
+                    }
+                }
+            }
+        }
+        // The copies' frames moved to another adapter (a splash screen on one GPU, the
+        // game on the other): with nothing drawn from this device, move to that one.
+        if panes.iter().all(|p| p.opened.is_none() && p.previous.is_none())
+            && let Some(other) = panes.iter().find_map(|p| p.failed_on).filter(|l| failed_luid != Some(*l))
+        {
+            eprintln!("peerparty: session: the copies' frames are on another graphics adapter now; the window's device moves there");
+            reset_gpu(&mut panes);
+            gpu = None;
+            prefer = Some(other);
+            set_live(shared, &panes);
+            continue;
+        }
+        // Minimized: nothing is shown, so nothing is taken, uploaded or presented.
+        if unsafe { windows_sys::Win32::UI::WindowsAndMessaging::IsIconic(hwnd) } != 0 {
+            set_live(shared, &panes);
+            continue;
+        }
+        // The newest frames; `taken`: the pane's frame is its current set's, taken now
+        // (only those are released: an old set's fence means nothing to the copy now).
+        let mut fresh = false;
+        let mut take: Vec<Option<(usize, u64)>> = Vec::with_capacity(panes.len());
+        let mut taken: Vec<bool> = Vec::with_capacity(panes.len());
+        for p in &mut panes {
+            let mut t = None;
+            let mut now = false;
+            let visible = p.draw.dest.width > 0 && p.draw.dest.height > 0;
+            if let (Some(o), Some(ring), true) = (p.opened.as_mut(), p.draw.ring.as_ref(), visible) {
+                match ring.header().take(o.surface.generation) {
+                    Some(f) => {
+                        if o.last != Some((f.slot, f.seq)) {
+                            fresh = true;
+                        }
+                        o.last = Some((f.slot, f.seq));
+                        t = Some((f.slot, f.ready));
+                        now = true;
+                        // Pixels are copied out now: the hook may write the slot once
+                        // it's no longer the one taken.
+                        r.upload(o, f.slot, f.seq);
+                    }
+                    // A newer generation's surface hasn't come yet: the last frame again.
+                    None => t = o.last.map(|(slot, _)| (slot, 0)),
+                }
+                if o.last.is_some() && p.previous.take().is_some() {
+                    dirty = true;
+                }
+            }
+            if t.is_none()
+                && let Some(prev) = p.previous.as_ref()
+            {
+                // Neither waited on nor released: that set is done with.
+                t = prev.last.map(|(slot, _)| (slot, 0));
+            }
+            take.push(t);
+            taken.push(now);
+        }
+        set_live(shared, &panes);
+        if !fresh && !dirty {
+            continue;
+        }
+        if !r.waitable.is_null() {
+            unsafe { WaitForSingleObjectEx(r.waitable, 100, 1) };
+        }
+        let Some(rtv) = r.target() else {
+            lost += 1;
+            if lost <= 5 {
+                eprintln!("peerparty: session: the window's swap chain couldn't be resized; making a new device (time {lost})");
+            }
+            reset_gpu(&mut panes);
+            gpu = None;
+            failed_luid = None;
+            continue;
+        };
+        let drawn = r.draw(rtv, &panes, &take);
+        // IDXGISwapChain::Present (8): vsync.
+        let hr = vcall!(r.swap, 8, fn(u32, u32) -> i32, 1, 0);
+        for (i, slot) in drawn {
+            let p = &mut panes[i];
+            let Some(ring) = p.draw.ring.as_ref() else { continue };
+            ring.header().presented();
+            // The previous set's frame (drawn while the new one has none), or the last
+            // frame of a set the copy has moved on from, isn't released.
+            let Some(o) = p.opened.as_mut().filter(|o| !o.pixels && taken[i]) else { continue };
+            o.released += 1;
+            vcall!(r.ctx4, 147, fn(usize, u64) -> i32, o.release, o.released);
+            ring.header().release(o.surface.generation, slot, o.released);
+        }
+        vcall!(r.ctx, 111, fn() -> ());
+        dirty = false;
+        // DXGI_ERROR_DEVICE_REMOVED / DEVICE_RESET: start over on a new device.
+        if hr == 0x887A_0005_u32 as i32 || hr == 0x887A_0007_u32 as i32 {
+            eprintln!("peerparty: session: the window's graphics device was lost ({hr:#x}); making a new one");
+            reset_gpu(&mut panes);
+            gpu = None;
+            failed_luid = None;
+        }
+    }
+    for p in &panes {
+        if let Some(r) = &p.draw.ring {
+            r.header().stop_reading();
+        }
+    }
+    drop(panes);
+    drop(gpu);
+}
+
+fn set_live(shared: &Shared, panes: &[Pane]) {
+    let live: Vec<bool> = panes.iter().map(|p| p.shown().is_some_and(|o| o.last.is_some())).collect();
+    let mut l = shared.live.lock().unwrap_or_else(|e| e.into_inner());
+    if *l != live {
+        *l = live;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// D3D11_TEXTURE2D_DESC.
+    #[repr(C)]
+    struct TexDesc {
+        width: u32,
+        height: u32,
+        mips: u32,
+        array: u32,
+        format: u32,
+        samples: u32,
+        quality: u32,
+        usage: u32,
+        bind: u32,
+        cpu: u32,
+        misc: u32,
+    }
+
+    fn surface_again(m: &SurfaceMsg) -> SharedSurface {
+        SharedSurface::duplicate(m).expect("handles duplicated")
+    }
+
+    /// `tex`'s pixels (BGRA, w x h), through a staging copy.
+    fn read(r: &Renderer, tex: usize, w: u32, h: u32) -> Vec<u32> {
+        let desc = TexDesc { width: w, height: h, mips: 1, array: 1, format: 87, samples: 1, quality: 0, usage: 3, bind: 0, cpu: 0x20000, misc: 0 };
+        let mut staging = 0usize;
+        assert!(vcall!(r.dev, 5, fn(*const TexDesc, usize, *mut usize) -> i32, &desc, 0, &mut staging) >= 0);
+        vcall!(r.ctx, 47, fn(usize, usize) -> (), staging, tex);
+        let mut mapped = [0usize; 2];
+        assert!(vcall!(r.ctx, 14, fn(usize, u32, u32, u32, *mut [usize; 2]) -> i32, staging, 0, 1, 0, &mut mapped) >= 0);
+        let pitch = mapped[1] & 0xffff_ffff;
+        let mut out = Vec::new();
+        for y in 0..h as usize {
+            out.extend_from_slice(unsafe { std::slice::from_raw_parts((mapped[0] + y * pitch) as *const u32, w as usize) });
+        }
+        vcall!(r.ctx, 15, fn(usize, u32) -> (), staging, 0);
+        release(staging);
+        out
+    }
+
+    /// The whole way round on WARP, in this process: a "copy" (a device of its own) puts a
+    /// frame in a shared texture and publishes it; the window's thread opens the textures
+    /// on a device of its own on the same adapter, draws the frame, presents, and signals
+    /// the release fence, which the copy's device sees completed.
+    #[test]
+    fn a_published_frame_is_drawn_and_released() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WS_POPUP};
+        let class = wide("STATIC");
+        let hwnd = unsafe { CreateWindowExW(0, class.as_ptr(), class.as_ptr(), WS_POPUP, 0, 0, 128, 64, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null()) };
+        assert!(!hwnd.is_null());
+
+        // The copy's side: WARP, three shared textures (the first cleared red) and two fences.
+        type Create = unsafe extern "system" fn(usize, u32, usize, u32, *const u32, u32, u32, *mut usize, *mut u32, *mut usize) -> i32;
+        let create: Create = unsafe { std::mem::transmute(system_proc("d3d11.dll", c"D3D11CreateDevice").unwrap()) };
+        let (mut dev, mut fl, mut ctx) = (0usize, 0u32, 0usize);
+        assert!(unsafe { create(0, 5, 0, 0x20, std::ptr::null(), 0, 7, &mut dev, &mut fl, &mut ctx) } >= 0);
+        let dev5 = query(dev, &IID_ID3D11DEVICE5);
+        let ctx4 = query(ctx, &IID_ID3D11DEVICECONTEXT4);
+        const IID_IDXGIRESOURCE1: Guid = Guid(0x30961379, 0x4609, 0x4a41, [0x99, 0x8e, 0x54, 0xfe, 0x56, 0x7e, 0xe0, 0xc1]);
+        let (w, h) = (32u32, 16u32);
+        let desc = TexDesc { width: w, height: h, mips: 1, array: 1, format: 87, samples: 1, quality: 0, usage: 0, bind: 0x28, cpu: 0, misc: 0x802 };
+        let mut textures = Vec::new();
+        let mut handles = Vec::new();
+        for _ in 0..SLOTS {
+            let mut t = 0usize;
+            assert!(vcall!(dev, 5, fn(*const TexDesc, usize, *mut usize) -> i32, &desc, 0, &mut t) >= 0);
+            let r1 = query(t, &IID_IDXGIRESOURCE1);
+            let mut hnd: HANDLE = std::ptr::null_mut();
+            assert!(vcall!(r1, 13, fn(usize, u32, usize, *mut HANDLE) -> i32, 0, 0x8000_0001, 0, &mut hnd) >= 0);
+            release(r1);
+            textures.push(t);
+            handles.push(hnd as usize as u64);
+        }
+        let mut rtv = 0usize;
+        assert!(vcall!(dev, 9, fn(usize, usize, *mut usize) -> i32, textures[0], 0, &mut rtv) >= 0);
+        vcall!(ctx, 50, fn(usize, *const f32) -> (), rtv, [1.0f32, 0.0, 0.0, 1.0].as_ptr());
+        let mut fences = [0usize; 2];
+        let mut fence_handles = [0u64; 2];
+        for i in 0..2 {
+            assert!(vcall!(dev5, 68, fn(u64, u32, *const Guid, *mut usize) -> i32, 0, 0x2, &IID_ID3D11FENCE, &mut fences[i]) >= 0);
+            let mut hnd: HANDLE = std::ptr::null_mut();
+            assert!(vcall!(fences[i], 7, fn(usize, u32, usize, *mut HANDLE) -> i32, 0, 0x1000_0000, 0, &mut hnd) >= 0);
+            fence_handles[i] = hnd as usize as u64;
+        }
+        vcall!(ctx4, 147, fn(usize, u64) -> i32, fences[0], 1);
+        vcall!(ctx, 111, fn() -> ());
+        let ring = RingBlock::create(std::process::id()).expect("a ring block");
+        ring.header().publish(1, 0, 1);
+
+        // The session's side.
+        let m = SurfaceMsg {
+            pid: std::process::id(),
+            generation: 1,
+            textures: handles,
+            content: fence_handles[0],
+            release: fence_handles[1],
+            width: w,
+            height: h,
+            format: 87,
+            api: "d3d11".into(),
+            color_space: 0,
+            pixels: None,
+            stride: 0,
+        };
+        let surface = Arc::new(SharedSurface::duplicate(&m).expect("handles duplicated"));
+        let gpu = Gpu::start(hwnd).expect("the drawing thread");
+        gpu.set(vec![PaneDraw { dest: PaneRect { x: 0, y: 0, width: 128, height: 64 }, ring: Some(ring.clone()), surface: Some(surface) }]);
+        let start = std::time::Instant::now();
+        while !(gpu.live(0) && ring.header().presents.load(Ordering::SeqCst) > 0) {
+            assert!(start.elapsed().as_secs() < 10, "drawn within 10 s");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(ring.header().reading.load(Ordering::SeqCst), 1 << 32, "it samples slot 0 of set 1");
+        let released = ring.header().released[0].load(Ordering::SeqCst);
+        assert!(released > 0, "slot 0's release noted");
+        while vcall!(fences[1], 8, fn() -> u64) < released {
+            assert!(start.elapsed().as_secs() < 10, "the copy's device sees the release");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // The copy may now write any slot but the one being sampled.
+        assert_eq!(ring.header().pick(1, |v| v <= released), Some(1));
+
+        // A new frame in slot 1 wakes the thread through the frame event.
+        ring.header().publish(1, 1, 1);
+        let event = unsafe { windows_sys::Win32::System::Threading::OpenEventW(0x2, 0, wide(&gpu.event_name).as_ptr()) };
+        assert!(!event.is_null(), "the hooks can open the frame event");
+        unsafe { SetEvent(event) };
+        while ring.header().reading.load(Ordering::SeqCst) != (1 << 32 | 1) {
+            assert!(start.elapsed().as_secs() < 10, "slot 1 taken");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        drop(gpu);
+        assert_eq!(ring.header().reading.load(Ordering::SeqCst), peerparty_protocol::frame_ring::NONE, "it lets go when it stops");
+
+        // What it draws: the frame scaled into its pane, black around it.
+        let mut r = Renderer::new(hwnd, luid_of(surface_again(&m).textures[0]).unwrap()).expect("a renderer");
+        // Drawn for an SDR display, whatever this PC's is.
+        r.display = Display::SDR;
+        let s2 = Arc::new(surface_again(&m));
+        let mut pane = Pane::default();
+        pane.draw = PaneDraw { dest: PaneRect { x: 32, y: 16, width: 64, height: 32 }, ring: None, surface: Some(s2.clone()) };
+        pane.opened = r.open(&s2);
+        assert!(pane.opened.is_some(), "the textures open on the window's device");
+        let target_desc = TexDesc { width: 128, height: 64, mips: 1, array: 1, format: 87, samples: 1, quality: 0, usage: 0, bind: 0x20, cpu: 0, misc: 0 };
+        let mut target = 0usize;
+        assert!(vcall!(r.dev, 5, fn(*const TexDesc, usize, *mut usize) -> i32, &target_desc, 0, &mut target) >= 0);
+        let mut trtv = 0usize;
+        assert!(vcall!(r.dev, 9, fn(usize, usize, *mut usize) -> i32, target, 0, &mut trtv) >= 0);
+        assert_eq!(r.draw(trtv, std::slice::from_ref(&pane), &[Some((0, 1))]), vec![(0, 0)]);
+        let px = read(&r, target, 128, 64);
+        assert_eq!(px[40 * 128 / 2 + 64] & 0x00ff_ffff, 0xff0000, "red inside the pane");
+        assert_eq!(px[8 * 128 + 8] & 0x00ff_ffff, 0, "black outside it");
+        assert_eq!(px[16 * 128 + 31] & 0x00ff_ffff, 0, "just left of it");
+        assert_eq!(px[16 * 128 + 32] & 0x00ff_ffff, 0xff0000, "its top-left pixel");
+        drop(pane);
+        for o in [trtv, target] {
+            release(o);
+        }
+        drop(r);
+        unsafe {
+            CloseHandle(event);
+            DestroyWindow(hwnd);
+        }
+        for o in textures.into_iter().chain(fences).chain([rtv, ctx4, dev5, ctx, dev]) {
+            release(o);
+        }
+    }
+
+    /// PQ's inverse EOTF: nits to a code value.
+    fn pq(nits: f32) -> f32 {
+        let y = (nits / 10000.0).powf(0.159_301_76);
+        ((0.835_937_5 + 18.851_563 * y) / (1.0 + 18.6875 * y)).powf(78.84375)
+    }
+
+    fn half(h: u16) -> f32 {
+        let (s, e, m) = ((h >> 15) & 1, i32::from((h >> 10) & 0x1f), f32::from(h & 0x3ff));
+        let v = match e {
+            0 => m * 2f32.powi(-24),
+            31 => f32::INFINITY,
+            e => (1.0 + m / 1024.0) * 2f32.powi(e - 15),
+        };
+        if s == 1 { -v } else { v }
+    }
+
+    /// One pixel of `tex` (an R16G16B16A16_FLOAT texture, `w x h`).
+    fn read_float(r: &Renderer, tex: usize, w: u32, h: u32, x: u32, y: u32) -> [f32; 4] {
+        let desc = TexDesc { width: w, height: h, mips: 1, array: 1, format: 10, samples: 1, quality: 0, usage: 3, bind: 0, cpu: 0x20000, misc: 0 };
+        let mut staging = 0usize;
+        assert!(vcall!(r.dev, 5, fn(*const TexDesc, usize, *mut usize) -> i32, &desc, 0, &mut staging) >= 0);
+        vcall!(r.ctx, 47, fn(usize, usize) -> (), staging, tex);
+        let mut mapped = [0usize; 2];
+        assert!(vcall!(r.ctx, 14, fn(usize, u32, u32, u32, *mut [usize; 2]) -> i32, staging, 0, 1, 0, &mut mapped) >= 0);
+        let pitch = mapped[1] & 0xffff_ffff;
+        let p = unsafe { std::slice::from_raw_parts((mapped[0] + y as usize * pitch + x as usize * 8) as *const u16, 4) };
+        let out = [half(p[0]), half(p[1]), half(p[2]), half(p[3])];
+        vcall!(r.ctx, 15, fn(usize, u32) -> (), staging, 0);
+        release(staging);
+        out
+    }
+
+    /// A "copy's" set of shared textures in `format`, each cleared to `color`, and its
+    /// fences, on WARP device `dev`: what a hook reports.
+    fn shared_set(dev: usize, ctx: usize, format: u32, color: [f32; 4], color_space: u32) -> (SurfaceMsg, Vec<usize>) {
+        const IID_IDXGIRESOURCE1: Guid = Guid(0x30961379, 0x4609, 0x4a41, [0x99, 0x8e, 0x54, 0xfe, 0x56, 0x7e, 0xe0, 0xc1]);
+        let dev5 = query(dev, &IID_ID3D11DEVICE5);
+        let (w, h) = (16u32, 16u32);
+        let desc = TexDesc { width: w, height: h, mips: 1, array: 1, format, samples: 1, quality: 0, usage: 0, bind: 0x28, cpu: 0, misc: 0x802 };
+        let (mut objects, mut handles) = (Vec::new(), Vec::new());
+        for _ in 0..SLOTS {
+            let mut t = 0usize;
+            assert!(vcall!(dev, 5, fn(*const TexDesc, usize, *mut usize) -> i32, &desc, 0, &mut t) >= 0, "a shared texture in format {format}");
+            let mut rtv = 0usize;
+            assert!(vcall!(dev, 9, fn(usize, usize, *mut usize) -> i32, t, 0, &mut rtv) >= 0);
+            vcall!(ctx, 50, fn(usize, *const f32) -> (), rtv, color.as_ptr());
+            release(rtv);
+            let r1 = query(t, &IID_IDXGIRESOURCE1);
+            let mut hnd: HANDLE = std::ptr::null_mut();
+            assert!(vcall!(r1, 13, fn(usize, u32, usize, *mut HANDLE) -> i32, 0, 0x8000_0001, 0, &mut hnd) >= 0);
+            release(r1);
+            objects.push(t);
+            handles.push(hnd as usize as u64);
+        }
+        let mut fence_handles = [0u64; 2];
+        for fh in &mut fence_handles {
+            let mut f = 0usize;
+            assert!(vcall!(dev5, 68, fn(u64, u32, *const Guid, *mut usize) -> i32, 0, 0x2, &IID_ID3D11FENCE, &mut f) >= 0);
+            let mut hnd: HANDLE = std::ptr::null_mut();
+            assert!(vcall!(f, 7, fn(usize, u32, usize, *mut HANDLE) -> i32, 0, 0x1000_0000, 0, &mut hnd) >= 0);
+            *fh = hnd as usize as u64;
+            objects.push(f);
+        }
+        release(dev5);
+        vcall!(ctx, 111, fn() -> ());
+        let m = SurfaceMsg {
+            pid: std::process::id(),
+            generation: 1,
+            textures: handles,
+            content: fence_handles[0],
+            release: fence_handles[1],
+            width: w,
+            height: h,
+            format,
+            api: "d3d11".into(),
+            color_space,
+            pixels: None,
+            stride: 0,
+        };
+        (m, objects)
+    }
+
+    /// Pane `set` of `sets` drawn into a new 16x16 target in `format` for `display`.
+    fn draw_for(r: &mut Renderer, sets: &[(SurfaceMsg, Vec<usize>)], format: u32, display: Display, set: usize) -> usize {
+        r.display = display;
+        r.params = None;
+        let s = Arc::new(surface_again(&sets[set].0));
+        let mut pane = Pane::default();
+        pane.draw = PaneDraw { dest: PaneRect { x: 0, y: 0, width: 16, height: 16 }, ring: None, surface: Some(s.clone()) };
+        pane.opened = r.open(&s);
+        assert!(pane.opened.is_some(), "set {set} opens");
+        let desc = TexDesc { width: 16, height: 16, mips: 1, array: 1, format, samples: 1, quality: 0, usage: 0, bind: 0x20, cpu: 0, misc: 0 };
+        let mut t = 0usize;
+        assert!(vcall!(r.dev, 5, fn(*const TexDesc, usize, *mut usize) -> i32, &desc, 0, &mut t) >= 0);
+        let mut rtv = 0usize;
+        assert!(vcall!(r.dev, 9, fn(usize, usize, *mut usize) -> i32, t, 0, &mut rtv) >= 0);
+        assert_eq!(r.draw(rtv, std::slice::from_ref(&pane), &[Some((0, 0))]).len(), 1);
+        release(rtv);
+        t
+    }
+
+    fn near(got: f32, want: f32, what: &str) {
+        assert!((got - want).abs() <= want.abs() * 0.02 + 0.005, "{what}: {got}, not {want}");
+    }
+
+    /// Each kind of frame drawn for each kind of display, on WARP: an HDR10 frame decoded
+    /// from PQ to scRGB nits (its BT.2020 red going out of BT.709's gamut, kept) or
+    /// tone-mapped to sRGB, an SDR frame at Windows' SDR white or as it is, and a float
+    /// (scRGB) frame as it is.
+    #[test]
+    fn hdr10_and_sdr_frames_on_hdr_and_sdr_displays() {
+        use peerparty_protocol::frame_ring::{COLOR_SPACE_HDR10, COLOR_SPACE_SCRGB, COLOR_SPACE_SRGB};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WS_POPUP};
+        let class = wide("STATIC");
+        let hwnd = unsafe { CreateWindowExW(0, class.as_ptr(), class.as_ptr(), WS_POPUP, 0, 0, 16, 16, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null()) };
+        type Create = unsafe extern "system" fn(usize, u32, usize, u32, *const u32, u32, u32, *mut usize, *mut u32, *mut usize) -> i32;
+        let create: Create = unsafe { std::mem::transmute(system_proc("d3d11.dll", c"D3D11CreateDevice").unwrap()) };
+        let (mut dev, mut fl, mut ctx) = (0usize, 0u32, 0usize);
+        assert!(unsafe { create(0, 5, 0, 0x20, std::ptr::null(), 0, 7, &mut dev, &mut fl, &mut ctx) } >= 0);
+
+        let grey100 = pq(100.0);
+        let sets = [
+            shared_set(dev, ctx, 24, [grey100, grey100, grey100, 1.0], COLOR_SPACE_HDR10),
+            shared_set(dev, ctx, 24, [grey100, 0.0, 0.0, 1.0], COLOR_SPACE_HDR10),
+            shared_set(dev, ctx, 24, [pq(203.0), pq(203.0), pq(203.0), 1.0], COLOR_SPACE_HDR10),
+            shared_set(dev, ctx, 87, [0.5, 0.5, 0.5, 1.0], COLOR_SPACE_SRGB),
+            shared_set(dev, ctx, 10, [2.5, 2.5, 2.5, 1.0], COLOR_SPACE_SCRGB),
+        ];
+        let mut r = Renderer::new(hwnd, luid_of(surface_again(&sets[0].0).textures[0]).unwrap()).expect("a renderer");
+        let hdr = Display { hdr: true, sdr_white: 2.5 };
+
+        // An HDR display (scRGB, 1.0 = 80 nits).
+        let t = draw_for(&mut r, &sets, 10, hdr, 0);
+        let p = read_float(&r, t, 16, 16, 8, 8);
+        for c in &p[..3] {
+            near(*c, 100.0 / 80.0, "100-nit grey");
+        }
+        release(t);
+        let t = draw_for(&mut r, &sets, 10, hdr, 1);
+        let p = read_float(&r, t, 16, 16, 8, 8);
+        near(p[0], 1.660_491 * 100.0 / 80.0, "BT.2020 red's red");
+        near(p[1], -0.124_55 * 100.0 / 80.0, "BT.2020 red's green, out of gamut");
+        release(t);
+        let t = draw_for(&mut r, &sets, 10, hdr, 3);
+        near(read_float(&r, t, 16, 16, 8, 8)[1], 0.215_86 * 2.5, "SDR grey at SDR white");
+        release(t);
+        let t = draw_for(&mut r, &sets, 10, hdr, 4);
+        near(read_float(&r, t, 16, 16, 8, 8)[2], 2.5, "scRGB as it is");
+        release(t);
+
+        // An SDR display (sRGB-encoded BGRA).
+        let px = |r: &Renderer, t: usize| read(r, t, 16, 16)[8 * 16 + 8];
+        let t = draw_for(&mut r, &sets, 87, Display::SDR, 2);
+        let g = (px(&r, t) >> 8) & 0xff;
+        assert!((242..=245).contains(&g), "203-nit grey rolled off just under white: {g}");
+        release(t);
+        let t = draw_for(&mut r, &sets, 87, Display::SDR, 3);
+        assert_eq!(px(&r, t) & 0x00ff_ffff, 0x80_8080, "SDR as it is");
+        release(t);
+        let t = draw_for(&mut r, &sets, 87, Display::SDR, 0);
+        let g = (px(&r, t) >> 8) & 0xff;
+        assert!((183..=189).contains(&g), "100-nit grey, under the knee: {g}");
+        release(t);
+
+        drop(r);
+        for (_, objects) in sets {
+            for o in objects {
+                release(o);
+            }
+        }
+        release(ctx);
+        release(dev);
+        unsafe { DestroyWindow(hwnd) };
+    }
+
+    /// Frames as pixels (`PEERPARTY_COMPOSITOR=pixels`, a Linux session's way): a pixel
+    /// file as a hook writes one, its slot uploaded into the pane's texture and drawn, on
+    /// the first adapter's device.
+    #[test]
+    fn a_pixel_file_pane_is_uploaded_and_drawn() {
+        use peerparty_protocol::frame_ring::{pixels_size, slot_bytes};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WS_POPUP};
+        let dir = std::env::temp_dir().join(format!("peerparty-gpu-pixels-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (w, h) = (16u32, 16u32);
+        let stride = w * 4;
+        let mut bytes = vec![0u8; pixels_size(stride, h).unwrap()];
+        let s1 = slot_bytes(stride, h).unwrap();
+        for px in bytes[s1..s1 + (stride * h) as usize].chunks_mut(4) {
+            px.copy_from_slice(&[0, 0, 0xff, 0xff]); // BGRA red
+        }
+        let path = dir.join("pixels-7-1");
+        std::fs::write(&path, &bytes).unwrap();
+        let m = SurfaceMsg {
+            pid: 7,
+            generation: 1,
+            textures: Vec::new(),
+            content: 0,
+            release: 0,
+            width: w,
+            height: h,
+            format: 87,
+            api: "vulkan".into(),
+            color_space: 0,
+            pixels: Some(path.to_string_lossy().into_owned()),
+            stride,
+        };
+        let s = Arc::new(SharedSurface::duplicate(&m).expect("the pixel file maps"));
+        let class = wide("STATIC");
+        let hwnd = unsafe { CreateWindowExW(0, class.as_ptr(), class.as_ptr(), WS_POPUP, 0, 0, 16, 16, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null()) };
+        let mut r = Renderer::new(hwnd, default_luid().expect("an adapter")).expect("a renderer");
+        r.display = Display::SDR;
+        let mut pane = Pane::default();
+        pane.draw = PaneDraw { dest: PaneRect { x: 0, y: 0, width: 16, height: 16 }, ring: None, surface: Some(s.clone()) };
+        pane.opened = r.open(&s);
+        let o = pane.opened.as_mut().expect("its texture");
+        assert!(o.pixels);
+        r.upload(o, 1, 5);
+        assert_eq!(o.uploaded, Some((1, 5)));
+        let desc = TexDesc { width: 16, height: 16, mips: 1, array: 1, format: 87, samples: 1, quality: 0, usage: 0, bind: 0x20, cpu: 0, misc: 0 };
+        let mut t = 0usize;
+        assert!(vcall!(r.dev, 5, fn(*const TexDesc, usize, *mut usize) -> i32, &desc, 0, &mut t) >= 0);
+        let mut rtv = 0usize;
+        assert!(vcall!(r.dev, 9, fn(usize, usize, *mut usize) -> i32, t, 0, &mut rtv) >= 0);
+        assert_eq!(r.draw(rtv, std::slice::from_ref(&pane), &[Some((1, 0))]), vec![(0, 1)]);
+        assert_eq!(read(&r, t, 16, 16)[8 * 16 + 8] & 0x00ff_ffff, 0xff0000, "red from slot 1");
+        release(rtv);
+        release(t);
+        drop(pane);
+        drop(r);
+        drop(s);
+        unsafe { DestroyWindow(hwnd) };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inputs_follow_colour_space_and_format() {
+
+        assert_eq!(input_of(24, 12), 2);
+        assert_eq!(input_of(24, 0), 0);
+        assert_eq!(input_of(10, 0), 1, "float frames are linear light");
+        assert_eq!(input_of(87, 10), 1);
+        assert_eq!(input_of(87, 0), 0);
+        assert_eq!(Display::SDR.swap_format(), (87, 0));
+        assert_eq!(Display { hdr: true, sdr_white: 3.0 }.swap_format(), (10, 10));
+    }
+}
+

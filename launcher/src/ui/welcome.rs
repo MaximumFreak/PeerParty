@@ -173,14 +173,14 @@ impl App {
                         let label = if last { t!("welcome.start") } else { t!("common.next") };
                         let r = widgets::button(ui, Some(if last { Icon::Play } else { Icon::ChevronRight }), label, Kind::Primary);
                         if w.step > 0 {
-                            first_focus(&r, &mut self.focus_first);
+                            first_focus(&r, &mut self.nav.focus_first);
                         }
                         if r.clicked() {
                             if last {
                                 done = Some(true);
                             } else {
                                 w.step += 1;
-                                self.focus_first = true;
+                                self.nav.focus_first = true;
                             }
                         }
                     });
@@ -239,7 +239,7 @@ impl App {
         labels.extend(crate::i18n::LANGS.iter().map(|l| l.1.to_string()));
         let mut i = crate::i18n::LANGS.iter().position(|l| l.0 == w.language).map_or(0, |i| i + 1);
         let r = widgets::stepper(ui, "welcome-lang", &labels, &mut i, ui.available_width());
-        first_focus(&r, &mut self.focus_first);
+        first_focus(&r, &mut self.nav.focus_first);
         if r.changed() {
             w.language = if i == 0 { String::new() } else { crate::i18n::LANGS[i - 1].0.to_string() };
             // Shown in the new language straight away (saved only on Start).

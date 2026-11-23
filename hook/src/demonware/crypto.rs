@@ -2,8 +2,8 @@
 //! expansion Demonware's lobby handshake uses, and AES-128-CBC with an explicit IV and
 //! no padding (the sender pads to 16 bytes itself), over photon/crypto.rs's AES.
 
-use crate::photon::crypto::Aes;
-use crate::ugs::wire::sha1;
+use crate::util::crypto::Aes;
+use crate::util::crypto::sha1;
 
 pub fn hmac_sha1(key: &[u8], data: &[u8]) -> [u8; 20] {
     let mut k = [0u8; 64];

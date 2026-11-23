@@ -4,7 +4,8 @@
 //! from EncryptionData). The client side sends what Photon's client libraries send on
 //! the wire (checked against Photon's own client in tests/photon).
 
-use super::crypto::{Aes256, Dh};
+use super::crypto::Dh;
+use crate::util::crypto::Aes256;
 use super::enet::{self, Peer, State};
 use super::host::{Host, Options};
 use super::message::Proto;
@@ -36,7 +37,7 @@ impl Client {
     fn connect(name: &'static str, to: SocketAddr, proto: Proto, hello: Option<Vec<u8>>) -> Client {
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         sock.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
-        let challenge = u32::from_le_bytes(super::crypto::random_bytes(4).try_into().unwrap());
+        let challenge = u32::from_le_bytes(crate::util::crypto::random_bytes(4).try_into().unwrap());
         let mut c = Client {
             name,
             sock,
@@ -654,12 +655,12 @@ fn fusion_host_and_client_meet_through_the_plugin() {
     let (host, logs) = start();
     let ns = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), host.ports[0][0]);
     let mut a = to_game("A", ns, "a", Proto::V18, op::CREATE_GAME, "fusion", None);
-    send(&mut a, Body::Join { kind: 1, game_mode: fusion::CLIENT_SERVER, peer_mode: fusion::PEER_SERVER, requests: 0, unique_id: None });
+    send(&mut a, Body::Join { kind: 1, game_mode: fusion::CLIENT_SERVER, peer_mode: fusion::PEER_SERVER, requests: 0, unique_id: None, player_ref: -1 });
     assert!(matches!(recv(&mut a)[..], [Body::Join { kind: 2, .. }]));
     assert!(matches!(recv(&mut a)[..], [Body::Start { remote_server: 1, .. }]));
     send(&mut a, Body::ReflexiveInfo { actor: 1, public: [0; 3], private: [7, 0, 0], nat: 2, unique_id: None });
     let mut b = to_game("B", ns, "b", Proto::V18, op::JOIN_GAME, "fusion", None);
-    send(&mut b, Body::Join { kind: 1, game_mode: fusion::CLIENT_SERVER, peer_mode: fusion::PEER_CLIENT, requests: 0, unique_id: None });
+    send(&mut b, Body::Join { kind: 1, game_mode: fusion::CLIENT_SERVER, peer_mode: fusion::PEER_CLIENT, requests: 0, unique_id: None, player_ref: -1 });
     assert!(matches!(recv(&mut b)[..], [Body::Join { kind: 2, .. }]));
     assert!(matches!(recv(&mut b)[..], [Body::Start { remote_server: 1, .. }]));
     send(&mut b, Body::ReflexiveInfo { actor: 2, public: [0; 3], private: [8, 0, 0], nat: 2, unique_id: None });
@@ -702,11 +703,11 @@ fn fusion_shared_peers_connect_to_the_plugin_server() {
     let (host, logs) = start();
     let ns = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), host.ports[0][0]);
     let mut a = to_game("A", ns, "a", Proto::V18, op::CREATE_GAME, "fusion", None);
-    send(&mut a, Body::Join { kind: 1, game_mode: fusion::SHARED, peer_mode: fusion::PEER_CLIENT, requests: 0, unique_id: None });
+    send(&mut a, Body::Join { kind: 1, game_mode: fusion::SHARED, peer_mode: fusion::PEER_CLIENT, requests: 0, unique_id: None, player_ref: -1 });
     assert!(matches!(recv(&mut a)[..], [Body::Join { kind: 2, .. }]));
     assert!(matches!(recv(&mut a)[..], [Body::Start { requests: fusion::start_requests::CONNECT_TO_SHARED, .. }]));
     let mut b = to_game("B", ns, "b", Proto::V18, op::JOIN_GAME, "fusion", None);
-    send(&mut b, Body::Join { kind: 1, game_mode: fusion::SHARED, peer_mode: fusion::PEER_CLIENT, requests: 0, unique_id: None });
+    send(&mut b, Body::Join { kind: 1, game_mode: fusion::SHARED, peer_mode: fusion::PEER_CLIENT, requests: 0, unique_id: None, player_ref: -1 });
     assert!(matches!(recv(&mut b)[..], [Body::Join { kind: 2, .. }]));
     assert!(matches!(recv(&mut b)[..], [Body::Start { .. }]));
     a.raise_to(101, connect(0xa1), &[0], false);

@@ -37,18 +37,18 @@
 pub mod api;
 pub mod curl;
 pub mod real;
+pub mod ui;
 pub mod winhttp;
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
 
 use peerparty_core::PeerId;
 
-use crate::json::Json;
+use crate::util::json::Json;
 use crate::log;
 use crate::net;
-use crate::playfab::http::Request;
+use crate::https::server::Request;
 
 /// The hosts PeerParty answers, and the service name api.rs routes on.
 pub const HOSTS: &[(&str, &str)] = &[
@@ -64,14 +64,32 @@ pub fn service_of(host: &str) -> Option<&'static str> {
     HOSTS.iter().find(|(name, _)| *name == h).map(|(_, s)| *s)
 }
 
+/// Whether `host` (a lookup or a Host header) is one of the hosts PeerParty answers.
+pub fn is_host(host: &str) -> bool {
+    service_of(host).is_some()
+}
+
+/// The Xbox Live friends hosts on the local HTTPS server (named one by one: the rest of
+/// xboxlive.com never comes here).
+pub static HTTPS: crate::https::HttpsService = crate::https::HttpsService {
+    name: "xboxlive",
+    cert_names: || HOSTS.iter().map(|(h, _)| *h).collect(),
+    is_host,
+    handle,
+    upgrade: None,
+    reads_root_early: || false,
+};
+
+/// Lookups of the Xbox Live friends hosts.
+pub static DNS: crate::net::dns::DnsService = crate::net::dns::DnsService { layer: "xboxlive", is_host, redirect };
+
 /// Whether the stand-in is on for this game (see the module comment).
 pub fn wanted() -> bool {
     net::enabled()
         && !net::skip("xboxlive")
-        && match std::env::var("PEERPARTY_XBL").ok().as_deref() {
-            Some("0") => false,
-            Some("1") => true,
-            _ => title().is_some(),
+        && match crate::config::HookConfig::global().xbl {
+            Some(on) => on,
+            None => title().is_some(),
         }
 }
 
@@ -82,7 +100,7 @@ pub fn redirect(host: &str) -> Option<String> {
     if !wanted() {
         return None;
     }
-    let ip = crate::playfab::server()?;
+    let ip = crate::https::server()?;
     crate::log::throttled(&format!("xboxlive redirect {h}"), 2, |n| {
         log!("xboxlive {h} -> {ip} (PeerParty's Xbox Live friends, from the LAN) n={n}")
     });
@@ -226,7 +244,7 @@ fn directory() -> api::Directory {
         .map(|l| l.peers().into_iter().map(|(p, name)| api::Player { xuid: xuid_of(p), name, quiet: quiet(l, p) }).collect())
         .unwrap_or_default();
     let (title_id, title_name) = title().map(|t| (t.id, t.name.clone())).unwrap_or_default();
-    api::Directory { me, peers, title_id, title_name, now: crate::playfab::api::iso(SystemTime::now()) }
+    api::Directory { me, peers, title_id, title_name, now: crate::util::time::now_iso() }
 }
 
 /// A path with its digits folded, for throttling log lines per kind of request.

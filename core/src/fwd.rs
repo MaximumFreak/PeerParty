@@ -1,7 +1,7 @@
 //! Games where a player types the host's IP address (no lobby SDK): the forwarder carries
 //! their plain UDP and TCP traffic over the mesh, so they work with internet peers too.
 //!
-//! Each peer has a stand-in address (`inet::redact::stand_in`, in 198.18.0.0/15, never
+//! Each peer has a stand-in address (`redact::stand_in`, in 198.18.0.0/15, never
 //! routed and never its real address). The hook rewrites the game's socket calls:
 //!
 //! - UDP: a `sendto` to stand-in:P goes to a local "alias" socket instead
@@ -33,7 +33,7 @@
 //! trust most, and of those the one here longest (`Lan::peers_by_standing`): a public
 //! player can't take over the address a friend or a LAN player already answers at.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -42,7 +42,7 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::inet::redact::stand_in;
+use crate::redact::stand_in;
 use crate::{Event, Lan, Packet, PeerId, SendResult, Trust};
 
 /// Every socket name the forwarder uses starts with this.
@@ -132,6 +132,9 @@ struct St {
     udp: HashMap<(PeerId, u16, u16), Arc<Alias>>,
     by_addr: HashMap<SocketAddrV4, Arc<Alias>>,
     tcp: HashMap<(PeerId, String), Arc<Tcp>>,
+    /// Streams a peer asked for that are still connecting to the game: they count toward
+    /// its limit, and one closed (or whose peer left) meanwhile is dropped once connected.
+    connecting: HashSet<(PeerId, String)>,
     /// The ports this process has open, and when the socket tables were read.
     owned: Option<(Instant, Owned)>,
     peers: Vec<(Ipv4Addr, PeerId)>,
@@ -144,6 +147,10 @@ pub struct Forwarder {
     st: Mutex<St>,
     me: Weak<Forwarder>,
     pumping: AtomicBool,
+    /// The pump thread's (`ensure_pump`): it holds the forwarder only by `me`, a moment
+    /// at a time, so dropping the last handle drops the forwarder (and its `Lan`), and
+    /// the drop tells the pump to stop.
+    pump: Arc<Pump>,
     /// The hook ticks the engine and hands us its events; `None`: we do it ourselves.
     tick: Option<fn()>,
     next: AtomicU64,
@@ -156,6 +163,14 @@ pub struct Forwarder {
     /// datagrams from there): senders that aren't loopback are looked up too.
     lan_aliases: AtomicBool,
     log: fn(&str),
+}
+
+#[derive(Default)]
+struct Pump {
+    /// Set when the forwarder drops.
+    stop: AtomicBool,
+    /// Set by the pump thread as it ends.
+    done: AtomicBool,
 }
 
 /// Why a peer's traffic for a port isn't handed to our game.
@@ -190,6 +205,7 @@ impl Forwarder {
             st: Mutex::new(St::default()),
             me: me.clone(),
             pumping: AtomicBool::new(false),
+            pump: Arc::new(Pump::default()),
             tick,
             next: AtomicU64::new(1),
             refused: AtomicU64::new(0),
@@ -207,6 +223,7 @@ impl Forwarder {
 
     /// Whether public players are kept off ports the game bound to loopback only. On
     /// unless in `loopback_only()` mode; tests turn it on to check it.
+    #[cfg(any(test, feature = "test-util"))]
     #[doc(hidden)]
     pub fn keep_loopback_private(&self, on: bool) {
         self.loopback_private.store(on, Ordering::Relaxed);
@@ -322,13 +339,15 @@ impl Forwarder {
                 }
             }
             Event::ChanClosed { peer, socket, .. } => {
+                self.st.lock().unwrap().connecting.remove(&(*peer, socket.clone()));
                 if let Some(t) = self.find_tcp(*peer, socket) {
                     t.kill();
                 }
             }
             Event::PeerLeft(peer) => {
                 let (tcps, aliases): (Vec<_>, Vec<_>) = {
-                    let st = self.st.lock().unwrap();
+                    let mut st = self.st.lock().unwrap();
+                    st.connecting.retain(|(p, _)| p != peer);
                     (
                         st.tcp.values().filter(|t| t.peer == *peer).cloned().collect(),
                         st.udp.values().filter(|a| a.peer == *peer).cloned().collect(),
@@ -357,12 +376,14 @@ impl Forwarder {
     /// from loopback, so a game server can't tell them from a local client otherwise.
     /// Also answers for datagrams from one of our UDP aliases.
     pub fn forwarded_peer(&self, game_sees: SocketAddr) -> Option<PeerId> {
-        if let SocketAddr::V4(v4) = game_sees
-            && let Some(from) = self.udp_from(v4)
-        {
-            return self.peer_at(*from.ip());
-        }
         let st = self.st.lock().unwrap();
+        // The alias knows its peer: not through its stand-in address, which two peers
+        // can share and which `peer_at` reads from a list that may not have it yet.
+        if let SocketAddr::V4(v4) = game_sees
+            && let Some(a) = st.by_addr.get(&v4)
+        {
+            return Some(a.peer);
+        }
         st.tcp.values().find(|t| t.stream.local_addr().ok() == Some(game_sees)).map(|t| t.peer)
     }
 
@@ -392,7 +413,15 @@ impl Forwarder {
             self.lan.close(peer, Some(socket));
             return;
         };
-        let count = self.st.lock().unwrap().tcp.keys().filter(|(p, _)| *p == peer).count();
+        let key = (peer, socket.to_string());
+        let count = {
+            let st = self.st.lock().unwrap();
+            if st.tcp.contains_key(&key) || st.connecting.contains(&key) {
+                // Asked again while it's open or connecting: the one there stands.
+                return;
+            }
+            st.tcp.keys().chain(st.connecting.iter()).filter(|(p, _)| *p == peer).count()
+        };
         let target = match self.for_peer(peer, Proto::Tcp, port) {
             Ok(t) if count < MAX_TCP_PER_PEER => Ok(t),
             Ok(_) => Err("too many streams from that peer"),
@@ -404,13 +433,19 @@ impl Forwarder {
             return;
         };
         let socket = socket.to_string();
-        let _ = thread::Builder::new().name("peerparty-ipfwd-connect".into()).spawn(move || {
+        self.st.lock().unwrap().connecting.insert(key.clone());
+        let gone = key.clone();
+        let spawned = thread::Builder::new().name("peerparty-ipfwd-connect".into()).spawn(move || {
             let mut stream = Err(std::io::Error::from(std::io::ErrorKind::NotFound));
             for ip in target.connect_to(strict) {
                 stream = TcpStream::connect_timeout(&SocketAddr::new(ip, port), Duration::from_secs(3));
                 if stream.is_ok() {
                     break;
                 }
+            }
+            // Closed, or the peer gone, while connecting: nobody wants it now.
+            if !me.st.lock().unwrap().connecting.remove(&key) {
+                return;
             }
             match stream {
                 Ok(s) => me.run_tcp(peer, socket, s, false),
@@ -420,6 +455,10 @@ impl Forwarder {
                 }
             }
         });
+        if spawned.is_err() {
+            self.st.lock().unwrap().connecting.remove(&gone);
+            self.lan.close(peer, Some(&gone.1));
+        }
     }
 
     /// Runs one stream until both directions finish (on the calling thread).
@@ -526,7 +565,12 @@ impl Forwarder {
             let _ = h.join();
         }
         self.lan.close(peer, Some(&socket));
-        self.st.lock().unwrap().tcp.remove(&(peer, socket));
+        let mut st = self.st.lock().unwrap();
+        let key = (peer, socket);
+        // Only this stream's entry: a later one under the same name isn't ours to drop.
+        if st.tcp.get(&key).is_some_and(|x| Arc::ptr_eq(x, &t)) {
+            st.tcp.remove(&key);
+        }
     }
 
     fn alias(&self, peer: PeerId, remote: u16, local: u16) -> Option<Arc<Alias>> {
@@ -702,10 +746,13 @@ impl Forwarder {
         if self.pumping.swap(true, Ordering::AcqRel) {
             return;
         }
-        let Some(me) = self.arc() else { return };
+        let (weak, pump) = (self.me.clone(), self.pump.clone());
         let _ = thread::Builder::new().name("peerparty-ipfwd".into()).spawn(move || {
             let mut last_tick = Instant::now() - Duration::from_secs(1);
-            loop {
+            // One pass at a time with the forwarder in hand, let go before the sleep: a
+            // forwarder nobody else holds is dropped, and the pump ends.
+            while !pump.stop.load(Ordering::Acquire) {
+                let Some(me) = weak.upgrade() else { break };
                 let mut events = Vec::new();
                 if last_tick.elapsed() >= Duration::from_millis(5) {
                     last_tick = Instant::now();
@@ -729,11 +776,20 @@ impl Forwarder {
                 for ev in &events {
                     me.event(ev);
                 }
+                drop(me);
                 if !busy {
                     thread::sleep(Duration::from_millis(1));
                 }
             }
+            pump.done.store(true, Ordering::Release);
         });
+    }
+}
+
+impl Drop for Forwarder {
+    fn drop(&mut self) {
+        // Not joined: the last handle may be the pump's own, dropped on its thread.
+        self.pump.stop.store(true, Ordering::Release);
     }
 }
 
@@ -795,6 +851,20 @@ struct Row {
     loopback: bool,
 }
 
+impl Row {
+    /// The row of a socket at `addr`.
+    fn of(addr: SocketAddr) -> Row {
+        match addr {
+            SocketAddr::V4(a) => Row { port: a.port(), v4: Some(*a.ip()), loopback: a.ip().is_loopback() },
+            SocketAddr::V6(a) => {
+                let ip = a.ip();
+                let loopback = ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|v| v.is_loopback());
+                Row { port: a.port(), v4: None, loopback }
+            }
+        }
+    }
+}
+
 /// The ports this process has open, from the system's socket tables: TCP listeners and
 /// UDP sockets.
 #[derive(Default)]
@@ -840,91 +910,59 @@ impl Owned {
         }
     }
 
-    #[cfg(windows)]
+    /// This process's TCP listeners and UDP sockets (IPv4 rows first).
     fn read() -> Owned {
+        let pid = std::process::id();
+        let (Some(tcp), Some(udp)) = (crate::sys::sockets_of(pid, true), crate::sys::sockets_of(pid, false)) else {
+            return Owned { ports: HashMap::new(), all: true };
+        };
         let mut owned = Owned::default();
-        for proto in [Proto::Tcp, Proto::Udp] {
-            owned.add(proto, &owned_by_me(proto == Proto::Tcp));
-        }
+        owned.add(Proto::Tcp, &tcp.into_iter().map(Row::of).collect::<Vec<_>>());
+        owned.add(Proto::Udp, &udp.into_iter().map(Row::of).collect::<Vec<_>>());
         owned
     }
-
-    #[cfg(not(windows))]
-    fn read() -> Owned {
-        Owned { ports: HashMap::new(), all: true }
-    }
-}
-
-/// Our rows of the socket tables, as `GetExtendedTcpTable` (`TCP_TABLE_OWNER_PID_*`) and
-/// `GetExtendedUdpTable` (`UDP_TABLE_OWNER_PID`) fill them: a row count, then rows of
-/// u32s. `v4` and `v6` are the two tables, `pid` ours. IPv4 rows first.
-fn parse_rows(tcp: bool, v4: &[u32], v6: &[u32], pid: u32) -> Vec<Row> {
-    let mut out = Vec::new();
-    // Row layouts (u32s): MIB_TCPROW_OWNER_PID starts with its state; the UDP row with
-    // the address.
-    let (width, addr_at, port_at, pid_at) = if tcp { (6, 1, 2, 5) } else { (3, 0, 1, 2) };
-    let rows = v4.first().copied().unwrap_or(0) as usize;
-    for i in 0..rows {
-        let Some(r) = v4.get(1 + i * width..1 + (i + 1) * width) else { break };
-        if r[pid_at] == pid {
-            // The address is in network order in memory.
-            let ip = Ipv4Addr::from(r[addr_at].to_ne_bytes());
-            out.push(Row { port: u16::from_be(r[port_at] as u16), v4: Some(ip), loopback: ip.is_loopback() });
-        }
-    }
-    // MIB_TCP6ROW_OWNER_PID and MIB_UDP6ROW_OWNER_PID start with the 16-byte address.
-    let (width, port_at, pid_at) = if tcp { (14, 5, 13) } else { (7, 5, 6) };
-    let rows = v6.first().copied().unwrap_or(0) as usize;
-    for i in 0..rows {
-        let Some(r) = v6.get(1 + i * width..1 + (i + 1) * width) else { break };
-        if r[pid_at] == pid {
-            let mut b = [0u8; 16];
-            for (k, w) in r[..4].iter().enumerate() {
-                b[k * 4..k * 4 + 4].copy_from_slice(&w.to_ne_bytes());
-            }
-            let ip = Ipv6Addr::from(b);
-            let loopback = ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|v| v.is_loopback());
-            out.push(Row { port: u16::from_be(r[port_at] as u16), v4: None, loopback });
-        }
-    }
-    out
-}
-
-/// Every port this process listens on (TCP) or has a socket at (UDP). IPv4 rows first.
-#[cfg(windows)]
-fn owned_by_me(tcp: bool) -> Vec<Row> {
-    use windows_sys::Win32::NetworkManagement::IpHelper::{
-        GetExtendedTcpTable, GetExtendedUdpTable, TCP_TABLE_OWNER_PID_LISTENER, UDP_TABLE_OWNER_PID,
-    };
-    use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
-    let pid = std::process::id();
-    let table = |v6: bool| -> Vec<u32> {
-        let af = if v6 { AF_INET6 } else { AF_INET } as u32;
-        let mut size = 0u32;
-        for _ in 0..4 {
-            let mut buf = vec![0u32; size as usize / 4 + 1];
-            let rc = unsafe {
-                if tcp {
-                    GetExtendedTcpTable(buf.as_mut_ptr().cast(), &mut size, 0, af, TCP_TABLE_OWNER_PID_LISTENER, 0)
-                } else {
-                    GetExtendedUdpTable(buf.as_mut_ptr().cast(), &mut size, 0, af, UDP_TABLE_OWNER_PID, 0)
-                }
-            };
-            if rc == 0 {
-                return buf;
-            }
-        }
-        Vec::new()
-    };
-    parse_rows(tcp, &table(false), &table(true), pid)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Dropping the last handle to a forwarder whose pump runs drops it (and the `Lan`
+    /// it holds), and the pump thread ends.
+    #[test]
+    fn a_dropped_forwarder_stops_its_pump() {
+        fn quiet(_: &str) {}
+        let lan = Lan::start(crate::Options {
+            game: format!("fwdtest:drop:{}", std::process::id()),
+            identity: crate::Identity::ephemeral("a"),
+            discovery_port: crate::test_ports::claim(1),
+            extra_targets: Vec::new(),
+            log: quiet,
+            internet: None,
+            public: None,
+            lan_discovery: false,
+            public_voice: None,
+        })
+        .expect("start");
+        let f = Forwarder::new(lan.clone(), None, quiet);
+        f.ensure_pump();
+        let (weak, pump) = (Arc::downgrade(&f), f.pump.clone());
+        // The pump is running: it has taken the forwarder in hand at least once.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!pump.done.load(Ordering::Acquire));
+        drop(f);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pump.done.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "the pump still runs");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(pump.stop.load(Ordering::Acquire), "dropped, which tells the pump to stop");
+        assert_eq!(weak.strong_count(), 0, "nothing holds the forwarder");
+        lan.shutdown();
+    }
+
     /// The socket tables name this process's own listeners and sockets.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn reads_this_processes_open_ports() {
         let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -937,61 +975,32 @@ mod tests {
         assert!(!owned.all);
     }
 
-    /// Rows as the tables hold them: the address in network order, the port in network
-    /// order in the low 16 bits.
-    fn v4_row(tcp: bool, ip: [u8; 4], port: u16, pid: u32) -> Vec<u32> {
-        let (a, p) = (u32::from_ne_bytes(ip), port.to_be() as u32);
-        if tcp { vec![2, a, p, 0, 0, pid] } else { vec![a, p, pid] }
-    }
-
-    fn v6_row(tcp: bool, ip: Ipv6Addr, port: u16, pid: u32) -> Vec<u32> {
-        let o = ip.octets();
-        let mut r: Vec<u32> = o.chunks(4).map(|c| u32::from_ne_bytes(c.try_into().unwrap())).collect();
-        r.push(0);
-        r.push(port.to_be() as u32);
-        if tcp {
-            // Remote address, scope and port, then the state.
-            r.extend([0; 7]);
-        }
-        r.push(pid);
-        r
-    }
-
-    fn table(rows: &[Vec<u32>]) -> Vec<u32> {
-        let mut t = vec![rows.len() as u32];
-        rows.iter().for_each(|r| t.extend(r));
-        t
-    }
-
     /// Which of the game's ports are kept to this PC: a socket on loopback alone makes
-    /// it so for its address family; "any", a LAN address and IPv6 "any" don't. Another
-    /// process's rows don't count, and `[::1]` is only tried when the game has an IPv6
-    /// socket there.
+    /// it so for its address family; "any", a LAN address and IPv6 "any" don't, and
+    /// `[::1]` is only tried when the game has an IPv6 socket there. (Which rows are this
+    /// process's is `sys`'s: its tests.)
     #[test]
     fn loopback_only_ports_are_told_from_the_tables() {
-        let me = 4242;
         let any6 = Ipv6Addr::UNSPECIFIED;
         let mapped = Ipv4Addr::LOCALHOST.to_ipv6_mapped();
+        let v4 = |ip: [u8; 4], port: u16| SocketAddr::from((ip, port));
+        let v6 = |ip: Ipv6Addr, port: u16| SocketAddr::from((ip, port));
         for tcp in [true, false] {
             let proto = if tcp { Proto::Tcp } else { Proto::Udp };
-            let v4 = table(&[
-                v4_row(tcp, [127, 0, 0, 1], 1000, me),
-                v4_row(tcp, [0, 0, 0, 0], 1001, me),
-                v4_row(tcp, [10, 1, 2, 3], 1002, me),
-                v4_row(tcp, [0, 0, 0, 0], 1003, me + 1),
-                v4_row(tcp, [0, 0, 0, 0], 1005, me),
-                v4_row(tcp, [127, 0, 0, 1], 1005, me),
-                v4_row(tcp, [127, 9, 9, 9], 1007, me),
-            ]);
-            let v6 = table(&[
-                v6_row(tcp, Ipv6Addr::LOCALHOST, 1001, me),
-                v6_row(tcp, any6, 1004, me),
-                v6_row(tcp, Ipv6Addr::LOCALHOST, 1003, me + 1),
-                v6_row(tcp, mapped, 1006, me),
-                v6_row(tcp, any6, 1002, me),
-            ]);
+            let socks = [
+                v4([127, 0, 0, 1], 1000),
+                v4([0, 0, 0, 0], 1001),
+                v4([10, 1, 2, 3], 1002),
+                v4([0, 0, 0, 0], 1005),
+                v4([127, 0, 0, 1], 1005),
+                v4([127, 9, 9, 9], 1007),
+                v6(Ipv6Addr::LOCALHOST, 1001),
+                v6(any6, 1004),
+                v6(mapped, 1006),
+                v6(any6, 1002),
+            ];
             let mut owned = Owned::default();
-            owned.add(proto, &parse_rows(tcp, &v4, &v6, me));
+            owned.add(proto, &socks.map(Row::of));
             let get = |port| owned.get(proto, port);
             let lo = Ipv4Addr::LOCALHOST;
             let (v4lo, v6lo) = (IpAddr::V4(lo), IpAddr::V6(Ipv6Addr::LOCALHOST));
@@ -999,7 +1008,7 @@ mod tests {
             assert_eq!(get(1000), port(lo, true, false, true, false));
             assert_eq!(get(1001), port(lo, false, true, true, true), "IPv4 any, IPv6 loopback");
             assert_eq!(get(1002), port(Ipv4Addr::new(10, 1, 2, 3), false, false, true, true));
-            assert_eq!(get(1003), None, "another process's");
+            assert_eq!(get(1003), None, "not the game's");
             assert_eq!(get(1004), port(lo, false, false, false, true));
             assert_eq!(get(1005), port(lo, true, false, true, false), "loopback beside any");
             assert_eq!(get(1006).map(|p| p.kept_local()), Some(true), "IPv4-mapped loopback");
@@ -1014,8 +1023,5 @@ mod tests {
             assert_eq!(p(1004).connect_to(true), vec![v6lo]);
             assert_eq!(p(1005).connect_to(true), Vec::<IpAddr>::new());
         }
-        // A short or empty table is read as far as it goes.
-        assert!(parse_rows(true, &[5, 1, 2], &[], me).is_empty());
-        assert!(parse_rows(false, &[], &[], me).is_empty());
     }
 }

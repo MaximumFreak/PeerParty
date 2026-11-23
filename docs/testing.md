@@ -4,9 +4,10 @@
 
 `tests\run_all.ps1` runs everything that doesn't need a person at the keyboard:
 
-- `cargo test --workspace`: unit and loopback tests (hook, core, launcher). Some use the
-  PC's own devices and skip themselves without them: GameInput, the Vulkan overlay
-  pipeline (GPU), Windows' Voice Capture DSP (microphone).
+- `cargo test --workspace`: unit and loopback tests (hook, core, launcher), through
+  `cargo nextest run` when cargo-nextest is installed (see below). Some use the PC's own
+  devices and skip themselves without them: GameInput, the Vulkan overlay pipeline (GPU),
+  Windows' Voice Capture DSP (microphone).
 - A testexe build: the same optimizations as a release build, without link-time
   optimization, so the suite's exe builds faster. The shipping exe is still the release
   build. `-SkipBuild` reuses the last testexe build.
@@ -31,13 +32,33 @@
   routine, `GetQueuedCompletionStatus(Ex)`, `WSAGetOverlappedResult`,
   `GetOverlappedResult`, a thread-pool IO object, `BindIoCompletionCallback`) and must
   come from the other's stand-in.
-- Internet play (`core/tests/internet.rs`, `core/tests/public.rs`, no internet needed):
+- Internet play (`core/tests/integration/internet.rs`, `core/tests/integration/public.rs`, no internet needed):
   room-code peers through a tunnel; three public-session players finding each other and
   each other's lobbies through a local test DHT, with no address in names, lobbies,
   status or logs; a blocked player dropped and kept out; forged, altered and replayed
   adverts refused; thousands of junk packets survived. Tests marked "needs the
   internet" use the real DHT (`cargo test -p peerparty_core -- --ignored` with
   `PEERPARTY_LOOPBACK=0`).
+
+### Faster builds and test runs (optional)
+
+- **cargo-nextest** (`cargo install cargo-nextest`, or the binary from
+  https://get.nexte.st): `cargo nextest run --workspace` runs every test in a process of
+  its own, as many at once as there are cores, and stops one that hangs after two
+  minutes (`.config/nextest.toml`). `run_all.ps1` uses it when it's installed. There
+  are no doctests, which nextest doesn't run.
+- **sccache** (`winget install Mozilla.sccache`, then `RUSTC_WRAPPER=sccache`): compiled
+  dependencies are kept across `cargo clean` and between target folders. A cold
+  `cargo test --workspace --no-run` took 51 s without it and 32 s with its cache filled.
+  Our own crates build incrementally, which sccache passes through, so an edit-and-test
+  cycle is no faster.
+- **rust-lld** comes with the toolchain, but linking isn't where the time goes here: on
+  the PC these were measured on, a hook edit's testexe rebuild took 7.8 s with
+  `link.exe` and 8.1 s with `rust-lld`, and a relink 1.6 s and 1.5 s. To try it:
+  `$env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = 'rust-lld'` (and the `I686` one;
+  the environment reaches the hook's nested build, a `--config` flag doesn't).
+- core's integration tests are one binary (`core/tests/integration`), so they run side
+  by side: `cargo test -p peerparty_core --test integration public::` runs one file's.
 
 ### SDK DLLs for the tests
 
@@ -65,7 +86,8 @@ Without the variable, `run_all.ps1` uses copies kept in
 exist, the kept copies are refreshed from them, so the tests keep working after a game
 is uninstalled. A test with no DLL is skipped and named in the summary. `-Only
 photon,ugs` runs some; `-SkipBuild` reuses the last testexe build. The two-copy tests
-run four at a time, each with its own game key so they don't meet on the peer board.
+run half as many at a time as the PC has logical processors (4 to 8; `-Jobs <n>` sets
+it), each with its own game key so they don't meet on the peer board.
 The Steam licence test runs by itself afterwards, because it uses the real Steam client.
 Photon shares that pool, one Photon build at a time (its ports are fixed).
 

@@ -30,12 +30,13 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use peerparty_core::{Attr, Event, Lobby, PeerId, Query, Value};
 
-use super::http::Request;
-use crate::json::Json;
+use crate::https::server::Request;
+use crate::util::time::{iso, millis};
+use crate::util::json::Json;
 use crate::log;
 use crate::net::{self, Front};
 
@@ -100,12 +101,9 @@ struct Saved {
 
 /// `PEERPARTY_PLAYFAB_DIR` replaces the folder, for tests.
 fn saved_path() -> Option<PathBuf> {
-    if let Some(d) = std::env::var_os("PEERPARTY_PLAYFAB_DIR") {
-        return Some(PathBuf::from(d).join(format!("{}.json", entity_id())));
-    }
-    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from)?;
-    let game = std::env::current_exe().ok()?.file_stem()?.to_string_lossy().to_ascii_lowercase();
-    Some(base.join("peerparty").join("playfab").join(game).join(format!("{}.json", entity_id())))
+    use crate::util::local_store;
+    let dir = crate::config::HookConfig::global().playfab_dir().or_else(|| local_store::game_dir("playfab"))?;
+    Some(dir.join(format!("{}.json", entity_id())))
 }
 
 fn strings_of(j: &Json) -> BTreeMap<String, String> {
@@ -116,7 +114,7 @@ fn strings_of(j: &Json) -> BTreeMap<String, String> {
 }
 
 fn with_saved<T>(f: impl FnOnce(&mut Saved) -> T) -> T {
-    let mut st = STATE.lock().unwrap();
+    let mut st = crate::sys::lock(&STATE);
     let s = &mut st.saved;
     if !s.loaded {
         s.loaded = true;
@@ -215,7 +213,7 @@ fn store_call(path: &str) -> bool {
     match service {
         "client" | "server" => {
             // The legacy matchmaker's ticket, not a store item.
-            name != "redeemmatchmakerticket" && (VERBS.iter().any(|p| name.starts_with(p)) || name.ends_with("virtualcurrency"))
+            name != "redeemmatchmakerticket" && (VERBS.iter().any(|p| name.starts_with(p)) || (name.ends_with("virtualcurrency") && !name.starts_with("get")))
         }
         "admin" => true,
         "inventory" => !name.starts_with("get"),
@@ -285,7 +283,7 @@ pub fn handle(req: &Request) -> (u16, String) {
         )])),
         "/Client/UpdateAvatarUrl" => {
             if let Some(url) = body.get("ImageUrl").as_str() {
-                STATE.lock().unwrap().avatar_url = url.to_string();
+                crate::sys::lock(&STATE).avatar_url = url.to_string();
             }
             ok(Json::Obj(vec![]))
         }
@@ -418,30 +416,30 @@ pub fn handle(req: &Request) -> (u16, String) {
         "/Lobby/JoinLobby" => {
             let (member, data) = member_of(&body);
             let connection = body.get("ConnectionString").as_str().unwrap_or_default();
-            lobby_result(crate::pfmp::rest_join(connection, member, data).map(|id| Json::obj(vec![("LobbyId", Json::str(id))])))
+            lobby_result(crate::playfab::mp::rest_join(connection, member, data).map(|id| Json::obj(vec![("LobbyId", Json::str(id))])))
         }
         "/Lobby/JoinArrangedLobby" => {
             let arrangement = body.get("ArrangementString").as_str().unwrap_or_default().to_string();
             let c = create_settings(&body);
-            lobby_result(crate::pfmp::rest_join_arranged(&arrangement, c).map(|id| Json::obj(vec![("LobbyId", Json::str(id))])))
+            lobby_result(crate::playfab::mp::rest_join_arranged(&arrangement, c).map(|id| Json::obj(vec![("LobbyId", Json::str(id))])))
         }
-        "/Lobby/DeleteLobby" => lobby_result(crate::pfmp::rest_delete(body.get("LobbyId").as_str().unwrap_or_default()).map(|()| Json::Obj(vec![]))),
+        "/Lobby/DeleteLobby" => lobby_result(crate::playfab::mp::rest_delete(body.get("LobbyId").as_str().unwrap_or_default()).map(|()| Json::Obj(vec![]))),
         "/Lobby/RemoveMember" => lobby_result(
-            crate::pfmp::rest_remove(
+            crate::playfab::mp::rest_remove(
                 body.get("LobbyId").as_str().unwrap_or_default(),
                 body.get("MemberEntity").get("Id").as_str().unwrap_or_default(),
             )
             .map(|()| Json::Obj(vec![])),
         ),
         "/Lobby/InviteToLobby" => lobby_result(
-            crate::pfmp::rest_invite(
+            crate::playfab::mp::rest_invite(
                 body.get("LobbyId").as_str().unwrap_or_default(),
                 body.get("InviteeEntity").get("Id").as_str().unwrap_or_default(),
             )
             .map(|()| Json::Obj(vec![])),
         ),
         "/Lobby/LeaveLobby" => {
-            crate::pfmp::rest_leave(body.get("LobbyId").as_str().unwrap_or_default());
+            crate::playfab::mp::rest_leave(body.get("LobbyId").as_str().unwrap_or_default());
             ok(Json::Obj(vec![]))
         }
         "/Match/CreateMatchmakingTicket" => create_ticket(&body),
@@ -566,7 +564,7 @@ fn empty_result(path: &str, body: &Json, now: &str) -> Json {
 }
 
 fn player_profile() -> Json {
-    let avatar = STATE.lock().unwrap().avatar_url.clone();
+    let avatar = crate::sys::lock(&STATE).avatar_url.clone();
     Json::obj(vec![
         ("PlayerId", Json::str(playfab_id())),
         ("TitleId", Json::str("")),
@@ -584,9 +582,6 @@ fn new_ticket_id() -> String {
     format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
 }
 
-fn millis(t: SystemTime) -> i64 {
-    t.duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
-}
 
 fn create_ticket(body: &Json) -> (u16, String) {
     let attrs = body.get("Creator").get("Attributes");
@@ -641,7 +636,7 @@ pub(crate) fn open_ticket(queue: &str, entity: &str, data: &str, give_up: f64) -
     }
     lan.create_lobby(lobby).map_err(|e| format!("{e:?}"))?;
     log!("playfab ticket {id} queue={queue} data={data}");
-    STATE.lock().unwrap().tickets.insert(
+    crate::sys::lock(&STATE).tickets.insert(
         id.clone(),
         Ticket {
             queue,
@@ -667,7 +662,7 @@ pub(crate) fn poll_ticket(id: &str) -> Option<Poll> {
     if !advance(lan, id) {
         return None;
     }
-    let s = STATE.lock().unwrap();
+    let s = crate::sys::lock(&STATE);
     let t = s.tickets.get(id)?;
     Some(match (&t.matched, t.canceled) {
         (Some((m, _)), _) => Poll::Matched(m.clone(), s.matches.get(m).cloned().unwrap_or_default()),
@@ -678,7 +673,7 @@ pub(crate) fn poll_ticket(id: &str) -> Option<Poll> {
 
 fn cancel(which: impl Fn(&str, &Ticket) -> bool, reason: &'static str) {
     let lan = net::lan();
-    let mut s = STATE.lock().unwrap();
+    let mut s = crate::sys::lock(&STATE);
     for (id, t) in s.tickets.iter_mut() {
         if t.canceled.is_none() && t.matched.is_none() && which(id, t) {
             t.canceled = Some(reason);
@@ -692,7 +687,7 @@ fn cancel(which: impl Fn(&str, &Ticket) -> bool, reason: &'static str) {
 
 /// Matched tickets leave the LAN once the other side has had time to adopt the match.
 fn tidy(lan: &peerparty_core::Lan) {
-    let s = STATE.lock().unwrap();
+    let s = crate::sys::lock(&STATE);
     for (id, t) in &s.tickets {
         if t.matched.as_ref().is_some_and(|(_, at)| at.elapsed() > MATCH_LINGER) {
             let _ = lan.destroy(id);
@@ -819,9 +814,9 @@ fn member_of(body: &Json) -> ((String, String), Vec<(String, Option<String>)>) {
     ((id, ty), data)
 }
 
-fn create_settings(body: &Json) -> crate::pfmp::RestCreate {
+fn create_settings(body: &Json) -> crate::playfab::mp::RestCreate {
     let (member, member_data) = member_of(body);
-    crate::pfmp::RestCreate {
+    crate::playfab::mp::RestCreate {
         member,
         max: body.get("MaxPlayers").as_f64().map_or(8, |n| n as u32),
         access: body.get("AccessPolicy").as_str().unwrap_or("Public").to_string(),
@@ -833,8 +828,8 @@ fn create_settings(body: &Json) -> crate::pfmp::RestCreate {
 }
 
 fn create_lobby(body: &Json) -> (u16, String) {
-    lobby_result(crate::pfmp::rest_create(create_settings(body)).map(|id| {
-        Json::obj(vec![("LobbyId", Json::str(id.clone())), ("ConnectionString", Json::str(format!("{}{id}", crate::pfmp::CONNECT_PREFIX)))])
+    lobby_result(crate::playfab::mp::rest_create(create_settings(body)).map(|id| {
+        Json::obj(vec![("LobbyId", Json::str(id.clone())), ("ConnectionString", Json::str(format!("{}{id}", crate::playfab::mp::CONNECT_PREFIX)))])
     }))
 }
 
@@ -893,7 +888,7 @@ fn lan_lobbies(lan: &peerparty_core::Lan, ns: &str) -> Vec<Lobby> {
 /// public address, which a game looks the server up by). Blocks for a LAN search.
 pub(crate) fn lobby_address(owner: PeerId, port: u16) -> Option<String> {
     let lan = net::lan()?;
-    let lobbies = lan_lobbies(lan, crate::pfmp::NS);
+    let lobbies = lan_lobbies(lan, crate::playfab::mp::NS);
     let found = address_in(lobbies.iter().filter(|l| l.owner == owner), port);
     log!("playfab lobby address of {owner} for port {port}: {}", found.as_deref().unwrap_or("none"));
     found
@@ -939,7 +934,7 @@ fn string_map(pairs: Vec<(String, String)>) -> Json {
 /// `/Lobby/GetLobby`: a LAN lobby this copy is in, as PlayFab's `Lobby` model.
 fn get_lobby(body: &Json) -> (u16, String) {
     let id = body.get("LobbyId").as_str().unwrap_or_default();
-    let Some(l) = crate::pfmp::rest_lobby(id) else {
+    let Some(l) = crate::playfab::mp::rest_lobby(id) else {
         log!("playfab GetLobby {id}: not a lobby this copy is in");
         return error(404, "LobbyNotFound", 0, "Lobby not found.");
     };
@@ -975,7 +970,7 @@ fn get_lobby(body: &Json) -> (u16, String) {
 /// `/Lobby/UpdateLobby`: changes a LAN lobby of the PlayFab Multiplayer library's.
 fn update_lobby(body: &Json) -> (u16, String) {
     let id = body.get("LobbyId").as_str().unwrap_or_default();
-    let u = crate::pfmp::RestUpdate {
+    let u = crate::playfab::mp::RestUpdate {
         max: body.get("MaxPlayers").as_f64().map(|n| n as u32),
         locked: body.get("MembershipLock").as_str().map(|l| l == "Locked"),
         search: changes(body.get("SearchData"), body.get("SearchDataToDelete")),
@@ -983,7 +978,7 @@ fn update_lobby(body: &Json) -> (u16, String) {
         member: changes(body.get("MemberData"), body.get("MemberDataToDelete")),
         owner: body.get("Owner").get("Id").as_str().map(str::to_string),
     };
-    match crate::pfmp::rest_update(id, u) {
+    match crate::playfab::mp::rest_update(id, u) {
         Ok(()) => ok(Json::Obj(vec![])),
         Err(name) => {
             log!("playfab UpdateLobby {id}: {name}");
@@ -1001,7 +996,7 @@ fn find_lobbies(body: &Json) -> (u16, String) {
     let filter = body.get("Filter").as_str().unwrap_or_default();
     let sort = body.get("OrderBy").as_str().unwrap_or_default();
     let count = body.get("Pagination").get("PageSizeRequested").as_f64().map_or(50, |n| n as usize).clamp(1, 200);
-    let found = crate::pfmp::summaries(lan_lobbies(lan, crate::pfmp::NS), lan.me(), filter, sort, count);
+    let found = crate::playfab::mp::summaries(lan_lobbies(lan, crate::playfab::mp::NS), lan.me(), filter, sort, count);
     log!("playfab FindLobbies filter={filter:?} sort={sort:?}: {} on the LAN", found.len());
     let lobbies: Vec<Json> = found
         .into_iter()
@@ -1032,7 +1027,7 @@ fn get_ticket(body: &Json) -> (u16, String) {
     if !advance(lan, &id) {
         return error(400, "MatchmakingTicketNotFound", 2053, "Ticket not found.");
     }
-    let s = STATE.lock().unwrap();
+    let s = crate::sys::lock(&STATE);
     ok(ticket_json(&id, &s.tickets[&id]))
 }
 
@@ -1041,13 +1036,13 @@ fn get_ticket(body: &Json) -> (u16, String) {
 fn advance(lan: &peerparty_core::Lan, id: &str) -> bool {
     let id = id.to_string();
     let read = || {
-        let s = STATE.lock().unwrap();
+        let s = crate::sys::lock(&STATE);
         let t = s.tickets.get(&id)?;
         let open = t.canceled.is_none() && t.matched.is_none();
         Some(open.then(|| (t.queue.clone(), t.entity.clone(), t.data.clone(), t.created, t.started.elapsed().as_secs_f64() > t.give_up)))
     };
     {
-        let _one = MATCHING.lock().unwrap();
+        let _one = crate::sys::lock(&MATCHING);
         tidy(lan);
     }
     let queue = match read() {
@@ -1055,7 +1050,7 @@ fn advance(lan: &peerparty_core::Lan, id: &str) -> bool {
         Some(None) => return true,
         // Waited too long: no search needed to say so.
         Some(Some(t)) if t.4 => {
-            let _one = MATCHING.lock().unwrap();
+            let _one = crate::sys::lock(&MATCHING);
             cancel(|tid, _| tid == id, "Timeout");
             return true;
         }
@@ -1064,7 +1059,7 @@ fn advance(lan: &peerparty_core::Lan, id: &str) -> bool {
     // The search waits up to SEARCH_WAIT for the LAN's answers: not while holding the
     // guard, so polls of other tickets aren't held up behind it.
     let all = search(lan, &queue);
-    let _one = MATCHING.lock().unwrap();
+    let _one = crate::sys::lock(&MATCHING);
     // Read again under the guard: another poll may have matched or ended it meanwhile.
     let (entity, data, created, expired) = match read() {
         None => return false,
@@ -1089,7 +1084,7 @@ fn advance(lan: &peerparty_core::Lan, id: &str) -> bool {
                 }
                 let _ = lan.update(&id, Some(&l), &[], &[]);
             }
-            let mut s = STATE.lock().unwrap();
+            let mut s = crate::sys::lock(&STATE);
             s.matches.insert(
                 match_id.clone(),
                 members.into_iter().map(|v| (v.entity, v.data)).collect(),
@@ -1201,7 +1196,8 @@ pub(crate) fn compatible(a: &str, b: &str) -> bool {
             return true;
         }
         match (va.as_str(), b.get(k).as_str()) {
-            (Some(x), Some(y)) => x.trim_end_matches('j') == y.trim_end_matches('j'),
+            // One marker `j`, not every trailing one ("ha" and "hajj" differ).
+            (Some(x), Some(y)) => x.strip_suffix('j').unwrap_or(x) == y.strip_suffix('j').unwrap_or(y),
             _ => true,
         }
     })
@@ -1249,7 +1245,7 @@ fn get_match(body: &Json) -> (u16, String) {
     let id = body.get("MatchId").as_str().unwrap_or_default();
     let escaped = matches!(body.get("EscapeObject"), Json::Bool(true));
     let with_attrs = !matches!(body.get("ReturnMemberAttributes"), Json::Bool(false));
-    let s = STATE.lock().unwrap();
+    let s = crate::sys::lock(&STATE);
     let Some(members) = s.matches.get(id) else {
         return error(400, "MatchNotFound", 2056, "Match not found.");
     };
@@ -1270,30 +1266,6 @@ fn get_match(body: &Json) -> (u16, String) {
     ]))
 }
 
-/// `2026-10-30T09:15:00.000Z`.
-pub(crate) fn iso(t: SystemTime) -> String {
-    let ms = millis(t);
-    let secs = ms.div_euclid(1000);
-    let days = secs.div_euclid(86_400);
-    let rem = secs.rem_euclid(86_400);
-    // Howard Hinnant's civil-from-days.
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    format!(
-        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{:03}Z",
-        rem / 3600,
-        rem / 60 % 60,
-        rem % 60,
-        ms.rem_euclid(1000)
-    )
-}
 
 /// What a game is told when it asks a CloudScript function to delete the player's
 /// account: in English, as games show a script's text as it comes.
@@ -1321,7 +1293,7 @@ mod tests {
 
     #[test]
     fn a_lobby_advertises_the_address_for_its_game_port() {
-        let mut l = Lobby::new(crate::pfmp::NS);
+        let mut l = Lobby::new(crate::playfab::mp::NS);
         let s = |k: &str, v: &str| Attr { key: format!("s:{k}"), value: Value::Str(v.into()), public: true };
         l.attrs = vec![s("string_key5", "My World"), s("string_key9", "1.2.3.4:99"), s("string_key10", "203.0.113.5:2456")];
         assert_eq!(address_in([&l].into_iter(), 2456).as_deref(), Some("203.0.113.5:2456"));
@@ -1507,12 +1479,4 @@ mod tests {
         assert_eq!(members.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(), ["b", "c"]);
     }
 
-    #[test]
-    fn iso_dates() {
-        assert_eq!(iso(UNIX_EPOCH), "1970-01-01T00:00:00.000Z");
-        assert_eq!(
-            iso(UNIX_EPOCH + Duration::from_millis(1_793_352_900_123)),
-            "2026-10-30T09:35:00.123Z"
-        );
-    }
 }

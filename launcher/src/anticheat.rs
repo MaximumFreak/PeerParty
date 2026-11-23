@@ -8,16 +8,10 @@
 
 use std::path::Path;
 
-/// Whether a file name is an anti-cheat program or module (the hook's `is_anticheat`).
+/// Whether a file name is an anti-cheat program or module: the names the hook checks
+/// too (`catalog::ANTICHEAT_PATTERNS`).
 fn is_anticheat(file: &str) -> bool {
-    let f = file.to_ascii_lowercase();
-    f.contains("easyanticheat")
-        || f.contains("start_protected_game")
-        || f.contains("battleye")
-        || f.starts_with("beclient")
-        || f.starts_with("beservice")
-        || f.starts_with("bedaisy")
-        || f.starts_with("eac_launcher")
+    peerparty_protocol::catalog::is_anticheat_name(file)
 }
 
 /// Why `exe` won't be started, when it's anti-cheat's own starter or has an anti-cheat
@@ -50,6 +44,7 @@ mod tests {
         std::fs::write(dir.join("EasyAntiCheat").join("EasyAntiCheat_EOS_Setup.exe"), b"MZ").unwrap();
         assert_eq!(refuse(&dir.join("Game.exe")), None);
         assert_eq!(refuse(&dir.join("start_protected_game.exe")).as_deref(), Some("start_protected_game.exe"));
+        assert_eq!(refuse(&dir.join("EAC_Launcher.exe")).as_deref(), Some("EAC_Launcher.exe"));
         std::fs::write(dir.join("BEClient_x64.dll"), b"MZ").unwrap();
         assert_eq!(refuse(&dir.join("Game.exe")).as_deref(), Some("BEClient_x64.dll"));
         let _ = std::fs::remove_dir_all(&dir);

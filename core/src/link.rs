@@ -1,13 +1,15 @@
 //! What outlives a dropped connection to a peer, so a short break doesn't make the peer
 //! leave (see `lan::LINK_GRACE`).
 //!
-//! Every message on a peer's ordered stream that counts in its session (`counted`)
+//! Every message on a peer's ordered stream that counts in its session (`Msg::is_counted`)
 //! carries its number (`Msg::Numbered`), each side numbering what it sends from 1. What
 //! was sent stays kept until the peer says it has everything up to it (`Msg::Ack`).
 //! The receiver goes by the numbers, not by how many came: one it already has is
-//! dropped, and one past a gap (messages lost on a connection cut while another one
-//! already carried later ones) is delivered and remembered, and the gap is asked for
-//! again (`Msg::Resend`). When the connection drops and the peer comes back on a new
+//! dropped, and one past a gap (messages still on another connection, as when both
+//! sides dialed at once and both connections carry data for a moment, or lost on a
+//! connection that was cut) is remembered and held back until the gap fills, so what
+//! is delivered stays in order; the gap is asked for again (`Msg::Resend`), and given
+//! up on in the end. When the connection drops and the peer comes back on a new
 //! one, each side first says where it stands (`Msg::Session`): its process's session,
 //! the one it holds for the other, how many it sent, how far it has everything it
 //! received, and the oldest one it still keeps. Both sides then make the same decision
@@ -34,24 +36,6 @@ const GAP_TRIES: u32 = 3;
 const BEYOND_MAX: usize = 1 << 16;
 /// A peer's asks to send again are answered at most this often (each may be KEEP_MAX).
 const RESEND_EVERY: Duration = Duration::from_secs(1);
-
-/// Whether a message is numbered in a session: everything on the ordered stream except
-/// what is about the stream itself, and unreliable channel data, which may travel as a
-/// datagram instead (`Conn::send_unreliable`) and may be lost anyway.
-pub(crate) fn counted(m: &Msg) -> bool {
-    !matches!(
-        m,
-        Msg::Hello { .. }
-            | Msg::Proof { .. }
-            | Msg::Moved
-            | Msg::Session { .. }
-            | Msg::Ack { .. }
-            | Msg::Bye
-            | Msg::Numbered { .. }
-            | Msg::Resend { .. }
-            | Msg::ChanData { reliable: false, .. }
-    )
-}
 
 fn size(m: &Msg) -> usize {
     match m {
@@ -123,7 +107,7 @@ impl Link {
     /// fails, the same way on both sides); while away nothing goes, since the peer has
     /// none of it, and past KEEP_MAX the link is `overfull`.
     pub fn sent(&mut self, m: &Msg, away: bool) {
-        if !counted(m) {
+        if !m.is_counted() {
             return;
         }
         self.sent += 1;
@@ -143,20 +127,30 @@ impl Link {
         self.overfull
     }
 
+    /// The bytes kept for replay (at most KEEP_MAX while the peer is here).
+    pub fn kept_bytes(&self) -> usize {
+        self.kept_bytes
+    }
+
     /// The peer's message number `n` came: false when we already have it (a resend, or
     /// the same message on two connections), which is then dropped. One past a gap is
-    /// taken (and remembered), so a gap never holds the rest up.
+    /// counted (and remembered); the caller holds it back while `n > recv()`.
     pub fn received(&mut self, n: u64, now: Instant) -> bool {
         if n <= self.recv || self.beyond.contains(&n) {
             return false;
         }
-        if n == self.recv + 1 {
+        if self.recv.checked_add(1) != Some(n) && self.beyond.len() >= BEYOND_MAX {
+            self.give_up_gap();
+            // That can take `recv` past `n`: `n` was in the gap given up on, and is
+            // taken now without being remembered (everything up to `recv` counts as had).
+            if n <= self.recv {
+                return true;
+            }
+        }
+        if self.recv.checked_add(1) == Some(n) {
             self.recv = n;
             self.fill();
         } else {
-            if self.beyond.len() >= BEYOND_MAX {
-                self.give_up_gap();
-            }
             self.beyond.insert(n);
             self.gap_since.get_or_insert(now);
         }
@@ -166,7 +160,7 @@ impl Link {
     /// `recv` up past what came after it, the gap closed once it's filled.
     fn fill(&mut self) {
         let before = self.recv;
-        while self.beyond.first() == Some(&(self.recv + 1)) {
+        while self.recv < u64::MAX && self.beyond.first() == Some(&(self.recv + 1)) {
             self.beyond.pop_first();
             self.recv += 1;
         }
@@ -180,8 +174,15 @@ impl Link {
         }
     }
 
-    /// What's missing before the first message past the gap is taken as lost.
-    fn give_up_gap(&mut self) {
+    /// How far we have every message the peer sent: what came past it is held back
+    /// until it gets there.
+    pub fn recv(&self) -> u64 {
+        self.recv
+    }
+
+    /// What's missing before the first message past the gap is taken as lost (what the
+    /// caller held back then goes, in order).
+    pub fn give_up_gap(&mut self) {
         if let Some(&first) = self.beyond.first() {
             self.recv = first - 1;
             self.fill();
@@ -276,15 +277,48 @@ pub(crate) fn can_resume(ours: Standing, theirs: Standing) -> bool {
 
 /// Whether `from` still keeps everything after what `to` received.
 fn fits(from: Standing, to: Standing) -> bool {
-    to.recv <= from.sent && to.recv + 1 >= from.first
+    to.recv <= from.sent && to.recv.saturating_add(1) >= from.first
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// What comes past a gap is counted but stays past `recv` (the caller holds it)
+    /// until the gap fills, or is given up on.
+    #[test]
+    fn past_a_gap_waits_until_it_fills_or_is_given_up() {
+        let t = Instant::now();
+        let mut l = Link::new(1);
+        assert!(l.received(1, t) && l.recv() == 1);
+        // Both sides dialed at once: 3 came on the kept connection before 2 on the other.
+        assert!(l.received(3, t) && l.recv() == 1, "3 waits for 2");
+        assert!(!l.received(3, t), "and isn't taken twice");
+        assert!(l.received(2, t) && l.recv() == 3, "2 lets 3 go after it");
+        // Lost for good: given up on, what came after it goes.
+        assert!(l.received(6, t) && l.recv() == 3);
+        l.give_up_gap();
+        assert_eq!(l.recv(), 6);
+        assert!(!l.received(4, t), "one of the given-up turning up late is old");
+    }
+
     fn data(n: u8, len: usize) -> Msg {
         Msg::ChanData { socket: "s".into(), channel: 0, reliable: true, data: vec![n; len] }
+    }
+
+    /// A full gap list given up on for a message below it: nothing past `recv` is left
+    /// behind it, and nothing already had comes again.
+    #[test]
+    fn a_full_gap_never_leaves_numbers_behind_recv() {
+        let mut l = Link::new(1);
+        let now = Instant::now();
+        for i in 0..BEYOND_MAX as u64 {
+            assert!(l.received(100_000 + 2 * i, now));
+        }
+        assert!(l.received(2, now), "in the gap given up on, so taken");
+        assert_eq!(l.recv, 100_000);
+        assert!(l.beyond.first().is_none_or(|&f| f > l.recv));
+        assert!(!l.received(2, now) && !l.received(3, now) && !l.received(100_000, now));
     }
 
     #[test]

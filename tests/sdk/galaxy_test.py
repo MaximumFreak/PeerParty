@@ -5,7 +5,7 @@ Roles A and B are two copies on the LAN.
 
 Galaxy is C++: the accessors (galaxy::api::Stats() and the rest) are the DLL's own
 exports, and the methods are called through each object's vtable, in the order
-hook/src/galaxyvt.rs gives for the DLL's version (checked against the DLL's RTTI by the
+hook/src/galaxy/vt.rs gives for the DLL's version (checked against the DLL's RTTI by the
 cargo tests). Listeners are objects whose vtables are ctypes callbacks. Without peerparty
 these calls fail: the real Galaxy isn't signed in.
 
@@ -55,7 +55,7 @@ def file_version(path):
     return (ffi[2] >> 16, ffi[2] & 0xFFFF, ffi[3] >> 16)
 
 
-vt_src = open(os.path.join(HERE, "..", "..", "hook", "src", "galaxyvt.rs"), encoding="utf-8").read()
+vt_src = open(os.path.join(HERE, "..", "..", "hook", "src", "galaxy", "vt.rs"), encoding="utf-8").read()
 classes = re.findall(r'"(I\w+)"', re.search(r"pub const CLASSES: &\[&str\] = &\[(.*?)\];", vt_src).group(1))
 VERSION = file_version(os.environ["PPTEST_GALAXY_DLL"])
 # As the hook picks: the newest SDK in the table that isn't newer than the DLL.

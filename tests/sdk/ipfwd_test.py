@@ -5,9 +5,9 @@ loopback (LAN discovery off, so each sees the other only at its stand-in address
     run_pair.ps1 ipfwd_test.py -Env PEERPARTY_ROOM=<code>,PEERPARTY_LAN_DISCOVERY=0,
         PEERPARTY_INET_DHT=0,PEERPARTY_INET_STUN=0,PEERPARTY_INET_PORTMAP=0,PEERPARTY_IPV6=0
         -RoleEnv A:PEERPARTY_INET_PORT=<p1>,B:PEERPARTY_INET_PORT=<p2>,
-        B:PEERPARTY_INET_PEERS=127.0.0.1:<p1>
+        B:PEERPARTY_INET_PEERS=127.0.0.1:<p1>,PPTEST_IPFWD_PORT=<p3>
 
-(tests/run_all.ps1 does). No SDK: Winsock and the thread pool through ctypes, as a .NET
+(tests/run_all.ps1 does, with three ports claimed for the run). No SDK: Winsock and the thread pool through ctypes, as a .NET
 or C++ game calls them.
 
 A: a plain UDP socket on 127.0.0.1:PORT. Every datagram must come from B's stand-in;
@@ -23,7 +23,8 @@ from ctypes import wintypes
 
 DIR = os.environ["PPTEST_DIR"]
 ROLE = sys.argv[1]
-PORT = 47913
+# A's game port: one the run claimed (another run's copy of this test may be going).
+PORT = int(os.environ.get("PPTEST_IPFWD_PORT", "47913"))
 RESULTS = []
 
 

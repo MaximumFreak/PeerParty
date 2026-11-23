@@ -59,12 +59,14 @@ use std::time::{Duration, Instant};
 
 use peerparty_core::{Attr, Filter, Lobby, Op, Query, Value};
 
-use crate::json::Json;
+use crate::util::json::Json;
 use crate::log;
 use crate::net;
 
 use super::dtls;
-use super::{base64, error_body, random_bytes, random_text};
+use super::error_body;
+use crate::util::crypto::random_bytes;
+use crate::util::encoding::{base64, hex, random_text};
 
 pub const NS: &str = "ugs.relay";
 const MAGIC: &[u8; 4] = b"LBRL";
@@ -139,7 +141,7 @@ pub fn new_key() -> Vec<u8> {
 pub fn bind_hmac(key: &[u8], bind: &[u8]) -> Option<[u8; 32]> {
     let mut m = bind.get(..263)?.to_vec();
     m[4] = 0;
-    Some(crate::photon::crypto::hmac_sha256(key, &m))
+    Some(crate::util::crypto::hmac_sha256(key, &m))
 }
 
 fn same(a: &[u8], b: &[u8]) -> bool {
@@ -292,6 +294,11 @@ impl Server {
             }
             out.extend(r.send.into_iter().map(|p| (from, p)));
             r.data
+        } else if self.tls.contains_key(&from) {
+            // An address that talks DTLS sends everything sealed: a plain packet from it
+            // is someone else's, using its address.
+            crate::log::throttled("ugs relay plain from dtls", 3, |n| log!("ugs relay: a plain packet from {from}, which talks DTLS, dropped n={n}"));
+            return out;
         } else {
             vec![pkt.to_vec()]
         };
@@ -406,14 +413,9 @@ impl Server {
     }
 }
 
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
 /// A GUID's text for 16 bytes, in RFC 4122 byte order.
 pub fn guid(id: &AllocId) -> String {
-    let h = hex(id);
-    format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..])
+    crate::util::encoding::guid(id)
 }
 
 // ---- the socket ----
@@ -463,7 +465,7 @@ pub fn tick() {
     if let Some(Some(r)) = RELAY_SERVER.get() {
         let gone = r.server.lock().unwrap().expire(Instant::now());
         for id in gone {
-            let Some(a) = ALLOCS.lock().unwrap().remove(&guid(&id)) else { continue };
+            let Some(a) = crate::sys::lock(&ALLOCS).remove(&guid(&id)) else { continue };
             log!("ugs relay: allocation {} expired{}", guid(&id), a.code.as_deref().map(|c| format!(", join code {c} with it")).unwrap_or_default());
             if let (Some(code), Some(lan)) = (a.code, net::lan()) {
                 let _ = lan.destroy(&format!("relay:{code}"));
@@ -544,7 +546,7 @@ fn allocate(body: &Json) -> Reply {
     let data = connection_data(&id, true, max as u16);
     r.server.lock().unwrap().add_host(id, max as u16, key.clone(), Instant::now());
     let region = body.get("region").as_str().unwrap_or("lan").to_string();
-    ALLOCS.lock().unwrap().insert(guid(&id), Alloc { id, data: data.clone(), code: None });
+    crate::sys::lock(&ALLOCS).insert(guid(&id), Alloc { id, data: data.clone(), code: None });
     log!("ugs relay: allocation {} for {max} connection(s), relay on port {}", guid(&id), r.port);
     let out = Json::obj(vec![
         ("meta", meta(201)),
@@ -556,7 +558,7 @@ fn allocate(body: &Json) -> Reply {
 fn join_code(body: &Json) -> Reply {
     let Some(lan) = net::lan() else { return err(503, 15010, "No Suitable Relay", "no LAN") };
     let key = body.get("allocationId").as_str().unwrap_or_default().to_ascii_lowercase();
-    let mut allocs = ALLOCS.lock().unwrap();
+    let mut allocs = crate::sys::lock(&ALLOCS);
     let Some(a) = allocs.get_mut(&key) else {
         return err(404, 15008, "Allocation Not Found", "no such allocation on this copy");
     };
@@ -620,7 +622,7 @@ fn join(body: &Json) -> Reply {
     };
     let attr = |k: &str| l.attr(k).map(|a| a.value.text()).unwrap_or_default();
     let port: u16 = attr("port").parse().unwrap_or(0);
-    let Some(host_data) = super::base64_decode(&attr("data")).filter(|d| d.len() == 255) else {
+    let Some(host_data) = crate::util::encoding::base64_decode(&attr("data")).filter(|d| d.len() == 255) else {
         return err(404, 15009, "Join Code Not Found", "the code's host data is unreadable");
     };
     // The allocation is the host's relay's to make: only it and this player learn the key.
@@ -643,7 +645,7 @@ fn join(body: &Json) -> Reply {
 
 /// A joiner's allocation on this copy's relay, for one of this copy's join codes.
 fn make_client(code: &str) -> Option<(AllocId, Vec<u8>)> {
-    if !ALLOCS.lock().unwrap().values().any(|a| a.code.as_deref() == Some(code)) {
+    if !crate::sys::lock(&ALLOCS).values().any(|a| a.code.as_deref() == Some(code)) {
         return None;
     }
     let r = relay()?;
@@ -921,7 +923,7 @@ mod tests {
         let data = connection_data(&[0x42; 16], false, 0);
         let mut m = vec![0xDA, 0x72, 0x00, 0x00, 0x00, 0x34, 0x12, 0xFF];
         m.extend_from_slice(&data);
-        let want = crate::photon::crypto::hmac_sha256(&key, &m);
+        let want = crate::util::crypto::hmac_sha256(&key, &m);
         let mut pkt = header(BIND).to_vec();
         pkt.push(1); // accept mode: not part of the HMAC
         pkt.extend_from_slice(&0x1234u16.to_le_bytes());
@@ -1059,11 +1061,11 @@ mod tests {
         let id = [5u8; 16];
         let k = new_key();
         let a = allocation(&id, &k, &connection_data(&id, false, 0), "10.0.0.2", 4000, "lan", Some(&connection_data(&[6; 16], true, 2)));
-        assert_eq!(super::super::base64_decode(a.get("allocationIdBytes").as_str().unwrap()).unwrap(), id.to_vec());
-        assert_eq!(super::super::base64_decode(a.get("key").as_str().unwrap()).unwrap(), k, "RelayHMACKey, 64 bytes");
+        assert_eq!(crate::util::encoding::base64_decode(a.get("allocationIdBytes").as_str().unwrap()).unwrap(), id.to_vec());
+        assert_eq!(crate::util::encoding::base64_decode(a.get("key").as_str().unwrap()).unwrap(), k, "RelayHMACKey, 64 bytes");
         assert_eq!(k.len(), 64);
         assert_ne!(k, new_key(), "random per allocation");
-        assert_eq!(super::super::base64_decode(a.get("connectionData").as_str().unwrap()).unwrap().len(), 255);
+        assert_eq!(crate::util::encoding::base64_decode(a.get("connectionData").as_str().unwrap()).unwrap().len(), 255);
         let eps = a.get("serverEndpoints").as_arr();
         assert!(eps.iter().any(|e| e.get("connectionType").as_str() == Some("dtls") && e.get("secure") == &Json::Bool(false)));
         assert_eq!(handle("GET", "/v1/regions", &Json::Null).0, 200);

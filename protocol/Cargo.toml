@@ -1,0 +1,10 @@
+[package]
+name = "peerparty_protocol"
+description = "What the launcher, the hook and the LAN core agree on: environment, service catalog, IPC messages, the overlay frame's layout, transports and instance layouts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# No dependencies, on purpose: std only, so it builds in a moment for the x64 and x86
+# hooks and for Linux alike.
+[dependencies]

@@ -10,6 +10,10 @@
 //! check). A connection to a Demonware host (whose lookups resolve to PeerParty's own
 //! loopback server) uses the twin; every other connection, and every credential before
 //! the stand-in is in use, is untouched and keeps Windows' check.
+//!
+//! `FreeCredentialsHandle` and `DeleteSecurityContext` are hooked too: a handle's
+//! values come back for later credentials and contexts once it's freed, and one still
+//! remembered here would put another host's connection on the twin.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
@@ -19,9 +23,9 @@ use retour::GenericDetour;
 use windows_sys::Win32::Security::Authentication::Identity::{SCHANNEL_CRED, SecBufferDesc};
 use windows_sys::Win32::Security::Credentials::SecHandle;
 
-use crate::hook::with_lock;
+use crate::sys::hook::with_lock;
 use crate::log;
-use crate::pe::Export;
+use crate::sys::pe::Export;
 
 type AcquireA = unsafe extern "system" fn(
     *const i8,
@@ -74,7 +78,11 @@ type IscW = unsafe extern "system" fn(
     *mut i64,
 ) -> i32;
 
+type FreeHandle = unsafe extern "system" fn(*mut SecHandle) -> i32;
+
 static ACQ_A: OnceLock<GenericDetour<AcquireA>> = OnceLock::new();
+static FREE_CRED: OnceLock<GenericDetour<FreeHandle>> = OnceLock::new();
+static DELETE_CTX: OnceLock<GenericDetour<FreeHandle>> = OnceLock::new();
 static ACQ_W: OnceLock<GenericDetour<AcquireW>> = OnceLock::new();
 static ISC_A: OnceLock<GenericDetour<IscA>> = OnceLock::new();
 static ISC_W: OnceLock<GenericDetour<IscW>> = OnceLock::new();
@@ -136,7 +144,7 @@ fn twin_cred(use_: u32, auth: *const c_void) -> Option<SCHANNEL_CRED> {
 
 fn remember_twin(real: *const SecHandle, twin: SecHandle) {
     if let Some(k) = key(real) {
-        TWINS.lock().unwrap().get_or_insert_with(HashMap::new).insert(k, twin);
+        crate::sys::lock(&TWINS).get_or_insert_with(HashMap::new).insert(k, twin);
     }
 }
 
@@ -213,31 +221,54 @@ unsafe extern "system" fn acquire_w(
 }
 
 /// The credential a context call should use: the twin for a connection to a
-/// Demonware host (or a context already started on the twin), else `cred` itself.
-fn credential_for(cred: *mut SecHandle, ctx: *mut SecHandle, target: &str) -> (*mut SecHandle, bool) {
-    let Some(k) = key(cred) else { return (cred, false) };
-    let started_here = key(ctx).is_some_and(|c| OURS.lock().unwrap().as_ref().is_some_and(|s| s.contains(&c)));
+/// Demonware host (or a context already started on the twin), else `None` for `cred`
+/// itself. A copy of the twin: a pointer into TWINS would outlive the lock, and another
+/// credential's insert can move the map's entries while SSPI still reads it.
+fn credential_for(cred: *mut SecHandle, ctx: *mut SecHandle, target: &str) -> Option<SecHandle> {
+    let k = key(cred)?;
+    let started_here = key(ctx).is_some_and(|c| crate::sys::lock(&OURS).as_ref().is_some_and(|s| s.contains(&c)));
     let first_to_demonware = key(ctx).is_none() && super::active() && super::is_host(target);
     if !(started_here || first_to_demonware) {
-        return (cred, false);
+        return None;
     }
-    let mut twins = TWINS.lock().unwrap();
-    match twins.as_mut().and_then(|t| t.get_mut(&k)) {
+    let twins = crate::sys::lock(&TWINS);
+    match twins.as_ref().and_then(|t| t.get(&k)) {
         Some(t) => {
             if first_to_demonware {
                 crate::log::throttled(&format!("demonware tls {target}"), 2, |n| {
                     log!("demonware tls: {target} is PeerParty's own server; the game's certificate check for it is PeerParty's n={n}")
                 });
             }
-            (t as *mut SecHandle, true)
+            Some(*t)
         }
-        None => (cred, false),
+        None => None,
     }
+}
+
+/// A credential freed: its twin goes with it, and its handle is forgotten before
+/// Windows can hand the same values out again.
+unsafe extern "system" fn free_cred(cred: *mut SecHandle) -> i32 {
+    let orig = FREE_CRED.get().unwrap();
+    let twin = key(cred).and_then(|k| crate::sys::lock(&TWINS).as_mut().and_then(|t| t.remove(&k)));
+    if let Some(mut twin) = twin {
+        unsafe { orig.call(&mut twin) };
+    }
+    unsafe { orig.call(cred) }
+}
+
+/// A context deleted: forgotten before its handle's values can come back.
+unsafe extern "system" fn delete_ctx(ctx: *mut SecHandle) -> i32 {
+    if let Some(k) = key(ctx) {
+        if let Some(s) = crate::sys::lock(&OURS).as_mut() {
+            s.remove(&k);
+        }
+    }
+    unsafe { DELETE_CTX.get().unwrap().call(ctx) }
 }
 
 fn note_context(new_ctx: *mut SecHandle) {
     if let Some(c) = key(new_ctx) {
-        OURS.lock().unwrap().get_or_insert_with(HashSet::new).insert(c);
+        crate::sys::lock(&OURS).get_or_insert_with(HashSet::new).insert(c);
     }
 }
 
@@ -255,7 +286,9 @@ unsafe extern "system" fn isc_a(
     attrs: *mut u32,
     expiry: *mut i64,
 ) -> i32 {
-    let (use_cred, twin) = credential_for(cred, ctx, &unsafe { c_text(target) });
+    let mut twin_handle = credential_for(cred, ctx, &unsafe { c_text(target) });
+    let twin = twin_handle.is_some();
+    let use_cred = twin_handle.as_mut().map_or(cred, |t| t as *mut SecHandle);
     let r = unsafe { ISC_A.get().unwrap().call(use_cred, ctx, target, req, reserved, rep, input, reserved2, new_ctx, output, attrs, expiry) };
     if twin {
         note_context(new_ctx);
@@ -277,7 +310,9 @@ unsafe extern "system" fn isc_w(
     attrs: *mut u32,
     expiry: *mut i64,
 ) -> i32 {
-    let (use_cred, twin) = credential_for(cred, ctx, &unsafe { w_text(target) });
+    let mut twin_handle = credential_for(cred, ctx, &unsafe { w_text(target) });
+    let twin = twin_handle.is_some();
+    let use_cred = twin_handle.as_mut().map_or(cred, |t| t as *mut SecHandle);
     let r = unsafe { ISC_W.get().unwrap().call(use_cred, ctx, target, req, reserved, rep, input, reserved2, new_ctx, output, attrs, expiry) };
     if twin {
         note_context(new_ctx);
@@ -296,7 +331,9 @@ pub fn attach(exports: &[Export]) -> usize {
                     if let Some(addr) = find($name) {
                         let target: $ty = unsafe { std::mem::transmute(addr) };
                         if let Ok(h) = unsafe { GenericDetour::new(target, $detour) } {
-                            if unsafe { h.enable() }.is_ok() && $cell.set(h).is_ok() {
+                            // Kept before it's on: the detour reads it at once, from
+                            // whichever thread calls first.
+                            if $cell.set(h).is_ok() && unsafe { $cell.get().unwrap().enable() }.is_ok() {
                                 n += 1;
                             }
                         }
@@ -308,6 +345,8 @@ pub fn attach(exports: &[Export]) -> usize {
         hook!(ACQ_W, AcquireW, "AcquireCredentialsHandleW", acquire_w);
         hook!(ISC_A, IscA, "InitializeSecurityContextA", isc_a);
         hook!(ISC_W, IscW, "InitializeSecurityContextW", isc_w);
+        hook!(FREE_CRED, FreeHandle, "FreeCredentialsHandle", free_cred);
+        hook!(DELETE_CTX, FreeHandle, "DeleteSecurityContext", delete_ctx);
     });
     n
 }
@@ -337,18 +376,13 @@ mod tests {
         let twin = SecHandle { dwLower: 0x3333, dwUpper: 0x4444 };
         remember_twin(&cred, twin);
         let mut none = SecHandle { dwLower: 0, dwUpper: 0 };
-        let (c, used) = credential_for(&mut cred, &mut none, "title-pc-auth3.prod.demonware.net");
-        assert!(used);
-        assert_eq!(unsafe { (*c).dwLower }, 0x3333);
-        let (c, used) = credential_for(&mut cred, &mut none, "www.example.com");
-        assert!(!used);
-        assert_eq!(unsafe { (*c).dwLower }, 0x1111);
+        let c = credential_for(&mut cred, &mut none, "title-pc-auth3.prod.demonware.net");
+        assert_eq!(c.map(|c| c.dwLower), Some(0x3333));
+        assert!(credential_for(&mut cred, &mut none, "www.example.com").is_none());
         // A context started on the twin keeps it, whatever name its later calls give.
         let mut ctx = SecHandle { dwLower: 0x5555, dwUpper: 1 };
         note_context(&mut ctx);
-        let (c, used) = credential_for(&mut cred, &mut ctx, "");
-        assert!(used);
-        assert_eq!(unsafe { (*c).dwLower }, 0x3333);
+        assert_eq!(credential_for(&mut cred, &mut ctx, "").map(|c| c.dwLower), Some(0x3333));
     }
 
     /// A client like libcurl's SChannel back end (automatic validation with a
@@ -358,13 +392,13 @@ mod tests {
     fn a_curl_like_schannel_client_accepts_peerpartys_server_for_demonware_only() {
         use std::net::TcpStream;
         use windows_sys::Win32::Security::Authentication::Identity::{AcquireCredentialsHandleW, FreeCredentialsHandle, UNISP_NAME_W};
-        let ip = crate::playfab::server().expect("service started");
+        let ip = crate::https::server().expect("service started");
         let sspicli = crate::watch::modules()
             .into_iter()
             .find(|(_, n)| n.eq_ignore_ascii_case("sspicli.dll"))
             .expect("sspicli loaded");
-        let table = unsafe { crate::pe::exports(sspicli.0 as *const u8).unwrap() };
-        assert_eq!(attach(&table.code), 4);
+        let table = unsafe { crate::sys::pe::exports(sspicli.0 as *const u8).unwrap() };
+        assert_eq!(attach(&table.code), 6);
         crate::demonware::set_active();
         let try_host = |host: &str| -> std::io::Result<()> {
             let mut sc: SCHANNEL_CRED = unsafe { std::mem::zeroed() };
@@ -390,7 +424,7 @@ mod tests {
             let target: Vec<u16> = host.encode_utf16().chain(Some(0)).collect();
             let mut ctx = SecHandle { dwLower: 0, dwUpper: 0 };
             let mut incoming = Vec::new();
-            let r = crate::playfab::tls::client_handshake(&mut sock, &creds, &target, &mut ctx, false, &mut incoming);
+            let r = crate::https::client::client_handshake(&mut sock, &creds, &target, &mut ctx, false, &mut incoming);
             unsafe { FreeCredentialsHandle(&creds) };
             r
         };

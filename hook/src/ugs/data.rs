@@ -19,10 +19,13 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use crate::json::Json;
+use crate::util::json::Json;
 use crate::log;
+use crate::util::local_store;
 
-use super::{error_body, now_iso, random_text};
+use super::error_body;
+use crate::util::encoding::random_text;
+use crate::util::time::now_iso;
 
 type Reply = (u16, String);
 
@@ -34,17 +37,12 @@ const LOCK_ALPHABET: &[u8] = b"0123456789abcdef";
 static FILES: Mutex<()> = Mutex::new(());
 
 fn root() -> Option<PathBuf> {
-    if let Some(d) = std::env::var_os("PEERPARTY_UGS_DIR") {
-        return Some(PathBuf::from(d));
-    }
-    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from)?;
-    let game = std::env::current_exe().ok()?.file_stem()?.to_string_lossy().to_ascii_lowercase();
-    Some(base.join("peerparty").join("ugs").join(game))
+    crate::config::HookConfig::global().ugs_dir().or_else(|| local_store::game_dir("ugs"))
 }
 
 /// A name from the path, kept to one path component.
 fn safe(name: &str) -> String {
-    name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect()
+    local_store::component(name)
 }
 
 fn store_path(owner: &str, access: &str) -> Option<PathBuf> {
@@ -189,7 +187,7 @@ pub fn cloud_save(method: &str, path: &str, body: &Json) -> Reply {
         }
     };
     let path_buf = store_path(&owner, access);
-    let _guard = FILES.lock().unwrap();
+    let _guard = crate::sys::lock(&FILES);
     let mut items = load(&path_buf);
     let keys: Vec<String> = query_param(path, "keys").map(|k| k.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect()).unwrap_or_default();
     let writable = access != "protected" && access != "custom";
@@ -296,10 +294,11 @@ mod tests {
 
     fn with_dir<T>(f: impl FnOnce() -> T) -> T {
         static LOCK: Mutex<()> = Mutex::new(());
-        let _g = LOCK.lock().unwrap();
+        let _g = crate::sys::lock(&LOCK);
         let dir = std::env::temp_dir().join(format!("peerparty-ugs-data-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         unsafe { std::env::set_var("PEERPARTY_UGS_DIR", &dir) };
+        crate::config::reload();
         let r = f();
         let _ = std::fs::remove_dir_all(&dir);
         r

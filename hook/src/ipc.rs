@@ -1,30 +1,39 @@
-//! The pipe to the peerparty.exe that started the game, which stays running beside it
-//! and draws the overlay (launcher/src/host). Two one-way pipes, so a read waiting on
-//! one never holds up a write on the other: `<PEERPARTY_PIPE>-up` carries our messages
-//! to the launcher, `<PEERPARTY_PIPE>-down` its commands to us. Each message is one line
-//! of JSON.
+//! The connection to the peerparty.exe that started the game, which stays running beside
+//! it and draws the overlay (launcher/src/host). Each message is one line of JSON, typed
+//! in protocol/src/ipc.rs (`HookMsg` up, `HostMsg` down). The launcher names where it is
+//! in `PEERPARTY_IPC` or `PEERPARTY_PIPE` (an `IpcEndpoint`):
+//!
+//! - Two one-way named pipes, so a read waiting on one never holds up a write on the
+//!   other: `<name>-up` carries our messages to the launcher, `<name>-down` its commands
+//!   to us. The pipes' server must be the launcher whose pid is in the name.
+//! - Or a TCP connection on loopback, opened with the launcher's token: where a named
+//!   pipe can't reach (a launcher outside Wine, the game inside it).
 //!
 //! Up: `state` (who we are, LAN players, the lobby we're in, invites waiting for the
 //! player, settings), sent whenever it changes and every few seconds; `open` (the game
-//! asked for an overlay page: its invite dialog, its friends list); `log`.
+//! asked for an overlay page: its invite dialog, its friends list); `note` (a `Notice`
+//! with its code, which the launcher says in the player's language); `local_saves`.
 //!
 //! Down: `invite` (one player or everyone), `accept` / `decline` (a waiting invite),
 //! `join` (ask a player to invite us), `set` (a setting changed), `overlay` (shown or
 //! hidden: games hear it as their SDK's overlay event, and controllers stop reaching
-//! the game while it shows).
+//! the game while it shows), and the rest of `HostMsg`.
 //!
-//! Without `PEERPARTY_PIPE` (a game started some other way) none of this runs, and the
+//! Without either variable (a game started some other way) none of this runs, and the
 //! game calls that would open the overlay do what they did before it existed.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Mutex, Once};
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
 use peerparty_core::PeerId;
+use peerparty_protocol::env;
+use peerparty_protocol::ipc::{HookMsg, HostMsg, MAX_HOST_LINE, Notice, msg_type, read_line_capped};
+use peerparty_protocol::transport::{IpcEndpoint, IpcStreams, TcpIpcClient, launcher_pid};
 
-use crate::json::Json;
+use crate::util::json::Json;
 use crate::log;
 
 static START: Once = Once::new();
@@ -35,10 +44,20 @@ static CONNECTED: AtomicBool = AtomicBool::new(false);
 const STATE_EVERY: Duration = Duration::from_millis(250);
 /// The state goes out at least this often, so a launcher that missed one catches up.
 const HEARTBEAT: Duration = Duration::from_secs(5);
+/// How long the launcher gets to be there when the game starts.
+const FIND_FOR: Duration = Duration::from_secs(10);
+/// One TCP connection attempt's wait.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Whether the launcher that started the game has the overlay on (it named a pipe).
+/// Where the launcher is: `PEERPARTY_IPC`, else `PEERPARTY_PIPE` (either may hold any
+/// `IpcEndpoint`).
+fn endpoint_var() -> Option<String> {
+    crate::config::HookConfig::global().ipc.clone()
+}
+
+/// Whether the launcher that started the game has the overlay on (it named where it is).
 pub fn enabled() -> bool {
-    std::env::var_os("PEERPARTY_PIPE").is_some()
+    endpoint_var().is_some()
 }
 
 /// Whether a launcher is listening (the overlay can be shown).
@@ -46,13 +65,13 @@ pub fn connected() -> bool {
     CONNECTED.load(Ordering::Relaxed)
 }
 
-/// Starts the pipe threads if the launcher set `PEERPARTY_PIPE`.
+/// Starts the connection's threads if the launcher named where it is.
 pub fn start() {
-    let Ok(base) = std::env::var("PEERPARTY_PIPE") else { return };
+    let Some(spec) = endpoint_var() else { return };
     START.call_once(|| {
         let _ = std::thread::Builder::new()
             .name("peerparty-ipc".into())
-            .spawn(move || run(base));
+            .spawn(move || run(&spec));
     });
 }
 
@@ -64,7 +83,7 @@ pub fn hand_over() {
     if CONNECTED.swap(false, Ordering::Relaxed) {
         log!("ipc: handing the launcher over to the game this process started");
     }
-    *OUT.lock().unwrap() = None;
+    *crate::sys::lock(&OUT) = None;
 }
 
 static HANDED_OVER: AtomicBool = AtomicBool::new(false);
@@ -78,18 +97,17 @@ pub fn handed_over() -> bool {
 }
 
 /// Sends one message to the launcher (dropped when there's none).
-pub fn send(msg: Json) {
-    if let Some(tx) = OUT.lock().unwrap().as_ref() {
-        let _ = tx.send(msg.to_string());
+pub fn send(msg: HookMsg) {
+    if let Some(tx) = crate::sys::lock(&OUT).as_ref() {
+        let _ = tx.send(msg.to_line());
     }
 }
 
-/// Asks the launcher to show an overlay page. False when there's no launcher to ask.
 /// A short message for the player about something they just did (an invite that went,
 /// or couldn't): the overlay shows it, or a notification while the overlay is closed.
-pub fn note(title: &str, detail: &str) {
+pub fn note_notice(notice: Notice) {
     if connected() {
-        send(Json::obj(vec![("t", Json::str("note")), ("title", Json::str(title)), ("detail", Json::str(detail))]));
+        send(HookMsg::Note(notice));
     }
 }
 
@@ -100,7 +118,7 @@ pub fn note(title: &str, detail: &str) {
 pub fn local_store(service: &'static str, path: &std::path::Path) {
     static SAID: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
     {
-        let mut said = SAID.lock().unwrap();
+        let mut said = crate::sys::lock(&SAID);
         if said.contains(&service) {
             return;
         }
@@ -109,20 +127,17 @@ pub fn local_store(service: &'static str, path: &std::path::Path) {
     let folder = path.parent().unwrap_or(path).display().to_string();
     log!("saves: {service}'s cloud saves and player data are kept on this PC, in {folder}: the real {service} service and other PCs don't see them");
     if connected() {
-        send(Json::obj(vec![("t", Json::str("local_saves")), ("service", Json::str(service)), ("path", Json::str(&folder))]));
+        send(HookMsg::LocalSaves { service: service.into(), path: folder });
     }
 }
 
+/// Asks the launcher to show an overlay page. False when there's no launcher to ask.
 pub fn open(page: &str, peer: Option<PeerId>) -> bool {
     if !connected() {
         return false;
     }
     log!("overlay: the game asked for the {page} page");
-    send(Json::obj(vec![
-        ("t", Json::str("open")),
-        ("page", Json::str(page)),
-        ("peer", peer.map(|p| Json::str(p.hex())).unwrap_or(Json::Null)),
-    ]));
+    send(HookMsg::Open { page: page.into(), peer: peer.map(|p| p.hex()) });
     true
 }
 
@@ -137,8 +152,48 @@ fn open_pipe(name: &str, write: bool) -> Option<std::fs::File> {
         .ok()
 }
 
-fn run(base: String) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+/// Our end of the connection to write to. A TCP one keeps its port listed as ours
+/// (`own::tcp`) while either end of it lives, and says it's done when the writer ends
+/// (the read end is a second handle on the same socket, so dropping this alone wouldn't).
+enum Up {
+    Pipe(std::fs::File),
+    Tcp { stream: std::net::TcpStream, _held: Arc<peerparty_core::own::Held> },
+}
+
+impl Write for Up {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Up::Pipe(f) => f.write(buf),
+            Up::Tcp { stream, .. } => stream.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Up::Pipe(f) => f.flush(),
+            Up::Tcp { stream, .. } => stream.flush(),
+        }
+    }
+}
+
+impl Drop for Up {
+    fn drop(&mut self) {
+        if let Up::Tcp { stream, .. } = self {
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    }
+}
+
+fn run(spec: &str) {
+    match IpcEndpoint::parse(spec) {
+        Some(IpcEndpoint::WinPipe { name }) => run_pipes(&name),
+        Some(IpcEndpoint::TcpToken { addr, token }) => run_tcp(addr, &token),
+        None => log!("ipc: the launcher's endpoint isn't one PeerParty makes; the overlay is off"),
+    }
+}
+
+fn run_pipes(base: &str) {
+    let deadline = Instant::now() + FIND_FOR;
     let (up, down) = loop {
         if HANDED_OVER.load(Ordering::Relaxed) {
             return;
@@ -156,7 +211,7 @@ fn run(base: String) {
     };
     // The pipe's server must be the launcher the name was made by (its pid is in it):
     // nothing else can stand in for it, even with an instance of the same name.
-    if let Some(want) = launcher_pid(&base) {
+    if let Some(want) = launcher_pid(base) {
         use std::os::windows::io::AsRawHandle;
         let mut got = 0u32;
         let ok = unsafe { windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId(down.as_raw_handle() as _, &mut got) } != 0;
@@ -166,20 +221,56 @@ fn run(base: String) {
         }
     }
     log!("ipc: connected to the launcher at {base}");
+    serve(Up::Pipe(up), down);
+}
+
+fn run_tcp(addr: std::net::SocketAddr, token: &str) {
+    let deadline = Instant::now() + FIND_FOR;
+    let IpcStreams { read, write } = loop {
+        if HANDED_OVER.load(Ordering::Relaxed) {
+            return;
+        }
+        match TcpIpcClient::connect(addr, token, CONNECT_TIMEOUT) {
+            Ok(s) => break s,
+            // The launcher refused the token: trying again won't change that.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                log!("ipc: the launcher on port {} refused us ({e}); the overlay is off", addr.port());
+                return;
+            }
+            Err(e) if Instant::now() > deadline => {
+                log!("ipc: no launcher on port {} ({e}); the overlay is off", addr.port());
+                return;
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(100)),
+        }
+    };
+    let Ok(local) = read.local_addr() else { return };
+    // Our socket is ours, not the game's: the forwarder never hands a peer to its port.
+    let held = Arc::new(peerparty_core::own::tcp(local.port()));
+    log!("ipc: connected to the launcher on port {}", addr.port());
+    serve(Up::Tcp { stream: write, _held: held.clone() }, read);
+    drop(held);
+}
+
+/// Talks to a connected launcher until it goes away (or this process hands it over).
+fn serve(up: Up, down: impl Read) {
     let (tx, rx) = mpsc::channel::<String>();
-    *OUT.lock().unwrap() = Some(tx);
+    *crate::sys::lock(&OUT) = Some(tx);
     CONNECTED.store(true, Ordering::Relaxed);
     let _ = std::thread::Builder::new()
         .name("peerparty-ipc-out".into())
         .spawn(move || writer(up, rx));
     let mut reader = BufReader::new(down);
     let mut line = Vec::new();
-    while read_line_capped(&mut reader, &mut line, MAX_LINE) {
+    while read_line_capped(&mut reader, &mut line, MAX_HOST_LINE) {
         if HANDED_OVER.load(Ordering::Relaxed) {
             return;
         }
         if let Some(msg) = std::str::from_utf8(&line).ok().and_then(Json::parse) {
-            command(&msg);
+            match HostMsg::from_json(&msg) {
+                Some(cmd) => command(cmd),
+                None => log!("ipc: unknown command {:?}", msg_type(&msg).unwrap_or_default()),
+            }
         }
     }
     if HANDED_OVER.load(Ordering::Relaxed) {
@@ -187,12 +278,12 @@ fn run(base: String) {
     }
     log!("ipc: the launcher went away");
     CONNECTED.store(false, Ordering::Relaxed);
-    *OUT.lock().unwrap() = None;
+    *crate::sys::lock(&OUT) = None;
     crate::overlay::set_visible(false);
     crate::overlay::pads_released();
 }
 
-fn writer(mut up: std::fs::File, rx: Receiver<String>) {
+fn writer(mut up: Up, rx: Receiver<String>) {
     let mut last_state = String::new();
     let mut last_sent = Instant::now() - HEARTBEAT;
     loop {
@@ -218,78 +309,46 @@ fn writer(mut up: std::fs::File, rx: Receiver<String>) {
     }
 }
 
-/// The longest command line taken from the launcher (a frame name, settings, a paste).
-const MAX_LINE: usize = 1 << 20;
-
-/// The launcher's pid from a pipe name (`\\.\pipe\peerparty-<pid>-<digits>`).
-fn launcher_pid(base: &str) -> Option<u32> {
-    let rest = base.rsplit('\\').next()?.strip_prefix("peerparty-")?;
-    rest.split('-').next()?.parse().ok()
+fn peer_of(hex: &str) -> Option<PeerId> {
+    PeerId::from_hex(hex)
 }
 
-/// Reads one line of at most `max` bytes (without its newline): false at the end, on an
-/// error, or for a longer line (the connection then ends).
-fn read_line_capped(r: &mut impl BufRead, buf: &mut Vec<u8>, max: usize) -> bool {
-    use std::io::Read;
-    buf.clear();
-    match r.by_ref().take(max as u64 + 1).read_until(b'\n', buf) {
-        Ok(0) | Err(_) => false,
-        Ok(_) if buf.last() == Some(&b'\n') => {
-            buf.pop();
-            if buf.last() == Some(&b'\r') {
-                buf.pop();
-            }
-            true
-        }
-        Ok(_) => false,
-    }
-}
-
-fn peer_arg(msg: &Json, key: &str) -> Option<PeerId> {
-    msg.get(key).as_str().and_then(PeerId::from_hex)
-}
-
-fn command(msg: &Json) {
-    let t = msg.get("t").as_str().unwrap_or_default();
-    match t {
-        "invite" => {
-            let to = peer_arg(msg, "to");
+fn command(cmd: HostMsg) {
+    match cmd {
+        HostMsg::Invite { to } => {
+            let to = to.as_deref().and_then(peer_of);
             std::thread::spawn(move || crate::invite::to(to));
         }
-        "accept" => {
-            if let Some(id) = msg.get("id").as_f64() {
-                crate::invite::accept(id as u64);
-            }
+        HostMsg::Accept { id } => {
+            crate::invite::accept(id);
         }
-        "paste" => {
+        HostMsg::Paste => {
             // Type the clipboard's room code into the game (the overlay is closing).
             crate::invite::type_clipboard();
         }
-        "copy" => {
-            if let Some(text) = msg.get("text").as_str().and_then(crate::typing::clean_code) {
-                crate::typing::set_clipboard(&text);
+        HostMsg::Copy { text } => {
+            if let Some(text) = crate::invite::typing::clean_code(&text) {
+                crate::invite::typing::set_clipboard(&text);
             }
         }
-        "decline" => {
-            if let Some(id) = msg.get("id").as_f64() {
-                crate::invite::decline(id as u64);
-            }
+        HostMsg::Decline { id } => {
+            crate::invite::decline(id);
         }
-        "join" => {
-            if let Some(p) = peer_arg(msg, "peer")
-                && !crate::steamgs::join_server(p)
+        HostMsg::Join { peer } => {
+            if let Some(p) = peer_of(&peer)
+                && !crate::steam::gs::join_server(p)
             {
                 crate::invite::request_join(p);
             }
         }
-        "block" => {
-            if let Some(p) = peer_arg(msg, "peer")
+        HostMsg::Block { peer } => {
+            if let Some(p) = peer_of(&peer)
                 && let Some(lan) = crate::net::lan_if_started()
             {
                 match lan.block_peer(p) {
                     Ok(fp) => {
                         log!("ipc: blocked public player {p} ({fp})");
-                        let mut b = BLOCKED.lock().unwrap();
+                        let mut b = crate::sys::lock(&BLOCKED);
                         b.retain(|(q, _)| *q != p);
                         if b.len() >= 16 {
                             b.remove(0);
@@ -300,25 +359,23 @@ fn command(msg: &Json) {
                 }
             }
         }
-        // The overlay's Undo, for a player blocked from it in this run.
         // The overlay's voice switches (voice.rs): the microphone, and one player.
-        "mic" => {
-            let on = matches!(msg.get("on"), Json::Bool(true));
+        HostMsg::Mic { on } => {
             crate::voice::set_mic(on);
             log!("ipc: microphone {}", if on { "on" } else { "off" });
         }
-        "mute" => {
-            if let Some(p) = peer_arg(msg, "peer") {
-                let on = matches!(msg.get("on"), Json::Bool(true));
+        HostMsg::Mute { peer, on } => {
+            if let Some(p) = peer_of(&peer) {
                 crate::voice::set_player_muted(p, on);
                 log!("ipc: {p}'s voice {}", if on { "muted" } else { "heard again" });
             }
         }
-        "unblock" => {
-            if let Some(p) = peer_arg(msg, "peer")
+        // The overlay's Undo, for a player blocked from it in this run.
+        HostMsg::Unblock { peer } => {
+            if let Some(p) = peer_of(&peer)
                 && let Some(lan) = crate::net::lan_if_started()
             {
-                let fp = BLOCKED.lock().unwrap().iter().find(|(q, _)| *q == p).map(|(_, f)| f.clone());
+                let fp = crate::sys::lock(&BLOCKED).iter().find(|(q, _)| *q == p).map(|(_, f)| f.clone());
                 match fp.map(|fp| lan.unblock(&fp)) {
                     Some(Ok(_)) => log!("ipc: unblocked public player {p}"),
                     Some(Err(e)) => log!("ipc: can't unblock {p}: {e}"),
@@ -326,47 +383,53 @@ fn command(msg: &Json) {
                 }
             }
         }
-        "set" => {
-            let key = msg.get("key").as_str().unwrap_or_default();
-            let value = msg.get("value").as_str().unwrap_or_default();
+        HostMsg::Set { key, value } => {
             if key == "internet" {
-                set_internet(value);
+                set_internet(&value);
             } else {
-                crate::settings::set(key, value);
+                crate::config::settings::set(&key, &value);
             }
         }
-        "overlay" => {
-            let visible = matches!(msg.get("visible"), Json::Bool(true));
-            if let Some(why) = msg.get("why").as_str().filter(|_| visible && !crate::overlay::visible()) {
+        HostMsg::Overlay { visible, why, pads_held } => {
+            if let Some(why) = why.filter(|_| visible && !crate::overlay::visible()) {
                 log!("overlay: opened by {why}");
             }
-            crate::overlay::set_visible_holding(visible, matches!(msg.get("pads_held"), Json::Bool(true)));
+            crate::overlay::set_visible_holding(visible, pads_held);
         }
         // The buttons down when the overlay closed are up.
-        "pads_held" => {
-            if !matches!(msg.get("on"), Json::Bool(true)) {
+        HostMsg::PadsHeld { on } => {
+            if !on {
                 crate::overlay::pads_released();
             }
         }
-        "note" => {
+        HostMsg::Note { text } => {
             // A line from the overlay host for the game's log.
-            if let Some(text) = msg.get("text").as_str() {
-                log!("{}", text.chars().take(300).collect::<String>());
+            log!("{}", text.chars().take(300).collect::<String>());
+        }
+        HostMsg::Frame { name } => crate::overlay::frame_ready(&name),
+        HostMsg::Instance(spec) => {
+            let has_pane = spec.pane.is_some();
+            crate::window::update_spec(spec);
+            if has_pane {
+                crate::video::ensure_viewport_hooks();
             }
         }
-        "frame" => {
-            if let Some(name) = msg.get("name").as_str() {
-                crate::overlay::frame_ready(name);
-            }
+        HostMsg::InputShm { name } => {
+            crate::input::attach_shm(&name);
         }
-        other => log!("ipc: unknown command {other:?}"),
+        HostMsg::Capture { enabled, ring, event, pixels } => {
+            crate::video::set_capture(enabled, ring.as_deref(), event.as_deref(), pixels);
+        }
+        HostMsg::DevicesChanged => {
+            crate::window::notify_devices_changed();
+        }
     }
 }
 
 /// The overlay's internet switch: the room and public sessions on or off, live. Off
 /// keeps LAN players; it takes a moment (sessions say goodbye), so not on the pipe's thread.
 fn set_internet(value: &str) {
-    let on = !matches!(value.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no");
+    let on = env::parse_bool(value) != Some(false);
     let Some(lan) = crate::net::lan_if_started() else {
         // Not started yet: it starts that way.
         peerparty_core::choose_internet(on);
@@ -403,38 +466,46 @@ fn foreign_overlays() -> Vec<&'static str> {
 
 /// What the overlay shows, as one line of JSON.
 fn state() -> String {
-    let mut fields: Vec<(&str, Json)> = vec![("t", Json::str("state"))];
-    fields.push(("pid", Json::Num(f64::from(std::process::id()))));
+    let mut fields: Vec<(&str, Json)> = Vec::new();
+    fields.push(("pid", Json::u64(u64::from(std::process::id()))));
     fields.push(("lan", Json::Bool(crate::net::enabled())));
-    let sdks: Vec<Json> = crate::net::fronts().iter().map(|f| Json::str(format!("{f:?}"))).collect();
+    let sdks: Vec<Json> = crate::net::fronts().iter().map(|f| Json::str(f.name())).collect();
     fields.push(("sdks", Json::Arr(sdks)));
     // Whether the game joins by room code (Photon): the overlay offers to copy and paste codes.
     fields.push(("codes", Json::Bool(crate::photon::in_use())));
     fields.push(("can_invite", Json::Bool(crate::invite::can_invite())));
-    fields.push(("invite_note", Json::str(crate::invite::why_not().unwrap_or_default())));
+    // Why there's nothing to invite to: its English, and its code and arguments for the
+    // launcher to say in the player's language.
+    let why_not = crate::invite::why_not();
+    fields.push(("invite_note", Json::str(why_not.as_ref().map(|b| b.english()).unwrap_or_default())));
+    fields.push(("invite_block", why_not.as_ref().map_or(Json::Null, |b| b.to_json())));
     // Layers the player turned off that this game needs: the overlay says what each costs.
     let off: Vec<Json> = crate::net::off_layers().into_iter().map(Json::str).collect();
     fields.push(("layers_off", Json::Arr(off)));
     let foreign: Vec<Json> = foreign_overlays().into_iter().map(Json::str).collect();
     fields.push(("foreign", Json::Arr(foreign)));
-    fields.push(("present", Json::str(crate::present::api())));
+    fields.push(("present", Json::str(crate::video::api())));
+    // Whether the overlay should draw inside the game's frames from the start (asked
+    // to, or `auto` in Gamescope), and what the game runs under when it isn't Windows.
+    fields.push(("prefer_ingame", Json::Bool(crate::video::prefer_ingame())));
+    fields.push(("wine", crate::sys::wine::to_json()));
     fields.push((
         "settings",
         Json::obj(vec![
-            ("auto_accept", Json::Bool(crate::settings::auto_accept())),
-            ("invite_buttons", Json::Num(f64::from(crate::settings::invite_buttons()))),
+            ("auto_accept", Json::Bool(crate::config::settings::auto_accept())),
+            ("invite_buttons", Json::u64(u64::from(crate::config::settings::invite_buttons()))),
         ]),
     ));
     let lan = crate::net::lan_if_started();
     // The overlay's internet switch: whether it's on, and whether there's anything
     // (a room code or public sessions) for it to switch.
     fields.push(("internet_on", Json::Bool(lan.map_or_else(peerparty_core::internet_wanted, |l| l.internet_on()))));
-    fields.push(("internet_configured", Json::Bool(lan.map_or_else(crate::ipfwd::internet_configured, |l| l.internet_configured()))));
+    fields.push(("internet_configured", Json::Bool(lan.map_or_else(crate::net::ipfwd::internet_configured, |l| l.internet_configured()))));
     let name_of = |p: PeerId| lan.and_then(|l| l.peer_name(p)).unwrap_or_else(|| format!("Player {}", &p.hex()[..6]));
     if let Some(l) = lan {
         // Which of this PC's player slots this copy holds (0: the first player).
         let slot = if l.server() || l.slot() == u32::MAX { 0 } else { l.slot() };
-        fields.push(("me", Json::obj(vec![("id", Json::str(l.me().hex())), ("name", Json::str(l.name())), ("slot", Json::Num(f64::from(slot)))])));
+        fields.push(("me", Json::obj(vec![("id", Json::str(l.me().hex())), ("name", Json::str(l.name())), ("slot", Json::u64(u64::from(slot)))])));
     }
     let here = crate::invite::current_lobby();
     if let Some(lobby) = &here {
@@ -454,7 +525,7 @@ fn state() -> String {
             Json::obj(vec![
                 ("id", Json::str(lobby.id.clone())),
                 ("kind", Json::str(lobby.namespace.clone())),
-                ("max", Json::Num(f64::from(lobby.max_members))),
+                ("max", Json::u64(u64::from(lobby.max_members))),
                 ("members", Json::Arr(members)),
             ]),
         ));
@@ -525,9 +596,9 @@ fn state() -> String {
                 .map(|p| {
                     Json::obj(vec![
                         ("name", Json::str(p.id.map(name_of).unwrap_or_else(|| p.name.clone()))),
-                        ("rtt_ms", Json::Num(p.rtt.map_or(-1.0, |r| r.as_millis() as f64))),
+                        ("rtt_ms", Json::int(p.rtt.map_or(-1, |r| i64::try_from(r.as_millis()).unwrap_or(i64::MAX)))),
                         ("bridged", Json::Bool(p.bridged)),
-                        ("resent", Json::Num(p.resent as f64)),
+                        ("resent", Json::u64(p.resent)),
                         ("ipv6", Json::Bool(p.ipv6)),
                         // What to type in a game that asks for an IP (ipfwd.rs): a
                         // stand-in, never the player's real address.
@@ -543,9 +614,9 @@ fn state() -> String {
                 ("online", Json::Bool(st.public.is_some())),
                 ("nat", Json::str(st.nat.describe())),
                 ("port_map", Json::str(st.port_map.clone().unwrap_or_default())),
-                ("dht_nodes", Json::Num(st.dht_nodes as f64)),
-                ("found", Json::Num(st.candidates as f64)),
-                ("blocked", Json::Num(st.blocked as f64)),
+                ("dht_nodes", Json::u64(st.dht_nodes as u64)),
+                ("found", Json::u64(st.candidates as u64)),
+                ("blocked", Json::u64(st.blocked as u64)),
                 ("peers", Json::Arr(peers)),
             ]));
         }
@@ -555,18 +626,19 @@ fn state() -> String {
     // the overlay says so, and points at the fix on their PC.
     // Only while the engine runs: the overlay checks the firewall then.
     if let Some(l) = lan {
-        fields.push(("lan_unreachable", Json::Num(l.unreachable().len() as f64)));
+        fields.push(("lan_unreachable", Json::u64(l.unreachable().len() as u64)));
         // Players of this game on another PeerParty: they can't connect, and the overlay
         // says why (and who should update).
         let other = l.other_versions();
-        fields.push(("lan_other_version", Json::Num(other.len() as f64)));
+        fields.push(("lan_other_version", Json::u64(other.len() as u64)));
         fields.push(("lan_newer_version", Json::Bool(other.iter().any(|newer| *newer))));
     }
     let pending: Vec<Json> = crate::invite::pending()
         .into_iter()
         .map(|p| {
             Json::obj(vec![
-                ("id", Json::Num(p.id as f64)),
+                // Exact: an id past 2^53 would come back as another through an f64.
+                ("id", Json::u64(p.id)),
                 ("from", Json::str(p.from.hex())),
                 ("name", Json::str(name_of(p.from))),
                 ("kind", Json::str(p.kind())),
@@ -575,7 +647,7 @@ fn state() -> String {
         })
         .collect();
     fields.push(("pending", Json::Arr(pending)));
-    Json::obj(fields).to_string()
+    HookMsg::State(Json::obj(fields)).to_line()
 }
 
 /// Whether a peer is another copy on this PC (its id is one of this PC's identity
@@ -583,7 +655,7 @@ fn state() -> String {
 /// per peer: a copy's key file is written before it meets anyone.
 fn on_this_pc(peer: peerparty_core::PeerId) -> bool {
     static SEEN: std::sync::Mutex<Vec<(peerparty_core::PeerId, bool)>> = std::sync::Mutex::new(Vec::new());
-    let mut seen = SEEN.lock().unwrap();
+    let mut seen = crate::sys::lock(&SEEN);
     if let Some((_, here)) = seen.iter().find(|(p, _)| *p == peer) {
         return *here;
     }
@@ -609,5 +681,47 @@ mod tests {
         assert!(read_line_capped(&mut r, &mut line, 16));
         assert_eq!(line, b"{\"t\":\"note\"}");
         assert!(!read_line_capped(&mut r, &mut line, 4));
+    }
+
+    /// Over TCP: the hook proves the token, its socket's port is ours (the forwarder
+    /// won't deliver to it) until both of its ends are gone, and the writer's end says
+    /// so to the launcher.
+    #[test]
+    fn a_tcp_connection_is_held_as_ours_while_it_lives() {
+        use peerparty_protocol::transport::TcpIpcServer;
+        use std::io::BufRead;
+        let token = "00112233445566778899aabbccddeeff";
+        let server = TcpIpcServer::bind(token).unwrap();
+        let addr = server.local_addr().unwrap();
+        let launcher = std::thread::spawn(move || {
+            let IpcStreams { read, .. } = server.accept().unwrap();
+            let mut r = BufReader::new(read);
+            let mut line = String::new();
+            r.read_line(&mut line).unwrap();
+            assert_eq!(HookMsg::from_line(line.trim_end()), Some(HookMsg::Close));
+            // The hook's writer ended: the launcher reads the end.
+            line.clear();
+            assert_eq!(r.read_line(&mut line).unwrap(), 0);
+        });
+        let IpcStreams { read, write } = TcpIpcClient::connect(addr, token, CONNECT_TIMEOUT).unwrap();
+        let port = read.local_addr().unwrap().port();
+        let held = Arc::new(peerparty_core::own::tcp(port));
+        let mut up = Up::Tcp { stream: write, _held: held.clone() };
+        assert!(peerparty_core::own::is_held(true, port));
+        up.write_all(format!("{}\n", HookMsg::Close.to_line()).as_bytes()).unwrap();
+        drop(held);
+        assert!(peerparty_core::own::is_held(true, port), "the writer's end still lives");
+        drop(up);
+        assert!(!peerparty_core::own::is_held(true, port));
+        launcher.join().unwrap();
+        drop(read);
+    }
+
+    /// What the launcher sends comes in typed, ids exact.
+    #[test]
+    fn commands_are_typed() {
+        assert_eq!(HostMsg::from_line(r#"{"t":"accept","id":18446744073709551615}"#), Some(HostMsg::Accept { id: u64::MAX }));
+        assert_eq!(HostMsg::from_line(r#"{"t":"mute","peer":"00aa","on":true}"#), Some(HostMsg::Mute { peer: "00aa".into(), on: true }));
+        assert_eq!(peer_of("not hex"), None);
     }
 }

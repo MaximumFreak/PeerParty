@@ -46,6 +46,9 @@ pub const CREATELOBBY_PRESENCE: i32 = 2;
 pub const CREATELOBBY_ALLOW_INVITES: i32 = 3;
 pub const CREATELOBBY_BUCKET: i32 = 4;
 pub const CREATELOBBY_DISABLE_MIGRATION: i32 = 5;
+/// bEnableRTCRoom and LocalRTCOptions: the only fields between bDisableHostMigration (5)
+/// and LobbyId (7), so the version between them.
+pub const CREATELOBBY_RTC: i32 = 6;
 pub const CREATELOBBY_LOBBY_ID: i32 = 7;
 pub const CREATELOBBY_JOIN_BY_ID: i32 = 8;
 pub const SENDPACKET_RELIABILITY: i32 = 2;

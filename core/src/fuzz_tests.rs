@@ -138,7 +138,7 @@ fn wire_messages_survive_mutation_and_noise() {
 /// panic, and whatever it changes it changes to the stand-in.
 #[test]
 fn the_address_scrubber_survives_mutation_and_noise() {
-    use crate::inet::redact::{has_address, scrub, scrub_int};
+    use crate::redact::{has_address, scrub, scrub_int};
     let mut r = Rng(0x5c7u64 << 40 | 0xab1e);
     let w = std::net::Ipv4Addr::new(198, 18, 4, 9);
     let seeds = [

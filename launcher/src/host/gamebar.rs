@@ -36,7 +36,7 @@ impl GameBar {
 
     /// Whether Game Bar covers `area` (the game's client area on screen), looked at
     /// most every EVERY.
-    pub fn open(&mut self, area: Option<RECT>) -> bool {
+    pub fn open(&mut self, area: Option<super::desktop::Rect>) -> bool {
         let now = Instant::now();
         if self.checked.is_some_and(|t| now.duration_since(t) < EVERY) {
             return self.open;
@@ -46,7 +46,7 @@ impl GameBar {
             self.names.clear();
             self.names_at = now;
         }
-        self.open = area.is_some_and(|r| covered(r, &mut self.names));
+        self.open = area.is_some_and(|r| covered(RECT { left: r.left, top: r.top, right: r.right, bottom: r.bottom }, &mut self.names));
         self.open
     }
 }
@@ -86,20 +86,8 @@ fn is_gamebar_exe(name: &str) -> bool {
 
 /// A process's exe file name.
 fn image_name(pid: u32) -> Option<String> {
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW};
-    let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if h.is_null() {
-        return None;
-    }
-    let mut buf = vec![0u16; 1024];
-    let mut len = buf.len() as u32;
-    let ok = unsafe { QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len) } != 0;
-    unsafe { windows_sys::Win32::Foundation::CloseHandle(h) };
-    if !ok {
-        return None;
-    }
-    let path = String::from_utf16_lossy(&buf[..len as usize]);
-    path.rsplit(['\\', '/']).next().map(str::to_string)
+    let path = crate::backend::windows::process_exe(pid)?;
+    path.file_name().map(|n| n.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]

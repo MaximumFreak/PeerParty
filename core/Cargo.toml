@@ -5,8 +5,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Test-only hooks into the engine (shortened intervals, severed links, forged packets,
+# a one-node DHT): core's own tests enable it, release builds leave it out.
+test-util = []
+
 [dependencies]
-windows-sys.workspace = true
 # Internet play (src/inet): pure-Rust crypto, built for x64 and the 32-bit hook alike.
 chacha20poly1305 = "0.10"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
@@ -19,3 +23,22 @@ getrandom = "0.2"
 ed25519-dalek = "2"
 # Wipes key material we hold in plain arrays (the dalek and chacha types wipe their own).
 zeroize = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+    # WSAIoctl takes an OVERLAPPED.
+    "Win32_System_IO",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(unix)'.dependencies]
+# sys/unix.rs: flock, kill, getifaddrs and socket options.
+libc = "0.2"
+
+[dev-dependencies]
+# The integration tests (tests/) link the library without cfg(test).
+peerparty_core = { path = ".", features = ["test-util"] }

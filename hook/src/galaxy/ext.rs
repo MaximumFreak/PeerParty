@@ -35,7 +35,7 @@ use super::{
     s, targets,
 };
 use crate::log;
-use crate::steamobj::vmethod;
+use crate::sys::vtable::vmethod;
 
 /// LAN channel socket for IChat messages: room id (8 bytes LE), then the text.
 pub const IM: &str = "galaxy:im";
@@ -119,17 +119,16 @@ fn now() -> u32 {
 /// `%LOCALAPPDATA%\peerparty\galaxy\<exe>\<LAN id>\` (`PEERPARTY_GALAXY_DIR` replaces
 /// it, for tests).
 fn root() -> Option<PathBuf> {
-    if let Some(d) = std::env::var_os("PEERPARTY_GALAXY_DIR") {
-        return Some(PathBuf::from(d));
+    use crate::util::local_store;
+    if let Some(d) = crate::config::HookConfig::global().galaxy_dir() {
+        return Some(d);
     }
-    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from)?;
-    let game = std::env::current_exe().ok()?.file_stem()?.to_string_lossy().to_ascii_lowercase();
-    Some(base.join("peerparty").join("galaxy").join(game).join(lan()?.me().hex()))
+    Some(local_store::game_dir("galaxy")?.join(lan()?.me().hex()))
 }
 
-/// A name the game gave, kept to one ordinary file (`saves::file_name`).
+/// A name the game gave, kept to one ordinary file (`local_store::file_name`).
 fn safe(name: &str) -> Option<String> {
-    crate::saves::file_name(name)
+    crate::util::local_store::file_name(name)
 }
 
 fn storage_path(name: &str) -> Option<PathBuf> {
@@ -206,7 +205,7 @@ static SESSION: LazyLock<u64> = LazyLock::new(|| {
 });
 
 fn with_stats<T>(f: impl FnOnce(&mut Stats) -> T) -> T {
-    let mut x = X.lock().unwrap();
+    let mut x = crate::sys::lock(&X);
     if !x.stats.loaded {
         x.stats.loaded = true;
         load(&mut x.stats);
@@ -452,7 +451,7 @@ fn stored(listener: usize, reset: bool) {
     }
     for a in &unlocked {
         log!("galaxy achievement unlocked: {a}");
-        crate::ipc::note("Achievement unlocked", a);
+        crate::ipc::note_notice(peerparty_protocol::ipc::Notice::achievement(a));
     }
     notify(STATS_AND_ACHIEVEMENTS_STORE, listener, |l| virt!(l, 1, fn()));
     if !unlocked.is_empty() {
@@ -861,20 +860,20 @@ vmethod! {
         let files: Vec<(String, u32, u32, String)> = listing(root().zip(safe(&c)).map(|(r, c)| r.join("cloud").join(c)))
             .into_iter()
             .map(|(n, size, t)| {
-                let hash = cloud_path(&c, &n).and_then(|p| std::fs::read(p).ok()).map(|d| crate::eos::storage::md5_hex(&d)).unwrap_or_default();
+                let hash = cloud_path(&c, &n).and_then(|p| std::fs::read(p).ok()).map(|d| crate::util::crypto::md5_hex(&d)).unwrap_or_default();
                 (n, size, t, hash)
             })
             .collect();
         let count = files.len() as u32;
-        let used: u32 = files.iter().map(|f| f.1).sum();
-        X.lock().unwrap().cloud_list = files;
+        let used = files.iter().fold(0u32, |a, f| a.saturating_add(f.1));
+        crate::sys::lock(&X).cloud_list = files;
         // GOG's default quota is 200 MB a game.
         notify(CLOUD_STORAGE_GET_FILE_LIST, listener, move |l| virt!(l, 1, fn(u32, u32, u32), count, 200 << 20, used));
     }
 }
 
 fn cloud_at<T>(index: u32, f: impl FnOnce(&(String, u32, u32, String)) -> T) -> Option<T> {
-    X.lock().unwrap().cloud_list.get(index as usize).map(f)
+    crate::sys::lock(&X).cloud_list.get(index as usize).map(f)
 }
 
 vmethod! { fn cloud_name_at(_this: usize, index: u32) -> *const c_char { ours(); c_str(&cloud_at(index, |e| e.0.clone()).unwrap_or_default()) } }
@@ -1009,7 +1008,7 @@ vmethod! {
 vmethod! {
     fn hash_buffer(_this: usize, buf: *const u8, len: u32, out: *mut c_char, size: u32) {
         ours();
-        copy_out(&crate::eos::storage::md5_hex(bytes(buf, len)), out, size);
+        copy_out(&crate::util::crypto::md5_hex(bytes(buf, len)), out, size);
     }
 }
 
@@ -1018,7 +1017,7 @@ vmethod! {
         ours();
         let data = read_all(param, read).unwrap_or_default();
         rewind(param, rewind_f);
-        copy_out(&crate::eos::storage::md5_hex(&data), out, size);
+        copy_out(&crate::util::crypto::md5_hex(&data), out, size);
     }
 }
 
@@ -1075,7 +1074,7 @@ vmethod! {
 }
 
 fn visit() -> String {
-    let mut x = X.lock().unwrap();
+    let mut x = crate::sys::lock(&X);
     if x.visit.is_empty() {
         x.visit = format!("{:016x}", *SESSION ^ now() as u64);
     }
@@ -1084,7 +1083,7 @@ fn visit() -> String {
 
 vmethod! { fn visit_id(_this: usize) -> *const c_char { ours(); c_str(&visit()) } }
 vmethod! { fn visit_id_copy(_this: usize, buf: *mut c_char, len: u32) { ours(); copy_out(&visit(), buf, len) } }
-vmethod! { fn reset_visit(_this: usize) { ours(); X.lock().unwrap().visit.clear(); } }
+vmethod! { fn reset_visit(_this: usize) { ours(); crate::sys::lock(&X).visit.clear(); } }
 
 // ---- IChat ----
 
@@ -1125,9 +1124,17 @@ vmethod! {
             return;
         }
         let room = room_of(my_id(), id);
-        X.lock().unwrap().rooms.insert(room, id);
+        crate::sys::lock(&X).rooms.insert(room, id);
         notify(CHAT_ROOM_WITH_USER_RETRIEVE, listener, move |l| virt!(l, 1, fn(Gid, u64), by_value(&id), room));
     }
+}
+
+/// The messages GetChatRoomMessageByIndex reads, set as the listener call telling of
+/// them is made: set earlier, a later message the same tick would replace them first.
+fn showing(room: u64, msgs: &[(u64, u64, u32, String)]) {
+    let mut x = crate::sys::lock(&X);
+    x.current = msgs.to_vec();
+    x.current_room = room;
 }
 
 fn longest(v: &[(u64, u64, u32, String)]) -> u32 {
@@ -1137,16 +1144,18 @@ fn longest(v: &[(u64, u64, u32, String)]) -> u32 {
 vmethod! {
     fn chat_messages(_this: usize, room: u64, limit: u32, before: u64, listener: usize) {
         ours();
-        let (count, long) = {
-            let mut x = X.lock().unwrap();
+        let msgs = {
+            let x = crate::sys::lock(&X);
             let all = x.history.get(&room).cloned().unwrap_or_default();
             let upto = if before == 0 { all.len() } else { all.iter().position(|m| m.0 == before).unwrap_or(all.len()) };
             let from = upto.saturating_sub(if limit == 0 { upto } else { limit as usize });
-            x.current = all[from..upto].to_vec();
-            x.current_room = room;
-            (x.current.len() as u32, longest(&x.current))
+            all[from..upto].to_vec()
         };
-        notify(CHAT_ROOM_MESSAGES_RETRIEVE, listener, move |l| virt!(l, 1, fn(u64, u32, u32), room, count, long));
+        let (count, long) = (msgs.len() as u32, longest(&msgs));
+        notify(CHAT_ROOM_MESSAGES_RETRIEVE, listener, move |l| {
+            showing(room, &msgs);
+            virt!(l, 1, fn(u64, u32, u32), room, count, long)
+        });
     }
 }
 
@@ -1155,7 +1164,7 @@ vmethod! {
         ours();
         let index = NEXT_INDEX.fetch_add(1, Ordering::Relaxed);
         let text = s(msg);
-        let to = X.lock().unwrap().rooms.get(&room).copied();
+        let to = crate::sys::lock(&X).rooms.get(&room).copied();
         let sent = match (lan(), to.and_then(peer_of)) {
             (Some(lan), Some(peer)) => {
                 let mut packet = room.to_le_bytes().to_vec();
@@ -1172,7 +1181,7 @@ vmethod! {
         }
         let id = NEXT_MESSAGE.fetch_add(1, Ordering::Relaxed);
         let t = now();
-        X.lock().unwrap().history.entry(room).or_default().push((id, my_id(), t, text));
+        crate::sys::lock(&X).history.entry(room).or_default().push((id, my_id(), t, text));
         notify(CHAT_ROOM_MESSAGE_SEND, listener, move |l| virt!(l, 1, fn(u64, u32, u64, u32), room, index, id, t));
         index
     }
@@ -1181,7 +1190,7 @@ vmethod! {
 vmethod! {
     fn chat_message_at(_this: usize, index: u32, id: *mut u64, kind: *mut u32, sender: *mut u64, time: *mut u32, buf: *mut c_char, len: u32) -> u32 {
         ours();
-        let Some(m) = X.lock().unwrap().current.get(index as usize).cloned() else { return 0 };
+        let Some(m) = crate::sys::lock(&X).current.get(index as usize).cloned() else { return 0 };
         unsafe {
             if !id.is_null() {
                 *id = m.0;
@@ -1201,12 +1210,12 @@ vmethod! {
     }
 }
 
-vmethod! { fn chat_member_count(_this: usize, room: u64) -> u32 { ours(); if X.lock().unwrap().rooms.contains_key(&room) { 2 } else { 0 } } }
+vmethod! { fn chat_member_count(_this: usize, room: u64) -> u32 { ours(); if crate::sys::lock(&X).rooms.contains_key(&room) { 2 } else { 0 } } }
 
 vmethod! {
     fn chat_member_at(_this: usize, ret: *mut u64, room: u64, index: u32) -> *mut u64 {
         ours();
-        let other = X.lock().unwrap().rooms.get(&room).copied();
+        let other = crate::sys::lock(&X).rooms.get(&room).copied();
         unsafe {
             *ret = match (index, other) {
                 (0, Some(_)) => my_id(),
@@ -1218,8 +1227,8 @@ vmethod! {
     }
 }
 
-vmethod! { fn chat_unread(_this: usize, room: u64) -> u32 { ours(); X.lock().unwrap().unread.get(&room).copied().unwrap_or(0) } }
-vmethod! { fn chat_read(_this: usize, room: u64) { ours(); X.lock().unwrap().unread.remove(&room); } }
+vmethod! { fn chat_unread(_this: usize, room: u64) -> u32 { ours(); crate::sys::lock(&X).unread.get(&room).copied().unwrap_or(0) } }
+vmethod! { fn chat_read(_this: usize, room: u64) { ours(); crate::sys::lock(&X).unread.remove(&room); } }
 
 /// From ProcessData: chat messages LAN players sent us.
 pub fn pump() {
@@ -1237,16 +1246,18 @@ pub fn pump() {
         crate::log::throttled("galaxy chat receive", 4, |n| log!("galaxy chat message n={n} from {from}"));
         let text = String::from_utf8_lossy(&p.data[8..]).into_owned();
         let m = (NEXT_MESSAGE.fetch_add(1, Ordering::Relaxed), from, now(), text);
-        let long = {
-            let mut x = X.lock().unwrap();
+        {
+            let mut x = crate::sys::lock(&X);
             x.rooms.insert(room, from);
             x.history.entry(room).or_default().push(m.clone());
             *x.unread.entry(room).or_default() += 1;
-            x.current = vec![m];
-            x.current_room = room;
-            longest(&x.current)
-        };
-        notify(CHAT_ROOM_MESSAGES, 0, move |l| virt!(l, 1, fn(u64, u32, u32), room, 1, long));
+        }
+        let msgs = vec![m];
+        let long = longest(&msgs);
+        notify(CHAT_ROOM_MESSAGES, 0, move |l| {
+            showing(room, &msgs);
+            virt!(l, 1, fn(u64, u32, u32), room, 1, long)
+        });
     }
 }
 
@@ -1571,6 +1582,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("peerparty-galaxy-stats-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         unsafe { std::env::set_var("PEERPARTY_GALAXY_DIR", &dir) };
+        crate::config::reload();
         let mut st = Stats { loaded: true, ..Default::default() };
         st.ints.insert("kills".into(), 7);
         st.floats.insert("distance".into(), 1.5);
@@ -1673,7 +1685,7 @@ vmethod! {
         len: u32,
     ) -> u32 {
         if !room.is_null() {
-            unsafe { *room = X.lock().unwrap().current_room };
+            unsafe { *room = crate::sys::lock(&X).current_room };
         }
         unsafe { chat_message_at(this, index, id, std::ptr::null_mut(), sender, time, buf, len) }
     }

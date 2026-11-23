@@ -2,55 +2,46 @@
 //! each one's multiplayer calls PeerParty's backend (watch.rs). A loaded EasyAntiCheat or
 //! BattlEye module stops the process, as does an EOS Anti-Cheat session (eos/mod.rs).
 
+// Shared infrastructure.
+mod config;
+mod hub;
+mod https;
+mod log;
+mod sys;
+mod util;
+
+// The process: module watching, the launcher's pipe, the overlay, the LAN engine.
 mod child;
-mod demonware;
-mod dns;
-mod eos;
-mod exitlog;
-mod galaxy;
-mod galaxyvt;
-mod hook;
 mod instance;
 mod invite;
 mod ipc;
-mod ipfwd;
-mod json;
-mod lobbychat;
-mod log;
-mod modes;
 mod net;
 mod overlay;
-mod padblock;
-mod party;
-mod pe;
-mod pfmp;
+mod pointer;
+mod saves;
+mod screen_prefs;
+mod voice;
+mod vr;
+mod watch;
+
+// Input, video, overlapped I/O dispatch, and per-instance window/viewport spoofing.
+mod input;
+mod overlapped;
+mod video;
+mod window;
+
+// The SDK layers.
+mod demonware;
+mod eos;
+mod galaxy;
 mod photon;
 mod playfab;
-mod present;
-mod read;
-mod saves;
-mod sdk;
-mod settings;
 mod steam;
-mod steamgns;
-mod steamgs;
-mod steamids;
-mod steamlan;
-mod steammm;
-mod steamobj;
-mod steamown;
-mod steamp2p;
-mod steamvt;
-mod swap;
-mod typing;
 mod ugs;
+mod xboxlive;
+
 #[cfg(test)]
 mod untrusted_tests;
-mod vivox;
-mod voice;
-mod watch;
-mod xboxlive;
-mod xgameui;
 
 /// A test that needs something this PC may not have (an SDK DLL from an installed game,
 /// named by a PPTEST_* variable) and returns without it says so on stderr; with

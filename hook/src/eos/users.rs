@@ -240,9 +240,9 @@ const EAT_XBL: i32 = 3;
 /// the LAN id it's shown as.
 fn peer_of_external(kind: i32, id: &str) -> Option<peerparty_core::PeerId> {
     match kind {
-        EAT_XBL => crate::xboxlive::peer_of(id.trim().parse().ok()?),
+        EAT_XBL => crate::hub::accounts::peer_of_xuid(id.trim().parse().ok()?),
         EAT_EPIC => peerparty_core::PeerId::from_hex(id.trim()),
-        EAT_STEAM => crate::steamlan::peer_of(id.trim().parse().ok()?),
+        EAT_STEAM => crate::hub::accounts::peer_of_steam_id(id.trim().parse().ok()?),
         _ => None,
     }
 }
@@ -251,8 +251,8 @@ fn peer_of_external(kind: i32, id: &str) -> Option<peerparty_core::PeerId> {
 /// Live, else the LAN id the player is shown under (as CopyProductUserInfo gives it).
 fn external_id(peer: peerparty_core::PeerId, kind: i32) -> String {
     match kind {
-        EAT_XBL => crate::xboxlive::xuid_of(peer).to_string(),
-        EAT_STEAM => crate::steamlan::steam_id(peer).to_string(),
+        EAT_XBL => crate::hub::accounts::xuid(peer).to_string(),
+        EAT_STEAM => crate::hub::accounts::steam_id(peer).to_string(),
         _ => peer.hex(),
     }
 }
@@ -296,7 +296,7 @@ unsafe extern "system" fn connect_get_mapping(_h: usize, o: *const abi::GetExter
         return 0;
     }
     let (kind, id) = unsafe { ((*o).AccountIdType, (*o).TargetExternalUserId) };
-    let id = if id.is_null() { String::new() } else { crate::read::cstr(id as usize).unwrap_or_default() };
+    let id = if id.is_null() { String::new() } else { crate::sys::read::cstr(id as usize).unwrap_or_default() };
     let peer = peer_of_external(kind, &id);
     trace("EOS_Connect_GetExternalAccountMapping", || format!("type {kind} {id} -> {peer:?}"));
     peer.map_or(0, ids::puid)
@@ -391,7 +391,7 @@ fn credential_name(kind: i32) -> &'static str {
 /// How the game signs in to an Epic account: the credential type, and whether a token
 /// came with it. Never the id or the token themselves.
 fn describe_login(o: usize) -> String {
-    use crate::read::readable;
+    use crate::sys::read::readable;
     if !readable(o, size_of::<abi::AuthLoginOptions>()) {
         return "options unreadable".into();
     }

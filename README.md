@@ -43,9 +43,11 @@ itself still runs. PeerParty moves that part onto the players' own PCs:
   server list, like a LAN player. To play with friends only, share a private room code
   instead. Either way, players find each other through the public BitTorrent DHT and
   connect directly, through an encrypted tunnel.
-- **Several copies on one PC.** Two players on one PC each get their own instance, with
-  their own identity and, for a game whose saves aren't kept per player, their own
-  saves, and they meet as LAN players do.
+- **Several copies on one PC, or split screen.** Up to four players on one PC can play
+  together in one split-screen window (each with their own controller and in-game
+  overlay), or two in separate windows. Each player gets their own identity and, for a
+  game whose saves aren't kept per player, their own saves, and they meet as LAN
+  players do.
 - **An overlay in every game**: players, invites and settings, opened with the usual
   store hotkeys or a controller's Home button.
 
@@ -95,8 +97,8 @@ anyone in public sessions); **Play together** changes it later. The window and t
 overlay speak your Windows language, and work with a mouse, a keyboard or a controller
 alone. Games started through PeerParty find each other: copies on other PCs on your
 network, and in your room or public sessions if you use them. A game's panel can start
-two instances on one PC, copy the first player's saves for the second, and turn single
-layers off.
+up to four players on one PC in a split-screen window (or two in separate windows), copy
+the first player's saves for the others, and turn single layers off.
 
 Updates: once a day the window asks GitHub whether a newer PeerParty is out (Settings >
 About, where it can be turned off). **Download** opens it in your browser; PeerParty
@@ -180,6 +182,7 @@ included. Options for one run go in front of the game's path (or of `%command%`)
 | `--public` | Turns public sessions on this run. |
 | `--set key=value` | Changes one setting this run, e.g. `name=Alex`, `voice=off`, `internet=off`. |
 | `--multi-instance` | Lets a second copy of the game start on the same PC. |
+| `--split-screen` | Starts 2–4 copies (`--instances N`, default 2) in one shared split-screen window (`--layout horizontal\|vertical\|grid`). |
 | `--copy-saves` | This copy starts from player 1's whole save; its own save, if any, is moved aside as a backup. Only when given. |
 | `--log-dir DIR` | Where the logs go. |
 

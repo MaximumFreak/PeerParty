@@ -21,7 +21,7 @@ use super::{
     remove_listener, trace,
 };
 
-const NS: &str = "eos.lobby";
+pub(super) const NS: &str = "eos.lobby";
 
 /// How long a join takes to report back. A LAN join finishes in a few milliseconds; games
 /// tuned to Epic's servers can show a "connecting" screen and then check whether it has
@@ -282,9 +282,12 @@ unsafe extern "system" fn create_lobby(
     };
     let o = unsafe { &*o };
     let v = o.ApiVersion;
+    let Some(permission) = u8::try_from(o.PermissionLevel).ok().and_then(Permission::from_u8) else {
+        return complete(cb, cd, INVALID_PARAMETERS, "");
+    };
     let mut spec = Lobby::new(NS);
     spec.max_members = o.MaxLobbyMembers.max(1);
-    spec.permission = Permission::from_u8(o.PermissionLevel as u8);
+    spec.permission = permission;
     spec.allow_invites = v < abi::CREATELOBBY_ALLOW_INVITES || o.bAllowInvites != 0;
     if v >= abi::CREATELOBBY_BUCKET {
         spec.bucket = unsafe { text(o.BucketId) }.unwrap_or_default();
@@ -294,14 +297,15 @@ unsafe extern "system" fn create_lobby(
         spec.id = unsafe { text(o.LobbyId) }.unwrap_or_default();
     }
     spec.join_by_id = v >= abi::CREATELOBBY_JOIN_BY_ID && o.bEnableJoinById != 0;
-    // bEnableRTCRoom and LocalRTCOptions follow bDisableHostMigration (eos_lobby_types.h).
-    let rtc = v >= abi::CREATELOBBY_DISABLE_MIGRATION && o.bEnableRTCRoom != 0;
+    // bEnableRTCRoom and LocalRTCOptions follow bDisableHostMigration (eos_lobby_types.h),
+    // one version on: in an older struct they'd be read from past its end.
+    let rtc = v >= abi::CREATELOBBY_RTC && o.bEnableRTCRoom != 0;
     if rtc {
         super::rtc::lobby_voice(o.LocalRTCOptions);
     }
     // What LobbyDetails_CopyInfo says back, on every member's PC: kept with the lobby.
     let rejoin = v >= abi::CREATELOBBY_JOIN_BY_ID && o.bRejoinAfterKickRequiresInvite != 0;
-    for (key, on) in [(FLAG_PRESENCE, o.bPresenceEnabled != 0), (FLAG_RTC, rtc), (FLAG_REJOIN, rejoin)] {
+    for (key, on) in [(FLAG_PRESENCE, v >= abi::CREATELOBBY_PRESENCE && o.bPresenceEnabled != 0), (FLAG_RTC, rtc), (FLAG_REJOIN, rejoin)] {
         if on {
             peerparty_core::set_attr(&mut spec.attrs, Attr { key: key.into(), value: peerparty_core::Value::Bool(true), public: true });
         }
@@ -342,7 +346,7 @@ unsafe extern "system" fn destroy_lobby(
 /// the LAN won't answer it, so its calls are answered here, and nothing is held for it.
 fn drop_join(id: &str) {
     let waiting = {
-        let mut h = H.lock().unwrap();
+        let mut h = crate::sys::lock(&H);
         h.held.remove(id);
         h.joins.remove(id).unwrap_or_default()
     };
@@ -354,7 +358,7 @@ fn drop_join(id: &str) {
 /// Starts a join (`start`), or adds the call to the one already in flight for `id`.
 fn begin_join(id: String, cb: usize, cd: usize, start: impl FnOnce() -> Result<(), LobbyError>) {
     {
-        let mut h = H.lock().unwrap();
+        let mut h = crate::sys::lock(&H);
         if let Some(waiting) = h.joins.get_mut(&id) {
             waiting.push((cb, cd));
             return;
@@ -362,7 +366,7 @@ fn begin_join(id: String, cb: usize, cd: usize, start: impl FnOnce() -> Result<(
     }
     match start() {
         Ok(()) => {
-            let mut h = H.lock().unwrap();
+            let mut h = crate::sys::lock(&H);
             h.joins.insert(id.clone(), vec![(cb, cd)]);
             h.held.insert(id, Vec::new());
         }
@@ -540,7 +544,7 @@ fn hold(ev: &Event) -> bool {
     let (Event::LobbyUpdated { lobby } | Event::MemberUpdated { lobby, .. } | Event::MemberStatus { lobby, .. }) = ev else {
         return false;
     };
-    match H.lock().unwrap().held.get_mut(lobby) {
+    match crate::sys::lock(&H).held.get_mut(lobby) {
         Some(q) => {
             q.push(ev.clone());
             true
@@ -553,7 +557,7 @@ fn notify(ev: &Event) {
     match ev {
         Event::SearchDone { search, results } => {
             let done = {
-                let mut h = H.lock().unwrap();
+                let mut h = crate::sys::lock(&H);
                 let Some((handle, cb, cd)) = h.finds.remove(search) else {
                     return;
                 };
@@ -573,7 +577,7 @@ fn notify(ev: &Event) {
             unsafe { call(done.0, &info) };
         }
         Event::JoinDone { lobby, result } => {
-            let Some(waiting) = H.lock().unwrap().joins.remove(lobby) else {
+            let Some(waiting) = crate::sys::lock(&H).joins.remove(lobby) else {
                 return;
             };
             trace("EOS_Lobby_JoinLobby(done)", || {
@@ -591,7 +595,7 @@ fn notify(ev: &Event) {
                     unsafe { call(cb, &info) };
                 }
                 // Then what happened in the lobby meanwhile, in order.
-                let held = H.lock().unwrap().held.remove(&lobby).unwrap_or_default();
+                let held = crate::sys::lock(&H).held.remove(&lobby).unwrap_or_default();
                 if joined {
                     for ev in &held {
                         notify(ev);
@@ -661,7 +665,7 @@ fn notify(ev: &Event) {
 /// join accepted from the overlay.
 fn receive_invite(from: peerparty_core::PeerId, connect: &str, lobby: Lobby) {
     let (invite_id, ui_event) = {
-        let mut h = H.lock().unwrap();
+        let mut h = crate::sys::lock(&H);
         h.next_invite += 1;
         let n = h.next_invite;
         let id = format!("peerparty-invite-{n}");
@@ -744,7 +748,7 @@ unsafe extern "system" fn send_invite(
     let lobby = lan().and_then(|l| l.lobby(&id));
     let r = match (lan(), lobby, target) {
         (Some(l), Some(lobby), Some(t)) => {
-            let connect = crate::steamlan::my_connect();
+            let connect = crate::invite::connect_of(crate::net::Front::Steam);
             if l.invite(Some(t), &connect, Some(&lobby)) > 0 {
                 SUCCESS
             } else {
@@ -768,7 +772,7 @@ unsafe extern "system" fn reject_invite(
         .then(|| unsafe { text((*o).InviteId) })
         .flatten()
         .unwrap_or_default();
-    let mut h = H.lock().unwrap();
+    let mut h = crate::sys::lock(&H);
     let before = h.invites.len();
     h.invites.retain(|(i, _, _)| *i != id);
     let r = if h.invites.len() < before {
@@ -781,7 +785,7 @@ unsafe extern "system" fn reject_invite(
 }
 
 unsafe extern "system" fn invite_count(_h: usize, _o: usize) -> u32 {
-    H.lock().unwrap().invites.len() as u32
+    crate::sys::lock(&H).invites.len() as u32
 }
 
 unsafe extern "system" fn invite_id_by_index(
@@ -819,7 +823,7 @@ unsafe extern "system" fn invite_id_by_index(
 fn hand_out_details(lobby: Lobby, out: *mut usize) -> i32 {
     let d = Box::new(lobby);
     let k = key(&*d);
-    H.lock().unwrap().details.insert(k, d);
+    crate::sys::lock(&H).details.insert(k, d);
     unsafe { *out = k };
     SUCCESS
 }
@@ -857,7 +861,7 @@ unsafe extern "system" fn copy_by_ui_event(
     }
     unsafe { *out = 0 };
     let ev = unsafe { (*o).UiEventId };
-    let lobby = H.lock().unwrap().ui_events.get(&ev).cloned();
+    let lobby = crate::sys::lock(&H).ui_events.get(&ev).cloned();
     match lobby {
         Some(l) => hand_out_details(l, out),
         None => NOT_FOUND,
@@ -887,13 +891,13 @@ unsafe extern "system" fn update_lobby_modification(
         member_remove: Vec::new(),
     });
     let k = key(&*m);
-    H.lock().unwrap().mods.insert(k, m);
+    crate::sys::lock(&H).mods.insert(k, m);
     unsafe { *out = k };
     SUCCESS
 }
 
 fn with_mod(handle: usize, f: impl FnOnce(&mut ModObj) -> i32) -> i32 {
-    match H.lock().unwrap().mods.get_mut(&handle) {
+    match crate::sys::lock(&H).mods.get_mut(&handle) {
         Some(m) => f(m),
         None => INVALID_PARAMETERS,
     }
@@ -917,7 +921,9 @@ unsafe extern "system" fn mod_set_permission(h: usize, o: *const abi::I32Options
     if o.is_null() {
         return INVALID_PARAMETERS;
     }
-    let p = Permission::from_u8(unsafe { (*o).Value } as u8);
+    let Some(p) = u8::try_from(unsafe { (*o).Value }).ok().and_then(Permission::from_u8) else {
+        return INVALID_PARAMETERS;
+    };
     with_mod(h, |m| {
         m.edited.permission = p;
         m.lobby_changed = true;
@@ -1019,7 +1025,7 @@ unsafe extern "system" fn mod_remove_member_attribute(h: usize, o: *const abi::K
 }
 
 unsafe extern "system" fn mod_release(h: usize) {
-    H.lock().unwrap().mods.remove(&h);
+    crate::sys::lock(&H).mods.remove(&h);
 }
 
 unsafe extern "system" fn update_lobby(
@@ -1030,7 +1036,7 @@ unsafe extern "system" fn update_lobby(
 ) {
     let m = (!o.is_null())
         .then(|| {
-            let h = H.lock().unwrap();
+            let h = crate::sys::lock(&H);
             h.mods
                 .get(&unsafe { (*o).LobbyModificationHandle })
                 .map(|m| {
@@ -1082,13 +1088,13 @@ unsafe extern "system" fn create_search(
         searching: false,
     });
     let k = key(&*s);
-    H.lock().unwrap().searches.insert(k, s);
+    crate::sys::lock(&H).searches.insert(k, s);
     unsafe { *out = k };
     SUCCESS
 }
 
 fn with_search(handle: usize, f: impl FnOnce(&mut SearchObj) -> i32) -> i32 {
-    match H.lock().unwrap().searches.get_mut(&handle) {
+    match crate::sys::lock(&H).searches.get_mut(&handle) {
         Some(s) => f(s),
         None => INVALID_PARAMETERS,
     }
@@ -1212,7 +1218,7 @@ unsafe extern "system" fn search_find(h: usize, _o: usize, cd: usize, cb: usize)
         });
     };
     let query = {
-        let mut hs = H.lock().unwrap();
+        let mut hs = crate::sys::lock(&H);
         match hs.searches.get_mut(&h) {
             Some(s) if s.searching => Err(ALREADY_PENDING),
             Some(s) => {
@@ -1235,7 +1241,7 @@ unsafe extern "system" fn search_find(h: usize, _o: usize, cd: usize, cb: usize)
         Ok(q) => {
             trace("EOS_LobbySearch_Find", || format!("{q:?}"));
             let id = lan.search(q);
-            H.lock().unwrap().finds.insert(id, (h, cb, cd));
+            crate::sys::lock(&H).finds.insert(id, (h, cb, cd));
         }
         Err(r) => later(move || unsafe {
             call(
@@ -1268,7 +1274,7 @@ unsafe extern "system" fn search_copy_result(
     }
     unsafe { *out = 0 };
     let i = unsafe { (*o).Value } as usize;
-    let mut hs = H.lock().unwrap();
+    let mut hs = crate::sys::lock(&H);
     let Some(lobby) = hs
         .searches
         .get(&h)
@@ -1285,7 +1291,7 @@ unsafe extern "system" fn search_copy_result(
 }
 
 unsafe extern "system" fn search_release(h: usize) {
-    let mut hs = H.lock().unwrap();
+    let mut hs = crate::sys::lock(&H);
     hs.searches.remove(&h);
     hs.finds.retain(|_, (handle, _, _)| *handle != h);
 }
@@ -1305,7 +1311,7 @@ unsafe extern "system" fn copy_details_handle(
     };
     let d = Box::new(lobby);
     let k = key(&*d);
-    H.lock().unwrap().details.insert(k, d);
+    crate::sys::lock(&H).details.insert(k, d);
     unsafe { *out = k };
     SUCCESS
 }
@@ -1313,7 +1319,7 @@ unsafe extern "system" fn copy_details_handle(
 // ---- details ----
 
 fn with_details<R>(h: usize, missing: R, f: impl FnOnce(&Lobby) -> R) -> R {
-    match H.lock().unwrap().details.get(&h) {
+    match crate::sys::lock(&H).details.get(&h) {
         Some(l) => f(l),
         None => missing,
     }
@@ -1514,7 +1520,7 @@ unsafe extern "system" fn details_member_info(
 }
 
 unsafe extern "system" fn details_release(h: usize) {
-    H.lock().unwrap().details.remove(&h);
+    crate::sys::lock(&H).details.remove(&h);
 }
 
 #[cfg(test)]
@@ -1537,18 +1543,18 @@ mod tests {
             Ok(())
         });
         assert_eq!(started, 1, "one join for both calls");
-        assert_eq!(H.lock().unwrap().joins[&id], vec![(1, 10), (2, 20)]);
+        assert_eq!(crate::sys::lock(&H).joins[&id], vec![(1, 10), (2, 20)]);
         let ev = Event::MemberStatus { lobby: id.clone(), member: peerparty_core::PeerId([4; 16]), status: MemberStatus::Joined };
         assert!(hold(&ev));
         assert!(!hold(&Event::LobbyUpdated { lobby: "another".into() }));
-        assert_eq!(H.lock().unwrap().held[&id], vec![ev]);
+        assert_eq!(crate::sys::lock(&H).held[&id], vec![ev]);
         // Given up on (left before the answer): nothing stays held or waiting.
         {
-            let mut h = H.lock().unwrap();
+            let mut h = crate::sys::lock(&H);
             h.joins.get_mut(&id).unwrap().clear();
         }
         drop_join(&id);
-        assert!(!H.lock().unwrap().joins.contains_key(&id) && !H.lock().unwrap().held.contains_key(&id));
+        assert!(!crate::sys::lock(&H).joins.contains_key(&id) && !crate::sys::lock(&H).held.contains_key(&id));
         assert!(!hold(&Event::LobbyUpdated { lobby: id }));
     }
 }

@@ -35,10 +35,11 @@ use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 
 use super::{Inner, Role, State, Trust, TunnelEntry, rank};
+use crate::hello::HelloRewriter;
 use crate::id::PeerId;
 use crate::inet;
-use crate::inet::crypto::{Ephemeral, Keys};
-use crate::inet::public;
+use crate::crypto::{Ephemeral, Keys};
+use crate::identity_key as public;
 use crate::wire::Msg;
 
 /// How long a peer's connection has been down before we try reaching it through another
@@ -60,6 +61,9 @@ const BACKLOG: usize = 1 << 20;
 /// A player in between whose connection to the far end has this much not yet written
 /// ends the relayed connection rather than queue without end.
 const HOP_QUEUE_MAX: usize = 8 << 20;
+/// How long a pump waiting for the player in between to catch up (BACKLOG) sleeps
+/// before it looks again, at most: nothing wakes it for that.
+const WAIT_AT_MOST: Duration = Duration::from_millis(10);
 
 /// One relayed connection that ends here: (the player in between, the far end, stream).
 pub(super) type EndKey = (PeerId, PeerId, u64);
@@ -307,7 +311,7 @@ fn register(inner: &Inner, mesh: SocketAddr, far: PeerId, name: String, trust: T
         m.retain(|_, e| e.down.is_none_or(|d| d.elapsed() < Duration::from_secs(60)));
     }
     if m.len() < 1024 {
-        m.insert(mesh, TunnelEntry { tunnel, down: None, relayed: Some(trust) });
+        m.insert(mesh, TunnelEntry { tunnel, down: None, closed: None, relayed: Some(trust) });
     }
 }
 
@@ -368,9 +372,9 @@ fn pump(this: Weak<Inner>, key: EndKey, addr: SocketAddr, tcp: TcpStream, rx: Re
     let _ = tcp.set_nodelay(true);
     if let Ok(mut writer) = tcp.try_clone() {
         let _ = thread::Builder::new().name("peerparty-relay-in".into()).spawn(move || {
-            let mut first = FirstFrame::default();
+            let mut first = HelloRewriter::default();
             while let Ok(data) = rx.recv() {
-                let Ok(out) = first.feed(data) else { break };
+                let Ok(out) = first.no_udp(&data) else { break };
                 if writer.write_all(&out).is_err() {
                     break;
                 }
@@ -386,14 +390,15 @@ fn pump(this: Weak<Inner>, key: EndKey, addr: SocketAddr, tcp: TcpStream, rx: Re
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
+        let Some(inner) = this.upgrade() else { break };
+        let mut s = inner.state.lock().unwrap();
         loop {
-            let Some(inner) = this.upgrade() else { break 'read };
-            match out(&inner, key, &buf[..n]) {
+            match out(&inner, &mut s, key, &buf[..n]) {
                 Out::Sent => break,
-                Out::Wait => {
-                    drop(inner);
-                    thread::sleep(Duration::from_millis(5));
-                }
+                // Woken when the far end's answer keys the connection or the engine ticks
+                // (`Inner::wake`); the player in between's queue draining says nothing, so
+                // that is looked at again after WAIT_AT_MOST.
+                Out::Wait => s = inner.wake.wait_timeout(s, WAIT_AT_MOST).unwrap().0,
                 Out::Closed => break 'read,
             }
         }
@@ -409,13 +414,11 @@ enum Out {
 }
 
 /// Sends bytes of our mesh's side, sealed, once the far end has answered.
-fn out(inner: &Inner, key: EndKey, data: &[u8]) -> Out {
-    let mut guard = inner.state.lock().unwrap();
-    let s = &mut *guard;
+fn out(inner: &Inner, s: &mut State, key: EndKey, data: &[u8]) -> Out {
     let Some(end) = s.relay.ends.get_mut(&key) else { return Out::Closed };
     let Crypt::Keyed { keys, sent, .. } = &mut end.crypt else { return Out::Wait };
     let (hop, far, stream) = key;
-    let Some(p) = s.peers.get(&hop) else { return Out::Closed };
+    let Some(p) = s.peers.get_mut(&hop) else { return Out::Closed };
     if p.gone.is_some() || p.conn.queued_bytes() > BACKLOG {
         return Out::Wait;
     }
@@ -483,6 +486,8 @@ fn arrived(inner: &Inner, s: &mut State, key: EndKey, data: Vec<u8>) {
             match keys {
                 Some(keys) => {
                     end.crypt = Crypt::Keyed { keys, sent: 0, got: 0 };
+                    // Our side's pump waits for this.
+                    inner.wake.notify_all();
                     true
                 }
                 None => false,
@@ -577,12 +582,18 @@ fn carry(inner: &Inner, s: &mut State, from: PeerId, to: PeerId, stream: u64, da
         s.relay.hops.insert(key);
         (inner.log)(&format!("lan carrying a connection between {from} and {to}"));
     }
-    let Some(p) = s.peers.get(&to) else {
+    let Some(p) = s.peers.get_mut(&to) else {
         s.relay.hops.remove(&key);
         refuse(s);
         return;
     };
-    if p.gone.is_none() && p.conn.queued_bytes() > HOP_QUEUE_MAX {
+    // Away for a moment (LINK_GRACE), it's kept for replay: carried data may take half
+    // of that, not all of it (past KEEP_MAX the peer's session is dropped).
+    let backed_up = match p.gone {
+        None => p.conn.queued_bytes() > HOP_QUEUE_MAX,
+        Some(_) => p.link.kept_bytes() > crate::link::KEEP_MAX / 2,
+    };
+    if backed_up {
         (inner.log)(&format!("lan stopped carrying a connection between {from} and {to}: {to} isn't keeping up"));
         s.relay.hops.remove(&key);
         refuse(s);
@@ -602,43 +613,6 @@ pub(super) fn peer_gone(s: &mut State, peer: PeerId) {
         s.send_to(other, &Msg::RelayEnd { stream, from: peer, to: other });
     }
     s.relay.ends.retain(|(hop, _, _), _| *hop != peer);
-}
-
-/// Our mesh's own Hello's UDP port can't be reached through a relay: the first frame of
-/// the far end's side says none, so unreliable data stays on the connection.
-#[derive(Default)]
-struct FirstFrame {
-    buf: Vec<u8>,
-    done: bool,
-}
-
-impl FirstFrame {
-    fn feed(&mut self, data: Vec<u8>) -> Result<Vec<u8>, ()> {
-        if self.done {
-            return Ok(data);
-        }
-        self.buf.extend_from_slice(&data);
-        let Some(len) = self.buf.get(..4).map(|l| u32::from_le_bytes(l.try_into().unwrap()) as usize) else {
-            return Ok(Vec::new());
-        };
-        if len > 64 * 1024 {
-            return Err(());
-        }
-        if self.buf.len() < 4 + len {
-            return Ok(Vec::new());
-        }
-        let Some(Msg::Hello { version, game, id, name, key, nonce, .. }) = Msg::decode(&self.buf[4..4 + len]) else {
-            return Err(());
-        };
-        // The proof that follows signs neither the name nor the port.
-        let hello = Msg::Hello { version, game, id, name, udp: 0, key, nonce }.encode();
-        let mut out = (hello.len() as u32).to_le_bytes().to_vec();
-        out.extend_from_slice(&hello);
-        out.extend_from_slice(&self.buf[4 + len..]);
-        self.buf = Vec::new();
-        self.done = true;
-        Ok(out)
-    }
 }
 
 #[cfg(test)]
@@ -693,24 +667,5 @@ mod tests {
         offer.extend_from_slice(&sig);
         assert_eq!(parse_offer(&offer), Some((offer_eph.blob, lost.0, lost.1, sig)));
         assert!(parse_offer(&offer[..OFFER_LEN - 1]).is_none() && parse_answer(&offer).is_none());
-    }
-
-    #[test]
-    fn the_far_ends_hello_loses_its_udp_port_and_the_rest_passes() {
-        let hello = Msg::Hello { version: 8, game: "g".into(), id: PeerId([1; 16]), name: "n".into(), udp: 5000, key: [2; 32], nonce: [3; 16] }.encode();
-        let mut stream = (hello.len() as u32).to_le_bytes().to_vec();
-        stream.extend_from_slice(&hello);
-        stream.extend_from_slice(b"after");
-        let mut f = FirstFrame::default();
-        // In pieces: nothing until the whole frame is there.
-        let mut out = f.feed(stream[..3].to_vec()).unwrap();
-        assert!(out.is_empty());
-        out.extend(f.feed(stream[3..10].to_vec()).unwrap());
-        out.extend(f.feed(stream[10..].to_vec()).unwrap());
-        out.extend(f.feed(b"more".to_vec()).unwrap());
-        let len = u32::from_le_bytes(out[..4].try_into().unwrap()) as usize;
-        assert!(matches!(Msg::decode(&out[4..4 + len]), Some(Msg::Hello { udp: 0, .. })));
-        assert_eq!(&out[4 + len..], b"aftermore");
-        assert!(FirstFrame::default().feed(vec![5, 0, 0, 0, 21, 0, 0, 0, 0]).is_err(), "not a hello");
     }
 }

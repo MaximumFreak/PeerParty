@@ -182,7 +182,7 @@ impl App {
             widgets::card_title(ui, Icon::People, ACCENT, t!("together.room"), t!("together.room_sub"));
             let p = &mut self.settings.prefs;
             let st = &mut self.together;
-            let focus = &mut self.focus_first;
+            let focus = &mut self.nav.focus_first;
             let room = p.room.trim().to_string();
             match RoomCode::parse(&room) {
                 Some(code) => {
@@ -378,8 +378,8 @@ impl App {
             });
             widgets::divider(ui);
             widgets::setting(ui, t!("together.invite_buttons"), t!("together.invite_buttons_sub"), |ui| {
-                let values = ["", "guide", "combo", "both"];
-                let labels = vec![t!("together.ib_none").to_string(), t!("together.ib_guide").to_string(), t!("together.ib_combo").to_string(), t!("together.ib_both").to_string()];
+                let values = super::shared::INVITE_BUTTON_VALUES;
+                let labels: Vec<String> = values.iter().map(|v| super::shared::invite_button_label(v).to_string()).collect();
                 let mut i = values.iter().position(|v| *v == p.invite_buttons).unwrap_or(0);
                 if widgets::stepper(ui, "invite_buttons", &labels, &mut i, 220.0).changed() {
                     p.invite_buttons = values[i].to_string();

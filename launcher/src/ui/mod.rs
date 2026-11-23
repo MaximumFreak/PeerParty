@@ -22,11 +22,12 @@ pub mod fx;
 mod game;
 pub mod icons;
 mod library;
-mod mainexe;
+pub mod mainexe;
 mod padgate;
 mod pads;
 pub mod scan;
 pub mod settings;
+pub mod shared;
 pub mod store;
 pub mod theme;
 mod together;
@@ -53,8 +54,9 @@ use scan::{Found, Game, Source};
 use store::{GameOptions, Settings};
 use theme::{ACCENT, SIDEBAR, TEXT, TEXT2, TEXT3};
 
-/// `after_update`: started by an update (`--updated`) while the window before closes.
-pub fn run(after_update: bool) -> eframe::Result {
+/// `after_update`: started by an update (`--updated`), or after PeerParty's files moved
+/// (`moved`, `--moved`), while the window before closes.
+pub fn run(after_update: bool, moved: bool) -> eframe::Result {
     if !platform::first_launcher(after_update) {
         return Ok(());
     }
@@ -76,7 +78,11 @@ pub fn run(after_update: bool) -> eframe::Result {
             egui_extras::install_image_loaders(&cc.egui_ctx);
             theme::install_fonts(&cc.egui_ctx);
             theme::apply(&cc.egui_ctx);
-            Ok(Box::new(App::new(cc.egui_ctx.clone(), settings)))
+            let mut app = App::new(cc.egui_ctx.clone(), settings);
+            if moved {
+                app.say(t!("settings.portable_moved", folder = platform::data_dir().display()), true);
+            }
+            Ok(Box::new(app))
         }),
     )
 }
@@ -134,9 +140,11 @@ struct Session {
     key: String,
     name: String,
     player: u8,
+    /// Number of players inside one split-screen session (0 for a normal single-copy process).
+    split_players: u8,
     started: Instant,
     stderr: Arc<Mutex<String>>,
-    /// peerparty.exe's process id: Close all reaches it by `crate::close_event`.
+    /// peerparty.exe's process id: Close all reaches it by `platform::close_game`.
     pid: u32,
 }
 
@@ -191,9 +199,8 @@ struct IconDone {
     glow: Option<Color32>,
 }
 
-struct App {
-    ctx: egui::Context,
-    settings: Settings,
+/// Scanned games, recent history, filter, search, and selection state.
+struct LibraryState {
     scanned: Vec<Game>,
     /// A rescan's finds so far: they replace `scanned` once it's done, so the library
     /// (its filter, the open game) doesn't empty out while it runs.
@@ -202,164 +209,51 @@ struct App {
     recent: HashMap<String, u64>,
     scanning: bool,
     found_rx: Receiver<Found>,
-    icon_tx: Sender<IconJob>,
-    icon_rx: Receiver<IconDone>,
-    icons: HashMap<String, IconSlot>,
-    glows: HashMap<String, Color32>,
-    view: View,
     category: Category,
     search: String,
     selected: Option<String>,
-    sessions: Vec<Session>,
-    next_session: u64,
-    ended_tx: Sender<(u64, Option<i32>)>,
-    ended_rx: Receiver<(u64, Option<i32>)>,
-    pending: Vec<PendingStart>,
-    /// Games whose next extra copy starts from player 1's saves ("Copy Player 1's saves
-    /// to Player N"). Never saved: off whenever the window starts, and off again once a start
-    /// has used it, so a later Play can't replace a save by accident.
-    copy_saves: HashSet<String>,
-    /// Close all on the Now playing card asked first: Close all again closes everything.
-    confirm_close: bool,
-    snack: Option<Snack>,
-    peerparty: PathBuf,
-    focus_search: bool,
-    /// When ui.json was last read or written here (the overlay changes it too).
-    settings_seen: Option<std::time::SystemTime>,
-    /// Controllers, for picking a game from the couch.
-    pads: pads::PadThread,
-    /// Which presses count (only while this window is in front).
-    pad_gate: padgate::PadGate,
-    pad_repeat: Option<(u32, Instant)>,
-    /// Controller presses for the game grid, from the input hook.
-    pad_fire: u32,
-    /// The controller was the last thing used (its hints show).
-    pad_mode: bool,
-    /// The first control of the page just opened takes the focus (controller, keyboard).
-    focus_first: bool,
-    /// The game panel's Play button takes the focus.
-    focus_play: bool,
     /// Columns in the grid as last drawn (up / down move by a row).
     grid_cols: usize,
     /// Scroll the grid to the selected game.
     scroll_to_selected: bool,
+    focus_search: bool,
     /// The top bar's controls this frame: down from one goes back to the grid.
     top_bar_ids: HashSet<egui::Id>,
-    /// Reads Windows Firewall's rules for the warnings.
-    firewall: firewall::Checker,
-    /// "Also on public networks" for the firewall fix.
-    fw_public: bool,
-    /// The settings "Reset to recommended" replaced, offered back until one of them
-    /// changes again or the window closes.
-    reset_undo: Option<store::Prefs>,
-    /// Per program: its game folder looked through, whether its Steam app id can't be
-    /// found, and when that was checked (steamid.rs).
-    steam_ids: HashMap<PathBuf, (crate::steamid::Game, bool, Instant)>,
-    /// A firewall fix under way: what to say when it's done, and whether it worked.
-    fixing: Option<Receiver<(String, bool)>>,
-    /// The "Invite players at home" button's answer, while it is awaited.
-    inviting: Option<Receiver<bool>>,
-    /// The Play button's spark: when it was pressed, and a seed for its arcs.
-    spark: Option<(Instant, u64)>,
-    /// The first-run setup, while it shows.
-    welcome: Option<welcome::Welcome>,
-    /// Play together's state (the code being typed, the blocked players).
-    together: together::State,
-    /// Settings' open section.
-    settings_tab: settings::Tab,
-    /// In background mode (a game runs, the window is behind it).
-    background: bool,
-    /// The real window, not a test's or a preview's: it may ask GitHub for updates.
-    live: bool,
-    /// The newer version already announced.
-    update_told: Option<String>,
 }
 
-impl App {
-    fn new(ctx: egui::Context, settings: Settings) -> App {
-        Self::with(ctx, settings, true)
-    }
-
-    /// The window's state; `scan` looks for installed games (tests show their own).
-    fn with(ctx: egui::Context, settings: Settings, scan: bool) -> App {
+impl LibraryState {
+    fn new(ctx: &egui::Context, folders: Vec<PathBuf>, scan: bool) -> LibraryState {
         let (found_tx, found_rx) = channel();
         if scan {
-            start_scan(&ctx, settings.folders.clone(), found_tx);
+            start_scan(ctx, folders, found_tx);
         }
-        let (icon_tx, icon_rx) = icon_worker(ctx.clone());
-        let (ended_tx, ended_rx) = channel();
-        // Games start through this same program, with a command line.
-        let peerparty = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("peerparty.exe"));
-        let welcome = (!settings.onboarded).then(|| welcome::Welcome::new(&settings.prefs));
-        let mut app = App {
-            pads: pads::PadThread::start(ctx.clone()),
-            ctx,
-            settings,
+        let mut lib = LibraryState {
             scanned: Vec::new(),
             rescanned: None,
             entries: Vec::new(),
             recent: HashMap::new(),
             scanning: scan,
             found_rx,
-            icon_tx,
-            icon_rx,
-            icons: HashMap::new(),
-            glows: HashMap::new(),
-            view: View::Library,
             category: Category::All,
             search: String::new(),
             selected: None,
-            sessions: Vec::new(),
-            next_session: 1,
-            ended_tx,
-            ended_rx,
-            pending: Vec::new(),
-            copy_saves: HashSet::new(),
-            confirm_close: false,
-            snack: None,
-            peerparty,
-            focus_search: false,
-            settings_seen: store::Settings::modified(),
-            pad_gate: padgate::PadGate::default(),
-            pad_repeat: None,
-            pad_fire: 0,
-            pad_mode: false,
-            focus_first: false,
-            focus_play: false,
             grid_cols: 1,
             scroll_to_selected: false,
+            focus_search: false,
             top_bar_ids: HashSet::new(),
-            firewall: firewall::Checker::default(),
-            fw_public: false,
-            reset_undo: None,
-            steam_ids: HashMap::new(),
-            fixing: None,
-            inviting: None,
-            spark: None,
-            welcome,
-            together: together::State::default(),
-            settings_tab: settings::Tab::General,
-            background: false,
-            live: scan,
-            update_told: None,
         };
-        app.reload_recent();
-        if !app.recent.is_empty() {
-            app.category = Category::Recent;
+        lib.reload_recent();
+        if !lib.recent.is_empty() {
+            lib.category = Category::Recent;
         }
-        app.rebuild();
-        app
+        lib
     }
 
     fn reload_recent(&mut self) {
         self.recent = store::recent().into_iter().map(|r| (store::key_of(&r.exe), r.when)).collect();
     }
 
-    /// The library: scanned games (one per program), then added programs and recent
-    /// launches that no library knows. A game GOG or Epic installed into one of the
-    /// player's game folders shows under that folder (its store name kept): only Steam
-    /// and Xbox games start through their own client.
-    fn rebuild(&mut self) {
+    fn rebuild(&mut self, settings: &Settings) {
         let mut seen = HashSet::new();
         let mut at: HashMap<String, usize> = HashMap::new();
         let mut out: Vec<Game> = Vec::new();
@@ -378,7 +272,7 @@ impl App {
                 }
             }
         }
-        for exe in &self.settings.added {
+        for exe in &settings.added {
             if exe.is_file() && seen.insert(store::key_of(exe)) {
                 out.push(scan::loose(exe, Source::Added));
             }
@@ -392,60 +286,43 @@ impl App {
         self.entries = out;
     }
 
-    fn rescan(&mut self) {
+    fn rescan(&mut self, ctx: &egui::Context, settings: &Settings) {
         let (tx, rx) = channel();
         self.found_rx = rx;
         self.rescanned = Some(Vec::new());
         self.scanning = true;
-        start_scan(&self.ctx, self.settings.folders.clone(), tx);
+        start_scan(ctx, settings.folders.clone(), tx);
         self.reload_recent();
-        self.rebuild();
+        self.rebuild(settings);
+    }
+
+    fn poll_scan(&mut self, settings: &Settings) {
+        let mut changed = false;
+        while let Ok(f) = self.found_rx.try_recv() {
+            match f {
+                Found::Game(g) => match self.rescanned.as_mut() {
+                    Some(r) => r.push(g),
+                    None => {
+                        self.scanned.push(g);
+                        changed = true;
+                    }
+                },
+                Found::Done => {
+                    if let Some(r) = self.rescanned.take() {
+                        self.scanned = r;
+                    }
+                    self.scanning = false;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.rebuild(settings);
+        }
     }
 
     fn game(&self, key: &str) -> Option<&Game> {
         self.entries.iter().find(|g| store::key_of(&g.exe) == key)
-    }
-
-    fn hidden(&self, key: &str) -> bool {
-        self.settings.hidden.iter().any(|h| h == key)
-    }
-
-    fn in_category(&self, g: &Game, key: &str, c: Category) -> bool {
-        let hidden = self.hidden(key);
-        match c {
-            Category::Hidden => hidden,
-            _ if hidden => false,
-            Category::All => true,
-            Category::Recent => self.recent.contains_key(key),
-            Category::Source(s) => g.source == s && !(s == Source::Added && !self.is_added(key)),
-        }
-    }
-
-    /// Where a game came from, as the player sees it.
-    fn origin(&self, g: &Game, key: &str) -> &'static str {
-        if g.source == Source::Added && !self.is_added(key) { t!("source.recent") } else { source_name(g.source) }
-    }
-
-    fn is_added(&self, key: &str) -> bool {
-        self.settings.added.iter().any(|p| store::key_of(p) == key)
-    }
-
-    fn count(&self, c: Category) -> usize {
-        self.entries.iter().filter(|g| self.in_category(g, &store::key_of(&g.exe), c)).count()
-    }
-
-    /// The filters with games in them, in order.
-    fn categories(&self) -> Vec<Category> {
-        let mut cats = vec![Category::All, Category::Recent];
-        for s in [Source::Steam, Source::Epic, Source::Gog, Source::Xbox, Source::Folder, Source::Added] {
-            if self.count(Category::Source(s)) > 0 {
-                cats.push(Category::Source(s));
-            }
-        }
-        if self.count(Category::Hidden) > 0 {
-            cats.push(Category::Hidden);
-        }
-        cats
     }
 
     /// The filter the grid is showing: a search looks through All, whichever filter was
@@ -462,12 +339,327 @@ impl App {
         }
         self.category = c;
     }
+}
+
+/// Running game sessions, queued second copies, and per-start save-copy toggles.
+struct SessionManager {
+    sessions: Vec<Session>,
+    next_session: u64,
+    ended_tx: Sender<(u64, Option<i32>)>,
+    ended_rx: Receiver<(u64, Option<i32>)>,
+    pending: Vec<PendingStart>,
+    /// Games whose next extra copy starts from player 1's saves ("Copy Player 1's saves
+    /// to Player N"). Never saved: off whenever the window starts, and off again once a start
+    /// has used it, so a later Play can't replace a save by accident.
+    copy_saves: HashSet<String>,
+    /// Close all on the Now playing card asked first: Close all again closes everything.
+    confirm_close: bool,
+    peerparty: PathBuf,
+    /// The Play button's spark: when it was pressed, and a seed for its arcs.
+    spark: Option<(Instant, u64)>,
+    /// In background mode (a game runs, the window is behind it).
+    background: bool,
+}
+
+impl SessionManager {
+    fn new() -> SessionManager {
+        let (ended_tx, ended_rx) = channel();
+        let peerparty = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("peerparty.exe"));
+        SessionManager {
+            sessions: Vec::new(),
+            next_session: 1,
+            ended_tx,
+            ended_rx,
+            pending: Vec::new(),
+            copy_saves: HashSet::new(),
+            confirm_close: false,
+            peerparty,
+            spark: None,
+            background: false,
+        }
+    }
+
+    fn running(&self, key: &str) -> Vec<u8> {
+        let mut p: Vec<u8> = Vec::new();
+        for s in self.sessions.iter().filter(|s| s.key == key) {
+            let count = s.split_players.max(1);
+            for offset in 0..count {
+                p.push(s.player.saturating_add(offset));
+            }
+        }
+        p.sort();
+        p
+    }
+
+    /// Whether "Copy Player 1's saves to Player N" is shown.
+    pub(super) fn copy_saves_offered(&mut self, key: &str, players: u8, running: bool) -> bool {
+        let waiting = self.pending.iter().any(|p| p.key == key);
+        let shown = (players >= 2 || running) && !waiting;
+        if !shown {
+            self.copy_saves.remove(key);
+        }
+        shown
+    }
+
+    /// The player the save switch is for: the next copy Play adds.
+    pub(super) fn copy_saves_target(&self, key: &str) -> u8 {
+        let running = self.running(key).last().copied().unwrap_or(0);
+        let waiting = self.pending.iter().filter(|p| p.key == key).map(|p| p.player).max().unwrap_or(0);
+        running.max(waiting).max(1) + 1
+    }
+
+    /// Starts peerparty.exe for a game; a thread of its own waits for it to end.
+    fn spawn(&mut self, ctx: &egui::Context, key: &str, name: &str, args: Vec<String>, player: u8, split_players: u8) -> Result<(), std::io::Error> {
+        let mut cmd = Command::new(&self.peerparty);
+        cmd.arg("--why").args(&args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+        let mut child = platform::quiet(&mut cmd).spawn()?;
+        let pid = child.id();
+        let id = self.next_session;
+        self.next_session += 1;
+        let stderr = Arc::new(Mutex::new(String::new()));
+        let pipe = child.stderr.take();
+        let sink = stderr.clone();
+        let tx = self.ended_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            if let Some(mut pipe) = pipe {
+                let mut buf = String::new();
+                let _ = pipe.read_to_string(&mut buf);
+                sink.lock().unwrap().push_str(&buf);
+            }
+            let code = child.wait().ok().and_then(|s| s.code());
+            let _ = tx.send((id, code));
+            ctx.request_repaint();
+        });
+        self.sessions.push(Session { id, key: key.into(), name: name.into(), player, split_players, started: Instant::now(), stderr, pid });
+        Ok(())
+    }
+
+    /// Close all on the Now playing card: returns how many running copies were asked to close.
+    fn close_all(&mut self) -> usize {
+        self.pending.clear();
+        let mut asked = 0;
+        for s in &self.sessions {
+            if platform::close_game(s.pid) {
+                asked += 1;
+            }
+        }
+        asked
+    }
+}
+
+/// Async icon and glow color cache loaded off the UI thread.
+struct IconLoader {
+    tx: Sender<IconJob>,
+    rx: Receiver<IconDone>,
+    icons: HashMap<String, IconSlot>,
+    glows: HashMap<String, Color32>,
+}
+
+impl IconLoader {
+    fn start(ctx: egui::Context) -> IconLoader {
+        let (tx, rx) = icon_worker(ctx);
+        IconLoader { tx, rx, icons: HashMap::new(), glows: HashMap::new() }
+    }
+
+    fn poll(&mut self, ctx: &egui::Context) {
+        while let Ok(done) = self.rx.try_recv() {
+            let slot = match done.icon {
+                Some(rgba) => {
+                    let img = egui::ColorImage::from_rgba_unmultiplied([rgba.width, rgba.height], &rgba.pixels);
+                    IconSlot::Ready(ctx.load_texture(&done.key, img, TextureOptions::LINEAR))
+                }
+                None => IconSlot::Missing,
+            };
+            if let Some(c) = done.glow {
+                self.glows.insert(done.key.clone(), c);
+            }
+            self.icons.insert(done.key, slot);
+        }
+    }
+
+    /// The colour a game's light takes: its picture's, else one from its name.
+    fn glow_of(&self, g: &Game, key: &str) -> Color32 {
+        self.glows.get(key).copied().unwrap_or_else(|| theme::mix(theme::tint_for(&g.name), Color32::WHITE, 0.35))
+    }
+}
+
+/// Controller & keyboard navigation state.
+struct InputNav {
+    /// Controllers, for picking a game from the couch.
+    pads: pads::PadThread,
+    /// Which presses count (only while this window is in front).
+    pad_gate: padgate::PadGate,
+    repeat: shared::RepeatTimer,
+    /// Controller presses for the game grid, from the input hook.
+    pad_fire: u32,
+    /// The controller was the last thing used (its hints show).
+    pad_mode: bool,
+    /// The first control of the page just opened takes the focus (controller, keyboard).
+    focus_first: bool,
+    /// The game panel's Play button takes the focus.
+    focus_play: bool,
+}
+
+impl InputNav {
+    fn start(ctx: egui::Context) -> InputNav {
+        InputNav {
+            pads: pads::PadThread::start(ctx),
+            pad_gate: padgate::PadGate::default(),
+            repeat: shared::RepeatTimer::default(),
+            pad_fire: 0,
+            pad_mode: false,
+            focus_first: false,
+            focus_play: false,
+        }
+    }
+}
+
+/// Background system checks: Windows Firewall, Steam app ids, invites, and update notices.
+struct SystemChecks {
+    /// Reads Windows Firewall's rules for the warnings.
+    firewall: firewall::Checker,
+    /// "Also on public networks" for the firewall fix.
+    fw_public: bool,
+    /// A firewall fix under way: what to say when it's done, and whether it worked.
+    fixing: Option<Receiver<(String, bool)>>,
+    /// The "Invite players at home" button's answer, while it is awaited.
+    inviting: Option<Receiver<bool>>,
+    /// Per program: its game folder looked through, whether its Steam app id can't be
+    /// found, and when that was checked (steamid.rs).
+    steam_ids: HashMap<PathBuf, (crate::steamid::Game, bool, Instant)>,
+    /// The real window, not a test's or a preview's: it may ask GitHub for updates.
+    live: bool,
+    /// The newer version already announced.
+    update_told: Option<String>,
+}
+
+impl SystemChecks {
+    fn new(live: bool) -> SystemChecks {
+        SystemChecks {
+            firewall: firewall::Checker::default(),
+            fw_public: false,
+            fixing: None,
+            inviting: None,
+            steam_ids: HashMap::new(),
+            live,
+            update_told: None,
+        }
+    }
+}
+
+struct App {
+    ctx: egui::Context,
+    settings: Settings,
+    /// The settings as last loaded or saved here, for 3-way locked merging (`save_over`).
+    settings_base: Settings,
+    /// When ui.json was last read or written here (the overlay changes it too).
+    settings_seen: Option<std::time::SystemTime>,
+    lib: LibraryState,
+    sessions: SessionManager,
+    icons: IconLoader,
+    nav: InputNav,
+    checks: SystemChecks,
+    view: View,
+    snack: Option<Snack>,
+    /// The settings "Reset to recommended" replaced, offered back until one of them
+    /// changes again or the window closes.
+    reset_undo: Option<store::Prefs>,
+    /// The first-run setup, while it shows.
+    welcome: Option<welcome::Welcome>,
+    /// Play together's state (the code being typed, the blocked players).
+    together: together::State,
+    /// Settings' open section.
+    settings_tab: settings::Tab,
+}
+
+impl App {
+    fn new(ctx: egui::Context, settings: Settings) -> App {
+        Self::with(ctx, settings, true)
+    }
+
+    /// The window's state; `scan` looks for installed games (tests show their own).
+    fn with(ctx: egui::Context, settings: Settings, scan: bool) -> App {
+        let welcome = (!settings.onboarded).then(|| welcome::Welcome::new(&settings.prefs));
+        let lib = LibraryState::new(&ctx, settings.folders.clone(), scan);
+        let settings_base = settings.clone();
+        let mut app = App {
+            nav: InputNav::start(ctx.clone()),
+            icons: IconLoader::start(ctx.clone()),
+            sessions: SessionManager::new(),
+            checks: SystemChecks::new(scan),
+            lib,
+            ctx,
+            settings,
+            settings_base,
+            settings_seen: store::Settings::modified(),
+            view: View::Library,
+            snack: None,
+            reset_undo: None,
+            welcome,
+            together: together::State::default(),
+            settings_tab: settings::Tab::General,
+        };
+        app.rebuild();
+        app
+    }
+
+    fn rebuild(&mut self) {
+        self.lib.rebuild(&self.settings);
+    }
+
+    fn rescan(&mut self) {
+        self.lib.rescan(&self.ctx, &self.settings);
+    }
+
+    fn hidden(&self, key: &str) -> bool {
+        self.settings.hidden.iter().any(|h| h == key)
+    }
+
+    fn in_category(&self, g: &Game, key: &str, c: Category) -> bool {
+        let hidden = self.hidden(key);
+        match c {
+            Category::Hidden => hidden,
+            _ if hidden => false,
+            Category::All => true,
+            Category::Recent => self.lib.recent.contains_key(key),
+            Category::Source(s) => g.source == s && !(s == Source::Added && !self.is_added(key)),
+        }
+    }
+
+    /// Where a game came from, as the player sees it.
+    fn origin(&self, g: &Game, key: &str) -> &'static str {
+        if g.source == Source::Added && !self.is_added(key) { t!("source.recent") } else { source_name(g.source) }
+    }
+
+    fn is_added(&self, key: &str) -> bool {
+        self.settings.added.iter().any(|p| store::key_of(p) == key)
+    }
+
+    fn count(&self, c: Category) -> usize {
+        self.lib.entries.iter().filter(|g| self.in_category(g, &store::key_of(&g.exe), c)).count()
+    }
+
+    /// The filters with games in them, in order.
+    fn categories(&self) -> Vec<Category> {
+        let mut cats = vec![Category::All, Category::Recent];
+        for s in [Source::Steam, Source::Epic, Source::Gog, Source::Xbox, Source::Folder, Source::Added] {
+            if self.count(Category::Source(s)) > 0 {
+                cats.push(Category::Source(s));
+            }
+        }
+        if self.count(Category::Hidden) > 0 {
+            cats.push(Category::Hidden);
+        }
+        cats
+    }
 
     /// What the grid shows: the filter, or All narrowed by the search.
     fn visible(&self) -> Vec<usize> {
-        let needle = self.search.trim().to_lowercase();
-        let shown = self.shown();
+        let needle = self.lib.search.trim().to_lowercase();
+        let shown = self.lib.shown();
         let mut v: Vec<usize> = self
+            .lib
             .entries
             .iter()
             .enumerate()
@@ -478,7 +670,7 @@ impl App {
             .map(|(i, _)| i)
             .collect();
         if shown == Category::Recent {
-            v.sort_by_key(|i| std::cmp::Reverse(self.recent.get(&store::key_of(&self.entries[*i].exe)).copied()));
+            v.sort_by_key(|i| std::cmp::Reverse(self.lib.recent.get(&store::key_of(&self.lib.entries[*i].exe)).copied()));
         }
         v
     }
@@ -487,18 +679,18 @@ impl App {
         self.snack = Some(Snack { text: msg.into(), ok, at: Instant::now() });
     }
 
-    fn running(&self, key: &str) -> Vec<u8> {
-        let mut p: Vec<u8> = self.sessions.iter().filter(|s| s.key == key).map(|s| s.player).collect();
-        p.sort();
-        p
-    }
-
     /// peerparty.exe's arguments for a game with these options.
     fn command(&self, g: &Game, o: &GameOptions) -> Vec<String> {
         let mut args = Vec::new();
         // Never --copy-saves: that is for one start only (`plan`), not for a command line
         // kept in a .bat or copied from the game's page.
-        if o.players >= 2 {
+        if o.uses_split_screen() && g.source != Source::Xbox {
+            args.push("--split-screen".into());
+            args.push("--instances".into());
+            args.push(o.players.clamp(2, 4).to_string());
+            args.push("--layout".into());
+            args.push(o.effective_split_layout().into());
+        } else if o.players >= 2 && g.source != Source::Xbox {
             args.push("--multi-instance".into());
         }
         args.push(o.exe.clone().unwrap_or_else(|| g.exe.clone()).to_string_lossy().into_owned());
@@ -507,42 +699,48 @@ impl App {
     }
 
     fn play(&mut self, key: &str) {
-        let Some(g) = self.game(key).cloned() else { return };
+        let Some(g) = self.lib.game(key).cloned() else { return };
         let mut o = self.settings.options(key);
         // An Xbox app game runs one copy per PC.
         if g.source == Source::Xbox {
             o.players = 1;
+            o.split_screen = false;
         }
         // No bursts of copies, whatever asks (a stuck key, a held button, a script):
         // another instance only once the last one has had a few seconds to start.
-        if self.sessions.iter().any(|s| s.key == key && s.started.elapsed() < START_GUARD) {
+        if self.sessions.sessions.iter().any(|s| s.key == key && s.started.elapsed() < START_GUARD) {
             self.say(t!("snack.still_starting", game = g.name), false);
             return;
         }
         // A copy waiting for its turn (the two-player start's second): Play starts it
         // now, rather than turning the player away or adding a third.
-        if self.pending.iter().any(|p| p.key == key) {
+        if self.sessions.pending.iter().any(|p| p.key == key) {
             self.start_pending_now(key);
             return;
         }
-        let running = !self.running(key).is_empty();
-        let first = self.running(key).last().map_or(1, |p| p + 1);
-        let plan = plan(self.command(&g, &o), o.players, running, g.source == Source::Xbox, self.copy_saves.contains(key));
-        if !self.spawn(key, &g.name, plan.now, first) {
+        let running = self.sessions.running(key);
+        let first = running.last().map_or(1, |p| p + 1);
+        let split_players = if o.uses_split_screen() && running.is_empty() && g.source != Source::Xbox { o.players.clamp(2, 4) } else { 0 };
+        let plan = plan(self.command(&g, &o), o.players, o.split_screen, !running.is_empty(), g.source == Source::Xbox, self.sessions.copy_saves.contains(key));
+        if !self.spawn(key, &g.name, plan.now, first, split_players) {
             return;
         }
         // "Copy Player 1's saves to Player N" is for one start: off once a start used it.
         if plan.copied {
-            self.copy_saves.remove(key);
+            self.sessions.copy_saves.remove(key);
         }
-        self.spark = Some((Instant::now(), self.next_session.wrapping_mul(7919)));
+        self.sessions.spark = Some((Instant::now(), self.sessions.next_session.wrapping_mul(7919)));
         match plan.later {
             Some(args) => {
                 let delay = self.settings.second_delay.max(1);
-                self.pending.push(PendingStart { at: Instant::now() + Duration::from_secs(delay as u64), key: key.into(), name: g.name.clone(), args, player: first + 1 });
+                self.sessions.pending.push(PendingStart { at: Instant::now() + Duration::from_secs(delay as u64), key: key.into(), name: g.name.clone(), args, player: first + 1 });
                 // The window minimizes once the second copy has started (`tick`): until
                 // then its countdown, Start now and Cancel stay in view.
                 self.say(t!("snack.started_two", game = g.name, n = delay), true);
+            }
+            None if split_players >= 2 => {
+                self.say(t!("snack.started_split", game = g.name, n = split_players), true);
+                self.minimize_after_start();
             }
             None => {
                 self.say(t!("snack.started", game = g.name), true);
@@ -553,40 +751,25 @@ impl App {
 
     /// Starts a game's waiting copy now (Play, or Start now on the Now playing card).
     fn start_pending_now(&mut self, key: &str) {
-        let Some(i) = self.pending.iter().position(|p| p.key == key) else { return };
-        let p = self.pending.remove(i);
-        if self.spawn(&p.key, &p.name, p.args, p.player) {
-            self.spark = Some((Instant::now(), self.next_session.wrapping_mul(7919)));
+        let Some(i) = self.sessions.pending.iter().position(|p| p.key == key) else { return };
+        let p = self.sessions.pending.remove(i);
+        if self.spawn(&p.key, &p.name, p.args, p.player, 0) {
+            self.sessions.spark = Some((Instant::now(), self.sessions.next_session.wrapping_mul(7919)));
             self.say(t!("snack.started", game = p.name), true);
             self.minimize_after_start();
         }
     }
 
-    /// Close all on the Now playing card: every game PeerParty started from here, each
-    /// copy, asked to close (ended if it doesn't within a few seconds), and no waiting
-    /// copy starts after. The sessions go as each one's peerparty.exe ends.
+    /// Close all on the Now playing card.
     fn close_all(&mut self) {
-        self.pending.clear();
-        let mut asked = 0;
-        for s in &self.sessions {
-            use windows_sys::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
-            unsafe {
-                let ev = OpenEventW(EVENT_MODIFY_STATE, 0, crate::close_event(s.pid).as_ptr());
-                if !ev.is_null() {
-                    if SetEvent(ev) != 0 {
-                        asked += 1;
-                    }
-                    windows_sys::Win32::Foundation::CloseHandle(ev);
-                }
-            }
-        }
+        let asked = self.sessions.close_all();
         self.say(t!("snack.closing_all", n = asked), asked > 0);
     }
 
     /// Cancel on the Now playing card: the waiting copy won't start.
     fn cancel_pending(&mut self, key: &str) {
-        if let Some(i) = self.pending.iter().position(|p| p.key == key) {
-            let p = self.pending.remove(i);
+        if let Some(i) = self.sessions.pending.iter().position(|p| p.key == key) {
+            let p = self.sessions.pending.remove(i);
             self.say(t!("snack.copy_cancelled", game = p.name, player = p.player), true);
         }
     }
@@ -603,33 +786,9 @@ impl App {
     }
 
     /// Starts peerparty.exe for a game; a thread of its own waits for it to end.
-    fn spawn(&mut self, key: &str, name: &str, args: Vec<String>, player: u8) -> bool {
-        let mut cmd = Command::new(&self.peerparty);
-        // `--why`: a failure's reason comes as a line the window can translate.
-        cmd.arg("--why").args(&args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
-        match platform::quiet(&mut cmd).spawn() {
-            Ok(mut child) => {
-                let pid = child.id();
-                let id = self.next_session;
-                self.next_session += 1;
-                let stderr = Arc::new(Mutex::new(String::new()));
-                let pipe = child.stderr.take();
-                let sink = stderr.clone();
-                let tx = self.ended_tx.clone();
-                let ctx = self.ctx.clone();
-                std::thread::spawn(move || {
-                    if let Some(mut pipe) = pipe {
-                        let mut buf = String::new();
-                        let _ = pipe.read_to_string(&mut buf);
-                        sink.lock().unwrap().push_str(&buf);
-                    }
-                    let code = child.wait().ok().and_then(|s| s.code());
-                    let _ = tx.send((id, code));
-                    ctx.request_repaint();
-                });
-                self.sessions.push(Session { id, key: key.into(), name: name.into(), player, started: Instant::now(), stderr, pid });
-                true
-            }
+    fn spawn(&mut self, key: &str, name: &str, args: Vec<String>, player: u8, split_players: u8) -> bool {
+        match self.sessions.spawn(&self.ctx, key, name, args, player, split_players) {
+            Ok(()) => true,
             Err(e) => {
                 self.say(t!("snack.cant_start", error = e), false);
                 false
@@ -641,13 +800,20 @@ impl App {
     fn reload_prefs(&mut self) {
         let m = store::Settings::modified();
         if m.is_some() && m != self.settings_seen {
+            let loaded = Settings::load();
+            if loaded.unread {
+                return;
+            }
             self.settings_seen = m;
-            self.settings.prefs = Settings::load().prefs;
+            self.settings.prefs = loaded.prefs.clone();
+            self.settings_base.prefs = loaded.prefs;
         }
     }
 
     fn save_settings(&mut self) {
-        self.settings.save();
+        let saved = self.settings.save_over(&self.settings_base);
+        self.settings = saved.clone();
+        self.settings_base = saved;
         self.settings_seen = store::Settings::modified();
     }
 
@@ -656,36 +822,36 @@ impl App {
     fn tick(&mut self) {
         let now = Instant::now();
         self.reload_prefs();
-        if let Some(rx) = &self.fixing {
+        if let Some(rx) = &self.checks.fixing {
             match rx.try_recv() {
                 Ok((msg, ok)) => {
-                    self.fixing = None;
-                    self.firewall.forget();
+                    self.checks.fixing = None;
+                    self.checks.firewall.forget();
                     self.say(msg, ok);
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => self.ctx.request_repaint_after(Duration::from_millis(300)),
-                Err(_) => self.fixing = None,
+                Err(_) => self.checks.fixing = None,
             }
         }
-        if let Some(rx) = &self.inviting {
+        if let Some(rx) = &self.checks.inviting {
             match rx.try_recv() {
                 Ok(taken) => {
-                    self.inviting = None;
+                    self.checks.inviting = None;
                     self.say(if taken { t!("snack.invite_sent") } else { t!("snack.invite_none") }, taken);
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => self.ctx.request_repaint_after(Duration::from_millis(100)),
-                Err(_) => self.inviting = None,
+                Err(_) => self.checks.inviting = None,
             }
         }
         // Copies that ended first: a first copy that failed at once takes its waiting
         // second copy with it, even when that one is due in this same frame.
-        while let Ok((id, code)) = self.ended_rx.try_recv() {
-            let Some(i) = self.sessions.iter().position(|s| s.id == id) else { continue };
-            let s = self.sessions.remove(i);
+        while let Ok((id, code)) = self.sessions.ended_rx.try_recv() {
+            let Some(i) = self.sessions.sessions.iter().position(|s| s.id == id) else { continue };
+            let s = self.sessions.sessions.remove(i);
             // The game's last copy closed before the next one's turn: that one isn't
             // started on its own after everything has closed.
-            if !self.sessions.iter().any(|o| o.key == s.key) {
-                self.pending.retain(|p| p.key != s.key);
+            if !self.sessions.sessions.iter().any(|o| o.key == s.key) {
+                self.sessions.pending.retain(|p| p.key != s.key);
             }
             // PeerParty returns the game's own exit code; only a quick failure is news.
             if code != Some(0) && s.started.elapsed() < Duration::from_secs(20) {
@@ -693,19 +859,19 @@ impl App {
                 let why = why_text(&text).unwrap_or_else(|| t!("snack.exited_at_once").to_string());
                 self.say(t!("snack.didnt_start", game = s.name, n = s.player, why = why), false);
             }
-            self.reload_recent();
+            self.lib.reload_recent();
         }
-        let (due, wait): (Vec<PendingStart>, Vec<PendingStart>) = std::mem::take(&mut self.pending).into_iter().partition(|p| p.at <= now);
-        self.pending = wait;
+        let (due, wait): (Vec<PendingStart>, Vec<PendingStart>) = std::mem::take(&mut self.sessions.pending).into_iter().partition(|p| p.at <= now);
+        self.sessions.pending = wait;
         let mut started = false;
         for p in due {
-            started |= self.spawn(&p.key, &p.name, p.args, p.player);
+            started |= self.spawn(&p.key, &p.name, p.args, p.player, 0);
         }
         if started {
             // Two players on this PC: the window kept the countdown in view until now.
             self.minimize_after_start();
         }
-        if let Some(next) = self.pending.iter().map(|p| p.at).min() {
+        if let Some(next) = self.sessions.pending.iter().map(|p| p.at).min() {
             // The countdown shows seconds.
             self.ctx.request_repaint_after(next.saturating_duration_since(now).min(Duration::from_secs(1)));
         }
@@ -718,9 +884,9 @@ impl App {
             }
         }
         let front = self.ctx.input(|i| i.focused);
-        let back = !front && !self.sessions.is_empty();
-        if back != self.background {
-            self.background = back;
+        let back = !front && !self.sessions.sessions.is_empty();
+        if back != self.sessions.background {
+            self.sessions.background = back;
             platform::background(back);
         }
     }
@@ -728,21 +894,19 @@ impl App {
     fn apply(&mut self, actions: Vec<Action>) {
         for a in actions {
             match a {
-                Action::Select(k) => self.selected = Some(k),
+                Action::Select(k) => self.lib.selected = Some(k),
                 Action::Play(k) => {
-                    self.selected = Some(k.clone());
+                    self.lib.selected = Some(k.clone());
                     self.play(&k);
                 }
                 Action::Hide(k, hide) => {
                     self.settings.hidden.retain(|h| *h != k);
                     if hide {
-                        // Said where it went, and its panel closed (outside the Hidden
-                        // list, where it no longer is).
-                        if let Some(name) = self.game(&k).map(|g| g.name.clone()) {
+                        if let Some(name) = self.lib.game(&k).map(|g| g.name.clone()) {
                             self.say(t!("snack.hidden", game = name, list = t!("filter.hidden")), true);
                         }
-                        if self.category != Category::Hidden && self.selected.as_deref() == Some(k.as_str()) {
-                            self.selected = None;
+                        if self.lib.category != Category::Hidden && self.lib.selected.as_deref() == Some(k.as_str()) {
+                            self.lib.selected = None;
                         }
                         self.settings.hidden.push(k);
                     }
@@ -758,43 +922,45 @@ impl App {
     /// Asks Windows (as administrator) to let `exe` through the firewall, off this
     /// thread; if that's declined or fails, opens the firewall's settings instead.
     fn fix_firewall(&mut self, exe: PathBuf, public: bool) {
-        if self.fixing.is_some() {
+        if self.checks.fixing.is_some() {
             return;
         }
-        let (tx, rx) = channel();
-        let peerparty = self.peerparty.clone();
         let ctx = self.ctx.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(firewall::fix_or_open(&peerparty, &exe, public));
-            ctx.request_repaint();
-        });
-        self.fixing = Some(rx);
+        self.checks.fixing = Some(shared::spawn_firewall_fix(self.sessions.peerparty.clone(), exe, public, move || ctx.request_repaint()));
         self.say(t!("snack.firewall_asking"), true);
     }
 
     /// The firewall's verdict for a game played through PeerParty (none for an Xbox app
     /// game, whose rules are its package's), with its program.
     fn firewall_for(&mut self, key: &str) -> Option<(firewall::Verdict, PathBuf)> {
-        let g = self.game(key)?;
+        let g = self.lib.game(key)?;
         if g.source == Source::Xbox {
             return None;
         }
         let exe = self.settings.options(key).exe.unwrap_or_else(|| g.exe.clone());
-        Some((self.firewall.verdict(&exe), exe))
+        Some((self.checks.firewall.verdict(&exe), exe))
     }
 
     fn make_bat(&mut self, key: &str) {
-        let Some(g) = self.game(key).cloned() else { return };
+        let Some(g) = self.lib.game(key).cloned() else { return };
         let o = self.settings.options(key);
         let safe: String = g.name.chars().filter(|c| !r#"\/:*?"<>|"#.contains(*c)).collect();
-        let file = if o.players >= 2 { format!("{safe} (2 players).bat") } else { format!("{safe}.bat") };
-        let dir = self.peerparty.parent().map(Path::to_path_buf).unwrap_or_default();
+        let split = o.uses_split_screen() && g.source != Source::Xbox;
+        let file = if split {
+            format!("{safe} ({}p split screen).bat", o.players.clamp(2, 4))
+        } else if o.players >= 2 && g.source != Source::Xbox {
+            format!("{safe} (2 players).bat")
+        } else {
+            format!("{safe}.bat")
+        };
+        let dir = self.sessions.peerparty.parent().map(Path::to_path_buf).unwrap_or_default();
         let Some(path) = rfd::FileDialog::new().set_title(t!("dialog.save_bat")).set_directory(&dir).set_file_name(&file).add_filter("Batch file", &["bat"]).save_file() else {
             return;
         };
-        let pp = if path.parent() == Some(dir.as_path()) { "%~dp0peerparty.exe".to_string() } else { bat_text(&self.peerparty.display().to_string()) };
+        let pp = if path.parent() == Some(dir.as_path()) { "%~dp0peerparty.exe".to_string() } else { bat_text(&self.sessions.peerparty.display().to_string()) };
         let args = self.command(&g, &o);
-        let text = bat_file(&g.name, &pp, &args, (o.players >= 2).then_some(self.settings.second_delay));
+        let second_after = (!split && o.players >= 2 && g.source != Source::Xbox).then_some(self.settings.second_delay);
+        let text = bat_file(&g.name, &pp, &args, second_after);
         match std::fs::write(&path, text) {
             Ok(()) => self.say(t!("snack.saved", path = path.display()), true),
             Err(e) => self.say(t!("snack.cant_save", path = path.display(), error = e), false),
@@ -812,10 +978,10 @@ impl App {
         }
         self.rebuild();
         self.view = View::Library;
-        self.selected = Some(key);
-        self.search.clear();
-        if !self.entries.iter().any(|g| self.in_category(g, &store::key_of(&g.exe), self.category)) {
-            self.category = Category::All;
+        self.lib.selected = Some(key);
+        self.lib.search.clear();
+        if !self.lib.entries.iter().any(|g| self.in_category(g, &store::key_of(&g.exe), self.lib.category)) {
+            self.lib.category = Category::All;
         }
     }
 
@@ -833,7 +999,7 @@ impl App {
     /// Asks the game that was last in front (this window is, now) to invite everyone
     /// on the network, off this thread; `tick` says whether a game took it up.
     fn invite_everyone(&mut self) {
-        if self.inviting.is_some() {
+        if self.checks.inviting.is_some() {
             return;
         }
         let (tx, rx) = channel();
@@ -842,26 +1008,21 @@ impl App {
             let _ = tx.send(crate::signal_invite(true).unwrap_or(false));
             ctx.request_repaint();
         });
-        self.inviting = Some(rx);
+        self.checks.inviting = Some(rx);
     }
 
     fn request_icons(&mut self, keys: Vec<String>) {
         for key in keys {
-            if self.icons.contains_key(&key) {
+            if self.icons.icons.contains_key(&key) {
                 continue;
             }
-            let Some(g) = self.game(&key) else { continue };
+            let Some(g) = self.lib.game(&key) else { continue };
             let exe = self.settings.options(&key).exe.unwrap_or_else(|| g.exe.clone());
             let png = g.art.clone().filter(|a| a.extension().is_some_and(|x| x.eq_ignore_ascii_case("png")));
             let picture = g.cover.clone().or_else(|| g.art.clone());
-            self.icons.insert(key.clone(), IconSlot::Loading);
-            let _ = self.icon_tx.send(IconJob { key, exe, png, picture });
+            self.icons.icons.insert(key.clone(), IconSlot::Loading);
+            let _ = self.icons.tx.send(IconJob { key, exe, png, picture });
         }
-    }
-
-    /// The colour a game's light takes: its picture's, else one from its name.
-    fn glow_of(&self, g: &Game, key: &str) -> Color32 {
-        self.glows.get(key).copied().unwrap_or_else(|| theme::mix(theme::tint_for(&g.name), Color32::WHITE, 0.35))
     }
 
     // ---- controller and keyboard ----
@@ -872,28 +1033,20 @@ impl App {
     /// place, the shoulders through the library's filters or Settings' sections.
     fn controller(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
         let front = raw.focused && platform::in_front();
-        self.pads.set_front(front);
+        self.nav.pads.set_front(front);
         let now = Instant::now();
-        let held = if front { self.pads.held() } else { 0 };
-        let (b, pressed) = self.pad_gate.filter(front, held, now);
+        let held = if front { self.nav.pads.held() } else { 0 };
+        let (b, pressed) = self.nav.pad_gate.filter(front, held, now);
         if !front {
-            self.pad_repeat = None;
+            self.nav.repeat.reset();
             return;
         }
         let dirs = b & (pad::UP | pad::DOWN | pad::LEFT | pad::RIGHT);
-        let mut fire = pressed;
-        match self.pad_repeat {
-            Some((d, t)) if d == dirs && dirs != 0 && t.elapsed() > Duration::from_millis(400) => {
-                fire |= dirs;
-                self.pad_repeat = Some((d, t + Duration::from_millis(110)));
-            }
-            Some((d, _)) if d == dirs => {}
-            _ => self.pad_repeat = (dirs != 0).then(|| (dirs, Instant::now())),
-        }
+        let fire = pressed | self.nav.repeat.step(dirs, now);
         if fire == 0 {
             return;
         }
-        self.pad_mode = true;
+        self.nav.pad_mode = true;
         widgets::set_nav_mode(true);
         let focused = ctx.memory(|m| m.focused());
         let popup = egui::Popup::is_any_open(ctx);
@@ -908,14 +1061,13 @@ impl App {
             return;
         }
         if self.welcome.is_some() {
-            // The setup is all focusable controls; B steps back.
             if fire & pad::EAST != 0 {
                 if let Some(w) = self.welcome.as_mut() {
                     w.back();
                 }
             }
             if focused.is_none() && fire & (pad::UP | pad::DOWN | pad::LEFT | pad::RIGHT | pad::SOUTH) != 0 {
-                self.focus_first = true;
+                self.nav.focus_first = true;
                 return;
             }
             self.keys_for(raw, fire, &key);
@@ -931,12 +1083,12 @@ impl App {
             match self.view {
                 View::Library => {
                     let cats = self.categories();
-                    let i = cats.iter().position(|c| *c == self.shown()).unwrap_or(0) as i32;
-                    self.pick_category(cats[(i + d).rem_euclid(cats.len() as i32) as usize]);
+                    let i = cats.iter().position(|c| *c == self.lib.shown()).unwrap_or(0) as i32;
+                    self.lib.pick_category(cats[(i + d).rem_euclid(cats.len() as i32) as usize]);
                 }
                 View::Settings => {
                     self.settings_tab = self.settings_tab.step(d);
-                    self.focus_first = true;
+                    self.nav.focus_first = true;
                 }
                 View::Together => {}
             }
@@ -951,24 +1103,24 @@ impl App {
                 }
             } else if self.view != View::Library {
                 self.view = View::Library;
-            } else if !self.search.is_empty() {
-                self.search.clear();
+            } else if !self.lib.search.is_empty() {
+                self.lib.search.clear();
             } else {
-                self.selected = None;
+                self.lib.selected = None;
             }
             return;
         }
         let in_grid = self.view == View::Library && focused.is_none();
         if in_grid {
-            if fire & pad::WEST != 0 && self.selected.is_some() {
-                self.focus_play = true;
+            if fire & pad::WEST != 0 && self.lib.selected.is_some() {
+                self.nav.focus_play = true;
                 return;
             }
-            self.pad_fire |= fire;
+            self.nav.pad_fire |= fire;
             return;
         }
         // Down from the library's top bar goes back to the grid.
-        if self.view == View::Library && fire & pad::DOWN != 0 && focused.is_some_and(|f| self.top_bar_ids.contains(&f)) {
+        if self.view == View::Library && fire & pad::DOWN != 0 && focused.is_some_and(|f| self.lib.top_bar_ids.contains(&f)) {
             if let Some(id) = focused {
                 ctx.memory_mut(|m| m.surrender_focus(id));
             }
@@ -987,7 +1139,7 @@ impl App {
 
     /// The grid's own controller handling: the d-pad moves through the games, A plays.
     fn grid_pad(&mut self, ctx: &egui::Context) {
-        let fire = std::mem::take(&mut self.pad_fire);
+        let fire = std::mem::take(&mut self.nav.pad_fire);
         if fire == 0 {
             return;
         }
@@ -995,12 +1147,11 @@ impl App {
         if visible.is_empty() {
             return;
         }
-        let keys: Vec<String> = visible.iter().map(|&i| store::key_of(&self.entries[i].exe)).collect();
-        let at = self.selected.as_ref().and_then(|k| keys.iter().position(|x| x == k));
-        let step = if self.settings.list_view { 1 } else { self.grid_cols.max(1) as i32 };
+        let keys: Vec<String> = visible.iter().map(|&i| store::key_of(&self.lib.entries[i].exe)).collect();
+        let at = self.lib.selected.as_ref().and_then(|k| keys.iter().position(|x| x == k));
+        let step = if self.settings.list_view { 1 } else { self.lib.grid_cols.max(1) as i32 };
         if fire & pad::UP != 0 && at.is_some_and(|a| (a as i32) < step) {
-            // Up from the top row: the filters.
-            self.focus_first = true;
+            self.nav.focus_first = true;
             ctx.request_repaint();
             return;
         }
@@ -1017,24 +1168,24 @@ impl App {
             None
         };
         if let Some(n) = next {
-            self.selected = Some(keys[n].clone());
-            self.scroll_to_selected = true;
+            self.lib.selected = Some(keys[n].clone());
+            self.lib.scroll_to_selected = true;
         }
         if fire & pad::SOUTH != 0 {
-            match &self.selected {
+            match &self.lib.selected {
                 Some(k) => {
                     let k = k.clone();
-                    self.pad_gate.played(Instant::now());
+                    self.nav.pad_gate.played(Instant::now());
                     self.play(&k);
                 }
-                None => self.selected = Some(keys[0].clone()),
+                None => self.lib.selected = Some(keys[0].clone()),
             }
         }
     }
 
     fn open_view(&mut self, v: View, focus: bool) {
         self.view = v;
-        self.focus_first = focus && v != View::Library;
+        self.nav.focus_first = focus && v != View::Library;
         if v == View::Together {
             self.together.refresh();
         }
@@ -1046,12 +1197,9 @@ impl App {
         let full = ui.max_rect();
         let p = ui.painter().clone();
         p.rect_filled(full, 0.0, SIDEBAR);
-        // A faint blue light from the top left, and the edge against the content.
         fx::light(&p, full.left_top() + vec2(40.0, 30.0), vec2(260.0, 220.0), ACCENT.gamma_multiply(0.10));
         p.rect_filled(Rect::from_min_max(pos2(full.right() - 1.0, full.top()), full.right_bottom()), 0.0, theme::line());
         ui.add_space(22.0);
-        // The mark and the name, centred on each other and lined up with the nav items
-        // below: the mark over their icons, the name over their labels.
         let (head, _) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::hover());
         let mark = Rect::from_center_size(pos2(head.left() + 24.0, head.center().y), vec2(32.0, 32.0));
         brand_mark(ui.painter(), mark);
@@ -1059,7 +1207,7 @@ impl App {
         ui.add_space(22.0);
         for v in View::ALL {
             let sub = match v {
-                View::Library => Some(t!("nav.games", n = self.entries.len())),
+                View::Library => Some(t!("nav.games", n = self.lib.entries.len())),
                 View::Together => Some(together::summary(&self.settings.prefs)),
                 View::Settings => None,
             };
@@ -1068,14 +1216,11 @@ impl App {
                 self.open_view(v, false);
             }
         }
-        // What's running, with what can be done for it.
-        // Each game once (two games started in turn don't sit next to each other).
-        // Nothing running: no question left waiting for the next game.
-        if self.sessions.is_empty() {
-            self.confirm_close = false;
+        if self.sessions.sessions.is_empty() {
+            self.sessions.confirm_close = false;
         }
         let mut keys: Vec<String> = Vec::new();
-        for s in &self.sessions {
+        for s in &self.sessions.sessions {
             if !keys.contains(&s.key) {
                 keys.push(s.key.clone());
             }
@@ -1083,46 +1228,51 @@ impl App {
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             ui.add_space(14.0);
             ui.label(egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).size(11.0).color(TEXT3));
-            if self.sessions.is_empty() && self.pending.is_empty() {
+            if self.sessions.sessions.is_empty() && self.sessions.pending.is_empty() {
                 return;
             }
             ui.add_space(8.0);
             let mut invite = false;
             let mut close_all = false;
-            let mut confirm_close = self.confirm_close;
+            let mut confirm_close = self.sessions.confirm_close;
             let mut fix = None;
             let (mut start_now, mut cancel) = (None, None);
             widgets::card(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(egui::RichText::new(t!("nav.now_playing").to_uppercase()).font(theme::strong(11.0)).color(TEXT3));
-                for s in &self.sessions {
+                for s in &self.sessions.sessions {
                     ui.horizontal(|ui| {
                         let (d, _) = ui.allocate_exact_size(vec2(12.0, 18.0), Sense::hover());
                         fx::dot(ui.painter(), d.center(), 4.0, theme::GOOD);
-                        let name = if s.player > 1 { t!("nav.instance", game = s.name, n = s.player) } else { s.name.clone() };
+                        let name = if s.split_players >= 2 {
+                            t!("nav.split_session", game = s.name, n = s.split_players)
+                        } else if s.player > 1 {
+                            t!("nav.instance", game = s.name, n = s.player)
+                        } else {
+                            s.name.clone()
+                        };
                         ui.add(egui::Label::new(egui::RichText::new(name).size(13.0).color(TEXT)).truncate());
                     });
                 }
-                for p in &self.pending {
+                for p in &self.sessions.pending {
                     let left = p.at.saturating_duration_since(Instant::now()).as_secs() + 1;
                     ui.label(egui::RichText::new(t!("nav.instance_in", game = p.name, player = p.player, n = left)).size(12.0).color(TEXT2));
                     ui.horizontal(|ui| {
                         if widgets::button(ui, None, t!("nav.start_now"), widgets::Kind::Secondary).clicked() {
                             start_now = Some(p.key.clone());
                         }
-                        // An icon, so both fit the sidebar in every language.
                         if widgets::icon_button(ui, Icon::Close, t!("common.cancel")).clicked() {
                             cancel = Some(p.key.clone());
                         }
                     });
                 }
                 for key in &keys {
-                    let Some(g) = self.game(key) else { continue };
+                    let Some(g) = self.lib.game(key) else { continue };
                     let (g_name, exe) = (g.name.clone(), self.settings.options(key).exe.unwrap_or_else(|| g.exe.clone()));
                     if g.source == Source::Xbox {
                         continue;
                     }
-                    let v = self.firewall.verdict(&exe);
+                    let v = self.checks.firewall.verdict(&exe);
                     if v.blocked() {
                         widgets::note(ui, Icon::Shield, theme::WARN, &t!("nav.firewall_blocks", game = g_name));
                         if widgets::button(ui, Some(Icon::Shield), t!("common.fix"), widgets::Kind::Secondary).clicked() {
@@ -1137,8 +1287,7 @@ impl App {
                 {
                     invite = true;
                 }
-                // Closing loses unsaved progress: a yes first, here on the card.
-                if !self.sessions.is_empty() {
+                if !self.sessions.sessions.is_empty() {
                     if !confirm_close {
                         if widgets::wide_button(ui, Some(Icon::Close), t!("nav.close_all"), widgets::Kind::Ghost, 28.0)
                             .on_hover_text(t!("nav.close_all_tip"))
@@ -1163,7 +1312,7 @@ impl App {
             if invite {
                 self.invite_everyone();
             }
-            self.confirm_close = confirm_close;
+            self.sessions.confirm_close = confirm_close;
             if close_all {
                 self.close_all();
             }
@@ -1174,7 +1323,7 @@ impl App {
                 self.cancel_pending(&key);
             }
             if let Some(exe) = fix {
-                self.fix_firewall(exe, self.fw_public);
+                self.fix_firewall(exe, self.checks.fw_public);
             }
         });
     }
@@ -1184,14 +1333,14 @@ impl App {
         let r = ui.max_rect();
         let p = ui.painter();
         let y = r.center().y;
-        if self.pad_mode {
-            let style = self.pads.style;
+        if self.nav.pad_mode {
+            let style = self.nav.pads.style;
             let grid = self.view == View::Library && ui.ctx().memory(|m| m.focused()).is_none() && self.welcome.is_none();
             let next = View::ALL[(View::ALL.iter().position(|v| *v == self.view).unwrap_or(0) + 1) % 3].name();
             let mut items: Vec<(Glyph, &str)> = Vec::new();
             if grid {
                 items.push((Glyph::South, t!("hint.play")));
-                if self.selected.is_some() {
+                if self.lib.selected.is_some() {
                     items.push((Glyph::West, t!("hint.options")));
                 }
                 items.push((Glyph::Lb, t!("hint.filter")));
@@ -1207,7 +1356,7 @@ impl App {
             }
             icons::hints(p, pos2(r.left() + 4.0, y), &items, style, TEXT2);
         } else if self.view == View::Library {
-            let text = if self.scanning { t!("library.scanning").to_string() } else { t!("library.count", n = self.visible().len()) };
+            let text = if self.lib.scanning { t!("library.scanning").to_string() } else { t!("library.count", n = self.visible().len()) };
             p.text(pos2(r.left() + 4.0, y), egui::Align2::LEFT_CENTER, text, theme::font(12.5), TEXT3);
         }
     }
@@ -1301,31 +1450,68 @@ struct Plan {
     copied: bool,
 }
 
+/// Drops leading `--split-screen`, `--instances <n>`, and `--layout <preset>` flags from
+/// a command line so adding one more copy alongside a running session starts a single
+/// `--multi-instance` copy rather than a second split-screen session.
+fn strip_split_flags(args: &[String]) -> Vec<String> {
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--split-screen" => i += 1,
+            "--instances" | "--layout" => i += 2,
+            _ => break,
+        }
+    }
+    args[i.min(args.len())..].to_vec()
+}
+
 /// With a copy running, Play starts exactly one more, with --multi-instance (else the
 /// game's single-instance check hands focus to the running copy and quits). With
-/// nothing running and two players on this PC, the second copy follows later.
-/// `copy_saves` only ever goes to a copy after the first: the first copy's own save is
+/// nothing running and split screen on, one peerparty.exe starts every copy in a shared
+/// window; with split screen off and two players on this PC, the second copy follows
+/// later. `copy_saves` only ever goes to copies after the first: player 1's own save is
 /// never replaced.
-fn plan(command: Vec<String>, players: u8, running: bool, xbox: bool, copy_saves: bool) -> Plan {
+fn plan(command: Vec<String>, players: u8, split_screen: bool, running: bool, xbox: bool, copy_saves: bool) -> Plan {
     let copy_saves = copy_saves && !xbox;
-    let mut now = command.clone();
-    if running && players < 2 && !xbox {
-        now.insert(0, "--multi-instance".into());
+    let split = split_screen && players >= 2 && !xbox;
+    if running {
+        let mut now = if command.first().is_some_and(|a| a == "--split-screen") {
+            let mut rest = strip_split_flags(&command);
+            rest.insert(0, "--multi-instance".into());
+            rest
+        } else {
+            let mut cmd = command;
+            if !xbox && cmd.first().is_none_or(|a| a != "--multi-instance") {
+                cmd.insert(0, "--multi-instance".into());
+            }
+            cmd
+        };
+        let mut copied = false;
+        if copy_saves {
+            now.insert(1, "--copy-saves".into());
+            copied = true;
+        }
+        return Plan { now, later: None, copied };
+    }
+    if split {
+        let mut now = command;
+        let mut copied = false;
+        if copy_saves {
+            now.insert(1, "--copy-saves".into());
+            copied = true;
+        }
+        return Plan { now, later: None, copied };
     }
     let mut copied = false;
-    if running && copy_saves {
-        now.insert(1, "--copy-saves".into());
-        copied = true;
-    }
-    let later = (players >= 2 && !running && !xbox).then(|| {
-        let mut later = command;
+    let later = (players >= 2 && !xbox).then(|| {
+        let mut later = command.clone();
         if copy_saves {
             later.insert(1, "--copy-saves".into());
             copied = true;
         }
         later
     });
-    Plan { now, later, copied }
+    Plan { now: command, later, copied }
 }
 
 /// The .bat that starts a game through peerparty (`pp`, as the file names it) with
@@ -1360,24 +1546,9 @@ fn source_name(s: Source) -> &'static str {
     }
 }
 
-/// PeerParty's mark: the app's own icon (`icon_art`), drawn for the exact number of
-/// pixels it covers, so it is as sharp as the exe's icon and simplified the same way
-/// when small, with a faint glow round it.
+/// PeerParty's mark: delegates to the shared 3-node brand mark (`ui/shared.rs`).
 fn brand_mark(p: &egui::Painter, r: Rect) {
-    let ppp = p.ctx().pixels_per_point();
-    let n = (r.width() * ppp).round().max(16.0) as usize;
-    let id = egui::Id::unique(("brand_mark", n));
-    let tex = p.ctx().data(|d| d.get_temp::<TextureHandle>(id)).unwrap_or_else(|| {
-        let img = egui::ColorImage::from_rgba_unmultiplied([n, n], &crate::icon_art::icon_rgba(n));
-        let tex = p.ctx().load_texture(format!("brand_mark_{n}"), img, TextureOptions::LINEAR);
-        p.ctx().data_mut(|d| d.insert_temp(id, tex.clone()));
-        tex
-    });
-    // On whole pixels, so the texture's pixels land on the screen's.
-    let min = pos2((r.min.x * ppp).round() / ppp, (r.min.y * ppp).round() / ppp);
-    let r = Rect::from_min_size(min, vec2(n as f32 / ppp, n as f32 / ppp));
-    fx::glow(p, r, r.width() * 14.0 / 64.0, theme::VIOLET.gamma_multiply(0.30), 12.0);
-    p.image(tex.id(), r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+    shared::brand_mark(p, r);
 }
 
 /// One place in the sidebar: an icon, a name, a line under it, lit when it's the one
@@ -1472,11 +1643,11 @@ impl eframe::App for App {
             match e {
                 egui::Event::PointerMoved(_) | egui::Event::PointerButton { .. } | egui::Event::MouseWheel { .. } => {
                     widgets::set_nav_mode(false);
-                    self.pad_mode = false;
+                    self.nav.pad_mode = false;
                 }
                 egui::Event::Key { key: Key::Tab | Key::ArrowUp | Key::ArrowDown | Key::ArrowLeft | Key::ArrowRight, pressed: true, .. } => {
                     widgets::set_nav_mode(true);
-                    self.pad_mode = false;
+                    self.nav.pad_mode = false;
                 }
                 _ => {}
             }
@@ -1485,41 +1656,8 @@ impl eframe::App for App {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let mut changed = false;
-        while let Ok(f) = self.found_rx.try_recv() {
-            match f {
-                Found::Game(g) => match self.rescanned.as_mut() {
-                    Some(r) => r.push(g),
-                    None => {
-                        self.scanned.push(g);
-                        changed = true;
-                    }
-                },
-                Found::Done => {
-                    if let Some(r) = self.rescanned.take() {
-                        self.scanned = r;
-                    }
-                    self.scanning = false;
-                    changed = true;
-                }
-            }
-        }
-        if changed {
-            self.rebuild();
-        }
-        while let Ok(done) = self.icon_rx.try_recv() {
-            let slot = match done.icon {
-                Some(rgba) => {
-                    let img = egui::ColorImage::from_rgba_unmultiplied([rgba.width, rgba.height], &rgba.pixels);
-                    IconSlot::Ready(ctx.load_texture(&done.key, img, TextureOptions::LINEAR))
-                }
-                None => IconSlot::Missing,
-            };
-            if let Some(c) = done.glow {
-                self.glows.insert(done.key.clone(), c);
-            }
-            self.icons.insert(done.key, slot);
-        }
+        self.lib.poll_scan(&self.settings);
+        self.icons.poll(ctx);
         self.updates_tick(ctx);
         self.tick();
     }
@@ -1528,27 +1666,24 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::F)) {
             self.view = View::Library;
-            self.focus_search = true;
+            self.lib.focus_search = true;
         }
         let typing = ctx.egui_wants_keyboard_input();
         if self.welcome.is_none() && ctx.input(|i| i.key_pressed(Key::Escape)) && ctx.memory(|m| m.focused()).is_none() && !egui::Popup::is_any_open(&ctx) {
-            // The details panel's close says Esc: it goes before the search.
             if self.view != View::Library {
                 self.view = View::Library;
-            } else if self.selected.is_some() {
-                self.selected = None;
+            } else if self.lib.selected.is_some() {
+                self.lib.selected = None;
             } else {
-                self.search.clear();
+                self.lib.search.clear();
             }
         }
         let enter = self.welcome.is_none() && !typing && self.view == View::Library && ctx.memory(|m| m.focused()).is_none() && ctx.input(|i| i.key_pressed(Key::Enter));
         if self.view == View::Library && self.welcome.is_none() {
-            // The arrow keys move through the grid as the d-pad does, while nothing
-            // has the focus (with something focused they move the focus).
             if !typing && ctx.memory(|m| m.focused()).is_none() && !egui::Popup::is_any_open(&ctx) {
                 for (k, bit) in [(Key::ArrowUp, pad::UP), (Key::ArrowDown, pad::DOWN), (Key::ArrowLeft, pad::LEFT), (Key::ArrowRight, pad::RIGHT)] {
                     if ctx.input(|i| i.key_pressed(k)) {
-                        self.pad_fire |= bit;
+                        self.nav.pad_fire |= bit;
                     }
                 }
             }
@@ -1560,7 +1695,7 @@ impl eframe::App for App {
             .exact_size(232.0)
             .frame(egui::Frame::new().fill(SIDEBAR).inner_margin(Margin::symmetric(14, 0)))
             .show(ui, |ui| self.sidebar(ui));
-        if let Some(key) = self.selected.clone().filter(|_| self.view == View::Library) {
+        if let Some(key) = self.lib.selected.clone().filter(|_| self.view == View::Library) {
             egui::Panel::right("game")
                 .resizable(false)
                 .exact_size(384.0)
@@ -1574,7 +1709,6 @@ impl eframe::App for App {
         let mut content = Rect::NOTHING;
         egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::BG).inner_margin(Margin { left: 26, right: 18, top: 0, bottom: 0 })).show(ui, |ui| {
             content = ui.max_rect();
-            // The room's light: a cool glow from the top and a violet one from the right.
             let p = ui.painter();
             let full = ui.clip_rect();
             fx::light(p, pos2(full.left() + full.width() * 0.3, full.top() - 40.0), vec2(full.width() * 0.6, 280.0), ACCENT.gamma_multiply(0.07));
@@ -1590,7 +1724,7 @@ impl eframe::App for App {
         }
         self.snackbar(&ctx, content);
         if enter {
-            if let Some(k) = self.selected.clone() {
+            if let Some(k) = self.lib.selected.clone() {
                 self.play(&k);
             }
         }
@@ -1683,29 +1817,29 @@ mod tests {
     fn a_search_looks_through_all() {
         let ctx = egui::Context::default();
         let mut app = App::with(ctx, Settings { onboarded: true, ..Settings::default() }, false);
-        app.scanned = sample();
+        app.lib.scanned = sample();
         app.rebuild();
-        let names = |a: &App| a.visible().into_iter().map(|i| a.entries[i].name.clone()).collect::<Vec<_>>();
-        let tide = store::key_of(&app.entries.iter().find(|g| g.name == "Tidewatch").unwrap().exe);
-        app.recent = HashMap::from([(tide.clone(), 1)]);
-        app.category = Category::Recent;
+        let names = |a: &App| a.visible().into_iter().map(|i| a.lib.entries[i].name.clone()).collect::<Vec<_>>();
+        let tide = store::key_of(&app.lib.entries.iter().find(|g| g.name == "Tidewatch").unwrap().exe);
+        app.lib.recent = HashMap::from([(tide.clone(), 1)]);
+        app.lib.category = Category::Recent;
         assert_eq!(names(&app), ["Tidewatch"]);
-        app.search = "lantern".into();
-        assert_eq!(app.shown(), Category::All);
+        app.lib.search = "lantern".into();
+        assert_eq!(app.lib.shown(), Category::All);
         assert_eq!(names(&app), ["Lantern Keep"], "found outside Recent");
-        app.category = Category::Source(Source::Epic);
+        app.lib.category = Category::Source(Source::Epic);
         assert_eq!(names(&app), ["Lantern Keep"], "found outside Epic");
-        app.pick_category(Category::All);
-        assert_eq!(app.search, "lantern", "All keeps the search");
-        app.pick_category(Category::Recent);
-        assert!(app.search.is_empty(), "another filter clears it");
+        app.lib.pick_category(Category::All);
+        assert_eq!(app.lib.search, "lantern", "All keeps the search");
+        app.lib.pick_category(Category::Recent);
+        assert!(app.lib.search.is_empty(), "another filter clears it");
         assert_eq!(names(&app), ["Tidewatch"]);
         // Hidden: the search stays among the hidden games.
         app.settings.hidden.push(tide);
-        app.pick_category(Category::Hidden);
-        app.search = "tide".into();
+        app.lib.pick_category(Category::Hidden);
+        app.lib.search = "tide".into();
         assert_eq!(names(&app), ["Tidewatch"]);
-        app.search = "lantern".into();
+        app.lib.search = "lantern".into();
         assert!(names(&app).is_empty());
     }
 
@@ -1730,10 +1864,12 @@ mod tests {
     /// The test binary stands in for peerparty.exe in `a_bat_passes_its_arguments_intact`:
     /// started with PEERPARTY_TEST_ARGV naming a folder, it writes the arguments it was
     /// given there and exits, before the test harness would read them as test names.
+    #[cfg(windows)]
     #[used]
     #[unsafe(link_section = ".CRT$XCU")]
     static ARGV_ECHO: extern "C" fn() = argv_echo;
 
+    #[cfg(windows)]
     extern "C" fn argv_echo() {
         let Some(dir) = std::env::var_os("PEERPARTY_TEST_ARGV") else { return };
         let args: Vec<String> = std::env::args().skip(1).collect();
@@ -1746,6 +1882,7 @@ mod tests {
     /// The .bat files the launcher writes, run by cmd: every argument arrives as it was
     /// meant, in one start and in two (`start`), and nothing in a name or an argument
     /// runs as a command of its own.
+    #[cfg(windows)]
     #[test]
     fn a_bat_passes_its_arguments_intact() {
         use std::os::windows::process::CommandExt;
@@ -1869,24 +2006,36 @@ mod tests {
         let one = s(&[r"C:\g\a.exe"]);
         let two = s(&["--multi-instance", r"C:\g\a.exe"]);
         let copied = s(&["--multi-instance", "--copy-saves", r"C:\g\a.exe"]);
-        assert_eq!(plan(one.clone(), 1, false, false, true), Plan { now: one.clone(), later: None, copied: false });
-        assert_eq!(plan(two.clone(), 2, false, false, true), Plan { now: two.clone(), later: Some(copied.clone()), copied: true });
-        assert_eq!(plan(two.clone(), 2, false, false, false), Plan { now: two.clone(), later: Some(two.clone()), copied: false });
+        assert_eq!(plan(one.clone(), 1, false, false, false, true), Plan { now: one.clone(), later: None, copied: false });
+        assert_eq!(plan(two.clone(), 2, false, false, false, true), Plan { now: two.clone(), later: Some(copied.clone()), copied: true });
+        assert_eq!(plan(two.clone(), 2, false, false, false, false), Plan { now: two.clone(), later: Some(two.clone()), copied: false });
         for (cmd, players) in [(one.clone(), 1), (two.clone(), 2)] {
-            assert_eq!(plan(cmd, players, true, false, true), Plan { now: copied.clone(), later: None, copied: true }, "{players}");
+            assert_eq!(plan(cmd, players, false, true, false, true), Plan { now: copied.clone(), later: None, copied: true }, "{players}");
         }
-        assert_eq!(plan(one.clone(), 1, true, false, false).now, two);
-        assert_eq!(plan(one.clone(), 1, true, true, true), Plan { now: one, later: None, copied: false }, "an Xbox app game: one copy");
+        assert_eq!(plan(one.clone(), 1, false, true, false, false).now, two);
+        assert_eq!(plan(one.clone(), 1, false, true, true, true), Plan { now: one, later: None, copied: false }, "an Xbox app game: one copy");
+        // Split screen: one peerparty.exe runs all copies; copy-saves goes on that command
+        // (start_session strips it for player 1). Adding another copy while running strips
+        // the split flags and launches one --multi-instance copy.
+        let split = s(&["--split-screen", "--instances", "3", "--layout", "grid", r"C:\g\a.exe"]);
+        let split_copy = s(&["--split-screen", "--copy-saves", "--instances", "3", "--layout", "grid", r"C:\g\a.exe"]);
+        assert_eq!(plan(split.clone(), 3, true, false, false, false), Plan { now: split.clone(), later: None, copied: false });
+        assert_eq!(plan(split.clone(), 3, true, false, false, true), Plan { now: split_copy, later: None, copied: true });
+        assert_eq!(plan(split, 3, true, true, false, true), Plan { now: copied, later: None, copied: true });
         // The command shown and kept in a .bat has no --copy-saves, whatever is switched on.
         let ctx = egui::Context::default();
         let mut app = App::with(ctx, Settings { onboarded: true, ..Settings::default() }, false);
-        app.scanned = sample();
+        app.lib.scanned = sample();
         app.rebuild();
-        let g = app.entries[0].clone();
+        let g = app.lib.entries[0].clone();
         let key = store::key_of(&g.exe);
-        app.copy_saves.insert(key.clone());
+        app.sessions.copy_saves.insert(key.clone());
         let o = GameOptions { players: 2, ..GameOptions::default() };
         assert!(!app.command(&g, &o).iter().any(|a| a == "--copy-saves"));
+        let o_split = GameOptions { players: 4, split_screen: true, split_layout: "vertical".into(), ..GameOptions::default() };
+        let cmd = app.command(&g, &o_split);
+        assert_eq!(&cmd[..5], ["--split-screen", "--instances", "4", "--layout", "vertical"]);
+        assert!(!cmd.iter().any(|a| a == "--copy-saves"));
     }
 
     /// "Copy Player 1's saves to Player N" is never a setting: off when the window starts, off
@@ -1898,79 +2047,78 @@ mod tests {
         let ctx = egui::Context::default();
         let mut settings = Settings { onboarded: true, after_launch: "keep".into(), ..Settings::default() };
         let mut app = App::with(ctx.clone(), settings.clone(), false);
-        assert!(app.copy_saves.is_empty(), "off when the window starts");
-        app.scanned = sample();
+        assert!(app.sessions.copy_saves.is_empty(), "off when the window starts");
+        app.lib.scanned = sample();
         app.rebuild();
         // Something harmless in peerparty.exe's place: it exits at once.
-        app.peerparty = PathBuf::from(r"C:\Windows\System32\where.exe");
-        let key = store::key_of(&app.entries[0].exe);
+        app.sessions.peerparty = PathBuf::from(r"C:\Windows\System32\where.exe");
+        let key = store::key_of(&app.lib.entries[0].exe);
         settings.games.insert(key.clone(), GameOptions { players: 2, ..GameOptions::default() });
         app.settings.games = settings.games.clone();
-        app.copy_saves.insert(key.clone());
+        app.sessions.copy_saves.insert(key.clone());
         app.play(&key);
-        assert_eq!(app.sessions.len(), 1);
-        assert_eq!(app.pending.len(), 1);
-        assert!(app.pending[0].args.iter().any(|a| a == "--copy-saves"), "the second copy starts from player 1's saves");
-        assert!(app.copy_saves.is_empty(), "used, so off");
+        assert_eq!(app.sessions.sessions.len(), 1);
+        assert_eq!(app.sessions.pending.len(), 1);
+        assert!(app.sessions.pending[0].args.iter().any(|a| a == "--copy-saves"), "the second copy starts from player 1's saves");
+        assert!(app.sessions.copy_saves.is_empty(), "used, so off");
         // Too soon after the first: turned away. Then Play starts the waiting copy now.
         app.play(&key);
-        assert_eq!((app.sessions.len(), app.pending.len()), (1, 1));
+        assert_eq!((app.sessions.sessions.len(), app.sessions.pending.len()), (1, 1));
         let long_ago = Instant::now().checked_sub(Duration::from_secs(60)).unwrap();
-        app.sessions[0].started = long_ago;
+        app.sessions.sessions[0].started = long_ago;
         app.play(&key);
-        assert_eq!((app.sessions.len(), app.pending.len()), (2, 0));
-        assert_eq!(app.sessions[1].player, 2);
+        assert_eq!((app.sessions.sessions.len(), app.sessions.pending.len()), (2, 0));
+        assert_eq!(app.sessions.sessions[1].player, 2);
         // A copy running: Play adds exactly one, with nothing waiting after it.
-        app.sessions[1].started = long_ago;
+        app.sessions.sessions[1].started = long_ago;
         app.play(&key);
-        assert_eq!((app.sessions.len(), app.pending.len()), (3, 0));
+        assert_eq!((app.sessions.sessions.len(), app.sessions.pending.len()), (3, 0));
         // Cancel drops a waiting copy.
-        app.pending.push(PendingStart { at: Instant::now() + Duration::from_secs(30), key: key.clone(), name: "x".into(), args: vec![], player: 4 });
+        app.sessions.pending.push(PendingStart { at: Instant::now() + Duration::from_secs(30), key: key.clone(), name: "x".into(), args: vec![], player: 4 });
         app.cancel_pending(&key);
-        assert!(app.pending.is_empty());
+        assert!(app.sessions.pending.is_empty());
         // The game's copies all close before copy 2's turn: it isn't started after.
-        app.pending.push(PendingStart { at: Instant::now() + Duration::from_secs(30), key: key.clone(), name: "x".into(), args: vec![], player: 4 });
-        for s in &app.sessions {
-            app.ended_tx.send((s.id, Some(0))).unwrap();
+        app.sessions.pending.push(PendingStart { at: Instant::now() + Duration::from_secs(30), key: key.clone(), name: "x".into(), args: vec![], player: 4 });
+        for s in &app.sessions.sessions {
+            app.sessions.ended_tx.send((s.id, Some(0))).unwrap();
         }
         app.tick();
-        assert!(app.sessions.is_empty());
-        assert!(app.pending.is_empty(), "nothing starts on its own after everything closed");
+        assert!(app.sessions.sessions.is_empty());
+        assert!(app.sessions.pending.is_empty(), "nothing starts on its own after everything closed");
     }
 
     #[test]
     fn the_save_copy_switch_shows_at_two_players_or_with_a_copy_running() {
         let ctx = egui::Context::default();
         let mut app = App::with(ctx, Settings { onboarded: true, ..Settings::default() }, false);
-        // One player, nothing running: Play starts player 1, who never copies.
-        assert!(!app.copy_saves_offered("k", 1, false));
-        // Two players: for copy 2, before Play.
-        assert!(app.copy_saves_offered("k", 2, false));
-        // One player, a copy running: for the one Start another instance adds.
-        assert!(app.copy_saves_offered("k", 1, true));
-        app.copy_saves.insert("k".into());
-        assert!(app.copy_saves_offered("k", 1, true));
-        assert!(app.copy_saves.contains("k"), "still on while shown");
-        // Every copy closed: hidden again, and off.
-        assert!(!app.copy_saves_offered("k", 1, false));
-        assert!(app.copy_saves.is_empty(), "never comes back on by itself");
-        app.copy_saves.insert("k".into());
-        assert!(app.copy_saves_offered("k", 2, false));
-        assert!(app.copy_saves.contains("k"));
-        // The label names the copy it is for.
+        assert!(!app.sessions.copy_saves_offered("k", 1, false));
+        assert!(app.sessions.copy_saves_offered("k", 2, false));
+        assert!(app.sessions.copy_saves_offered("k", 1, true));
+        app.sessions.copy_saves.insert("k".into());
+        assert!(app.sessions.copy_saves_offered("k", 1, true));
+        assert!(app.sessions.copy_saves.contains("k"), "still on while shown");
+        assert!(!app.sessions.copy_saves_offered("k", 1, false));
+        assert!(app.sessions.copy_saves.is_empty(), "never comes back on by itself");
+        app.sessions.copy_saves.insert("k".into());
+        assert!(app.sessions.copy_saves_offered("k", 2, false));
+        assert!(app.sessions.copy_saves.contains("k"));
         crate::i18n::set("en");
-        assert_eq!(t!("game.copy_saves", player = app.copy_saves_target("k")), "Copy Player 1's saves to Player 2");
+        assert_eq!(t!("game.copy_saves", player = app.sessions.copy_saves_target("k")), "Copy Player 1's saves to Player 2");
         let at = Instant::now();
-        app.sessions.push(Session { id: 1, key: "k".into(), name: "x".into(), player: 1, started: at, stderr: Arc::default(), pid: 0 });
-        app.pending.push(PendingStart { at, key: "k".into(), name: "x".into(), args: vec![], player: 2 });
-        // Copy 2 counting down: its saves are settled, so no switch (it would name copy 3).
-        assert!(!app.copy_saves_offered("k", 2, true));
-        assert!(!app.copy_saves_offered("k", 1, true));
-        assert!(app.copy_saves.is_empty(), "hidden, so off");
-        app.pending.clear();
-        assert!(app.copy_saves_offered("k", 2, true), "back once copy 2 has started");
-        app.sessions.push(Session { id: 2, key: "k".into(), name: "x".into(), player: 2, started: at, stderr: Arc::default(), pid: 0 });
-        assert_eq!(t!("game.copy_saves", player = app.copy_saves_target("k")), "Copy Player 1's saves to Player 3");
+        app.sessions.sessions.push(Session { id: 1, key: "k".into(), name: "x".into(), player: 1, split_players: 0, started: at, stderr: Arc::default(), pid: 0 });
+        app.sessions.pending.push(PendingStart { at, key: "k".into(), name: "x".into(), args: vec![], player: 2 });
+        assert!(!app.sessions.copy_saves_offered("k", 2, true));
+        assert!(!app.sessions.copy_saves_offered("k", 1, true));
+        assert!(app.sessions.copy_saves.is_empty(), "hidden, so off");
+        app.sessions.pending.clear();
+        assert!(app.sessions.copy_saves_offered("k", 2, true), "back once copy 2 has started");
+        app.sessions.sessions.push(Session { id: 2, key: "k".into(), name: "x".into(), player: 2, split_players: 0, started: at, stderr: Arc::default(), pid: 0 });
+        assert_eq!(t!("game.copy_saves", player = app.sessions.copy_saves_target("k")), "Copy Player 1's saves to Player 3");
+        // A 3-player split-screen session counts all 3 players as running.
+        app.sessions.sessions.clear();
+        app.sessions.sessions.push(Session { id: 3, key: "k".into(), name: "x".into(), player: 1, split_players: 3, started: at, stderr: Arc::default(), pid: 0 });
+        assert_eq!(app.sessions.running("k"), vec![1, 2, 3]);
+        assert_eq!(app.sessions.copy_saves_target("k"), 4);
     }
 
     #[test]
@@ -1983,10 +2131,9 @@ mod tests {
         let mut settings = Settings { onboarded: true, ..Settings::default() };
         settings.prefs.room = peerparty_core::inet::RoomCode::generate().to_string();
         let mut app = App::with(ctx.clone(), settings, false);
-        app.scanned = sample();
+        app.lib.scanned = sample();
         app.rebuild();
-        app.category = Category::All;
-        // PEERPARTY_PREVIEW_SIZE=900x560 renders at another window size.
+        app.lib.category = Category::All;
         let (w, h) = std::env::var("PEERPARTY_PREVIEW_SIZE")
             .ok()
             .and_then(|s| s.split_once('x').and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?))))
@@ -1994,9 +2141,9 @@ mod tests {
         let mut tex = Textures::default();
         let mut frame = eframe::Frame::_new_kittest();
         let mut t = 0.0;
-        let scenes: [(&str, &dyn Fn(&mut App)); 12] = [
-            ("library", &|a: &mut App| a.selected = None),
-            ("game", &|a: &mut App| a.selected = Some(store::key_of(&a.entries[3].exe))),
+        let scenes: [(&str, &dyn Fn(&mut App)); 13] = [
+            ("library", &|a: &mut App| a.lib.selected = None),
+            ("game", &|a: &mut App| a.lib.selected = Some(store::key_of(&a.lib.entries[3].exe))),
             ("together", &|a: &mut App| a.open_view(View::Together, false)),
             ("settings", &|a: &mut App| a.open_view(View::Settings, false)),
             ("settings-overlay", &|a: &mut App| a.settings_tab = settings::Tab::Overlay),
@@ -2008,35 +2155,36 @@ mod tests {
             ("list", &|a: &mut App| {
                 a.welcome = None;
                 a.settings.list_view = true;
-                a.pad_mode = true;
+                a.nav.pad_mode = true;
             }),
-            // Two players on this PC, starting from player 1's saves (and its warning).
             ("game-two", &|a: &mut App| {
                 a.settings.list_view = false;
-                a.pad_mode = false;
-                let key = store::key_of(&a.entries[3].exe);
+                a.nav.pad_mode = false;
+                let key = store::key_of(&a.lib.entries[3].exe);
                 a.settings.games.insert(key.clone(), GameOptions { players: 2, ..GameOptions::default() });
-                a.copy_saves.insert(key.clone());
-                a.selected = Some(key);
+                a.sessions.copy_saves.insert(key.clone());
+                a.lib.selected = Some(key);
             }),
-            // Copy 2 waiting: the countdown on Play, Start now and Cancel on Now playing.
+            ("game-split", &|a: &mut App| {
+                let key = store::key_of(&a.lib.entries[3].exe);
+                a.settings.games.insert(key.clone(), GameOptions { players: 4, split_screen: true, split_layout: "grid".into(), ..GameOptions::default() });
+                a.lib.selected = Some(key);
+            }),
             ("game-waiting", &|a: &mut App| {
-                let key = store::key_of(&a.entries[3].exe);
-                let name = a.entries[3].name.clone();
-                a.sessions.push(Session { id: 9_999, key: key.clone(), name: name.clone(), player: 1, started: Instant::now(), stderr: Arc::default(), pid: 0 });
-                a.pending.push(PendingStart { at: Instant::now() + Duration::from_secs(9), key, name, args: vec![], player: 2 });
+                let key = store::key_of(&a.lib.entries[3].exe);
+                let name = a.lib.entries[3].name.clone();
+                a.sessions.sessions.push(Session { id: 9_999, key: key.clone(), name: name.clone(), player: 1, split_players: 0, started: Instant::now(), stderr: Arc::default(), pid: 0 });
+                a.sessions.pending.push(PendingStart { at: Instant::now() + Duration::from_secs(9), key, name, args: vec![], player: 2 });
             }),
-            // One player, a copy running: Start another instance, and the save switch for it.
             ("game-another", &|a: &mut App| {
-                a.pending.clear();
-                let key = store::key_of(&a.entries[3].exe);
+                a.sessions.pending.clear();
+                let key = store::key_of(&a.lib.entries[3].exe);
                 a.settings.games.insert(key.clone(), GameOptions { players: 1, ..GameOptions::default() });
-                a.copy_saves.insert(key);
+                a.sessions.copy_saves.insert(key);
             }),
-            // A newer PeerParty is out: Settings > About's Updates card.
             ("settings-update", &|a: &mut App| {
-                a.sessions.clear();
-                a.selected = None;
+                a.sessions.sessions.clear();
+                a.lib.selected = None;
                 a.open_view(View::Settings, false);
                 a.settings_tab = settings::Tab::About;
                 crate::update::preview();
@@ -2064,6 +2212,12 @@ mod tests {
                     eframe::App::ui(&mut app, ui, &mut frame);
                 });
                 tex.apply(out.textures_delta);
+                // The frames before the last settle layout and animations; only the last
+                // is looked at, so only it is drawn (drawing all four took most of the
+                // test's time, unoptimized).
+                if i < 3 {
+                    continue;
+                }
                 let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
                 canvas.clear(theme::BG);
                 tex.draw(&mut canvas, &prims, out.pixels_per_point, (0.0, 0.0));

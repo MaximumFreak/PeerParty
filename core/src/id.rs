@@ -37,15 +37,14 @@
 //! PC's first player.
 
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
-use std::os::windows::fs::OpenOptionsExt;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
-use crate::inet::public::IdentityKey;
+use crate::identity_key::IdentityKey;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct PeerId(pub [u8; 16]);
@@ -60,24 +59,16 @@ impl PeerId {
     /// Random bytes in an id's shape (lobby ids and the like; a player's id is `of_key`),
     /// from the OS's secure random source.
     pub fn random() -> Self {
-        PeerId(crate::inet::crypto::random_array())
+        PeerId(crate::crypto::random_array())
     }
 
     /// 32 lowercase hex digits, which is also the format of an EOS ProductUserId.
     pub fn hex(&self) -> String {
-        self.0.iter().map(|b| format!("{b:02x}")).collect()
+        crate::hex(&self.0)
     }
 
     pub fn from_hex(s: &str) -> Option<Self> {
-        let s = s.trim();
-        if s.len() != 32 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return None;
-        }
-        let mut out = [0u8; 16];
-        for (i, b) in out.iter_mut().enumerate() {
-            *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
-        }
-        Some(PeerId(out))
+        crate::unhex(s).map(PeerId)
     }
 }
 
@@ -106,50 +97,52 @@ pub struct Identity {
 }
 
 impl Identity {
-    /// The default location: `%LOCALAPPDATA%\peerparty\identity`.
+    /// The default location: `%LOCALAPPDATA%\peerparty\identity` (on Linux under
+    /// `$XDG_DATA_HOME` or `~/.local/share`).
     pub fn default_dir() -> PathBuf {
-        std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
-            .join("peerparty")
-            .join("identity")
+        crate::sys::data_dir_or_temp().join("identity")
     }
 
     /// Takes the first free player slot in `dir`. Falls back to a throwaway id if the
     /// folder can't be used, so a read-only profile still gets onto the LAN.
     pub fn claim(dir: &Path) -> Identity {
-        Self::claim_as(dir, false, None)
+        Self::claim_as(dir, false, None, wanted())
     }
 
     /// Takes the first player slot in `dir` that no other copy of `game` holds: copies
     /// of other games don't count (the player is the same one in each).
     pub fn claim_for(dir: &Path, game: &str) -> Identity {
-        Self::claim_as(dir, false, Some(game))
+        Self::claim_as(dir, false, Some(game), wanted())
     }
 
     /// Takes the first free server slot in `dir` (a dedicated server's), named
     /// "<player>'s server", or "<player>'s server (N)" after the first.
     pub fn claim_server(dir: &Path) -> Identity {
-        Self::claim_as(dir, true, None)
+        Self::claim_as(dir, true, None, None)
     }
 
     /// As `claim_server`, held per game.
     pub fn claim_server_for(dir: &Path, game: &str) -> Identity {
-        Self::claim_as(dir, true, Some(game))
+        Self::claim_as(dir, true, Some(game), None)
     }
 
-    fn claim_as(dir: &Path, server: bool, game: Option<&str>) -> Identity {
+    /// `want`: the slot to try first (`want_slot`).
+    fn claim_as(dir: &Path, server: bool, game: Option<&str>, want: Option<u32>) -> Identity {
         let tag = game.map(|g| format!(".{}", game_tag(g))).unwrap_or_default();
-        // The player's chosen name (the launcher's Settings), else the Windows user name.
+        // The player's chosen name (the launcher's Settings), else the account's name.
         let user = std::env::var("PEERPARTY_NAME")
             .ok()
             .map(|n| n.trim().chars().take(32).collect::<String>())
             .filter(|n| !n.is_empty())
-            .or_else(|| std::env::var("USERNAME").ok())
+            .or_else(crate::sys::user_name)
             .unwrap_or_else(|| "Player".into());
         let (prefix, base) = if server { ("server", format!("{user}'s server")) } else { ("slot", user) };
         if fs::create_dir_all(dir).is_ok() {
-            for slot in 0..32u32 {
+            // A split-screen session's copy tries the slot the session gave it first
+            // (`want_slot`), so its player is the same one each run whichever copy
+            // starts first; taken, it takes the first free one as any copy does.
+            let first = want.filter(|&w| !server && w < SLOTS);
+            for slot in first.into_iter().chain((0..SLOTS).filter(|s| Some(*s) != first)) {
                 let path = dir.join(format!("{prefix}-{slot}{tag}.lock"));
                 let owner = dir.join(format!("{prefix}-{slot}{tag}.owner"));
                 let mut lock = open_lock(&path);
@@ -266,6 +259,24 @@ impl Identity {
 /// How long a new copy waits for its slot's holder to finish quitting (see the top).
 const EXITING_WAIT: Duration = Duration::from_secs(8);
 
+/// How many player (or server) slots there are.
+const SLOTS: u32 = 32;
+
+/// The slot a split-screen session gave this copy (`want_slot`); `u32::MAX`: none.
+static WANTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// This process is copy `slot` of a split-screen session: its player claim tries that
+/// slot first (player 1 is slot 0, with the PC's player's name and saves), not
+/// whichever is free when its engine starts.
+pub fn want_slot(slot: u32) {
+    WANTED.store(slot, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The slot `want_slot` asked for, if any.
+fn wanted() -> Option<u32> {
+    Some(WANTED.load(std::sync::atomic::Ordering::Relaxed)).filter(|&s| s != u32::MAX)
+}
+
 /// The process (the game's starter) whose slot this one takes over: 0 for none.
 static STARTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -296,7 +307,7 @@ pub fn game_tag(game: &str) -> String {
 }
 
 fn open_lock(path: &Path) -> std::io::Result<File> {
-    OpenOptions::new().create(true).write(true).truncate(false).share_mode(0).open(path)
+    crate::sys::lock_exclusive(path)
 }
 
 /// This process's program, as `QueryFullProcessImageNameW` gives it.
@@ -321,48 +332,7 @@ fn leaving(owner: &Path) -> bool {
     theirs.eq_ignore_ascii_case(&ours) && !has_visible_window(pid)
 }
 
-/// The program a running process was started from; None when it has ended.
-fn process_exe(pid: u32) -> Option<String> {
-    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW,
-        WaitForSingleObject,
-    };
-    unsafe {
-        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE, 0, pid);
-        if h.is_null() {
-            return None;
-        }
-        let alive = WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
-        let mut buf = [0u16; 1024];
-        let mut len = buf.len() as u32;
-        let ok = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len) != 0;
-        CloseHandle(h);
-        (alive && ok).then(|| String::from_utf16_lossy(&buf[..len as usize]))
-    }
-}
-
-fn has_visible_window(pid: u32) -> bool {
-    use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
-    use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId, IsWindowVisible};
-    struct Find {
-        pid: u32,
-        found: bool,
-    }
-    unsafe extern "system" fn each(hwnd: HWND, l: LPARAM) -> BOOL {
-        let f = unsafe { &mut *(l as *mut Find) };
-        let mut pid = 0;
-        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
-        if pid == f.pid && unsafe { IsWindowVisible(hwnd) } != 0 {
-            f.found = true;
-            return 0;
-        }
-        1
-    }
-    let mut f = Find { pid, found: false };
-    unsafe { EnumWindows(Some(each), &mut f as *mut Find as LPARAM) };
-    f.found
-}
+use crate::sys::{has_visible_window, process_exe};
 
 /// `slot-N.id`, from before ids were their key's: its id goes on the slot's previous
 /// list, and only once it's there is the file deleted. A file that doesn't read as an id
@@ -406,6 +376,21 @@ mod tests {
         assert_ne!(second.id, a.id);
         assert_ne!(game_tag("steam:480"), game_tag("eos:abc"));
         drop((a, other_game, second));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A session's copy takes the slot it was given, whichever copy claims first; one
+    /// already taken falls back to the first free slot.
+    #[test]
+    fn a_sessions_copy_takes_its_own_slot() {
+        let dir = std::env::temp_dir().join(format!("peerparty-id-want-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let claim = |slot: u32| Identity::claim_as(&dir, false, Some("exe:game"), Some(slot));
+        let third = claim(2);
+        let first = claim(0);
+        let again = claim(2);
+        assert_eq!((third.slot, first.slot, again.slot), (2, 0, 1));
+        drop((third, first, again));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -470,6 +455,7 @@ mod tests {
 
     /// A slot held by the starter this game took it over from is waited for; one held
     /// by any other process, or a pid now another program's, isn't.
+    #[cfg(windows)]
     #[test]
     fn a_slot_held_by_the_games_starter_is_waited_for() {
         use std::os::windows::process::CommandExt;
@@ -512,6 +498,7 @@ mod tests {
 
     /// An earlier run of the same program still holding the slot while it quits is
     /// waited for: the new run is the same player, not the next slot's.
+    #[cfg(windows)]
     #[test]
     fn a_quitting_earlier_run_is_waited_for() {
         use std::os::windows::process::CommandExt;

@@ -9,7 +9,7 @@
 //! open with `POST /?init&app=..&protocol=GpBinaryV18 HTTP/1.1` whose body is the
 //! serialized token.
 
-use super::crypto::Aes256;
+use crate::util::crypto::Aes256;
 use super::value::*;
 use super::{gp16, gp18};
 

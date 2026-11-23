@@ -1,9 +1,7 @@
 //! Windows' side of `platform`: the registry, program icons, Explorer, the foreground
-//! window, the user's languages, the system fonts, the animation setting and process
-//! priority.
+//! window, the user's languages, the system fonts, the animation setting, process
+//! priority, PeerParty's folders and the game libraries (backend/windows/scan.rs).
 
-use std::ffi::OsStr;
-use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 pub use super::Rgba;
@@ -20,8 +18,19 @@ use windows_sys::Win32::System::Registry::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, ICONINFO, PrivateExtractIconsW};
 
-pub fn wide(s: impl AsRef<OsStr>) -> Vec<u16> {
-    s.as_ref().encode_wide().chain(Some(0)).collect()
+pub use crate::backend::windows::invite::close_game;
+pub use crate::backend::windows::process_exe;
+pub use crate::backend::windows::scan::{scan_installed_games, steam_dir};
+use crate::backend::windows::wide;
+
+/// PeerParty's usual folder: `%LOCALAPPDATA%\peerparty`.
+pub fn usual_data_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("peerparty")
+}
+
+/// The game folder the window starts with.
+pub fn default_games_dir() -> PathBuf {
+    PathBuf::from(r"C:\Games")
 }
 
 pub enum Hive {
@@ -158,9 +167,13 @@ unsafe fn icon_pixels(icon: HICON) -> Option<Rgba> {
 
 /// Shows a folder (or selects a file) in Explorer.
 pub fn reveal(path: &Path) {
+    use std::os::windows::process::CommandExt;
     let mut cmd = std::process::Command::new("explorer.exe");
     if path.is_file() {
-        cmd.arg(format!("/select,{}", path.display()));
+        // Only the path in quotes: a path with spaces quoted with the switch
+        // (`"/select,C:\My Games\game.exe"`, as `arg` would) isn't a switch to Explorer,
+        // which opens Documents instead.
+        cmd.raw_arg(format!("/select,\"{}\"", path.display()));
     } else {
         cmd.arg(path);
     }
@@ -262,7 +275,7 @@ fn launcher_window() -> Option<windows_sys::Win32::Foundation::HWND> {
         let title = String::from_utf16_lossy(&buf[..n]);
         let mut pid = 0;
         unsafe { GetWindowThreadProcessId(w, &mut pid) };
-        if pid != std::process::id() && is_launcher(&title, crate::firewall::process_exe(pid).as_deref(), &f.ours) {
+        if pid != std::process::id() && is_launcher(&title, process_exe(pid).as_deref(), &f.ours) {
             f.found = w;
             return 0;
         }
@@ -361,6 +374,60 @@ pub fn user_name() -> String {
 /// Where PeerParty's logs go.
 pub fn logs_dir() -> PathBuf {
     std::env::temp_dir().join("peerparty").join("logs")
+}
+
+/// Where browsers save downloads: the user's Downloads folder.
+pub fn downloads_dir() -> Option<PathBuf> {
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{FOLDERID_Downloads, SHGetKnownFolderPath};
+    let mut p = ptr::null_mut();
+    let hr = unsafe { SHGetKnownFolderPath(&FOLDERID_Downloads, 0, ptr::null_mut(), &mut p) };
+    let dir = if hr == 0 && !p.is_null() {
+        let len = (0..).take_while(|&i| unsafe { *p.add(i) } != 0).count();
+        Some(PathBuf::from(String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(p, len) })))
+    } else {
+        std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join("Downloads"))
+    };
+    unsafe { CoTaskMemFree(p as _) };
+    dir
+}
+
+/// How many other processes run the program `exe` (by its full path, case ignored).
+pub fn copies_running(exe: &Path) -> usize {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS};
+    let mine = exe.to_string_lossy().to_ascii_lowercase();
+    let Some(name) = exe.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()) else { return 0 };
+    let own = std::process::id();
+    let mut n = 0;
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return 0;
+        }
+        let mut e: PROCESSENTRY32W = mem::zeroed();
+        e.dwSize = mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut more = Process32FirstW(snap, &mut e) != 0;
+        while more {
+            let len = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
+            if e.th32ProcessID != own
+                && String::from_utf16_lossy(&e.szExeFile[..len]).to_ascii_lowercase() == name
+                && process_exe(e.th32ProcessID).is_some_and(|p| p.to_string_lossy().to_ascii_lowercase() == mine)
+            {
+                n += 1;
+            }
+            more = Process32NextW(snap, &mut e) != 0;
+        }
+        CloseHandle(snap);
+    }
+    n
+}
+
+/// The local time now: year, month, day, hour, minute, second.
+pub fn local_time() -> [u16; 6] {
+    let mut t: windows_sys::Win32::Foundation::SYSTEMTIME = unsafe { mem::zeroed() };
+    unsafe { windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut t) };
+    [t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond]
 }
 
 #[cfg(test)]

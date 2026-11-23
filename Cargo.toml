@@ -1,10 +1,10 @@
 [workspace]
 resolver = "3"
-members = ["launcher", "hook", "core"]
+members = ["launcher", "hook", "core", "protocol"]
 
 [workspace.package]
 # Tagged `v<version>` in git; peerparty.exe adds the commits since that tag (launcher/build.rs).
-version = "0.4.7"
+version = "0.5.0"
 edition = "2024"
 license = "MIT"
 
@@ -41,6 +41,17 @@ windows-sys = { version = "0.59", features = [
 # detour is disabled in release builds too (upstream's disable sat in a debug_assert!).
 [patch.crates-io]
 retour = { path = "vendor/retour" }
+
+# `cargo build` and `cargo test`. Line tables only: backtraces and panics still name
+# files and lines, but there are no variable types for a debugger, which made most of
+# the target folder (over 50 GB of debug builds) and most of each link's work.
+[profile.dev]
+debug = "line-tables-only"
+
+# Dependencies optimized: the crypto, Opus and UI crates were the slow part of a test
+# run unoptimized, and they're compiled once (they don't change with our code).
+[profile.dev.package."*"]
+opt-level = 2
 
 [profile.release]
 opt-level = 3

@@ -61,27 +61,26 @@
 //! off.
 
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 
 use retour::GenericDetour;
 
-use crate::hook::with_lock;
 use crate::log;
-use crate::pe::Export;
-use crate::read;
+use crate::sys::pe::Export;
+use crate::sys::read;
 
 /// `--copy-saves`.
 pub fn enabled() -> bool {
-    std::env::var_os("PEERPARTY_COPY_SAVES").is_some()
+    crate::config::HookConfig::global().copy_saves
 }
 
 /// Whether a game given a SteamID of its own starts from the saves under steam_api's
 /// (`PEERPARTY_STEAM_SAVES`, on unless 0).
 pub fn adopt_on() -> bool {
-    !std::env::var("PEERPARTY_STEAM_SAVES").is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "no" | "false"))
+    crate::config::HookConfig::global().steam_saves != Some(false)
 }
 
 /// A larger save than this (a folder of replays, say) isn't copied: copying runs inside
@@ -130,7 +129,7 @@ fn add_pair(ours: &str, from: &str, once: bool, fallback: bool) -> bool {
     if ours.is_empty() || from.is_empty() || ours.eq_ignore_ascii_case(from) {
         return false;
     }
-    let mut p = PAIRS.lock().unwrap();
+    let mut p = crate::sys::lock(&PAIRS);
     if p.iter().any(|q| q.ours.eq_ignore_ascii_case(ours) && q.from.eq_ignore_ascii_case(from)) {
         return false;
     }
@@ -178,7 +177,7 @@ pub fn adopt_steam(own: u64, game: u64, earlier: &[u64]) {
     if earlier.is_empty() {
         let mut never = vec![game];
         never.extend(other_slot_steam_ids());
-        *GUESS.lock().unwrap() = Some((own, never));
+        *crate::sys::lock(&GUESS) = Some((own, never));
     }
     if n > 0 {
         log!(
@@ -220,10 +219,10 @@ fn other_slot_steam_ids() -> Vec<u64> {
         let Some(rest) = name.strip_prefix("slot-") else { continue };
         if rest.ends_with(".ed25519") {
             if let Some(id) = std::fs::read_to_string(e.path()).ok().and_then(|t| id_of_key_file(&t)) {
-                out.push(crate::steamids::lan_steam_id(id));
+                out.push(crate::steam::ids::lan_steam_id(id));
             }
         } else if let Some(slot) = rest.strip_suffix(".previous").and_then(|n| n.parse::<u32>().ok()).filter(|n| *n != 0) {
-            out.extend(peerparty_core::Identity::previous_ids(&dir, slot).into_iter().map(crate::steamids::lan_steam_id));
+            out.extend(peerparty_core::Identity::previous_ids(&dir, slot).into_iter().map(crate::steam::ids::lan_steam_id));
         }
     }
     out
@@ -315,7 +314,7 @@ fn pick_newest(candidates: &[(PathBuf, Option<std::time::SystemTime>)]) -> Optio
 /// an earlier PeerParty SteamID beside it, if one can be told (module docs). Every
 /// candidate is logged, and why the one taken was.
 fn guess_earlier(root: &Path) -> Option<PathBuf> {
-    let (own, never) = GUESS.lock().unwrap().clone()?;
+    let (own, never) = crate::sys::lock(&GUESS).clone()?;
     let candidates = earlier_candidates(root, own, &never);
     if candidates.is_empty() {
         return None;
@@ -341,7 +340,7 @@ fn guess_earlier(root: &Path) -> Option<PathBuf> {
 
 /// The SteamIDs of its own this PC's first copy had before (its earlier peer ids').
 pub fn earlier_own_steam_ids() -> Vec<u64> {
-    peerparty_core::Identity::previous_ids(&peerparty_core::Identity::default_dir(), 0).into_iter().map(crate::steamids::lan_steam_id).collect()
+    peerparty_core::Identity::previous_ids(&peerparty_core::Identity::default_dir(), 0).into_iter().map(crate::steam::ids::lan_steam_id).collect()
 }
 
 /// How a SteamID shows up in a path: decimal, its account id, hex padded or not.
@@ -472,6 +471,17 @@ fn size_of_tree(p: &Path, cap: u64) -> u64 {
 /// Copies `from` to `to`, which doesn't exist: into a temporary name beside it first, so
 /// a copy cut short (the game closed mid-way) never passes for a finished one.
 fn copy_fresh(from: &Path, to: &Path) -> std::io::Result<usize> {
+    let (tmp, n) = stage_copy(from, to)?;
+    if let Err(e) = std::fs::rename(&tmp, to) {
+        drop_staged(&tmp);
+        return Err(e);
+    }
+    Ok(n)
+}
+
+/// All of `from` copied to `<to>.peerparty-copy`, for a rename onto `to` once it's
+/// whole: (that path, the files copied).
+fn stage_copy(from: &Path, to: &Path) -> std::io::Result<(PathBuf, usize)> {
     let mut tmp = to.as_os_str().to_owned();
     tmp.push(".peerparty-copy");
     let tmp = PathBuf::from(tmp);
@@ -480,12 +490,17 @@ fn copy_fresh(from: &Path, to: &Path) -> std::io::Result<usize> {
     } else if tmp.exists() {
         std::fs::remove_file(&tmp)?;
     }
-    let n = copy_newer(from, &tmp)?;
-    if let Err(e) = std::fs::rename(&tmp, to) {
-        let _ = if tmp.is_dir() { std::fs::remove_dir_all(&tmp) } else { std::fs::remove_file(&tmp) };
-        return Err(e);
+    match copy_newer(from, &tmp) {
+        Ok(n) => Ok((tmp, n)),
+        Err(e) => {
+            drop_staged(&tmp);
+            Err(e)
+        }
     }
-    Ok(n)
+}
+
+fn drop_staged(tmp: &Path) {
+    let _ = if tmp.is_dir() { std::fs::remove_dir_all(tmp) } else { std::fs::remove_file(tmp) };
 }
 
 /// How many of a save's earlier versions `replace` keeps beside it.
@@ -515,31 +530,41 @@ fn remove_any(p: &Path) -> std::io::Result<()> {
 /// if it can't be, nothing is copied and `to` stays as it was. Returns the files copied
 /// and the backup made, if there was anything to back up.
 fn replace(from: &Path, to: &Path) -> std::io::Result<(usize, Option<PathBuf>)> {
+    // The copy is made whole first: one that fails (a full disk, a locked file) leaves
+    // the save and its backups as they were, none shifted along or dropped.
+    let (tmp, n) = stage_copy(from, to)?;
     let mut backup = None;
     if std::fs::symlink_metadata(to).is_ok() {
-        remove_any(&backup_name(to, BACKUPS))?;
-        for n in (1..BACKUPS).rev() {
-            let older = backup_name(to, n);
-            if std::fs::symlink_metadata(&older).is_ok() {
-                std::fs::rename(&older, backup_name(to, n + 1))?;
+        let rotate = || -> std::io::Result<PathBuf> {
+            remove_any(&backup_name(to, BACKUPS))?;
+            for n in (1..BACKUPS).rev() {
+                let older = backup_name(to, n);
+                if std::fs::symlink_metadata(&older).is_ok() {
+                    std::fs::rename(&older, backup_name(to, n + 1))?;
+                }
+            }
+            let first = backup_name(to, 1);
+            std::fs::rename(to, &first)?;
+            Ok(first)
+        };
+        match rotate() {
+            Ok(first) => backup = Some(first),
+            Err(e) => {
+                drop_staged(&tmp);
+                return Err(e);
             }
         }
-        let first = backup_name(to, 1);
-        std::fs::rename(to, &first)?;
-        backup = Some(first);
     }
-    match copy_fresh(from, to) {
-        Ok(n) => Ok((n, backup)),
-        Err(e) => {
-            // The copy didn't happen (copy_fresh leaves nothing at `to`): what was there
-            // goes back.
-            if let Some(b) = &backup {
-                let _ = remove_any(to);
-                let _ = std::fs::rename(b, to);
-            }
-            Err(e)
+    if let Err(e) = std::fs::rename(&tmp, to) {
+        // What was there goes back.
+        drop_staged(&tmp);
+        if let Some(b) = &backup {
+            let _ = remove_any(to);
+            let _ = std::fs::rename(b, to);
         }
+        return Err(e);
     }
+    Ok((n, backup))
 }
 
 /// Whether a root `sources_of` found can be a save to copy. Not a device path (a named
@@ -565,7 +590,15 @@ fn worth_copying(root: &str, temp: Option<&str>) -> bool {
 
 /// A path the game opens or probes: copy its save in first, if it has one to start from.
 fn seen(path: &str) {
-    let pairs = PAIRS.lock().unwrap().clone();
+    // One spelling per save ("C:/x", "x" from the game's folder, "\\?\C:\x"), so DONE
+    // knows a save it has copied whichever way the game names it next (under
+    // --copy-saves a second copy would replace what this run has saved since).
+    let full = full_path(path).unwrap_or_else(|| path.to_string());
+    let path = match full.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.to_ascii_uppercase().starts_with(r"UNC\") => rest,
+        _ => full.as_str(),
+    };
+    let pairs = crate::sys::lock(&PAIRS).clone();
     let found = sources_of(path, &pairs);
     if found.first().is_some_and(|(root, ..)| !worth_copying(root, std::env::var("TEMP").ok().as_deref())) {
         return;
@@ -580,8 +613,8 @@ fn seen(path: &str) {
         }
         return;
     };
-    let _copying = COPYING.lock().unwrap_or_else(|e| e.into_inner());
-    if !DONE.lock().unwrap().insert(root.to_ascii_lowercase()) {
+    let _copying = crate::sys::lock(&COPYING);
+    if !crate::sys::lock(&DONE).insert(root.to_ascii_lowercase()) {
         return;
     }
     let root_p = PathBuf::from(&root);
@@ -686,12 +719,13 @@ pub fn learn_slot(lan: &peerparty_core::Lan) {
     if slot == 0 || slot == u32::MAX || lan.server() {
         return;
     }
-    if std::env::var("PEERPARTY_SEPARATE_SAVES").is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "no" | "false")) {
+    if crate::config::HookConfig::global().separate_saves == Some(false) {
         return;
     }
     OWN_SLOT.store(slot, Ordering::Relaxed);
     log!("saves: this copy is the PC's copy {}: saves shared by every copy are its own (a twin beside each, `.peerparty-{}`)", slot + 1, slot + 1);
-    arm_now();
+    // Called while the LAN is being set up: not from here (adopt_earlier_ids).
+    std::thread::spawn(arm_now);
 }
 
 /// For a full path the game uses, in a copy whose saves are its own: (the save's root,
@@ -746,19 +780,24 @@ pub fn twin_of(full: &str, exe_dir: &str, slot: u32) -> Option<(String, String, 
     Some((root.to_string(), twin, norm[re..].to_string()))
 }
 
-/// Roots whose twin this run has made (or found).
-static TWINS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
+/// Roots whose twin this run has made (or found), and that twin.
+static TWINS: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Mutex::default);
 
 /// Makes `twin` from `root` the first time this run sees it (a twin already there is
-/// the copy's own and stays).
-fn make_twin(root: &str, twin: &str) {
+/// the copy's own and stays). The root's twin: the one made first, so a root reached
+/// two ways ("Saves v1.0" itself, a file in it) keeps one twin.
+fn make_twin(root: &str, twin: &str) -> String {
     let key = root.to_ascii_lowercase();
-    if TWINS.lock().unwrap().contains(&key) {
-        return;
+    if let Some(t) = crate::sys::lock(&TWINS).get(&key) {
+        return t.clone();
     }
-    let _copying = COPYING.lock().unwrap();
-    if !TWINS.lock().unwrap().insert(key) {
-        return;
+    let _copying = crate::sys::lock(&COPYING);
+    {
+        let mut twins = crate::sys::lock(&TWINS);
+        if let Some(t) = twins.get(&key) {
+            return t.clone();
+        }
+        twins.insert(key, twin.to_string());
     }
     let (from, to) = (Path::new(root), Path::new(twin));
     if to.exists() {
@@ -773,6 +812,7 @@ fn make_twin(root: &str, twin: &str) {
     } else {
         log!("saves: {root} is {twin} in this copy (nothing there yet)");
     }
+    twin.to_string()
 }
 
 /// The path the game gets instead of `path` in a copy whose saves are its own; the
@@ -787,13 +827,19 @@ fn own_path(path: &str) -> Option<String> {
         return None;
     }
     let exe_dir = std::env::current_exe().ok()?.parent()?.to_string_lossy().into_owned();
-    let (root, twin, rest) = twin_of(&full, &exe_dir, slot)?;
+    let (root, mut twin, rest) = twin_of(&full, &exe_dir, slot)?;
     // A save keyed by an id (the other way above) is this copy's already.
-    let pairs = PAIRS.lock().unwrap().clone();
+    let pairs = crate::sys::lock(&PAIRS).clone();
     if !sources_of(&full, &pairs).is_empty() {
         return None;
     }
-    make_twin(&root, &twin);
+    // A folder with a dot in its name ("MyGame v1.0") is a folder's twin, as it is
+    // when a file in it is opened, not a file's (BUSY is set: this passes through).
+    let folder = format!("{root}.peerparty-{}", slot + 1);
+    if twin != folder && Path::new(&root).is_dir() {
+        twin = folder;
+    }
+    let twin = make_twin(&root, &twin);
     Some(format!("{twin}{rest}"))
 }
 
@@ -802,12 +848,15 @@ fn own_path(path: &str) -> Option<String> {
 /// "saves" there isn't the game's folder), the folders tests point those stores at, and
 /// the temp folder.
 fn not_saves() -> Vec<String> {
-    let mut v: Vec<String> = ["PEERPARTY_GALAXY_DIR", "PEERPARTY_PLAYFAB_DIR", "PEERPARTY_UGS_DIR", "PEERPARTY_LOG_DIR", "TEMP", "TMP"]
-        .iter()
-        .filter_map(|k| std::env::var(k).ok())
+    let c = crate::config::HookConfig::global();
+    let mut v: Vec<String> = [&c.galaxy_dir, &c.playfab_dir, &c.ugs_dir, &c.log_dir]
+        .into_iter()
+        .flatten()
+        .map(|d| d.to_string_lossy().into_owned())
+        .chain(["TEMP", "TMP"].iter().filter_map(|k| std::env::var(k).ok()))
         .collect();
-    if let Ok(l) = std::env::var("LOCALAPPDATA") {
-        v.push(format!("{l}\\peerparty"));
+    if let Some(d) = crate::util::local_store::peerparty_dir() {
+        v.push(d.to_string_lossy().into_owned());
     }
     v
 }
@@ -928,17 +977,7 @@ where
     let Some(e) = exports.iter().find(|e| e.name == name) else {
         return 0;
     };
-    let target: T = unsafe { std::mem::transmute_copy(&e.addr) };
-    with_lock(|| {
-        let Ok(hook) = (unsafe { GenericDetour::new(target, detour) }) else {
-            log!("saves {name} not hooked");
-            return 0;
-        };
-        if slot.set(hook).is_err() {
-            return 0;
-        }
-        usize::from(unsafe { slot.get().unwrap().enable() }.is_ok())
-    })
+    usize::from(crate::sys::detour::arm_at(slot, e.addr as usize, detour, "saves", name))
 }
 
 /// Arms the file hooks in kernelbase (once).
@@ -970,8 +1009,10 @@ pub fn attach_kernelbase(exports: &[Export]) -> usize {
         + arm(exports, "CopyFileExW", &COPY_EX, detour_copy_ex as CopyExW)
 }
 
-/// Arms the file hooks now, from kernelbase as it's loaded.
-fn arm_now() {
+/// Arms the file hooks now, from kernelbase as it's loaded (also for a split-screen
+/// copy without saves of its own to keep apart: its CreateFile keeps other players'
+/// controllers from it, input/device.rs).
+pub fn arm_now() {
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     if ARMED.load(Ordering::SeqCst) {
         return;
@@ -982,7 +1023,7 @@ fn arm_now() {
         log!("saves: kernelbase not found; saves aren't copied");
         return;
     }
-    match unsafe { crate::pe::exports(base.cast()) } {
+    match unsafe { crate::sys::pe::exports(base.cast()) } {
         Ok(t) => {
             let n = attach_kernelbase(&t.code);
             log!("saves file hooks {n}");
@@ -991,22 +1032,46 @@ fn arm_now() {
     }
 }
 
+/// A split-screen copy can't open another player's game controller (input/device.rs).
+fn not_there() -> isize {
+    unsafe { windows_sys::Win32::Foundation::SetLastError(windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND) };
+    -1
+}
+
 unsafe extern "system" fn detour_create_file(name: *const u16, access: u32, share: u32, sa: usize, disposition: u32, flags: u32, template: isize) -> isize {
+    if crate::input::refuse_open_w(name) {
+        return not_there();
+    }
     touch(name);
+    let asked = name;
     own!(own_w, name, own_name);
-    unsafe { CREATE_FILE.get().unwrap().call(name, access, share, sa, disposition, flags, template) }
+    let h = unsafe { CREATE_FILE.get().unwrap().call(name, access, share, sa, disposition, flags, template) };
+    crate::input::opened_w(asked, h);
+    h
 }
 
 unsafe extern "system" fn detour_create_file_a(name: *const u8, access: u32, share: u32, sa: usize, disposition: u32, flags: u32, template: isize) -> isize {
+    if crate::input::refuse_open_a(name) {
+        return not_there();
+    }
     touch_a(name);
+    let asked = name;
     own!(own_a, name, own_name);
-    unsafe { CREATE_FILE_A.get().unwrap().call(name, access, share, sa, disposition, flags, template) }
+    let h = unsafe { CREATE_FILE_A.get().unwrap().call(name, access, share, sa, disposition, flags, template) };
+    crate::input::opened_a(asked, h);
+    h
 }
 
 unsafe extern "system" fn detour_create_file2(name: *const u16, access: u32, share: u32, disposition: u32, params: usize) -> isize {
+    if crate::input::refuse_open_w(name) {
+        return not_there();
+    }
     touch(name);
+    let asked = name;
     own!(own_w, name, own_name);
-    unsafe { CREATE_FILE2.get().unwrap().call(name, access, share, disposition, params) }
+    let h = unsafe { CREATE_FILE2.get().unwrap().call(name, access, share, disposition, params) };
+    crate::input::opened_w(asked, h);
+    h
 }
 
 unsafe extern "system" fn detour_attrs(name: *const u16) -> u32 {
@@ -1121,30 +1186,6 @@ unsafe extern "system" fn detour_copy_ex(from: *const u16, to: *const u16, progr
     unsafe { COPY_EX.get().unwrap().call(from, to, progress, data, cancel, flags) }
 }
 
-/// A file name a game gave (a cloud-storage file), as one file in one folder: path
-/// separators, `:` and characters Windows refuses become `_`, a trailing dot or space
-/// (which Windows drops, so two names would share a file) gets a `_` after it, and a
-/// device name (`CON`, `NUL`, `COM1.sav`...), which would open the device instead of a
-/// file, gets one in front. Empty, `.` and `..` are no name.
-pub fn file_name(name: &str) -> Option<String> {
-    let mut n: String = name.chars().map(|c| if c < ' ' || "/\\:<>\"|?*".contains(c) { '_' } else { c }).collect();
-    if n.is_empty() || n == "." || n == ".." {
-        return None;
-    }
-    if n.ends_with(['.', ' ']) {
-        n.push('_');
-    }
-    let stem = n.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
-    let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
-        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
-            && stem[3..].chars().count() == 1
-            && stem[3..].chars().all(|c| c.is_ascii_digit() || "¹²³".contains(c)));
-    if device {
-        n.insert(0, '_');
-    }
-    Some(n)
-}
-
 /// A store file that is there but can't be read as one (damaged, or not ours) is moved
 /// aside to `<name>.unreadable-<seconds>`, so the empty store that replaces it doesn't
 /// overwrite what may still be recovered by hand. Logged with `what`.
@@ -1233,7 +1274,7 @@ mod tests {
         assert_eq!(std::fs::read(twin.join("savegame.dat")).unwrap(), b"first");
         std::fs::write(twin.join("savegame.dat"), b"second").unwrap();
         // Not copied again (this run or, the twin existing, the next).
-        TWINS.lock().unwrap().clear();
+        crate::sys::lock(&TWINS).clear();
         make_twin(&saves.to_string_lossy(), &twin.to_string_lossy());
         assert_eq!(std::fs::read(twin.join("savegame.dat")).unwrap(), b"second");
         assert_eq!(std::fs::read(saves.join("savegame.dat")).unwrap(), b"first");
@@ -1263,23 +1304,6 @@ mod tests {
             assert_eq!(std::fs::read(&file).unwrap(), b"two");
         }
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn stored_file_names_stay_one_ordinary_file() {
-        assert_eq!(file_name("../save.dat").as_deref(), Some(".._save.dat"));
-        assert_eq!(file_name(r"a\b:c").as_deref(), Some("a_b_c"));
-        assert_eq!(file_name("what?<x>|\"*\u{1}").as_deref(), Some("what__x_____"));
-        assert_eq!(file_name("slot1.").as_deref(), Some("slot1._"));
-        assert_eq!(file_name("slot1 ").as_deref(), Some("slot1 _"));
-        assert_eq!(file_name("CON").as_deref(), Some("_CON"));
-        assert_eq!(file_name("nul.sav").as_deref(), Some("_nul.sav"));
-        assert_eq!(file_name("com1.dat").as_deref(), Some("_com1.dat"));
-        assert_eq!(file_name("LPT¹").as_deref(), Some("_LPT¹"));
-        assert_eq!(file_name("console.sav").as_deref(), Some("console.sav"));
-        assert_eq!(file_name("com10").as_deref(), Some("com10"));
-        assert_eq!(file_name(".."), None);
-        assert_eq!(file_name(""), None);
     }
 
     fn pair(ours: &str, from: &str, once: bool) -> Pair {
@@ -1454,8 +1478,8 @@ mod tests {
     /// there is one, else steam_api's; and never over a save already there.
     #[test]
     fn an_earlier_own_steamid_comes_before_steam_apis() {
-        let own = crate::steamids::lan_steam_id(peerparty_core::PeerId([0xa1; 16]));
-        let old = crate::steamids::lan_steam_id(peerparty_core::PeerId([0x10; 16]));
+        let own = crate::steam::ids::lan_steam_id(peerparty_core::PeerId([0xa1; 16]));
+        let old = crate::steam::ids::lan_steam_id(peerparty_core::PeerId([0x10; 16]));
         let game = 76561197960270388u64;
         let mut pairs = Vec::new();
         for (ours, from) in steam_names(own, old) {
@@ -1485,8 +1509,8 @@ mod tests {
         use std::time::{Duration, SystemTime};
         let base = std::env::temp_dir().join(format!("peerparty-guess-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
-        let own = crate::steamids::lan_steam_id(peerparty_core::PeerId([0xa1; 16]));
-        let slot1 = crate::steamids::lan_steam_id(peerparty_core::PeerId([0x2b; 16]));
+        let own = crate::steam::ids::lan_steam_id(peerparty_core::PeerId([0xa1; 16]));
+        let slot1 = crate::steam::ids::lan_steam_id(peerparty_core::PeerId([0x2b; 16]));
         let game = 76561197960270388u64;
         let at = |days: u64| SystemTime::now() - Duration::from_secs(days * 86_400);
         let save = |name: &str, when: Option<SystemTime>| {
@@ -1497,9 +1521,9 @@ mod tests {
                 f.set_modified(when).unwrap();
             }
         };
-        let older = crate::steamids::lan_steam_id(peerparty_core::PeerId([0x10; 16]));
-        let newer = crate::steamids::lan_steam_id(peerparty_core::PeerId([0x20; 16]));
-        let empty = crate::steamids::lan_steam_id(peerparty_core::PeerId([0x30; 16]));
+        let older = crate::steam::ids::lan_steam_id(peerparty_core::PeerId([0x10; 16]));
+        let newer = crate::steam::ids::lan_steam_id(peerparty_core::PeerId([0x20; 16]));
+        let empty = crate::steam::ids::lan_steam_id(peerparty_core::PeerId([0x30; 16]));
         save(&(older as u32).to_string(), Some(at(20)));
         save(&(newer as u32).to_string(), Some(at(5)));
         save(&(empty as u32).to_string(), None);

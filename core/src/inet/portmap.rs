@@ -133,13 +133,7 @@ fn send_twice(local: Ipv4Addr, to: SocketAddr, d: &[u8]) {
 /// The default gateway's address (the next hop toward the internet), when it's on the
 /// LAN. Sends nothing.
 pub fn default_gateway() -> Option<Ipv4Addr> {
-    use windows_sys::Win32::NetworkManagement::IpHelper::{GetBestRoute, MIB_IPFORWARDROW};
-    let mut row: MIB_IPFORWARDROW = unsafe { std::mem::zeroed() };
-    let dest = u32::from_ne_bytes([8, 8, 8, 8]);
-    if unsafe { GetBestRoute(dest, 0, &mut row) } != 0 {
-        return None;
-    }
-    let gw = Ipv4Addr::from(row.dwForwardNextHop.to_ne_bytes());
+    let gw = crate::sys::default_gateway()?;
     (is_lan(gw) && !gw.is_loopback()).then_some(gw)
 }
 
@@ -155,7 +149,7 @@ pub fn map(client: Ipv4Addr, gateway: Option<Ipv4Addr>, port: u16) -> Result<Map
     } else {
         why.push("PCP/NAT-PMP: no gateway on the LAN".to_string());
     }
-    let found = from_gateway(ssdp_search(client, Duration::from_secs(2)), gateway);
+    let found = from_gateway(ssdp_search(client, gateway, Duration::from_secs(2)), gateway);
     if found.is_empty() {
         why.push("UPnP: no router answered".into());
     }
@@ -298,12 +292,15 @@ fn natpmp_request(internal: u16, external: u16, lifetime: u32) -> [u8; 12] {
 }
 
 fn parse_natpmp(d: &[u8], internal: u16) -> Option<Result<(u16, u32), Fail>> {
-    if d.len() < 16 || d[0] != 0 || d[1] != 129 || be16(&d[8..]) != internal {
+    if d.len() < 8 || d[0] != 0 || d[1] != 129 {
         return None;
     }
     match be16(&d[2..]) {
-        0 => Some(Ok((be16(&d[10..]), be32(&d[12..])))),
-        r => Some(Err(Fail::No(format!("refused (result {r})")))),
+        // Some refusals (unsupported version or opcode) are only the 8-byte header
+        // (RFC 6886 3.5), with no ports to match.
+        r if r != 0 && (d.len() < 16 || be16(&d[8..]) == internal) => Some(Err(Fail::No(format!("refused (result {r})")))),
+        0 if d.len() >= 16 && be16(&d[8..]) == internal => Some(Ok((be16(&d[10..]), be32(&d[12..])))),
+        _ => None,
     }
 }
 
@@ -370,8 +367,10 @@ fn from_gateway(found: Vec<(Ipv4Addr, String)>, gateway: Option<Ipv4Addr>) -> Ve
     }
 }
 
-/// Gateways answering an SSDP search on the LAN: (address, description URL).
-pub fn ssdp_search(lan: Ipv4Addr, wait: Duration) -> Vec<(Ipv4Addr, String)> {
+/// Gateways answering an SSDP search on the LAN: (address, description URL). With the
+/// default `gateway` known, only its answer cuts the wait short: a printer answering
+/// first mustn't end the search before the router (MX lets it wait up to 2 s).
+pub fn ssdp_search(lan: Ipv4Addr, gateway: Option<Ipv4Addr>, wait: Duration) -> Vec<(Ipv4Addr, String)> {
     let Ok(sock) = UdpSocket::bind((lan, 0)) else { return Vec::new() };
     let _ = sock.set_multicast_ttl_v4(2);
     for st in [
@@ -407,7 +406,9 @@ pub fn ssdp_search(lan: Ipv4Addr, wait: Duration) -> Vec<(Ipv4Addr, String)> {
         {
             out.push((ip, loc.to_string()));
             // The first answer is usually all there is: don't wait out the rest.
-            until = until.min(Instant::now() + Duration::from_millis(300));
+            if gateway.is_none_or(|g| g == ip) {
+                until = until.min(Instant::now() + Duration::from_millis(300));
+            }
         }
     }
     out

@@ -10,11 +10,13 @@
 //! follow AuthenticationNetworkClient / SignInResponse / User / AccessToken of the SDK
 //! and services.docs.unity.com/player-auth/v1.
 
-use crate::json::Json;
+use crate::util::json::Json;
 use crate::log;
 use crate::net;
 
-use super::{base64url, error_body, my_player_id, peer_of, unix_now};
+use super::{error_body, my_player_id, peer_of};
+use crate::util::encoding::{base64url, random_text};
+use crate::util::time::unix_now;
 
 /// How long an access token lasts, as Unity's do.
 const TOKEN_SECONDS: i64 = 3600;
@@ -31,7 +33,7 @@ pub fn access_token(player: &str, provider: &str) -> String {
         ("iat", Json::Num(now as f64)),
         ("nbf", Json::Num(now as f64)),
         ("iss", Json::str("https://player-auth.services.api.unity.com")),
-        ("jti", Json::str(super::random_text(32, b"0123456789abcdef"))),
+        ("jti", Json::str(random_text(32, b"0123456789abcdef"))),
         ("project_id", Json::str("peerparty")),
         ("sign_in_provider", Json::str(provider)),
         ("sub", Json::str(player)),
@@ -157,7 +159,7 @@ mod tests {
 
     fn payload(token: &str) -> Json {
         let part = token.split('.').nth(1).unwrap();
-        Json::parse(&String::from_utf8(super::super::base64_decode(part).unwrap()).unwrap()).unwrap()
+        Json::parse(&String::from_utf8(crate::util::encoding::base64_decode(part).unwrap()).unwrap()).unwrap()
     }
 
     #[test]

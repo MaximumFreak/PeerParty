@@ -28,7 +28,7 @@
 
 use std::time::Instant;
 
-use crate::photon::crypto::{hmac_sha256, random_bytes, sha256, Aes};
+use crate::util::crypto::{hmac_sha256, random_bytes, sha256, Aes};
 
 const CT_CCS: u8 = 20;
 const CT_ALERT: u8 = 21;
@@ -376,7 +376,8 @@ impl Session {
                     }
                 }
                 CT_APP if self.state == State::Open && epoch == 1 => r.data.push(body),
-                CT_ALERT => {
+                // Once open, an alert counts only if it's sealed: a plain one could be anyone's.
+                CT_ALERT if self.state != State::Open || epoch == 1 => {
                     // close_notify, or any fatal alert, ends the session.
                     if body.len() >= 2 && (body[1] == 0 || body[0] == 2) {
                         r.problem = Some(format!("the client sent alert {} (level {})", body[1], body[0]));

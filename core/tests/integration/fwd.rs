@@ -1,0 +1,235 @@
+//! The typed-IP forwarder: two engines in one process, a "game" on each side talking
+//! plain TCP and UDP to the other's stand-in address.
+
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
+use std::time::{Duration, Instant};
+
+use peerparty_core::fwd::{Forwarder, is_stand_in};
+use peerparty_core::*;
+
+fn quiet(_: &str) {}
+
+fn base_port(offset: u16) -> u16 {
+    // This file's own block of ports, claimed for this process from every other test
+    // on this PC (core/src/test_ports.rs).
+    static BASE: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    assert!(offset < peerparty_core::test_ports::BLOCK, "port offset {offset} is past the block");
+    *BASE.get_or_init(|| peerparty_core::test_ports::claim(peerparty_core::test_ports::BLOCK)) + offset
+}
+
+fn start(game: &str, port: u16, name: &str) -> Lan {
+    crate::take_turn();
+    Lan::start(Options {
+        game: game.into(),
+        identity: Identity::ephemeral(name),
+        discovery_port: port,
+        extra_targets: Vec::new(),
+        log: quiet,
+        internet: None,
+        public: None,
+        lan_discovery: true,
+        public_voice: None,
+    })
+    .expect("start")
+}
+
+fn meet(a: &Lan, b: &Lan) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (mut ma, mut mb) = (false, false);
+    while !(ma && mb) {
+        a.tick();
+        b.tick();
+        ma |= a.poll().contains(&Event::PeerJoined(b.me()));
+        mb |= b.poll().contains(&Event::PeerJoined(a.me()));
+        assert!(Instant::now() < deadline, "the engines didn't meet");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn v4(a: SocketAddr) -> SocketAddrV4 {
+    match a {
+        SocketAddr::V4(a) => a,
+        _ => panic!("not v4"),
+    }
+}
+
+#[test]
+fn typed_ip_tcp_and_udp_cross_the_mesh() {
+    let port = base_port(0);
+    let game = format!("fwdtest:{}", std::process::id());
+    let a = start(&game, port, "a");
+    let b = start(&game, port, "b");
+    meet(&a, &b);
+    let fa = Forwarder::new(a.clone(), None, quiet);
+    let fb = Forwarder::new(b.clone(), None, quiet);
+    // Every game socket here is on loopback only, which public players don't get to
+    // (tests/public.rs): LAN players do.
+    fa.keep_loopback_private(true);
+    fb.keep_loopback_private(true);
+    assert_eq!(a.peer_trust(b.me()), Some(Trust::Lan));
+    fa.ensure_pump();
+    fb.ensure_pump();
+    let (sa, sb) = (Forwarder::address_of(a.me()), Forwarder::address_of(b.me()));
+    assert!(is_stand_in(sa) && is_stand_in(sb) && sa != sb);
+    assert_eq!(fa.peer_at(sb), Some(b.me()));
+    assert_eq!(fa.peer_at(Ipv4Addr::new(198, 18, 0, 0)).filter(|p| *p != b.me()), None);
+    assert_eq!(fa.peer_at(Ipv4Addr::new(10, 0, 0, 1)), None);
+
+    // TCP: B's game listens; A's game connects to B's stand-in. 3 MiB each way exceeds
+    // the 1 MiB window, so flow control has to work.
+    let server = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let sport = server.local_addr().unwrap().port();
+    let echo = std::thread::spawn(move || {
+        let (mut s, _) = server.accept().unwrap();
+        let mut buf = vec![0u8; 65536];
+        let mut total = 0usize;
+        loop {
+            let n = s.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            total += n;
+            s.write_all(&buf[..n]).unwrap();
+        }
+        total
+    });
+    let to = fa.tcp_dest(SocketAddrV4::new(sb, sport)).expect("a stand-in");
+    assert!(to.ip().is_loopback());
+    let mut c = TcpStream::connect(to).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    let data: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i * 7 + i / 251) as u8).collect();
+    let mut w = c.try_clone().unwrap();
+    let sent = data.clone();
+    let writer = std::thread::spawn(move || {
+        w.write_all(&sent).unwrap();
+        w.shutdown(std::net::Shutdown::Write).unwrap();
+    });
+    let mut back = Vec::new();
+    c.read_to_end(&mut back).unwrap();
+    writer.join().unwrap();
+    assert_eq!(echo.join().unwrap(), data.len());
+    assert!(back == data, "the echo came back different ({} of {} bytes)", back.len(), data.len());
+
+    // Nobody listens on this port at B: the stream is refused and closes.
+    let unused = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let dead_port = unused.local_addr().unwrap().port();
+    drop(unused);
+    let to = fa.tcp_dest(SocketAddrV4::new(sb, dead_port)).unwrap();
+    let mut c = TcpStream::connect(to).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+    let mut buf = [0u8; 16];
+    assert!(matches!(c.read(&mut buf), Ok(0) | Err(_)), "a refused stream stayed open");
+
+    // B's engine listens in B's process too, but its listener isn't B's game: a peer the
+    // forwarder connected there would arrive from loopback, like a player on B's own PC,
+    // and be trusted as one. Refused like a port nobody listens on (the engine would
+    // have sent its hello at once).
+    assert!(peerparty_core::own::is_held(true, b.tcp_port()));
+    let to = fa.tcp_dest(SocketAddrV4::new(sb, b.tcp_port())).unwrap();
+    let mut c = TcpStream::connect(to).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+    assert!(matches!(c.read(&mut buf), Ok(0) | Err(_)), "the forwarder reached the engine's own listener");
+    assert_eq!(b.peers().len(), 1, "nobody new joined B through the forwarder");
+
+    // UDP: A's game sends to B's stand-in; B's game sees A's stand-in and answers it.
+    let ga = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let gb = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    ga.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+    gb.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+    let (pa, pb) = (ga.local_addr().unwrap().port(), gb.local_addr().unwrap().port());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut buf = [0u8; 2048];
+    let from = loop {
+        let via = fa.udp_dest(SocketAddrV4::new(sb, pb), pa).unwrap();
+        ga.send_to(b"ping", via).unwrap();
+        if let Ok((n, from)) = gb.recv_from(&mut buf) {
+            assert_eq!(&buf[..n], b"ping");
+            break v4(from);
+        }
+        assert!(Instant::now() < deadline, "the datagram never arrived");
+    };
+    assert_eq!(fb.udp_from(from), Some(SocketAddrV4::new(sa, pa)));
+    let reply_via = fb.udp_dest(SocketAddrV4::new(sa, pa), pb).unwrap();
+    assert_eq!(reply_via, from, "replies should leave by the same alias");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let from = loop {
+        gb.send_to(b"pong", reply_via).unwrap();
+        if let Ok((n, from)) = ga.recv_from(&mut buf) {
+            assert_eq!(&buf[..n], b"pong");
+            break v4(from);
+        }
+        assert!(Instant::now() < deadline, "the reply never arrived");
+    };
+    assert_eq!(fa.udp_from(from), Some(SocketAddrV4::new(sb, pb)));
+
+    // A datagram for a port B's game doesn't have is dropped, not delivered anywhere.
+    assert!(fa.udp_from(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9)).is_none());
+}
+
+/// Another PC's server reached over the mesh by a game whose UDP socket is connected
+/// (Photon's client: `connect`, then plain `send` and `recv`): the socket is connected
+/// to the forwarder's local socket for that peer and port, and the server's answers,
+/// sent to whoever it heard from, come back from that same address.
+#[test]
+fn a_connected_udp_socket_reaches_a_server_on_the_other_pc() {
+    let port = base_port(1);
+    let game = format!("fwdtest-connected:{}", std::process::id());
+    let a = start(&game, port, "a");
+    let b = start(&game, port, "b");
+    meet(&a, &b);
+    let fa = Forwarder::new(a.clone(), None, quiet);
+    let fb = Forwarder::new(b.clone(), None, quiet);
+    fa.ensure_pump();
+    fb.ensure_pump();
+    let sb = Forwarder::address_of(b.me());
+
+    // B's "server" answers each datagram to its sender.
+    let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    server.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+    let sport = server.local_addr().unwrap().port();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop2 = stop.clone();
+    let echo = std::thread::spawn(move || {
+        let mut buf = [0u8; 2048];
+        while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Ok((n, from)) = server.recv_from(&mut buf) {
+                let mut reply = b"re:".to_vec();
+                reply.extend_from_slice(&buf[..n]);
+                server.send_to(&reply, from).unwrap();
+            }
+        }
+    });
+
+    // A's game: bound, then connected where ipfwd's connect detour sends it.
+    let client = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+    client.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+    let local = client.local_addr().unwrap().port();
+    let via = fa.udp_dest(SocketAddrV4::new(sb, sport), local).expect("a stand-in");
+    assert!(via.ip().is_loopback());
+    client.connect(via).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut buf = [0u8; 2048];
+    loop {
+        client.send(b"hello").unwrap();
+        if let Ok(n) = client.recv(&mut buf) {
+            assert_eq!(&buf[..n], b"re:hello");
+            break;
+        }
+        assert!(Instant::now() < deadline, "no answer reached the connected socket");
+    }
+    // Several in a row, as a session would.
+    for i in 0..20u8 {
+        client.send(&[i]).unwrap();
+    }
+    let mut got = 0;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while got < 15 && Instant::now() < deadline {
+        if client.recv(&mut buf).is_ok() {
+            got += 1;
+        }
+    }
+    assert!(got >= 15, "only {got} of 20 answers came back");
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    echo.join().unwrap();
+}

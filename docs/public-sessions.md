@@ -192,5 +192,5 @@ to you. Use a VPN, or room codes with people you know.
 - Checked by the automated tests (three public players on one PC through a local test
   DHT: discovery, lobbies, blocking, forged adverts, junk packets) and once on the real
   DHT: two public players on one PC under a random game name found each other in about
-  18 s (`cargo test -p peerparty_core --test public real_dht -- --ignored` with
+  18 s (`cargo test -p peerparty_core --test integration public::real_dht -- --ignored` with
   `PEERPARTY_LOOPBACK=0`). Not yet tried between two homes, with strangers, or in a game.

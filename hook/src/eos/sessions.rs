@@ -233,13 +233,13 @@ fn key<T>(b: &T) -> usize {
 
 /// Whether a core lobby id is a session's.
 pub(super) fn is_session(id: &str) -> bool {
-    H.lock().unwrap().ids.contains(id)
+    crate::sys::lock(&H).ids.contains(id)
 }
 
 /// The presence-enabled session we're in, for invites.
 pub(super) fn current() -> Option<Lobby> {
     let id = {
-        let h = H.lock().unwrap();
+        let h = crate::sys::lock(&H);
         let s = h.sessions.values().find(|s| s.presence).or_else(|| h.sessions.values().next())?;
         s.id.clone()
     };
@@ -326,7 +326,7 @@ unsafe fn ptr_text(o: *const abi::PtrOptions) -> Option<String> {
 }
 
 fn session_id(name: &str) -> Option<String> {
-    H.lock().unwrap().sessions.get(name).map(|s| s.id.clone())
+    crate::sys::lock(&H).sessions.get(name).map(|s| s.id.clone())
 }
 
 /// PeerParty's own attributes, in any case (EOS attribute keys ignore case, so a game's
@@ -425,7 +425,7 @@ unsafe extern "system" fn create_modification(_h: usize, o: *const CreateOptions
         presence: o.ApiVersion >= 2 && o.bPresenceEnabled != 0,
     });
     let k = key(&*m);
-    H.lock().unwrap().mods.insert(k, m);
+    crate::sys::lock(&H).mods.insert(k, m);
     unsafe { *out = k };
     SUCCESS
 }
@@ -448,13 +448,13 @@ unsafe extern "system" fn update_modification(_h: usize, o: *const abi::PtrOptio
         presence: false,
     });
     let k = key(&*m);
-    H.lock().unwrap().mods.insert(k, m);
+    crate::sys::lock(&H).mods.insert(k, m);
     unsafe { *out = k };
     SUCCESS
 }
 
 fn with_mod(h: usize, f: impl FnOnce(&mut ModObj) -> i32) -> i32 {
-    match H.lock().unwrap().mods.get_mut(&h) {
+    match crate::sys::lock(&H).mods.get_mut(&h) {
         Some(m) => f(m),
         None => INVALID_PARAMETERS,
     }
@@ -484,7 +484,9 @@ unsafe extern "system" fn mod_set_permission(h: usize, o: *const abi::I32Options
     if o.is_null() {
         return INVALID_PARAMETERS;
     }
-    let p = Permission::from_u8(unsafe { (*o).Value } as u8);
+    let Some(p) = u8::try_from(unsafe { (*o).Value }).ok().and_then(Permission::from_u8) else {
+        return INVALID_PARAMETERS;
+    };
     with_mod(h, |m| {
         m.edited.permission = p;
         SUCCESS
@@ -558,13 +560,13 @@ unsafe extern "system" fn mod_remove_attribute(h: usize, o: *const abi::KeyOptio
 }
 
 unsafe extern "system" fn mod_release(h: usize) {
-    H.lock().unwrap().mods.remove(&h);
+    crate::sys::lock(&H).mods.remove(&h);
 }
 
 unsafe extern "system" fn update_session(_h: usize, o: *const abi::PtrOptions, cd: usize, cb: usize) {
     let m = (!o.is_null())
         .then(|| {
-            let h = H.lock().unwrap();
+            let h = crate::sys::lock(&H);
             h.mods
                 .get(&unsafe { (*o).Value })
                 .map(|m| (m.name.clone(), m.creating, m.edited.clone(), m.presence))
@@ -596,7 +598,7 @@ unsafe extern "system" fn update_session(_h: usize, o: *const abi::PtrOptions, c
                 trace("EOS_Sessions_UpdateSession", || {
                     format!("created {name} id={} bucket={} max={}", l.id, l.bucket, l.max_members)
                 });
-                let mut h = H.lock().unwrap();
+                let mut h = crate::sys::lock(&H);
                 h.ids.insert(l.id.clone());
                 h.sessions.insert(
                     name.clone(),
@@ -622,7 +624,7 @@ unsafe extern "system" fn destroy_session(_h: usize, o: *const abi::PtrOptions, 
     let Some(name) = (unsafe { ptr_text(o) }) else {
         return done(cb, cd, INVALID_PARAMETERS);
     };
-    let s = H.lock().unwrap().sessions.remove(&name);
+    let s = crate::sys::lock(&H).sessions.remove(&name);
     let Some(s) = s else {
         return done(cb, cd, NOT_FOUND);
     };
@@ -642,7 +644,7 @@ unsafe extern "system" fn join_session(_h: usize, o: *const JoinOptions, cd: usi
     }
     let o = unsafe { &*o };
     let name = name_of(o.SessionName).unwrap_or_default();
-    let target = H.lock().unwrap().details.get(&o.SessionHandle).map(|l| (**l).clone());
+    let target = crate::sys::lock(&H).details.get(&o.SessionHandle).map(|l| (**l).clone());
     let (Some(lan), Some(target), false) = (lan(), target, name.is_empty()) else {
         return done(cb, cd, INVALID_PARAMETERS);
     };
@@ -651,10 +653,10 @@ unsafe extern "system" fn join_session(_h: usize, o: *const JoinOptions, cd: usi
     }
     let presence = o.ApiVersion >= 2 && o.bPresenceEnabled != 0;
     trace("EOS_Sessions_JoinSession", || format!("{name} -> {} owner={}", target.id, target.owner));
-    H.lock().unwrap().ids.insert(target.id.clone());
+    crate::sys::lock(&H).ids.insert(target.id.clone());
     match lan.join(&target) {
         Ok(()) => {
-            H.lock().unwrap().joins.insert(target.id, (name, presence, cb, cd));
+            crate::sys::lock(&H).joins.insert(target.id, (name, presence, cb, cd));
         }
         Err(e) => done(cb, cd, lobby_error(e)),
     }
@@ -734,7 +736,7 @@ fn change_registration(o: *const PlayersOptions, cd: usize, cb: usize, add: bool
     let mut list = if hosting {
         registered(&l)
     } else {
-        H.lock().unwrap().registered.get(&id).cloned().unwrap_or_else(|| registered(&l))
+        crate::sys::lock(&H).registered.get(&id).cloned().unwrap_or_else(|| registered(&l))
     };
     // Epic answers Success and echoes every player asked about, also those already
     // (un)registered: the host is registered here at creation, and Unreal's EOS
@@ -756,7 +758,7 @@ fn change_registration(o: *const PlayersOptions, cd: usize, cb: usize, add: bool
     if hosting {
         let _ = edit_hosted(&name, |l| set_registered(l, &list));
     } else {
-        H.lock().unwrap().registered.insert(id, list);
+        crate::sys::lock(&H).registered.insert(id, list);
     }
     crate::log!(
         "eos-lan call EOS_Sessions_{}RegisterPlayers {name}: {} asked, {} registered",
@@ -795,7 +797,7 @@ unsafe extern "system" fn send_invite(_h: usize, o: *const SendInviteOptions, cd
 
 unsafe extern "system" fn reject_invite(_h: usize, o: *const RejectInviteOptions, cd: usize, cb: usize) {
     let id = (!o.is_null()).then(|| unsafe { text((*o).InviteId) }).flatten().unwrap_or_default();
-    let mut h = H.lock().unwrap();
+    let mut h = crate::sys::lock(&H);
     let before = h.invites.len();
     h.invites.retain(|(i, _, _)| *i != id);
     let r = if h.invites.len() < before { SUCCESS } else { NOT_FOUND };
@@ -816,7 +818,7 @@ unsafe extern "system" fn query_invites(_h: usize, o: *const abi::PtrOptions, cd
 }
 
 unsafe extern "system" fn invite_count(_h: usize, _o: usize) -> u32 {
-    H.lock().unwrap().invites.len() as u32
+    crate::sys::lock(&H).invites.len() as u32
 }
 
 unsafe extern "system" fn invite_id_by_index(
@@ -829,7 +831,7 @@ unsafe extern "system" fn invite_id_by_index(
         return INVALID_PARAMETERS;
     }
     let i = unsafe { (*o).Index } as usize;
-    let Some(id) = H.lock().unwrap().invites.get(i).map(|(id, _, _)| id.clone()) else {
+    let Some(id) = crate::sys::lock(&H).invites.get(i).map(|(id, _, _)| id.clone()) else {
         return NOT_FOUND;
     };
     let need = id.len() as i32 + 1;
@@ -849,7 +851,7 @@ unsafe extern "system" fn invite_id_by_index(
 /// the player accepts it (as lobby invites are).
 fn receive_invite(from: peerparty_core::PeerId, connect: &str, lobby: Lobby) {
     let (invite_id, ui_event) = {
-        let mut h = H.lock().unwrap();
+        let mut h = crate::sys::lock(&H);
         h.next_invite += 1;
         let n = h.next_invite;
         let id = format!("peerparty-session-invite-{n}");
@@ -901,7 +903,7 @@ fn receive_invite(from: peerparty_core::PeerId, connect: &str, lobby: Lobby) {
 fn hand_out_details(l: Lobby, out: *mut usize) -> i32 {
     let d = Box::new(l);
     let k = key(&*d);
-    H.lock().unwrap().details.insert(k, d);
+    crate::sys::lock(&H).details.insert(k, d);
     unsafe { *out = k };
     SUCCESS
 }
@@ -912,7 +914,7 @@ unsafe extern "system" fn copy_by_invite(_h: usize, o: *const abi::PtrOptions, o
     }
     unsafe { *out = 0 };
     let id = unsafe { ptr_text(o) }.unwrap_or_default();
-    let l = H.lock().unwrap().invites.iter().find(|(i, ..)| *i == id).map(|(_, l, _)| l.clone());
+    let l = crate::sys::lock(&H).invites.iter().find(|(i, ..)| *i == id).map(|(_, l, _)| l.clone());
     match l {
         Some(l) => hand_out_details(l, out),
         None => NOT_FOUND,
@@ -924,7 +926,7 @@ unsafe extern "system" fn copy_by_ui_event(_h: usize, o: *const abi::UiEventIdOp
         return INVALID_PARAMETERS;
     }
     unsafe { *out = 0 };
-    let l = H.lock().unwrap().ui_events.get(&unsafe { (*o).UiEventId }).cloned();
+    let l = crate::sys::lock(&H).ui_events.get(&unsafe { (*o).UiEventId }).cloned();
     match l {
         Some(l) => hand_out_details(l, out),
         None => NOT_FOUND,
@@ -936,7 +938,7 @@ unsafe extern "system" fn copy_for_presence(_h: usize, _o: usize, out: *mut usiz
         return INVALID_PARAMETERS;
     }
     unsafe { *out = 0 };
-    let id = H.lock().unwrap().sessions.values().find(|s| s.presence).map(|s| s.id.clone());
+    let id = crate::sys::lock(&H).sessions.values().find(|s| s.presence).map(|s| s.id.clone());
     match id.and_then(|id| lan()?.lobby(&id)) {
         Some(l) => hand_out_details(l, out),
         None => NOT_FOUND,
@@ -982,13 +984,13 @@ unsafe extern "system" fn create_search(_h: usize, o: *const abi::U32Options, ou
         results: Vec::new(),
     });
     let k = key(&*s);
-    H.lock().unwrap().searches.insert(k, s);
+    crate::sys::lock(&H).searches.insert(k, s);
     unsafe { *out = k };
     SUCCESS
 }
 
 fn with_search(h: usize, f: impl FnOnce(&mut SearchObj) -> i32) -> i32 {
-    match H.lock().unwrap().searches.get_mut(&h) {
+    match crate::sys::lock(&H).searches.get_mut(&h) {
         Some(s) => f(s),
         None => INVALID_PARAMETERS,
     }
@@ -1081,7 +1083,7 @@ unsafe extern "system" fn search_set_max(h: usize, o: *const abi::U32Options) ->
 }
 
 unsafe extern "system" fn search_find(h: usize, _o: usize, cd: usize, cb: usize) {
-    let query = H.lock().unwrap().searches.get(&h).map(|s| s.query.clone());
+    let query = crate::sys::lock(&H).searches.get(&h).map(|s| s.query.clone());
     let Some(query) = query else {
         return done(cb, cd, INVALID_PARAMETERS);
     };
@@ -1091,11 +1093,11 @@ unsafe extern "system" fn search_find(h: usize, _o: usize, cd: usize, cb: usize)
     // A search for one session or player that finds nothing is NotFound.
     let specific = query.lobby_id.is_some() || query.member.is_some();
     let search = lan.search(query);
-    H.lock().unwrap().finds.insert(search, (h, cb, cd, specific));
+    crate::sys::lock(&H).finds.insert(search, (h, cb, cd, specific));
 }
 
 unsafe extern "system" fn search_count(h: usize, _o: usize) -> u32 {
-    H.lock().unwrap().searches.get(&h).map_or(0, |s| s.results.len() as u32)
+    crate::sys::lock(&H).searches.get(&h).map_or(0, |s| s.results.len() as u32)
 }
 
 unsafe extern "system" fn search_copy(h: usize, o: *const abi::U32Options, out: *mut usize) -> i32 {
@@ -1104,7 +1106,7 @@ unsafe extern "system" fn search_copy(h: usize, o: *const abi::U32Options, out: 
     }
     unsafe { *out = 0 };
     let i = unsafe { (*o).Value } as usize;
-    let l = H.lock().unwrap().searches.get(&h).and_then(|s| s.results.get(i).cloned());
+    let l = crate::sys::lock(&H).searches.get(&h).and_then(|s| s.results.get(i).cloned());
     match l {
         Some(l) => hand_out_details(l, out),
         None => NOT_FOUND,
@@ -1112,13 +1114,13 @@ unsafe extern "system" fn search_copy(h: usize, o: *const abi::U32Options, out: 
 }
 
 unsafe extern "system" fn search_release(h: usize) {
-    H.lock().unwrap().searches.remove(&h);
+    crate::sys::lock(&H).searches.remove(&h);
 }
 
 // ---- details ----
 
 fn with_details<R>(h: usize, missing: R, f: impl FnOnce(&Lobby) -> R) -> R {
-    match H.lock().unwrap().details.get(&h) {
+    match crate::sys::lock(&H).details.get(&h) {
         Some(l) => f(l),
         None => missing,
     }
@@ -1280,7 +1282,7 @@ unsafe extern "system" fn details_attr_by_key(h: usize, o: *const abi::KeyOption
 }
 
 unsafe extern "system" fn details_release(h: usize) {
-    H.lock().unwrap().details.remove(&h);
+    crate::sys::lock(&H).details.remove(&h);
 }
 
 unsafe extern "system" fn free(p: usize) {
@@ -1302,20 +1304,20 @@ unsafe extern "system" fn copy_active(_h: usize, o: *const abi::PtrOptions, out:
     }
     let a = Box::new(name);
     let k = key(&*a);
-    H.lock().unwrap().actives.insert(k, a);
+    crate::sys::lock(&H).actives.insert(k, a);
     unsafe { *out = k };
     SUCCESS
 }
 
 fn active(h: usize) -> Option<(String, Lobby)> {
-    let name = H.lock().unwrap().actives.get(&h).map(|n| (**n).clone())?;
+    let name = crate::sys::lock(&H).actives.get(&h).map(|n| (**n).clone())?;
     let l = session_id(&name).and_then(|id| lan()?.lobby(&id))?;
     Some((name, l))
 }
 
 /// The registered players of a session as this copy knows them.
 fn players_of(l: &Lobby) -> Vec<peerparty_core::PeerId> {
-    H.lock().unwrap().registered.get(&l.id).cloned().unwrap_or_else(|| registered(l))
+    crate::sys::lock(&H).registered.get(&l.id).cloned().unwrap_or_else(|| registered(l))
 }
 
 unsafe extern "system" fn active_copy_info(h: usize, _o: usize, out: *mut usize) -> i32 {
@@ -1370,7 +1372,7 @@ unsafe extern "system" fn active_player_by_index(h: usize, o: *const abi::U32Opt
 }
 
 unsafe extern "system" fn active_release(h: usize) {
-    H.lock().unwrap().actives.remove(&h);
+    crate::sys::lock(&H).actives.remove(&h);
 }
 
 // ---- notifications ----
@@ -1400,10 +1402,10 @@ unsafe extern "system" fn remove_notify(_h: usize, id: u64) {
 pub fn on_event(_lan: &Lan, ev: &Event) {
     match ev {
         Event::SearchDone { search, results } => {
-            let found = H.lock().unwrap().finds.remove(search);
+            let found = crate::sys::lock(&H).finds.remove(search);
             let Some((handle, cb, cd, specific)) = found else { return };
             {
-                let mut h = H.lock().unwrap();
+                let mut h = crate::sys::lock(&H);
                 for l in results {
                     h.ids.insert(l.id.clone());
                 }
@@ -1420,13 +1422,13 @@ pub fn on_event(_lan: &Lan, ev: &Event) {
             unsafe { call(cb, &info) };
         }
         Event::JoinDone { lobby, result } => {
-            let Some((name, presence, cb, cd)) = H.lock().unwrap().joins.remove(lobby) else {
+            let Some((name, presence, cb, cd)) = crate::sys::lock(&H).joins.remove(lobby) else {
                 return;
             };
             trace("EOS_Sessions_JoinSession(done)", || format!("{name} {lobby} {result:?}"));
             let code = match result {
                 JoinResult::Ok => {
-                    H.lock().unwrap().sessions.insert(
+                    crate::sys::lock(&H).sessions.insert(
                         name,
                         Session {
                             id: lobby.clone(),
@@ -1454,7 +1456,7 @@ pub fn on_event(_lan: &Lan, ev: &Event) {
             ..
         } => {
             // The host ended it: the session is gone here too.
-            H.lock().unwrap().sessions.retain(|_, s| s.id != *lobby);
+            crate::sys::lock(&H).sessions.retain(|_, s| s.id != *lobby);
         }
         Event::Invite {
             from,

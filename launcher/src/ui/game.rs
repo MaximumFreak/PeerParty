@@ -8,7 +8,7 @@ use eframe::egui::{self, Color32, CornerRadius, Rect, Sense, Vec2, pos2, vec2};
 use super::icons::Icon;
 use super::scan::Source;
 use super::settings::{layers, mode_labels, mode_values, sdk_name};
-use super::store::{GameOptions, SDK_MODES};
+use super::store::{GameOptions, sdk_modes};
 use super::theme::{self, ACCENT, ACCENT_HI, TEXT, TEXT2, TEXT3};
 use super::widgets::{self, Kind};
 use super::{Action, App, View, first_focus, fx, store};
@@ -19,8 +19,8 @@ const SPARK: Duration = Duration::from_millis(900);
 
 impl App {
     pub(super) fn details(&mut self, ui: &mut egui::Ui, key: String) {
-        let Some(g) = self.game(&key).cloned() else {
-            self.selected = None;
+        let Some(g) = self.lib.game(&key).cloned() else {
+            self.lib.selected = None;
             return;
         };
         let mut o = self.settings.options(&key);
@@ -28,7 +28,7 @@ impl App {
         let mut actions = Vec::new();
         let mut close = false;
         let full = ui.max_rect();
-        let glow = self.glow_of(&g, &key);
+        let glow = self.icons.glow_of(&g, &key);
         {
             let p = ui.painter();
             fx::light(p, pos2(full.center().x, full.top() + 120.0), vec2(full.width() * 0.85, 300.0), glow.gamma_multiply(0.20));
@@ -57,7 +57,7 @@ impl App {
                 });
                 ui.add_space(16.0);
                 ui.add(egui::Label::new(egui::RichText::new(&g.name).font(theme::strong(23.0)).color(TEXT)).wrap());
-                let running = self.running(&key);
+                let running = self.sessions.running(&key);
                 ui.horizontal_wrapped(|ui| {
                     let origin = self.origin(&g, &key);
                     let (r, _) = ui.allocate_exact_size(vec2(ui.painter().layout_no_wrap(origin.to_string(), theme::strong(11.0), TEXT).size().x + 14.0, 20.0), Sense::hover());
@@ -76,44 +76,83 @@ impl App {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(t!("game.players_here")).size(13.0).color(TEXT2));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let mut n = o.players.clamp(1, 2);
-                            if widgets::segmented(ui, &mut n, &[(1u8, "1"), (2u8, "2")]) {
+                            let mut n = o.players.clamp(1, 4);
+                            if widgets::segmented(ui, &mut n, &[(1u8, "1"), (2u8, "2"), (3u8, "3"), (4u8, "4")]) {
+                                let was = o.players;
                                 o.players = n;
+                                if n == 1 {
+                                    o.split_screen = false;
+                                    o.split_layout.clear();
+                                } else if was <= 1 || n >= 3 {
+                                    o.split_screen = true;
+                                }
                             }
                         });
                     });
                     if o.players >= 2 {
-                        ui.add(egui::Label::new(egui::RichText::new(t!("game.players_two_note")).size(12.0).color(TEXT3)).wrap());
-                        // The label wraps beside the stepper rather than running under it.
-                        ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            let w = (ui.available_width() - 168.0).max(80.0);
-                            ui.vertical(|ui| {
-                                ui.set_width(w);
-                                ui.add(egui::Label::new(egui::RichText::new(t!("game.second_after")).size(13.5).color(TEXT)).wrap());
-                            });
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let opts = store::SECOND_DELAYS;
-                                let labels: Vec<String> = opts.iter().map(|s| t!("common.seconds", n = s)).collect();
-                                let mut i = opts.iter().position(|s| *s >= self.settings.second_delay).unwrap_or(4);
-                                if widgets::stepper(ui, "delay", &labels, &mut i, 160.0).changed() {
-                                    self.settings.second_delay = opts[i];
-                                    self.save_settings();
+                        let mut split = o.split_screen;
+                        stacked(ui, t!("game.split_screen"), t!("game.split_screen_sub"), |ui| {
+                            if widgets::switch(ui, &mut split).changed() {
+                                o.split_screen = split;
+                                if !split && o.players > 2 {
+                                    o.players = 2;
+                                }
+                            }
+                        });
+                        if o.split_screen {
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new(t!("game.split_layout")).size(13.5).color(TEXT));
+                            let mut layout = o.effective_split_layout();
+                            let layout_opts = [
+                                ("horizontal", t!("game.layout_horizontal")),
+                                ("vertical", t!("game.layout_vertical")),
+                                ("grid", t!("game.layout_grid")),
+                            ];
+                            ui.push_id("split-layout", |ui| {
+                                if widgets::segmented(ui, &mut layout, &layout_opts) {
+                                    o.split_layout = layout.to_string();
                                 }
                             });
-                        });
+                            ui.add_space(2.0);
+                            ui.add(egui::Label::new(egui::RichText::new(t!("game.split_screen_note")).size(12.0).color(TEXT3)).wrap());
+                        } else {
+                            ui.add(egui::Label::new(egui::RichText::new(t!("game.players_two_note")).size(12.0).color(TEXT3)).wrap());
+                            // The label wraps beside the stepper rather than running under it.
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                let w = (ui.available_width() - 168.0).max(80.0);
+                                ui.vertical(|ui| {
+                                    ui.set_width(w);
+                                    ui.add(egui::Label::new(egui::RichText::new(t!("game.second_after")).size(13.5).color(TEXT)).wrap());
+                                });
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    let opts = store::SECOND_DELAYS;
+                                    let labels: Vec<String> = opts.iter().map(|s| t!("common.seconds", n = s)).collect();
+                                    let mut i = opts.iter().position(|s| *s >= self.settings.second_delay).unwrap_or(4);
+                                    if widgets::stepper(ui, "delay", &labels, &mut i, 160.0).changed() {
+                                        self.settings.second_delay = opts[i];
+                                        self.save_settings();
+                                    }
+                                });
+                            });
+                        }
                     }
                     // For the second copy, or the next one "Start another instance" adds. Not a
                     // setting: it is off whenever the window starts and once a start used it.
-                    if self.copy_saves_offered(&key, o.players, !running.is_empty()) {
-                        let mut copy = self.copy_saves.contains(&key);
-                        let to = self.copy_saves_target(&key);
-                        stacked(ui, &t!("game.copy_saves", player = to), t!("game.copy_saves_sub"), |ui| {
+                    if self.sessions.copy_saves_offered(&key, o.players, !running.is_empty()) {
+                        let mut copy = self.sessions.copy_saves.contains(&key);
+                        let label = if o.uses_split_screen() && running.is_empty() && o.players > 2 {
+                            t!("game.copy_saves_others").to_string()
+                        } else {
+                            let to = self.sessions.copy_saves_target(&key);
+                            t!("game.copy_saves", player = to)
+                        };
+                        stacked(ui, &label, t!("game.copy_saves_sub"), |ui| {
                             if widgets::switch(ui, &mut copy).changed() {
                                 if copy {
-                                    self.copy_saves.insert(key.clone());
+                                    self.sessions.copy_saves.insert(key.clone());
                                 } else {
-                                    self.copy_saves.remove(&key);
+                                    self.sessions.copy_saves.remove(&key);
                                 }
                             }
                         });
@@ -184,7 +223,7 @@ impl App {
             });
         });
         if close {
-            self.selected = None;
+            self.lib.selected = None;
         }
         if o != before {
             if o == GameOptions::default() {
@@ -197,50 +236,27 @@ impl App {
         self.apply(actions);
     }
 
-    /// Whether "Copy Player 1's saves to Player N" is shown: at 2 players (it is for copy 2),
-    /// or at 1 once a copy runs (for the one "Start another instance" adds). A first copy
-    /// never copies, so at 1 with nothing running there is nothing for it to do. Hidden
-    /// too while a queued copy counts down: that copy's saves are settled already, and
-    /// the switch would name the one after it. Hidden, it is also turned off, so it
-    /// never comes back on by itself.
-    pub(super) fn copy_saves_offered(&mut self, key: &str, players: u8, running: bool) -> bool {
-        let waiting = self.pending.iter().any(|p| p.key == key);
-        let shown = (players >= 2 || running) && !waiting;
-        if !shown {
-            self.copy_saves.remove(key);
-        }
-        shown
-    }
-
-    /// The player the save switch is for: the next copy Play adds (2 before the first
-    /// starts at two players; after the last running copy otherwise; the switch isn't
-    /// shown while one waits, but the count goes past it all the same).
-    pub(super) fn copy_saves_target(&self, key: &str) -> u8 {
-        let running = self.running(key).last().copied().unwrap_or(0);
-        let waiting = self.pending.iter().filter(|p| p.key == key).map(|p| p.player).max().unwrap_or(0);
-        running.max(waiting).max(1) + 1
-    }
-
     fn play_button(&mut self, ui: &mut egui::Ui, g: &super::scan::Game, key: &str, o: &GameOptions, running: &[u8], actions: &mut Vec<Action>) {
         // An Xbox app game runs one copy per PC: Windows won't start another while one
         // runs, so the button says so instead.
         let xbox = g.source == Source::Xbox;
-        let waiting = self.pending.iter().find(|p| p.key == key).map(|p| (p.player, p.at.saturating_duration_since(std::time::Instant::now()).as_secs() + 1));
-        let label: String = match (o.players >= 2 && !xbox, running.is_empty(), xbox) {
+        let waiting = self.sessions.pending.iter().find(|p| p.key == key).map(|p| (p.player, p.at.saturating_duration_since(std::time::Instant::now()).as_secs() + 1));
+        let label: String = match (o.uses_split_screen() && !xbox, o.players >= 2 && !xbox, running.is_empty(), xbox) {
             // The two-player start's second copy is waiting: Play starts it now.
             _ if waiting.is_some() => {
                 let (player, left) = waiting.unwrap_or_default();
                 t!("game.start_now", player = player, n = left)
             }
-            (_, false, true) => t!("game.already_running").to_string(),
-            (true, true, _) => t!("game.play_two").to_string(),
-            (false, true, _) => t!("game.play").to_string(),
+            (_, _, false, true) => t!("game.already_running").to_string(),
+            (true, _, true, _) => t!("game.play_split", n = o.players.clamp(2, 4)),
+            (false, true, true, _) => t!("game.play_two").to_string(),
+            (false, false, true, _) => t!("game.play").to_string(),
             // With a copy running, Play adds one more, whatever the count says.
-            (_, false, _) => t!("game.play_another").to_string(),
+            (_, _, false, _) => t!("game.play_another").to_string(),
         };
         let enabled = !(xbox && !running.is_empty());
         let resp = ui.add_enabled_ui(enabled, |ui| widgets::wide_button(ui, Some(Icon::Play), &label, Kind::Primary, 54.0)).inner;
-        first_focus(&resp, &mut self.focus_play);
+        first_focus(&resp, &mut self.nav.focus_play);
         let resp = if !enabled {
             resp.on_disabled_hover_text(t!("game.xbox_running_tip"))
         } else if !running.is_empty() {
@@ -252,7 +268,7 @@ impl App {
             actions.push(Action::Play(key.to_string()));
         }
         // The spark: electricity round the button, and a bolt off each end.
-        if let Some((at, seed)) = self.spark {
+        if let Some((at, seed)) = self.sessions.spark {
             let e = at.elapsed();
             if e < SPARK {
                 let t = e.as_secs_f32() / SPARK.as_secs_f32();
@@ -266,7 +282,7 @@ impl App {
                 fx::glow(p, r, 10.0, ACCENT_HI.gamma_multiply(0.5 * s), 26.0);
                 ui.ctx().request_repaint();
             } else {
-                self.spark = None;
+                self.sessions.spark = None;
             }
         }
     }
@@ -283,7 +299,7 @@ impl App {
         let exe = self.settings.options(key).exe.unwrap_or_else(|| g.exe.clone());
         let now = std::time::Instant::now();
         let fresh = |at: std::time::Instant| now.duration_since(at) < Duration::from_secs(5);
-        let entry = self.steam_ids.entry(exe.clone()).or_insert_with(|| {
+        let entry = self.checks.steam_ids.entry(exe.clone()).or_insert_with(|| {
             let look = crate::steamid::Game::look(&exe, Some(&g.dir));
             let missing = look.missing(&exe);
             (look, missing, now)
@@ -317,13 +333,13 @@ impl App {
                     ui.add(egui::Label::new(egui::RichText::new(text).size(12.0).color(TEXT2)).wrap());
                     ui.horizontal_wrapped(|ui| {
                         let label = if v.blocked() { t!("common.fix") } else { t!("join.allow_now") };
-                        if ui.add_enabled_ui(self.fixing.is_none(), |ui| widgets::button(ui, Some(Icon::Shield), label, Kind::Secondary)).inner.on_hover_text(t!("join.fix_tip")).clicked() {
-                            actions.push(Action::FixFirewall(exe.clone(), self.fw_public));
+                        if ui.add_enabled_ui(self.checks.fixing.is_none(), |ui| widgets::button(ui, Some(Icon::Shield), label, Kind::Secondary)).inner.on_hover_text(t!("join.fix_tip")).clicked() {
+                            actions.push(Action::FixFirewall(exe.clone(), self.checks.fw_public));
                         }
-                        widgets::switch(ui, &mut self.fw_public).on_hover_text(t!("join.public_too_tip"));
+                        widgets::switch(ui, &mut self.checks.fw_public).on_hover_text(t!("join.public_too_tip"));
                         ui.label(egui::RichText::new(t!("join.public_too")).size(12.5).color(TEXT2));
                     });
-                    if v.public && !self.fw_public {
+                    if v.public && !self.checks.fw_public {
                         ui.add(egui::Label::new(egui::RichText::new(t!("join.public_network")).size(12.0).color(TEXT3)).wrap());
                     }
                 }
@@ -354,16 +370,16 @@ impl App {
 
     fn advanced(&mut self, ui: &mut egui::Ui, g: &super::scan::Game, key: &str, o: &mut GameOptions, actions: &mut Vec<Action>) {
         widgets::section(ui, t!("settings.services"));
-        for (sdk, label, default) in SDK_MODES {
-            let global = self.settings.prefs.modes.get(*sdk).cloned().unwrap_or_else(|| default.to_string());
+        for (sdk, label, default) in sdk_modes() {
+            let global = self.settings.prefs.modes.get(sdk).cloned().unwrap_or_else(|| default.to_string());
             let mut labels = vec![t!("common.default_value", value = mode_labels(sdk)[mode_values().iter().position(|m| *m == global).unwrap_or(0)])];
             labels.extend(mode_labels(sdk).iter().map(|s| s.to_string()));
-            let cur = o.modes.get(*sdk).cloned().unwrap_or_default();
+            let cur = o.modes.get(sdk).cloned().unwrap_or_default();
             let mut i = if cur.is_empty() { 0 } else { 1 + mode_values().iter().position(|m| *m == cur).unwrap_or(0) };
             ui.label(egui::RichText::new(sdk_name(sdk, label)).size(13.0).color(TEXT2));
             if widgets::stepper(ui, ("mode", sdk), &labels, &mut i, ui.available_width()).changed() {
                 if i == 0 {
-                    o.modes.remove(*sdk);
+                    o.modes.remove(sdk);
                 } else {
                     o.modes.insert(sdk.to_string(), mode_values()[i - 1].to_string());
                 }
@@ -414,7 +430,7 @@ impl App {
         // argument quoted the way peerparty reads it back. Shown read-only (it can be
         // selected and copied, not typed into: the options above change it).
         let quote = |a: &str| if a.is_empty() || a.contains([' ', '\t', '"']) { crate::crt_quote(a) } else { a.to_string() };
-        let mut cmd = vec![quote(&self.peerparty.to_string_lossy())];
+        let mut cmd = vec![quote(&self.sessions.peerparty.to_string_lossy())];
         cmd.extend(self.command(g, o).iter().map(|a| quote(a)));
         let text = cmd.join(" ");
         ui.add(egui::TextEdit::multiline(&mut text.as_str()).font(egui::TextStyle::Monospace).desired_rows(2).desired_width(f32::INFINITY).background_color(theme::FIELD));

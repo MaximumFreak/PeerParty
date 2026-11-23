@@ -38,17 +38,17 @@ use super::hex;
 static LAST_KEY: Mutex<Option<[u8; 24]>> = Mutex::new(None);
 
 pub fn remember_session_key(key: [u8; 24]) {
-    *LAST_KEY.lock().unwrap() = Some(key);
+    *crate::sys::lock(&LAST_KEY) = Some(key);
 }
 
 /// The session key in a client auth message: the 24 bytes before PeerParty's mark in
 /// the server ticket it carries, else the latest sign-in's.
-fn session_key_in(auth: &[u8]) -> Option<[u8; 24]> {
+pub(crate) fn session_key_in(auth: &[u8]) -> Option<[u8; 24]> {
     let at = auth.windows(4).position(|w| w == SERVER_TICKET_MARK);
     if let Some(i) = at.filter(|i| *i >= 24) {
         return auth[i - 24..i].try_into().ok();
     }
-    *LAST_KEY.lock().unwrap()
+    *crate::sys::lock(&LAST_KEY)
 }
 
 const CLIENT_HEADER: u32 = 0xC8;
@@ -164,7 +164,7 @@ pub fn seal(keys: &Keys, count: u32, body: &[u8]) -> Vec<u8> {
     let mut plain = (body.len() as u32 - 1).to_le_bytes().to_vec();
     plain.extend_from_slice(body);
     plain.resize(plain.len().div_ceil(16) * 16, 0);
-    let iv: [u8; 16] = crate::photon::crypto::random_bytes(16).try_into().unwrap();
+    let iv: [u8; 16] = crate::util::crypto::random_bytes(16).try_into().unwrap();
     let enc = crypto::cbc_encrypt(&keys.server_to_client, &iv, &plain);
     let mut msg = ((30 + enc.len()) as i32).to_le_bytes().to_vec();
     msg.extend_from_slice(&[MARK, ENCRYPTED]);
@@ -260,7 +260,7 @@ fn run(conn: &mut TcpStream, c: &mut Conn) -> io::Result<()> {
     // 2. The server's header.
     let mut challenge = vec![0x16, 0, 0, 0, MARK, SERVER_HEADER];
     challenge.extend_from_slice(&SERVER_CHALLENGE.to_le_bytes());
-    challenge.extend_from_slice(&crate::photon::crypto::random_bytes(16));
+    challenge.extend_from_slice(&crate::util::crypto::random_bytes(16));
     c.transcript.extend_from_slice(&challenge);
     conn.write_all(&challenge)?;
 

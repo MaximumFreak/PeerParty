@@ -13,7 +13,7 @@ use crate::update::{self, Status};
 impl App {
     /// Each frame: the daily check when it is due, and one message per new version.
     pub(super) fn updates_tick(&mut self, ctx: &egui::Context) {
-        if !self.live {
+        if !self.checks.live {
             return;
         }
         let now = update::now_secs();
@@ -24,9 +24,9 @@ impl App {
             update::check_in_background(move || c.request_repaint());
         }
         if let Some(r) = update::available()
-            && self.update_told.as_deref() != Some(r.version.as_str())
+            && self.checks.update_told.as_deref() != Some(r.version.as_str())
         {
-            self.update_told = Some(r.version.clone());
+            self.checks.update_told = Some(r.version.clone());
             self.say(t!("update.snack", version = r.version), true);
         }
     }
@@ -35,7 +35,7 @@ impl App {
         let ctx = ui.ctx().clone();
         let status = update::status();
         let addon = update::in_addon();
-        let games = !self.sessions.is_empty();
+        let games = !self.sessions.sessions.is_empty();
         let mut check = false;
         let mut download = None;
         let mut notes = None;

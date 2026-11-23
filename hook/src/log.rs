@@ -35,9 +35,7 @@ thread_local! {
 }
 
 pub fn open(dll_dir: PathBuf, exe_name: &str) -> Option<PathBuf> {
-    let dir = std::env::var_os("PEERPARTY_LOG_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| dll_dir.join("logs"));
+    let dir = crate::config::HookConfig::global().log_dir.clone().unwrap_or_else(|| dll_dir.join("logs"));
     let _ = std::fs::create_dir_all(&dir);
     let t = unsafe {
         let mut t = std::mem::zeroed();
@@ -55,7 +53,10 @@ pub fn open(dll_dir: PathBuf, exe_name: &str) -> Option<PathBuf> {
         unsafe { GetCurrentProcessId() }
     );
     let path = dir.join(name);
-    let file = File::create(&path).ok()?;
+    // Appending: the session writes its own lines into this log while the game runs
+    // (the launcher's `launch::note`), and writes at a position of the hook's own would
+    // land over them.
+    let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok()?;
     LOG.set(Log {
         file: Mutex::new(file),
         start: Instant::now(),

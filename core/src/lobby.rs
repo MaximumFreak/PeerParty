@@ -64,14 +64,17 @@ impl Permission {
         matches!(self, Permission::Public | Permission::Unlisted)
     }
 
-    pub fn from_u8(v: u8) -> Permission {
-        match v {
+    /// `None` for a number that is none of these: never taken as `Public`, which would
+    /// open to strangers a lobby that was meant to be closed.
+    pub fn from_u8(v: u8) -> Option<Permission> {
+        Some(match v {
+            0 => Permission::Public,
             1 => Permission::Presence,
             2 => Permission::InviteOnly,
             3 => Permission::Friends,
             4 => Permission::Unlisted,
-            _ => Permission::Public,
-        }
+            _ => return None,
+        })
     }
 }
 
@@ -153,7 +156,7 @@ impl Claim {
 
 /// A new lobby's secret key.
 pub fn new_lobby_secret() -> [u8; 32] {
-    crate::inet::crypto::random_array()
+    crate::crypto::random_array()
 }
 
 /// The public half of a lobby's secret key, as its claims carry it.
@@ -443,8 +446,11 @@ mod tests {
         // A friends lobby is listed like a public one (who may ask is the engine's part).
         l.permission = Permission::Friends;
         assert!(matches(&l, &Query::new("eos.lobby")));
-        assert_eq!(Permission::from_u8(Permission::Friends as u8), Permission::Friends);
-        assert_eq!(Permission::from_u8(Permission::Unlisted as u8), Permission::Unlisted);
+        for p in [Permission::Public, Permission::Presence, Permission::InviteOnly, Permission::Friends, Permission::Unlisted] {
+            assert_eq!(Permission::from_u8(p as u8), Some(p));
+        }
+        assert_eq!(Permission::from_u8(5), None);
+        assert_eq!(Permission::from_u8(u8::MAX), None);
     }
 
     #[test]

@@ -182,10 +182,10 @@ unsafe extern "system" fn called(id: usize) {
 }
 
 /// The thunks' memory: (where they're written, where they run). Written while earlier
-/// thunks in it may be running, so through a view of its own (crate::hook::wx_block).
+/// thunks in it may be running, so through a view of its own (crate::sys::hook::wx_block).
 fn block() -> Option<(usize, usize)> {
     static BASE: OnceLock<Option<(usize, usize)>> = OnceLock::new();
-    *BASE.get_or_init(|| crate::hook::wx_block(THUNKS * THUNK))
+    *BASE.get_or_init(|| crate::sys::hook::wx_block(THUNKS * THUNK))
 }
 
 fn thunk_code(id: usize, handler: usize) -> Vec<u8> {
@@ -226,7 +226,7 @@ pub fn noted(name: &str, handler: usize) -> usize {
         return handler;
     }
     let Some((write, base)) = block() else { return handler };
-    let mut names = NAMES.lock().unwrap();
+    let mut names = crate::sys::lock(&NAMES);
     if let Some(i) = names.iter().position(|n| *n == name) {
         return base + i * THUNK;
     }
@@ -253,7 +253,7 @@ mod tests {
         let mut out = 0x5678usize;
         assert_eq!(unsafe { f(1, 2, 3, &mut out as *mut usize as usize) }, result::NOT_FOUND as usize);
         assert_eq!(out, 0, "the fourth argument came through");
-        let id = NAMES.lock().unwrap().iter().position(|n| *n == "EOS_Test_CopyThing").unwrap();
+        let id = crate::sys::lock(&NAMES).iter().position(|n| *n == "EOS_Test_CopyThing").unwrap();
         assert!(CALLED[id].load(Ordering::Relaxed));
         assert_eq!(noted("EOS_Test_CopyThing", h), noted("EOS_Test_CopyThing", h));
         assert_eq!(noted("EOS_Test_Release", h), h);

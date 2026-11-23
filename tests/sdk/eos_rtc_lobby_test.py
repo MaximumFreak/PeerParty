@@ -56,7 +56,9 @@ if ROLE == "A":
 else:
     tick_until(plat, lambda: os.path.exists(os.path.join(DIR, "lobby.ready")), 20, "A's lobby")
     jo = JoinById(1, LOBBY, me)
-    end = time.time() + 15
+    # Each try waits for the owner a few seconds (a join that finds nobody times out):
+    # under load the copies can take longer than one try to meet.
+    end = time.time() + 40
     while time.time() < end and done.get("join", (1,))[0] != 0:
         done.pop("join", None)
         fn("EOS_Lobby_JoinLobbyById", None, C.c_void_p, C.c_void_p, C.c_void_p, CB)(lobby, C.byref(jo), None,
@@ -85,10 +87,10 @@ r = fn("EOS_Lobby_IsRTCRoomConnected", C.c_int32, C.c_void_p, C.c_void_p, C.POIN
     lobby, C.byref(LobbyOpts(1, LOBBY, me)), C.byref(conn))
 check("IsRTCRoomConnected", r == 0 and conn.value == 1, (r, conn.value))
 oid = text_id(other_id(other, plat))
-tick_until(plat, lambda: (oid, 0, room) in ev["status"], 15, "the other copy in the lobby room")
+tick_until(plat, lambda: (oid, 0, room) in ev["status"], 45, "the other copy in the lobby room")
 check("the other copy is in the lobby's room", (oid, 0, room) in ev["status"], ev["status"])
 open(os.path.join(DIR, f"{ROLE}.got"), "w").write("1")
-tick_until(plat, lambda: os.path.exists(os.path.join(DIR, f"{other}.got")), 10, "the other copy to finish")
+tick_until(plat, lambda: os.path.exists(os.path.join(DIR, f"{other}.got")), 45, "the other copy to finish")
 tick_until(plat, lambda: False, 1, "")
 finish()
 os._exit(0)

@@ -338,7 +338,7 @@ unsafe extern "system" fn set_ports(_h: usize, o: *const abi::PortRangeOptions) 
     if o.is_null() {
         return INVALID_PARAMETERS;
     }
-    *PORTS.lock().unwrap() = unsafe { ((*o).Port, (*o).MaxAdditionalPortsToTry) };
+    *crate::sys::lock(&PORTS) = unsafe { ((*o).Port, (*o).MaxAdditionalPortsToTry) };
     SUCCESS
 }
 
@@ -346,7 +346,7 @@ unsafe extern "system" fn get_ports(_h: usize, _o: usize, port: *mut u16, extra:
     if port.is_null() || extra.is_null() {
         return INVALID_PARAMETERS;
     }
-    let (p, n) = *PORTS.lock().unwrap();
+    let (p, n) = *crate::sys::lock(&PORTS);
     unsafe {
         *port = p;
         *extra = n;
@@ -358,7 +358,7 @@ unsafe extern "system" fn set_queue_size(_h: usize, o: *const abi::PacketQueueSi
     if o.is_null() {
         return INVALID_PARAMETERS;
     }
-    *QUEUE_LIMITS.lock().unwrap() = unsafe {
+    *crate::sys::lock(&QUEUE_LIMITS) = unsafe {
         (
             (*o).IncomingPacketQueueMaxSizeBytes,
             (*o).OutgoingPacketQueueMaxSizeBytes,
@@ -372,7 +372,7 @@ unsafe extern "system" fn queue_info(_h: usize, _o: usize, out: *mut abi::Packet
         return INVALID_PARAMETERS;
     }
     let (count, bytes) = lan().map_or((0, 0), |l| l.inbox_size());
-    let (max_in, max_out) = *QUEUE_LIMITS.lock().unwrap();
+    let (max_in, max_out) = *crate::sys::lock(&QUEUE_LIMITS);
     unsafe {
         out.write(abi::PacketQueueInfo {
             IncomingPacketQueueMaxSizeBytes: max_in,

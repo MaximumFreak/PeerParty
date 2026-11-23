@@ -9,15 +9,33 @@
 //!   are also XInput devices (`IG_` in their path) are skipped so they don't count twice.
 //!
 //! Every pad maps to one logical layout: south / east / west / north face buttons, the
-//! shoulders, back / start / home, the d-pad and the left stick. `Style` says which
+//! shoulders, back / start / home, the stick clicks, the d-pad, both sticks and the
+//! triggers. The overlay works with the buttons, the d-pad and the left stick; a
+//! split-screen copy's virtual controller gets all of it (host/input_hub.rs). `Style` says which
 //! glyphs to show for the pad that was used last. A Home press is noticed per pad
 //! (`home_pressed`), so any connected controller opens the overlay, whatever the others
 //! are holding. It counts only after that pad's Home was seen up: a pad that appears
 //! with Home down (Steam Input swapping its own pad in as a Steam game starts), or Home
 //! still down from closing Game Bar outside the game (`hold_home`), opens nothing.
+//!
+//! On Linux there's no XInput: every controller is an evdev device, read by
+//! backend/linux/pads.rs into the same per-device entries (`Hid`) the HID readers fill.
+//!
+//! The scan and the readers are threads `Pads` owns (`Threads`): dropping it stops them
+//! and waits for them (a reader blocked on a quiet device is woken), so none outlives it.
+//! `readings` gives each controller apart, by seat, for a session that hands controllers
+//! out by index (host/input_hub.rs). A controller takes a seat the first time it's used
+//! (a button, or a stick or trigger pushed past half way), not when it's first seen: a
+//! controller app that swaps its virtual pad as a game starts (a virtual Xbox pad for a
+//! virtual DualSense, Steam Input's pad for the real one) can leave the old one plugged
+//! in and idle, and that one mustn't take a player's seat. A controller keeps its seat
+//! for as long as `Pads` lives, so one going away (asleep, out of battery, a wireless
+//! drop) leaves its seat empty instead of handing the next player's controller to its
+//! copy.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 pub const SOUTH: u32 = 1 << 0;
@@ -33,6 +51,9 @@ pub const UP: u32 = 1 << 9;
 pub const DOWN: u32 = 1 << 10;
 pub const LEFT: u32 = 1 << 11;
 pub const RIGHT: u32 = 1 << 12;
+/// The stick clicks (L3 / R3).
+pub const LSTICK: u32 = 1 << 13;
+pub const RSTICK: u32 = 1 << 14;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Style {
@@ -42,15 +63,27 @@ pub enum Style {
     Nintendo,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct State {
     pub buttons: u32,
     /// Left stick, -1..1, up positive.
     pub lx: f32,
     pub ly: f32,
+    /// Right stick, the same way.
+    pub rx: f32,
+    pub ry: f32,
+    /// Triggers, 0 (released) to 1.
+    pub lt: f32,
+    pub rt: f32,
 }
 
 impl State {
+    /// Whether a player is using the controller: a button down, or a stick or trigger
+    /// pushed past half way (a resting stick's drift doesn't count).
+    pub fn in_use(self) -> bool {
+        self.buttons != 0 || [self.lx, self.ly, self.rx, self.ry].iter().any(|v| v.abs() > 0.5) || self.lt > 0.5 || self.rt > 0.5
+    }
+
     /// The buttons, with the stick as the d-pad (`stick`, from rest).
     pub fn with_stick(self) -> u32 {
         self.buttons | self.stick(0)
@@ -88,27 +121,143 @@ const STATE_LEN: usize = 20;
 
 type GetStateFn = unsafe extern "system" fn(u32, *mut [u8; STATE_LEN]) -> u32;
 
-struct Hid {
-    path: String,
-    vid: u16,
-    pid: u16,
-    style: Style,
-    state: Arc<Mutex<State>>,
-    alive: Arc<AtomicBool>,
+/// One controller read on a thread of its own: a HID device on Windows, an evdev one on
+/// Linux. The thread writes `state` and clears `alive` when the device goes.
+pub(crate) struct Hid {
+    pub(crate) path: String,
+    pub(crate) vid: u16,
+    pub(crate) pid: u16,
+    pub(crate) style: Style,
+    pub(crate) state: Arc<Mutex<State>>,
+    pub(crate) alive: Arc<AtomicBool>,
     /// Home was down at the last poll, or hasn't been seen up yet.
-    home: bool,
+    pub(crate) home: bool,
     /// The direction its stick gave at the last poll (`State::stick`).
-    stick: u32,
+    pub(crate) stick: u32,
+    /// Its key for the game's hook (`input_shm::hid_key`), 0 where there's none.
+    pub(crate) key: u64,
+}
+
+/// One controller as the last poll read it (`Pads::readings`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Reading {
+    /// "XInput slot 0", "HID 054c:0ce6": the log's name for it.
+    pub name: String,
+    pub style: Style,
+    /// Its buttons (the stick not folded in), sticks and triggers.
+    pub state: State,
+    /// An XInput pad: its slot and its `XINPUT_GAMEPAD` as XInput gave it.
+    pub xinput: Option<(u32, [u8; 12])>,
+    /// A HID pad's key (`input_shm::hid_key`); 0 for none, or when another pad read has
+    /// the same one (two pads of a model without serial numbers can't be told apart).
+    pub hid_key: u64,
+}
+
+/// How long `Threads::stop_all` waits for its threads before leaving the rest to end by
+/// themselves (each checks `stop` after its next read).
+const STOP_WAIT: Duration = Duration::from_millis(500);
+
+/// The threads reading controllers: a flag that asks them to end, and their handles,
+/// joined by `stop_all` (which `Pads` calls when it's dropped).
+pub(crate) struct Threads {
+    stop: AtomicBool,
+    handles: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl Threads {
+    pub(crate) fn new() -> Arc<Threads> {
+        Arc::new(Threads { stop: AtomicBool::new(false), handles: Mutex::new(Vec::new()) })
+    }
+
+    /// Whether the threads have been asked to end.
+    pub(crate) fn stopping(&self) -> bool {
+        self.stop.load(Ordering::Acquire)
+    }
+
+    /// Runs `f` on a thread of its own, kept to be joined; false (nothing started) once
+    /// stopping, or when the thread can't start.
+    pub(crate) fn spawn(&self, name: &str, f: impl FnOnce() + Send + 'static) -> bool {
+        if self.stopping() {
+            return false;
+        }
+        let Ok(t) = std::thread::Builder::new().name(name.into()).spawn(f) else { return false };
+        let mut handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
+        // The ones that ended (their device went) are joined as new ones start.
+        let (done, running): (Vec<_>, Vec<_>) = std::mem::take(&mut *handles).into_iter().partition(|t| t.is_finished());
+        *handles = running;
+        handles.push(t);
+        drop(handles);
+        for t in done {
+            let _ = t.join();
+        }
+        true
+    }
+
+    /// Asks every thread to end, wakes the ones blocked reading a quiet device, and
+    /// waits for them (at most `wait`). Whether all of them ended.
+    pub(crate) fn stop_all(&self, wait: Duration) -> bool {
+        self.stop.store(true, Ordering::Release);
+        let until = Instant::now() + wait;
+        let mut handles = std::mem::take(&mut *self.handles.lock().unwrap_or_else(|e| e.into_inner()));
+        loop {
+            let (done, running): (Vec<_>, Vec<_>) = handles.into_iter().partition(|t| t.is_finished());
+            for t in done {
+                let _ = t.join();
+            }
+            handles = running;
+            if handles.is_empty() {
+                return true;
+            }
+            if Instant::now() >= until {
+                // Left to end by themselves at their next read.
+                return false;
+            }
+            for t in &handles {
+                wake(t);
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+
+/// Ends a reader's blocked `ReadFile` (it then sees `stop`). One between reads isn't
+/// blocked: it sees `stop` itself, and this is tried again until it has ended.
+#[cfg(windows)]
+fn wake(t: &JoinHandle<()>) {
+    use std::os::windows::io::AsRawHandle;
+    unsafe { windows_sys::Win32::System::IO::CancelSynchronousIo(t.as_raw_handle() as _) };
+}
+
+/// Linux's readers wait in `poll` with a timeout, and see `stop` by themselves.
+#[cfg(not(windows))]
+fn wake(_t: &JoinHandle<()>) {}
+
+/// Which controller a seat is (`Pads::readings`): an XInput slot, or a HID (evdev)
+/// device by its path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Seat {
+    XInput(u32),
+    Device(String),
 }
 
 pub struct Pads {
     xinput: Option<GetStateFn>,
+    /// Every controller used, in the order they were first used: a controller's index
+    /// in `per`, `homes` and `readings` is its place here.
+    seats: Vec<Seat>,
     /// When each XInput slot was last tried while disconnected (a call on an empty slot
     /// is slow, so those are tried every two seconds).
     tried: [Option<Instant>; 4],
     connected: [bool; 4],
     hid: Arc<Mutex<Vec<Hid>>>,
     last_scan: Option<Instant>,
+    /// The scan running now, if one is (one at a time).
+    scan: Option<JoinHandle<()>>,
+    /// The scan's and the readers' threads, stopped and joined when this is dropped.
+    threads: Arc<Threads>,
+    /// What each XInput slot read at the last poll (`readings`), decoded and as it came.
+    x_state: [State; 4],
+    x_raw: [[u8; 12]; 4],
     /// The first HID scan has finished (until then `found` may be missing HID pads).
     scanned: Arc<AtomicBool>,
     pub style: Style,
@@ -117,27 +266,38 @@ pub struct Pads {
     x_home: [bool; 4],
     /// The direction each XInput pad's stick gave at the last poll (`State::stick`).
     x_stick: [u32; 4],
-    /// Some controller's Home went down since the last poll.
-    pub home_pressed: bool,
-    /// Which controller that was, for the log.
-    pub home_by: String,
+    /// Each controller's buttons at the last poll, the stick folded into the d-pad, by
+    /// seat (`readings()` index; 0 for one away now): a split-screen player's overlay
+    /// reads their own.
+    pub per: Vec<u32>,
+    /// Every controller whose Home went down since the last poll: its seat and its name
+    /// for the log (two players can press at once).
+    pub homes: Vec<(usize, String)>,
+    /// Controllers that first took a seat during the last poll: `(seat, name)`.
+    pub newly_seated: Vec<(usize, String)>,
 }
 
 impl Pads {
     pub fn new() -> Pads {
         Pads {
             xinput: xinput(),
+            seats: Vec::new(),
             tried: [None; 4],
             connected: [false; 4],
             hid: Arc::new(Mutex::new(Vec::new())),
             last_scan: None,
+            scan: None,
+            threads: Threads::new(),
+            x_state: [State::default(); 4],
+            x_raw: [[0; 12]; 4],
             scanned: Arc::new(AtomicBool::new(false)),
             style: Style::Xbox,
             last_buttons: 0,
             x_home: [true; 4],
             x_stick: [0; 4],
-            home_pressed: false,
-            home_by: String::new(),
+            per: Vec::new(),
+            homes: Vec::new(),
+            newly_seated: Vec::new(),
         }
     }
 
@@ -152,14 +312,23 @@ impl Pads {
     /// Every pad's buttons together, the stick folded into the d-pad.
     pub fn poll(&mut self) -> u32 {
         let mut all = 0u32;
-        self.home_pressed = false;
-        if self.last_scan.is_none_or(|t| t.elapsed() > Duration::from_secs(3)) {
+        self.per.clear();
+        self.per.resize(self.seats.len(), 0);
+        self.homes.clear();
+        self.newly_seated.clear();
+        if self.last_scan.is_none_or(|t| t.elapsed() > Duration::from_secs(3)) && self.scan.as_ref().is_none_or(|t| t.is_finished()) {
             self.last_scan = Some(Instant::now());
-            let (hid, scanned) = (self.hid.clone(), self.scanned.clone());
-            std::thread::spawn(move || {
-                scan_hid(&hid);
-                scanned.store(true, Ordering::Relaxed);
-            });
+            if let Some(t) = self.scan.take() {
+                let _ = t.join();
+            }
+            let (hid, scanned, threads) = (self.hid.clone(), self.scanned.clone(), self.threads.clone());
+            self.scan = std::thread::Builder::new()
+                .name("peerparty-pad-scan".into())
+                .spawn(move || {
+                    scan_hid(&hid, &threads);
+                    scanned.store(true, Ordering::Relaxed);
+                })
+                .ok();
         }
         if let Some(get) = self.xinput {
             for pad in 0..4u32 {
@@ -174,30 +343,44 @@ impl Pads {
                     self.tried[i] = Some(Instant::now());
                     self.x_home[i] = true;
                     self.x_stick[i] = 0;
+                    self.x_state[i] = State::default();
+                    self.x_raw[i] = [0; 12];
                     continue;
                 }
                 let b = from_xinput(&s);
+                self.x_state[i] = b;
+                self.x_raw[i].copy_from_slice(&s[4..16]);
+                let seat = self.seat(Seat::XInput(pad), b.in_use(), || format!("XInput slot {pad}"));
                 let home = b.buttons & HOME != 0;
-                if home && !self.x_home[i] {
-                    self.home_pressed = true;
-                    self.home_by = format!("XInput slot {pad}");
+                if home
+                    && !self.x_home[i]
+                    && let Some(seat) = seat
+                {
+                    self.pressed_home(seat, format!("XInput slot {pad}"));
                 }
                 self.x_home[i] = home;
                 if b.buttons != 0 && b.buttons != self.last_buttons {
                     self.style = Style::Xbox;
                 }
                 self.x_stick[i] = b.stick(self.x_stick[i]);
+                if let Some(seat) = seat {
+                    self.per[seat] = b.buttons | self.x_stick[i];
+                }
                 all |= b.buttons | self.x_stick[i];
             }
         }
-        let mut hid = self.hid.lock().unwrap();
+        let hid = self.hid.clone();
+        let mut hid = hid.lock().unwrap();
         hid.retain(|h| h.alive.load(Ordering::Relaxed));
         for h in hid.iter_mut() {
             let s = *h.state.lock().unwrap();
+            let seat = self.seat(Seat::Device(h.path.clone()), s.in_use(), || format!("HID {:04x}:{:04x}", h.vid, h.pid));
             let home = s.buttons & HOME != 0;
-            if home && !h.home {
-                self.home_pressed = true;
-                self.home_by = format!("HID {:04x}:{:04x}", h.vid, h.pid);
+            if home
+                && !h.home
+                && let Some(seat) = seat
+            {
+                self.pressed_home(seat, format!("HID {:04x}:{:04x}", h.vid, h.pid));
             }
             h.home = home;
             h.stick = s.stick(h.stick);
@@ -205,15 +388,84 @@ impl Pads {
             if s.buttons != 0 && s.buttons != self.last_buttons {
                 self.style = h.style;
             }
+            if let Some(seat) = seat {
+                self.per[seat] = b;
+            }
             all |= b;
         }
         self.last_buttons = all;
         all
     }
+
+    /// Controller `seat`'s index. One without a seat yet gets a new one at the end (with
+    /// its place in `per`) if it's `used` now, and none otherwise.
+    fn seat(&mut self, seat: Seat, used: bool, label: impl FnOnce() -> String) -> Option<usize> {
+        let i = match self.seats.iter().position(|s| *s == seat) {
+            Some(i) => i,
+            None if used => {
+                self.seats.push(seat);
+                let idx = self.seats.len() - 1;
+                self.newly_seated.push((idx, label()));
+                idx
+            }
+            None => return None,
+        };
+        if self.per.len() <= i {
+            self.per.resize(i + 1, 0);
+        }
+        Some(i)
+    }
+
+    /// Controller `index` (its `readings()` index), named `name`, had Home go down.
+    fn pressed_home(&mut self, index: usize, name: String) {
+        self.homes.push((index, name));
+    }
+}
+
+impl Drop for Pads {
+    /// Stops the scan and the readers, and waits for them.
+    fn drop(&mut self) {
+        self.threads.stop.store(true, Ordering::Release);
+        if let Some(t) = self.scan.take() {
+            let _ = t.join();
+        }
+        self.threads.stop_all(STOP_WAIT);
+    }
 }
 
 impl Pads {
-    /// Each controller read, with its buttons now (`peerparty --pads`).
+    /// Every controller used, by seat (the order they were first used in), as the last
+    /// poll read it: None for one away now. A seat is never handed to another
+    /// controller, so a copy given seat 0 never gets the next player's.
+    pub fn readings(&self) -> Vec<Option<Reading>> {
+        let hid = self.hid.lock().unwrap();
+        let mut out: Vec<Option<Reading>> = self
+            .seats
+            .iter()
+            .map(|seat| match seat {
+                Seat::XInput(slot) => {
+                    let i = *slot as usize;
+                    (self.xinput.is_some() && self.connected[i]).then(|| Reading {
+                        name: format!("XInput slot {slot}"),
+                        style: Style::Xbox,
+                        state: self.x_state[i],
+                        xinput: Some((*slot, self.x_raw[i])),
+                        hid_key: 0,
+                    })
+                }
+                Seat::Device(path) => hid.iter().find(|h| h.path == *path && h.alive.load(Ordering::Relaxed)).map(|h| Reading {
+                    name: format!("HID {:04x}:{:04x}", h.vid, h.pid),
+                    style: h.style,
+                    state: *h.state.lock().unwrap(),
+                    xinput: None,
+                    hid_key: h.key,
+                }),
+            })
+            .collect();
+        unique_keys(&mut out);
+        out
+    }
+
     /// Whether the first HID scan is done, so `found` names every controller there is.
     pub fn scanned(&self) -> bool {
         self.scanned.load(Ordering::Relaxed)
@@ -229,6 +481,7 @@ impl Pads {
         out
     }
 
+    /// Each controller read, with its buttons now (`peerparty --pads`).
     pub fn describe(&mut self) -> Vec<(String, u32)> {
         let mut out = Vec::new();
         if let Some(get) = self.xinput {
@@ -247,6 +500,17 @@ impl Pads {
     }
 }
 
+/// A key two readings share names neither: the game's hook couldn't tell which device
+/// is whose, so both are left to the virtual pad.
+fn unique_keys(readings: &mut [Option<Reading>]) {
+    let keys: Vec<u64> = readings.iter().flatten().map(|r| r.hid_key).collect();
+    for r in readings.iter_mut().flatten() {
+        if r.hid_key != 0 && keys.iter().filter(|k| **k == r.hid_key).count() > 1 {
+            r.hid_key = 0;
+        }
+    }
+}
+
 /// The buttons in `b`, by name.
 pub fn names(b: u32) -> String {
     let all = [
@@ -259,6 +523,8 @@ pub fn names(b: u32) -> String {
         (BACK, "View/Create"),
         (START, "Menu/Options"),
         (HOME, "Home/Guide/PS"),
+        (LSTICK, "L3"),
+        (RSTICK, "R3"),
         (UP, "Up"),
         (DOWN, "Down"),
         (LEFT, "Left"),
@@ -268,6 +534,13 @@ pub fn names(b: u32) -> String {
     if v.is_empty() { "-".into() } else { v.join(" + ") }
 }
 
+/// XInput is Windows' alone.
+#[cfg(not(windows))]
+fn xinput() -> Option<GetStateFn> {
+    None
+}
+
+#[cfg(windows)]
 fn xinput() -> Option<GetStateFn> {
     use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW};
     for dll in ["xinput1_4.dll", "xinput1_3.dll"] {
@@ -295,6 +568,8 @@ fn from_xinput(s: &[u8; STATE_LEN]) -> State {
         (0x0008, RIGHT),
         (0x0010, START),
         (0x0020, BACK),
+        (0x0040, LSTICK),
+        (0x0080, RSTICK),
         (0x0100, LB),
         (0x0200, RB),
         (0x0400, HOME),
@@ -304,12 +579,13 @@ fn from_xinput(s: &[u8; STATE_LEN]) -> State {
         (0x8000, NORTH),
     ];
     let buttons = map.iter().filter(|(x, _)| w & x != 0).fold(0, |b, (_, l)| b | l);
-    let lx = i16::from_le_bytes([s[8], s[9]]) as f32 / 32767.0;
-    let ly = i16::from_le_bytes([s[10], s[11]]) as f32 / 32767.0;
-    State { buttons, lx, ly }
+    let thumb = |at: usize| (i16::from_le_bytes([s[at], s[at + 1]]) as f32 / 32767.0).max(-1.0);
+    let trigger = |v: u8| f32::from(v) / 255.0;
+    State { buttons, lx: thumb(8), ly: thumb(10), rx: thumb(12), ry: thumb(14), lt: trigger(s[6]), rt: trigger(s[7]) }
 }
 
 /// A d-pad hat value (0 = up, clockwise, 8 or more = centred).
+#[cfg(any(windows, test))]
 fn hat(v: u8) -> u32 {
     match v {
         0 => UP,
@@ -324,11 +600,25 @@ fn hat(v: u8) -> u32 {
     }
 }
 
+#[cfg(any(windows, test))]
 fn axis(v: u8) -> f32 {
-    (v as f32 - 128.0) / 127.0
+    ((v as f32 - 128.0) / 127.0).max(-1.0)
+}
+
+/// An 8-bit trigger, 0..1.
+#[cfg(any(windows, test))]
+fn trigger(v: u8) -> f32 {
+    f32::from(v) / 255.0
+}
+
+/// A digital trigger (the Switch Pro's ZL / ZR): released or all the way.
+#[cfg(any(windows, test))]
+fn pulled(down: bool) -> f32 {
+    if down { 1.0 } else { 0.0 }
 }
 
 /// A value's logical range from a generic pad's report descriptor, and its size in bits.
+#[cfg(any(windows, test))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Range {
     min: i32,
@@ -336,6 +626,7 @@ struct Range {
     bits: u16,
 }
 
+#[cfg(any(windows, test))]
 impl Range {
     fn new(min: i32, max: i32, bits: u16) -> Range {
         // A maximum written in too few bytes (65535 as two) comes back negative: it
@@ -356,15 +647,23 @@ impl Range {
 }
 
 /// A generic pad's stick and hat ranges, read once when it's opened.
+#[cfg(windows)]
 #[derive(Clone, Copy, Debug, Default)]
 struct Ranges {
     x: Option<Range>,
     y: Option<Range>,
+    /// Z / Rz: the right stick on most DirectInput pads.
+    z: Option<Range>,
+    rz: Option<Range>,
+    /// Rx / Ry: the right stick on pads without Z / Rz.
+    rx: Option<Range>,
+    ry: Option<Range>,
     hat: Option<Range>,
 }
 
 /// A stick value as -1..1 across its range. Without one (a descriptor Windows
 /// couldn't read), a guess: 8 or 16 bits, unsigned.
+#[cfg(any(windows, test))]
 fn stick(v: u32, r: Option<Range>) -> f32 {
     match r {
         Some(r) if r.max > r.min => {
@@ -380,6 +679,7 @@ fn stick(v: u32, r: Option<Range>) -> f32 {
 /// The d-pad from a hat value: positions count from the range's minimum (some pads
 /// start at 1), 4 of them on a 4-way hat. Outside the range is the null value pads send
 /// for released, not a direction.
+#[cfg(any(windows, test))]
 fn hat_in(v: u32, r: Option<Range>) -> u32 {
     let Some(r) = r else { return hat(v.min(255) as u8) };
     let v = r.signed(v);
@@ -391,6 +691,7 @@ fn hat_in(v: u32, r: Option<Range>) -> u32 {
 }
 
 /// The logical range of Generic Desktop `usage` in a pad's input reports.
+#[cfg(windows)]
 fn value_range(pre: isize, usage: u16) -> Option<Range> {
     use windows_sys::Win32::Devices::HumanInterfaceDevice::{HIDP_VALUE_CAPS, HidP_GetSpecificValueCaps, HidP_Input};
     let mut caps: [HIDP_VALUE_CAPS; 4] = unsafe { std::mem::zeroed() };
@@ -399,38 +700,44 @@ fn value_range(pre: isize, usage: u16) -> Option<Range> {
     (rc == 0x0011_0000 && n >= 1).then(|| Range::new(caps[0].LogicalMin, caps[0].LogicalMax, caps[0].BitSize))
 }
 
-/// DualShock 4 / DualSense in their common layout: sticks at 0..4, buttons from `b`.
-fn playstation(r: &[u8], b: usize) -> Option<State> {
-    if r.len() < b + 3 {
+/// DualShock 4 / DualSense in their common layout: sticks at 0..4, buttons from `b`,
+/// the triggers' travel at `t` and `t + 1`.
+#[cfg(any(windows, test))]
+fn playstation(r: &[u8], b: usize, t: usize) -> Option<State> {
+    if r.len() < (b + 3).max(t + 2) {
         return None;
     }
     let (b0, b1, b2) = (r[b], r[b + 1], r[b + 2]);
     let mut buttons = hat(b0 & 0x0f);
     let face = [(0x10, WEST), (0x20, SOUTH), (0x40, EAST), (0x80, NORTH)];
     buttons |= face.iter().filter(|(x, _)| b0 & x != 0).fold(0, |a, (_, l)| a | l);
-    let more = [(0x01, LB), (0x02, RB), (0x10, BACK), (0x20, START)];
+    let more = [(0x01, LB), (0x02, RB), (0x10, BACK), (0x20, START), (0x40, LSTICK), (0x80, RSTICK)];
     buttons |= more.iter().filter(|(x, _)| b1 & x != 0).fold(0, |a, (_, l)| a | l);
     if b2 & 0x01 != 0 {
         buttons |= HOME;
     }
-    Some(State { buttons, lx: axis(r[0]), ly: -axis(r[1]) })
+    Some(State { buttons, lx: axis(r[0]), ly: -axis(r[1]), rx: axis(r[2]), ry: -axis(r[3]), lt: trigger(r[t]), rt: trigger(r[t + 1]) })
 }
 
 /// Parses one input report from a known pad. `report` starts with the report id.
+#[cfg(any(windows, test))]
 fn parse_known(vid: u16, pid: u16, report: &[u8]) -> Option<State> {
     let (id, r) = report.split_first()?;
     match (vid, pid) {
         // DualShock 4 (v1, v2, wireless adapter).
         (0x054c, 0x05c4 | 0x09cc | 0x0ba0) => match id {
-            0x01 => playstation(r, 4),
-            0x11 if r.len() > 6 => playstation(&r[2..], 4),
+            // Triggers right after the buttons.
+            0x01 => playstation(r, 4, 7),
+            0x11 if r.len() > 6 => playstation(&r[2..], 4, 7),
             _ => None,
         },
         // DualSense, DualSense Edge.
         (0x054c, 0x0ce6 | 0x0df2) => match id {
-            0x01 if r.len() >= 10 && r.len() > 30 => playstation(r, 7),
-            0x01 => playstation(r, 4),
-            0x31 if r.len() > 11 => playstation(&r[1..], 7),
+            // The full report: triggers right after the sticks.
+            0x01 if r.len() >= 10 && r.len() > 30 => playstation(r, 7, 4),
+            // Bluetooth's simple report is laid out as the DualShock 4's.
+            0x01 => playstation(r, 4, 7),
+            0x31 if r.len() > 11 => playstation(&r[1..], 7, 4),
             _ => None,
         },
         // Switch Pro Controller.
@@ -441,9 +748,9 @@ fn parse_known(vid: u16, pid: u16, report: &[u8]) -> Option<State> {
                 // Nintendo's positions: B south, A east, Y west, X north.
                 let map0 = [(0x01, SOUTH), (0x02, EAST), (0x04, WEST), (0x08, NORTH), (0x10, LB), (0x20, RB)];
                 buttons |= map0.iter().filter(|(x, _)| b0 & x != 0).fold(0, |a, (_, l)| a | l);
-                let map1 = [(0x01, BACK), (0x02, START), (0x10, HOME)];
+                let map1 = [(0x01, BACK), (0x02, START), (0x04, LSTICK), (0x08, RSTICK), (0x10, HOME)];
                 buttons |= map1.iter().filter(|(x, _)| b1 & x != 0).fold(0, |a, (_, l)| a | l);
-                Some(State { buttons, lx: 0.0, ly: 0.0 })
+                Some(State { buttons, lt: pulled(b0 & 0x40 != 0), rt: pulled(b0 & 0x80 != 0), ..Default::default() })
             }
             0x30 if r.len() >= 11 => {
                 let (right, shared, left) = (r[2], r[3], r[4]);
@@ -455,6 +762,8 @@ fn parse_known(vid: u16, pid: u16, report: &[u8]) -> Option<State> {
                     (right, 0x40, RB),
                     (shared, 0x01, BACK),
                     (shared, 0x02, START),
+                    (shared, 0x04, RSTICK),
+                    (shared, 0x08, LSTICK),
                     (shared, 0x10, HOME),
                     (left, 0x01, DOWN),
                     (left, 0x02, UP),
@@ -463,11 +772,16 @@ fn parse_known(vid: u16, pid: u16, report: &[u8]) -> Option<State> {
                     (left, 0x40, LB),
                 ];
                 let buttons = map.iter().filter(|(v, x, _)| v & x != 0).fold(0, |a, (_, _, l)| a | l);
-                let raw_x = u16::from(r[5]) | (u16::from(r[6] & 0x0f) << 8);
-                let raw_y = u16::from(r[6] >> 4) | (u16::from(r[7]) << 4);
-                let lx = (raw_x as f32 - 2048.0) / 1400.0;
-                let ly = (raw_y as f32 - 2048.0) / 1400.0;
-                Some(State { buttons, lx: lx.clamp(-1.0, 1.0), ly: ly.clamp(-1.0, 1.0) })
+                // Each stick: two 12-bit values packed in three bytes, up positive.
+                let stick_at = |at: usize| {
+                    let raw_x = u16::from(r[at]) | (u16::from(r[at + 1] & 0x0f) << 8);
+                    let raw_y = u16::from(r[at + 1] >> 4) | (u16::from(r[at + 2]) << 4);
+                    let unit = |v: u16| ((v as f32 - 2048.0) / 1400.0).clamp(-1.0, 1.0);
+                    (unit(raw_x), unit(raw_y))
+                };
+                let (lx, ly) = stick_at(5);
+                let (rx, ry) = stick_at(8);
+                Some(State { buttons, lx, ly, rx, ry, lt: pulled(left & 0x80 != 0), rt: pulled(right & 0x80 != 0) })
             }
             _ => None,
         },
@@ -475,7 +789,8 @@ fn parse_known(vid: u16, pid: u16, report: &[u8]) -> Option<State> {
     }
 }
 
-fn style_of(vid: u16) -> Style {
+/// The glyphs for a pad by its USB vendor.
+pub(crate) fn style_of(vid: u16) -> Style {
     match vid {
         0x054c => Style::PlayStation,
         0x057e => Style::Nintendo,
@@ -483,7 +798,14 @@ fn style_of(vid: u16) -> Style {
     }
 }
 
-fn scan_hid(list: &Arc<Mutex<Vec<Hid>>>) {
+/// Linux's controllers are its evdev devices.
+#[cfg(unix)]
+fn scan_hid(list: &Arc<Mutex<Vec<Hid>>>, threads: &Arc<Threads>) {
+    crate::backend::linux::pads::scan(list, threads);
+}
+
+#[cfg(windows)]
+fn scan_hid(list: &Arc<Mutex<Vec<Hid>>>, threads: &Arc<Threads>) {
     use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
         DIGCF_DEVICEINTERFACE, DIGCF_PRESENT, SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W,
         SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW, SetupDiGetDeviceInterfaceDetailW,
@@ -520,17 +842,21 @@ fn scan_hid(list: &Arc<Mutex<Vec<Hid>>>) {
     }
     unsafe { SetupDiDestroyDeviceInfoList(set) };
     for path in paths {
+        if threads.stopping() {
+            return;
+        }
         if path.to_ascii_lowercase().contains("ig_") {
             continue;
         }
         if list.lock().unwrap().iter().any(|h| h.path == path) {
             continue;
         }
-        open_hid(list, path);
+        open_hid(list, threads, path);
     }
 }
 
-fn open_hid(list: &Arc<Mutex<Vec<Hid>>>, path: String) {
+#[cfg(windows)]
+fn open_hid(list: &Arc<Mutex<Vec<Hid>>>, threads: &Arc<Threads>, path: String) {
     use windows_sys::Win32::Devices::HumanInterfaceDevice::{
         HIDD_ATTRIBUTES, HIDP_CAPS, HidD_FreePreparsedData, HidD_GetAttributes, HidD_GetPreparsedData, HidP_GetCaps,
     };
@@ -561,22 +887,27 @@ fn open_hid(list: &Arc<Mutex<Vec<Hid>>>, path: String) {
     }
     let state = Arc::new(Mutex::new(State::default()));
     let alive = Arc::new(AtomicBool::new(true));
-    list.lock().unwrap().push(Hid {
-        path,
-        vid: attr.VendorID,
-        pid: attr.ProductID,
-        style: style_of(attr.VendorID),
-        state: state.clone(),
-        alive: alive.clone(),
-        home: true,
-        stick: 0,
-    });
+    let key = peerparty_protocol::input_shm::hid_key(attr.VendorID, attr.ProductID, &serial_of(h));
+    let entry = Hid { path, vid: attr.VendorID, pid: attr.ProductID, style: style_of(attr.VendorID), state: state.clone(), alive: alive.clone(), home: true, stick: 0, key };
     let (vid, pid, len) = (attr.VendorID, attr.ProductID, caps.InputReportByteLength as usize);
-    let ranges = Ranges { x: value_range(pre, 0x30), y: value_range(pre, 0x31), hat: value_range(pre, 0x39) };
+    let ranges = Ranges {
+        x: value_range(pre, 0x30),
+        y: value_range(pre, 0x31),
+        z: value_range(pre, 0x32),
+        rz: value_range(pre, 0x35),
+        rx: value_range(pre, 0x33),
+        ry: value_range(pre, 0x34),
+        hat: value_range(pre, 0x39),
+    };
     let (h, pre) = (h as usize, pre);
-    std::thread::spawn(move || {
+    let stop = threads.clone();
+    let reader_alive = alive.clone();
+    let read = move || {
+        let alive = reader_alive;
         let mut buf = vec![0u8; len.max(64)];
-        loop {
+        // Ends when the device goes, or when `Pads` is dropped (`Threads::stop_all`
+        // cancels a read that waits).
+        while !stop.stopping() {
             let mut got = 0u32;
             let ok = unsafe {
                 windows_sys::Win32::Storage::FileSystem::ReadFile(h as _, buf.as_mut_ptr(), len as u32, &mut got, std::ptr::null_mut())
@@ -593,15 +924,39 @@ fn open_hid(list: &Arc<Mutex<Vec<Hid>>>, path: String) {
         alive.store(false, Ordering::Relaxed);
         unsafe { HidD_FreePreparsedData(pre) };
         unsafe { windows_sys::Win32::Foundation::CloseHandle(h as _) };
-    });
+    };
+    list.lock().unwrap().push(entry);
+    if !threads.spawn("peerparty-pad-hid", read) {
+        // Stopping, or no thread: the reader never ran, so the device is taken off the
+        // list and its handles are freed here.
+        list.lock().unwrap().retain(|e| !Arc::ptr_eq(&e.alive, &alive));
+        unsafe { HidD_FreePreparsedData(pre) };
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(h as _) };
+    }
+}
+
+/// A HID device's serial number, empty when it has none (the game's hook reads the same,
+/// `input_shm::hid_key`).
+#[cfg(windows)]
+fn serial_of(h: windows_sys::Win32::Foundation::HANDLE) -> String {
+    let mut buf = [0u16; 128];
+    let ok = unsafe { windows_sys::Win32::Devices::HumanInterfaceDevice::HidD_GetSerialNumberString(h, buf.as_mut_ptr().cast(), (buf.len() * 2) as u32) };
+    if ok == 0 {
+        return String::new();
+    }
+    let n = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..n])
 }
 
 /// Any other gamepad, through Windows' HID parser: buttons 1-4 as the face buttons
-/// (south, east, west, north: the common order), 5-6 shoulders, 7-8 back / start, 13 home;
-/// the hat switch as the d-pad; X / Y as the left stick. Home is also whichever of the
+/// (south, east, west, north: the common order), 5-6 shoulders, 7-8 back / start, 9-10
+/// the stick clicks, 13 home; the hat switch as the d-pad; X / Y as the left stick, and
+/// Z / Rz as the right one (DirectInput's usual), else Rx / Ry. Triggers aren't read:
+/// pads put them on different axes, and a wrong guess would hold one half down. Home is also whichever of the
 /// usages pads give it instead of a button number: Generic Desktop's System Main Menu
 /// (0x85) and Consumer's AC Home (0x223). Sticks and hat are read by their descriptor's
 /// `ranges`: a centred stick isn't always 128, and a released hat isn't always 8.
+#[cfg(windows)]
 fn parse_generic(pre: isize, ranges: Ranges, report: &[u8]) -> Option<State> {
     use windows_sys::Win32::Devices::HumanInterfaceDevice::{HidP_GetUsageValue, HidP_GetUsages, HidP_Input};
     let mut usages = [0u16; 32];
@@ -621,6 +976,8 @@ fn parse_generic(pre: isize, ranges: Ranges, report: &[u8]) -> Option<State> {
         (6, RB),
         (7, BACK),
         (8, START),
+        (9, LSTICK),
+        (10, RSTICK),
         (13, HOME),
     ];
     let mut buttons = 0;
@@ -647,11 +1004,18 @@ fn parse_generic(pre: isize, ranges: Ranges, report: &[u8]) -> Option<State> {
     if let Some(h) = value(0x39) {
         buttons |= hat_in(h, ranges.hat);
     }
-    let (lx, ly) = match (value(0x30), value(0x31)) {
-        (Some(x), Some(y)) => (stick(x, ranges.x), -stick(y, ranges.y)),
-        _ => (0.0, 0.0),
+    let pair = |x: u16, rx: Option<Range>, y: u16, ry: Option<Range>| match (value(x), value(y)) {
+        (Some(vx), Some(vy)) => Some((stick(vx, rx), -stick(vy, ry))),
+        _ => None,
     };
-    Some(State { buttons, lx, ly })
+    let (lx, ly) = pair(0x30, ranges.x, 0x31, ranges.y).unwrap_or_default();
+    let right = if ranges.z.is_some() && ranges.rz.is_some() {
+        pair(0x32, ranges.z, 0x35, ranges.rz)
+    } else {
+        pair(0x33, ranges.rx, 0x34, ranges.ry)
+    };
+    let (rx, ry) = right.unwrap_or_default();
+    Some(State { buttons, lx, ly, rx, ry, ..Default::default() })
 }
 
 #[cfg(test)]
@@ -667,24 +1031,57 @@ mod tests {
         r[2] = 128;
         r[5] = 0x20 | 2;
         r[7] = 0x01;
+        // Right stick full right, R3, L2 all the way.
+        r[3] = 255;
+        r[4] = 128;
+        r[6] = 0x80;
+        r[8] = 255;
         let s = parse_known(0x054c, 0x09cc, &r).unwrap();
-        assert_eq!(s.buttons, SOUTH | RIGHT | HOME);
+        assert_eq!(s.buttons, SOUTH | RIGHT | HOME | RSTICK);
+        assert!(s.rx > 0.99 && s.ry.abs() < 0.01 && s.lt > 0.99 && s.rt == 0.0, "{s:?}");
+        // DualSense over USB: triggers right after the sticks, buttons from byte 7.
+        let mut d = vec![0u8; 64];
+        d[0] = 0x01;
+        d[1..5].copy_from_slice(&[128, 128, 128, 0]);
+        d[6] = 200;
+        d[8] = 0x20 | 8;
+        let s = parse_known(0x054c, 0x0ce6, &d).unwrap();
+        assert_eq!(s.buttons, SOUTH);
+        assert!(s.ry > 0.99 && s.rt > 0.78 && s.lt == 0.0, "right stick up, R2 most of the way: {s:?}");
         // Switch Pro simple report: A (east) and home.
         let s = parse_known(0x057e, 0x2009, &[0x3f, 0x02, 0x10, 0x08]).unwrap();
         assert_eq!(s.buttons, EAST | HOME);
-        // XInput: A, start, d-pad up.
+        // Switch Pro full report: the right stick packed as the left is, ZR.
+        let mut n = vec![0u8; 13];
+        n[0] = 0x30;
+        n[3] = 0x80;
+        for at in [6, 9] {
+            n[at] = 0x00;
+            n[at + 1] = 0x08;
+            n[at + 2] = 0x80;
+        }
+        n[9] = 0xFF;
+        n[10] = 0x0F;
+        let s = parse_known(0x057e, 0x2009, &n).unwrap();
+        assert!(s.rx > 0.99 && s.rt == 1.0 && s.lt == 0.0, "{s:?}");
+        // XInput: A, start, d-pad up, both sticks and triggers.
         let mut x = [0u8; STATE_LEN];
-        x[4..6].copy_from_slice(&(0x1000u16 | 0x0010 | 0x0001).to_le_bytes());
-        assert_eq!(from_xinput(&x).buttons, SOUTH | START | UP);
+        x[4..6].copy_from_slice(&(0x1000u16 | 0x0010 | 0x0001 | 0x0080).to_le_bytes());
+        x[6] = 255;
+        x[12..14].copy_from_slice(&(-32768i16).to_le_bytes());
+        x[14..16].copy_from_slice(&16384i16.to_le_bytes());
+        let s = from_xinput(&x);
+        assert_eq!(s.buttons, SOUTH | START | UP | RSTICK);
+        assert!(s.rx == -1.0 && (s.ry - 0.5).abs() < 0.01 && s.lt == 1.0 && s.rt == 0.0, "{s:?}");
         // Stick folds into the d-pad.
-        assert_eq!(State { buttons: 0, lx: 0.0, ly: -0.9 }.with_stick(), DOWN);
+        assert_eq!(State { ly: -0.9, ..Default::default() }.with_stick(), DOWN);
     }
 
     /// A diagonal push is one direction, the axis pushed further; a held direction
     /// lets go only under 0.35, and turning the stick hands over to the next.
     #[test]
     fn the_stick_is_one_direction_with_hysteresis() {
-        let st = |lx: f32, ly: f32| State { buttons: 0, lx, ly };
+        let st = |lx: f32, ly: f32| State { lx, ly, ..Default::default() };
         assert_eq!(st(0.6, -0.8).stick(0), DOWN, "down and a little right is down");
         assert_eq!(st(0.8, -0.6).stick(0), RIGHT);
         assert_eq!(st(0.0, 0.45).stick(0), 0, "not yet half way");
@@ -732,6 +1129,166 @@ mod tests {
         0
     }
 
+    /// Threads that end by themselves when asked, and one blocked reading something
+    /// quiet, all end when stopped; nothing starts afterwards.
+    #[test]
+    fn reader_threads_stop_and_are_joined() {
+        let threads = Threads::new();
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..3 {
+            let (t, ran) = (threads.clone(), ran.clone());
+            assert!(threads.spawn("test-reader", move || {
+                while !t.stopping() {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                ran.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        // A reader that ended by itself is joined when the next one starts.
+        assert!(threads.spawn("test-done", || {}));
+        #[cfg(windows)]
+        let pipe_ends = {
+            use windows_sys::Win32::System::Pipes::CreatePipe;
+            let (mut r, mut w) = (std::ptr::null_mut(), std::ptr::null_mut());
+            assert_ne!(unsafe { CreatePipe(&mut r, &mut w, std::ptr::null(), 0) }, 0);
+            let (rh, t) = (r as usize, threads.clone());
+            // Blocked in a read nothing ever answers, like a quiet controller's.
+            assert!(threads.spawn("test-blocked", move || {
+                while !t.stopping() {
+                    let (mut buf, mut got) = ([0u8; 8], 0u32);
+                    if unsafe { windows_sys::Win32::Storage::FileSystem::ReadFile(rh as _, buf.as_mut_ptr(), 8, &mut got, std::ptr::null_mut()) } == 0 {
+                        break;
+                    }
+                }
+            }));
+            (r, w)
+        };
+        let t0 = Instant::now();
+        assert!(threads.stop_all(Duration::from_secs(5)), "every thread ended");
+        assert!(t0.elapsed() < Duration::from_secs(2), "promptly: {:?}", t0.elapsed());
+        assert_eq!(ran.load(Ordering::SeqCst), 3);
+        assert!(threads.handles.lock().unwrap().is_empty());
+        assert!(!threads.spawn("too-late", || {}), "nothing starts once stopping");
+        #[cfg(windows)]
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(pipe_ends.0);
+            windows_sys::Win32::Foundation::CloseHandle(pipe_ends.1);
+        }
+    }
+
+    /// Dropping `Pads` stops its scan and readers, and waits for them.
+    #[test]
+    fn pads_stop_their_threads_when_dropped() {
+        let mut pads = Pads::new();
+        pads.xinput = None;
+        pads.poll();
+        assert!(pads.scan.is_some(), "the first poll scans");
+        let threads = pads.threads.clone();
+        drop(pads);
+        assert!(threads.stopping());
+        assert!(threads.handles.lock().unwrap().is_empty(), "joined");
+    }
+
+    /// Each controller apart, by slot: what a session hands out by index.
+    #[test]
+    fn readings_list_each_controller_apart() {
+        let mut pads = Pads::new();
+        pads.xinput = Some(fake_second);
+        pads.last_scan = Some(Instant::now());
+        pads.poll();
+        let r = pads.readings();
+        assert_eq!(r.len(), 1, "{r:?}");
+        let r0 = r[0].as_ref().unwrap();
+        assert_eq!((r0.name.as_str(), r0.state.buttons, r0.style), ("XInput slot 1", SOUTH | UP, Style::Xbox));
+    }
+
+    /// A controller keeps its seat: the first one seen going away leaves seat 0 empty
+    /// and the second stays on seat 1 (its copy doesn't get the first player's); back,
+    /// the first takes seat 0 again.
+    #[test]
+    fn a_controller_keeps_its_seat_while_another_is_away() {
+        let _g = FAKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pads = Pads::new();
+        pads.xinput = Some(fake_two);
+        pads.last_scan = Some(Instant::now());
+        let names = |pads: &Pads| pads.readings().iter().map(|r| r.as_ref().map(|r| r.name.clone())).collect::<Vec<_>>();
+        let (s0, s1) = (Some("XInput slot 0".to_string()), Some("XInput slot 1".to_string()));
+        FAKE_SLOT0.store(true, Ordering::Relaxed);
+        pads.poll();
+        assert_eq!(names(&pads), [s0.clone(), s1.clone()]);
+        FAKE_SLOT0.store(false, Ordering::Relaxed);
+        pads.poll();
+        assert_eq!(names(&pads), [None, s1.clone()], "slot 1 keeps seat 1");
+        assert_eq!(pads.per, [0, SOUTH], "its buttons on its own seat");
+        FAKE_SLOT0.store(true, Ordering::Relaxed);
+        pads.tried = [None; 4];
+        pads.poll();
+        assert_eq!(names(&pads), [s0, s1]);
+    }
+
+    static FAKE_SLOT0: AtomicBool = AtomicBool::new(true);
+    /// What slot 0 holds (B, unless a test says otherwise).
+    static FAKE_SLOT0_BUTTONS: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0x2000);
+    /// The tests that change FAKE_SLOT0 / FAKE_SLOT0_BUTTONS run one at a time.
+    static FAKE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A controller that's plugged in but never used (a controller app's parked virtual
+    /// pad) takes no seat: the one used after it takes seat 0, and it gets seat 1 only
+    /// once it's used.
+    #[test]
+    fn a_controller_takes_a_seat_when_its_first_used() {
+        let _g = FAKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pads = Pads::new();
+        pads.xinput = Some(fake_two);
+        pads.last_scan = Some(Instant::now());
+        let names = |pads: &Pads| pads.readings().iter().map(|r| r.as_ref().map(|r| r.name.clone())).collect::<Vec<_>>();
+        FAKE_SLOT0.store(true, Ordering::Relaxed);
+        FAKE_SLOT0_BUTTONS.store(0, Ordering::Relaxed);
+        pads.poll();
+        assert_eq!(names(&pads), [Some("XInput slot 1".to_string())], "slot 0 idle: no seat");
+        assert_eq!(pads.per, [SOUTH]);
+        FAKE_SLOT0_BUTTONS.store(0x2000, Ordering::Relaxed);
+        pads.poll();
+        FAKE_SLOT0_BUTTONS.store(0, Ordering::Relaxed);
+        pads.poll();
+        assert_eq!(names(&pads), [Some("XInput slot 1".to_string()), Some("XInput slot 0".to_string())], "kept once used");
+        FAKE_SLOT0_BUTTONS.store(0x2000, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn resting_sticks_and_triggers_are_not_use() {
+        let rest = State { lx: 0.1, ly: -0.2, rx: 0.05, ry: 0.0, lt: 0.1, rt: 0.0, buttons: 0 };
+        assert!(!rest.in_use());
+        assert!(State { ly: 0.8, ..rest }.in_use());
+        assert!(State { rt: 0.9, ..rest }.in_use());
+        assert!(State { buttons: START, ..rest }.in_use());
+    }
+
+    /// Slot 0 there while `FAKE_SLOT0` says so (holding `FAKE_SLOT0_BUTTONS`), slot 1
+    /// holding A, nothing on the others.
+    unsafe extern "system" fn fake_two(pad: u32, s: *mut [u8; STATE_LEN]) -> u32 {
+        match pad {
+            0 if FAKE_SLOT0.load(Ordering::Relaxed) => {
+                unsafe { (&mut *s)[4..6].copy_from_slice(&FAKE_SLOT0_BUTTONS.load(Ordering::Relaxed).to_le_bytes()) };
+                0
+            }
+            1 => {
+                unsafe { (&mut *s)[4..6].copy_from_slice(&0x1000u16.to_le_bytes()) };
+                0
+            }
+            _ => 1167,
+        }
+    }
+
+    /// A pad on XInput slot 1 holding A and up, and nothing on the others.
+    unsafe extern "system" fn fake_second(pad: u32, s: *mut [u8; STATE_LEN]) -> u32 {
+        if pad != 1 {
+            return 1167;
+        }
+        unsafe { (&mut *s)[4..6].copy_from_slice(&0x1001u16.to_le_bytes()) };
+        0
+    }
+
     #[test]
     fn home_counts_only_after_it_was_seen_up() {
         let mut pads = Pads::new();
@@ -740,13 +1297,14 @@ mod tests {
         let press = |pads: &mut Pads, buttons: u16| {
             FAKE_BUTTONS.store(buttons, Ordering::Relaxed);
             pads.poll();
-            pads.home_pressed
+            !pads.homes.is_empty()
         };
         // Down the first time the pad is seen (Steam Input's pad arriving): nothing.
         assert!(!press(&mut pads, 0x0400));
         assert!(!press(&mut pads, 0));
         assert!(press(&mut pads, 0x0400));
-        assert_eq!(pads.home_by, "XInput slot 0");
+        assert_eq!(pads.homes, [(0, "XInput slot 0".to_string())]);
+        assert_eq!(pads.per, [HOME], "its buttons apart");
         assert!(!press(&mut pads, 0x0400));
         // Still down when the game comes back to the front: nothing until it comes up.
         assert!(!press(&mut pads, 0));

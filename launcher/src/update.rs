@@ -28,14 +28,16 @@
 //!
 //! A copy that came with another app's add-on (an `extension.yaml` beside it) is the
 //! add-on's to update: the window only says that a newer PeerParty is out.
+//!
+//! Off Windows the release's `peerparty.exe` isn't this program: a newer release is
+//! announced with its page, and nothing is downloaded or installed from the window
+//! (`for_platform`).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use peerparty_core::release;
-
-use crate::t;
+use crate::{release, t};
 
 /// The project's repository on GitHub.
 const REPO: &str = "MaximumFreak/PeerParty";
@@ -51,6 +53,8 @@ const CHECKSUM_FILES: [&str; 4] = ["peerparty.exe.sha256", "peerparty-release.tx
 pub const EVERY: Duration = Duration::from_secs(24 * 3600);
 /// How long to watch the Downloads folder after "Download".
 const WATCH_FOR: Duration = Duration::from_secs(30 * 60);
+/// Whether the release's asset is this platform's program (`ASSET` is a Windows exe).
+const INSTALLS_HERE: bool = cfg!(windows);
 
 /// The releases page, with each release's notes.
 pub fn releases_page() -> String {
@@ -165,16 +169,19 @@ pub fn check_in_background(wake: impl Fn() + Send + 'static) {
 }
 
 fn latest() -> Result<Release, String> {
-    let body = http::get(&latest_url(), "application/vnd.github+json", 1 << 20).map_err(|e| t!("update.err_reach", error = e))?;
+    let body = crate::backend::http::get(&latest_url(), "application/vnd.github+json", 1 << 20).map_err(|e| t!("update.err_reach", error = e))?;
     let json: serde_json::Value = serde_json::from_slice(&body).map_err(|_| t!("update.err_answer"))?;
     let (mut r, sums) = parse(&json).ok_or_else(|| t!("update.err_no_release"))?;
+    if !INSTALLS_HERE {
+        return Ok(for_platform(r, false));
+    }
     if r.expected.is_some() || !newer(&r.version, env!("CARGO_PKG_VERSION")) {
         return Ok(r);
     }
     // No digest from GitHub: a newer release's plain checksum file, if it has one (a small
     // text file, never a program).
     if let Some((url, size)) = sums {
-        match http::get(&url, "application/octet-stream", 64 * 1024) {
+        match crate::backend::http::get(&url, "application/octet-stream", 64 * 1024) {
             Err(e) => r.why = Some(t!("update.err_sum_fetch", error = e)),
             Ok(text) => match release::read_checksum(&String::from_utf8_lossy(&text), ASSET) {
                 Some((sha256, listed)) if listed.is_none_or(|l| size.is_none_or(|s| s == l)) => r.expected = Some(Expected { sha256, size: size.or(listed) }),
@@ -195,7 +202,7 @@ fn parse(v: &serde_json::Value) -> Option<(Release, Option<(String, Option<u64>)
     let asset = named(ASSET)?;
     let url = asset["browser_download_url"].as_str()?.to_string();
     let size = asset["size"].as_u64().filter(|&s| s > 0);
-    let digest = asset["digest"].as_str().and_then(|d| d.strip_prefix("sha256:")).and_then(release::unhex::<32>);
+    let digest = asset["digest"].as_str().and_then(|d| d.strip_prefix("sha256:")).and_then(peerparty_core::unhex::<32>);
     let sums = CHECKSUM_FILES.iter().find_map(|n| named(n)).and_then(|a| a["browser_download_url"].as_str()).map(str::to_string);
     // Downloads come from GitHub only.
     let ok = |u: &str| u.starts_with("https://github.com/");
@@ -207,6 +214,17 @@ fn parse(v: &serde_json::Value) -> Option<(Release, Option<(String, Option<u64>)
     Some((Release { version, page, url, expected, why: None }, sums))
 }
 
+/// The release as this platform can take it: where the asset isn't its program
+/// (`installs_here` false: Linux, whose PeerParty doesn't come as `peerparty.exe`) it is
+/// announced with its page and why it isn't installed from the window, never downloaded.
+fn for_platform(mut r: Release, installs_here: bool) -> Release {
+    if !installs_here {
+        r.expected = None;
+        r.why = Some(t!("update.err_platform").to_string());
+    }
+    r
+}
+
 fn parts(v: &str) -> Vec<u32> {
     v.split(|c: char| !c.is_ascii_digit()).take_while(|p| !p.is_empty()).map(|p| p.parse().unwrap_or(0)).collect()
 }
@@ -214,22 +232,6 @@ fn parts(v: &str) -> Vec<u32> {
 /// Whether version `a` is newer than `b` ("0.1.10" > "0.1.9").
 pub fn newer(a: &str, b: &str) -> bool {
     parts(a) > parts(b)
-}
-
-/// Where browsers save downloads: the user's Downloads folder.
-fn downloads() -> Option<PathBuf> {
-    use windows_sys::Win32::System::Com::CoTaskMemFree;
-    use windows_sys::Win32::UI::Shell::{FOLDERID_Downloads, SHGetKnownFolderPath};
-    let mut p = std::ptr::null_mut();
-    let hr = unsafe { SHGetKnownFolderPath(&FOLDERID_Downloads, 0, std::ptr::null_mut(), &mut p) };
-    let dir = if hr == 0 && !p.is_null() {
-        let len = (0..).take_while(|&i| unsafe { *p.add(i) } != 0).count();
-        Some(PathBuf::from(String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(p, len) })))
-    } else {
-        std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join("Downloads"))
-    };
-    unsafe { CoTaskMemFree(p as _) };
-    dir
 }
 
 /// Whether `file` is `r`'s exe: a program with the release's SHA-256, and its size when
@@ -249,7 +251,7 @@ fn verify(r: &Release, file: &Path) -> Result<(), String> {
 /// named it `peerparty (1).exe`).
 fn find_download(r: &Release) -> Option<PathBuf> {
     let want = r.expected.as_ref()?;
-    std::fs::read_dir(downloads()?).ok()?.flatten().map(|e| e.path()).find(|p| {
+    std::fs::read_dir(crate::platform::downloads_dir()?).ok()?.flatten().map(|e| e.path()).find(|p| {
         let name = p.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
         name.starts_with("peerparty") && name.ends_with(".exe") && std::fs::metadata(p).is_ok_and(|md| want.size.is_none_or(|s| s == md.len())) && verify(r, p).is_ok()
     })
@@ -381,114 +383,9 @@ pub fn clean_up() {
 /// Other running copies of this peerparty.exe (games started from here, from a game library or
 /// from a .bat), if any.
 pub fn other_copies() -> Option<usize> {
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS};
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW};
     let me = std::env::current_exe().ok()?;
-    let mine = me.to_string_lossy().to_ascii_lowercase();
-    let name = me.file_name()?.to_string_lossy().to_ascii_lowercase();
-    let own = std::process::id();
-    let mut n = 0;
-    unsafe {
-        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snap == INVALID_HANDLE_VALUE {
-            return None;
-        }
-        let mut e: PROCESSENTRY32W = std::mem::zeroed();
-        e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-        let mut more = Process32FirstW(snap, &mut e) != 0;
-        while more {
-            let len = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
-            if e.th32ProcessID != own && String::from_utf16_lossy(&e.szExeFile[..len]).to_ascii_lowercase() == name {
-                let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, e.th32ProcessID);
-                if !h.is_null() {
-                    let mut buf = [0u16; 1024];
-                    let mut l = buf.len() as u32;
-                    if QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut l) != 0 && String::from_utf16_lossy(&buf[..l as usize]).to_ascii_lowercase() == mine {
-                        n += 1;
-                    }
-                    CloseHandle(h);
-                }
-            }
-            more = Process32NextW(snap, &mut e) != 0;
-        }
-        CloseHandle(snap);
-    }
+    let n = crate::platform::copies_running(&me);
     (n > 0).then_some(n)
-}
-
-/// HTTPS GET over WinHTTP (Windows' own client: its proxy settings, its certificate
-/// checks), for GitHub's API and a release's small checksum file only.
-mod http {
-    use std::ffi::c_void;
-    use windows_sys::Win32::Networking::WinHttp::*;
-
-    struct H(*mut c_void);
-    impl Drop for H {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                unsafe { WinHttpCloseHandle(self.0) };
-            }
-        }
-    }
-
-    fn w(s: &str) -> Vec<u16> {
-        s.encode_utf16().chain(Some(0)).collect()
-    }
-
-    fn err(what: &str) -> String {
-        format!("{what}: {}", std::io::Error::last_os_error())
-    }
-
-    pub fn get(url: &str, accept: &str, max: usize) -> Result<Vec<u8>, String> {
-        let rest = url.strip_prefix("https://").ok_or("only https")?;
-        let (host, path) = match rest.split_once('/') {
-            Some((h, p)) => (h, format!("/{p}")),
-            None => (rest, "/".to_string()),
-        };
-        unsafe {
-            let agent = w(&format!("PeerParty/{}", env!("CARGO_PKG_VERSION")));
-            let session = H(WinHttpOpen(agent.as_ptr(), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, std::ptr::null(), std::ptr::null(), 0));
-            if session.0.is_null() {
-                return Err(err("WinHttpOpen"));
-            }
-            WinHttpSetTimeouts(session.0, 10_000, 10_000, 15_000, 15_000);
-            let conn = H(WinHttpConnect(session.0, w(host).as_ptr(), INTERNET_DEFAULT_HTTPS_PORT as u16, 0));
-            if conn.0.is_null() {
-                return Err(err("WinHttpConnect"));
-            }
-            let req = H(WinHttpOpenRequest(conn.0, w("GET").as_ptr(), w(&path).as_ptr(), std::ptr::null(), std::ptr::null(), std::ptr::null(), WINHTTP_FLAG_SECURE));
-            if req.0.is_null() {
-                return Err(err("WinHttpOpenRequest"));
-            }
-            let headers = w(&format!("Accept: {accept}\r\nCache-Control: no-cache\r\n"));
-            if WinHttpSendRequest(req.0, headers.as_ptr(), u32::MAX, std::ptr::null(), 0, 0, 0) == 0 || WinHttpReceiveResponse(req.0, std::ptr::null_mut()) == 0 {
-                return Err(err("the request failed"));
-            }
-            let mut code = 0u32;
-            let mut len = 4u32;
-            WinHttpQueryHeaders(req.0, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, std::ptr::null(), (&mut code as *mut u32).cast(), &mut len, std::ptr::null_mut());
-            if code != 200 {
-                return Err(format!("HTTP {code}"));
-            }
-            let mut out = Vec::new();
-            let mut buf = vec![0u8; 16 * 1024];
-            loop {
-                let mut n = 0u32;
-                if WinHttpReadData(req.0, buf.as_mut_ptr().cast(), buf.len() as u32, &mut n) == 0 {
-                    return Err(err("reading the answer"));
-                }
-                if n == 0 {
-                    break;
-                }
-                out.extend_from_slice(&buf[..n as usize]);
-                if out.len() > max {
-                    return Err("the answer is too long".into());
-                }
-            }
-            Ok(out)
-        }
-    }
 }
 
 #[cfg(test)]
@@ -509,7 +406,7 @@ mod tests {
             "html_url": "https://github.com/MaximumFreak/PeerParty/releases/tag/v0.2.0",
             "assets": [
                 {"name": "THIRD-PARTY-NOTICES.md", "browser_download_url": "https://github.com/MaximumFreak/PeerParty/releases/download/v0.2.0/notices", "size": 10},
-                {"name": "peerparty.exe", "browser_download_url": "https://github.com/MaximumFreak/PeerParty/releases/download/v0.2.0/peerparty.exe", "size": 5, "digest": format!("sha256:{}", release::hex(&release::sha256(b"MZexe")))},
+                {"name": "peerparty.exe", "browser_download_url": "https://github.com/MaximumFreak/PeerParty/releases/download/v0.2.0/peerparty.exe", "size": 5, "digest": format!("sha256:{}", peerparty_core::hex(&release::sha256(b"MZexe")))},
                 {"name": "peerparty.exe.sha256", "browser_download_url": "https://github.com/MaximumFreak/PeerParty/releases/download/v0.2.0/peerparty.exe.sha256", "size": 80}
             ]
         })
@@ -568,6 +465,27 @@ mod tests {
         r.expected = Some(Expected { sha256: release::sha256(b"MZexe"), size: Some(6) });
         assert!(verify(&r, &good).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Off Windows a newer release is announced with its page and the reason, and the
+    /// window never offers to download or install the Windows exe.
+    #[test]
+    fn off_windows_a_release_is_announced_not_installed() {
+        let (r, _) = parse(&answer()).unwrap();
+        assert!(r.installable());
+        assert_eq!(for_platform(r.clone(), true), r, "Windows: as it was");
+        let other = for_platform(r.clone(), false);
+        assert!(!other.installable());
+        assert_eq!((other.version.as_str(), other.page.as_str()), ("0.2.0", r.page.as_str()), "still announced, with its page");
+        assert_eq!(other.why.as_deref(), Some(t!("update.err_platform")));
+        assert!(find_download(&other).is_none());
+        let dir = std::env::temp_dir().join(format!("peerparty-update-platform-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("peerparty.exe");
+        std::fs::write(&f, b"MZexe").unwrap();
+        assert_eq!(verify(&other, &f), Err(t!("update.err_platform").to_string()), "the right file still isn't installed");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(INSTALLS_HERE, cfg!(windows));
     }
 
     #[test]

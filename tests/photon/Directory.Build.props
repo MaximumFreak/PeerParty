@@ -1,8 +1,10 @@
 <Project>
-  <!-- Build output stays in %TEMP%, out of the source folder. -->
+  <!-- Build output stays in %TEMP%, out of the source folder. One tree per set of Photon
+       DLLs (run.ps1 passes PPTEST_STAMP), so builds for two sets can run side by side. -->
   <PropertyGroup>
-    <BaseOutputPath>$(TEMP)\pp-photon-test\bin\$(MSBuildProjectName)\</BaseOutputPath>
-    <BaseIntermediateOutputPath>$(TEMP)\pp-photon-test\obj\$(MSBuildProjectName)\</BaseIntermediateOutputPath>
+    <PPTEST_STAMP Condition="'$(PPTEST_STAMP)' == ''">default</PPTEST_STAMP>
+    <BaseOutputPath>$(TEMP)\pp-photon-test\$(PPTEST_STAMP)\bin\$(MSBuildProjectName)\</BaseOutputPath>
+    <BaseIntermediateOutputPath>$(TEMP)\pp-photon-test\$(PPTEST_STAMP)\obj\$(MSBuildProjectName)\</BaseIntermediateOutputPath>
     <Nullable>disable</Nullable>
   </PropertyGroup>
 </Project>
