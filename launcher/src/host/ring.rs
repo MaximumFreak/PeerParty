@@ -14,11 +14,12 @@ use peerparty_protocol::frame_ring::{BLOCK_SIZE, RingHeader, SLOTS, bytes_per_pi
 use peerparty_protocol::ipc::SurfaceMsg;
 use peerparty_protocol::transport::{FileShm, ShmBacking};
 
-/// Whether this session's copies send their frames as pixels: always off Windows (a
-/// native window can't open Windows' shared textures), and on Windows when
-/// `PEERPARTY_COMPOSITOR=pixels` (to try that path there).
-pub fn pixel_frames() -> bool {
-    cfg!(unix) || std::env::var(peerparty_protocol::env::COMPOSITOR).is_ok_and(|v| v.trim().eq_ignore_ascii_case("pixels"))
+/// Whether a session's copies send their frames as pixels, by `PEERPARTY_COMPOSITOR`
+/// (`compositor`, the environment's or the game's setting): always off Windows (a native
+/// window can't open Windows' shared textures), and on Windows when it is `pixels` (to try
+/// that path there).
+pub fn pixel_frames(compositor: Option<&str>) -> bool {
+    cfg!(unix) || compositor.is_some_and(|v| v.trim().eq_ignore_ascii_case("pixels"))
 }
 
 /// A random suffix for the names nothing should guess.

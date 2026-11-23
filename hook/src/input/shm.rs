@@ -256,4 +256,44 @@ mod tests {
         }
         shm.remove().unwrap();
     }
+
+    /// While the session is writing (or keeps rewriting) a copy's input, a read is the
+    /// last whole snapshot or controllers held still, never a Virtual one read torn: a
+    /// half-written pad reads as unplugged, and the game would drop its player.
+    #[test]
+    fn contention_never_reads_a_torn_unplugged_pad() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let whole = |s: &InputSnapshot| s.mode == InputMode::BlockAll || (s.mode == InputMode::Virtual && s.pad.connected);
+        // Stuck mid-write: the session's writer stopped between its two sequence bumps.
+        let stuck = InputHeader::new();
+        stuck.init();
+        stuck.publish(&InputSnapshot { mode: InputMode::Virtual, pad: VirtualPad { connected: true, ..Default::default() }, ..Default::default() });
+        stuck.seq.fetch_add(1, Ordering::AcqRel);
+        for _ in 0..8 {
+            let got = read_from(&stuck).unwrap();
+            assert!(whole(&got), "stuck writer: {got:?}");
+        }
+        // A writer that never stops: every read is whole.
+        let busy: &'static InputHeader = Box::leak(Box::new(InputHeader::new()));
+        busy.init();
+        busy.publish(&InputSnapshot { mode: InputMode::Virtual, pad: VirtualPad { connected: true, ..Default::default() }, ..Default::default() });
+        let stop: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+        let writer = std::thread::spawn(move || {
+            let mut n = 0u32;
+            while !stop.load(Ordering::Relaxed) {
+                n = n.wrapping_add(1);
+                busy.publish(&InputSnapshot { mode: InputMode::Virtual, pad: VirtualPad { connected: true, buttons: n, packet_number: n, ..Default::default() }, ..Default::default() });
+            }
+        });
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        let mut reads = 0;
+        while std::time::Instant::now() < until {
+            let got = read_from(busy).unwrap();
+            assert!(whole(&got), "busy writer: {got:?}");
+            reads += 1;
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+        assert!(reads > 0);
+    }
 }

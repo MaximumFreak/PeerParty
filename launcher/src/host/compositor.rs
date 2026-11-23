@@ -69,6 +69,61 @@ impl MonitorBounds {
         let (w, h) = std::env::var("PEERPARTY_SCREEN").ok().as_deref().and_then(super::desktop::landscape_mode).unwrap_or((1280, 800));
         MonitorBounds { x: 0, y: 0, width: w as u32, height: h as u32, dpi: 96 }
     }
+
+    /// Every monitor, numbered as `--monitor` and the game page number them: the main one
+    /// first, then the others left to right (top to bottom where they're level). Windows'
+    /// own numbers aren't used: they don't follow where the monitors are, and change when
+    /// one is plugged into another port.
+    #[cfg(windows)]
+    pub fn all() -> Vec<MonitorBounds> {
+        use windows_sys::Win32::Foundation::{LPARAM, RECT};
+        use windows_sys::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
+        use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+        unsafe extern "system" fn each(m: HMONITOR, _: HDC, _: *mut RECT, out: LPARAM) -> i32 {
+            let out = unsafe { &mut *(out as *mut Vec<(bool, MonitorBounds)>) };
+            let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
+            info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            if unsafe { GetMonitorInfoW(m, &mut info) } == 0 {
+                return 1;
+            }
+            let (mut dx, mut dy) = (0u32, 0u32);
+            let dpi = if unsafe { GetDpiForMonitor(m, MDT_EFFECTIVE_DPI, &mut dx, &mut dy) } == 0 && dx != 0 { dx } else { 96 };
+            let r = info.rcMonitor;
+            let b = MonitorBounds { x: r.left, y: r.top, width: (r.right - r.left).max(1) as u32, height: (r.bottom - r.top).max(1) as u32, dpi };
+            // MONITORINFOF_PRIMARY
+            out.push((info.dwFlags & 1 != 0, b));
+            1
+        }
+        let mut found: Vec<(bool, MonitorBounds)> = Vec::new();
+        unsafe { EnumDisplayMonitors(std::ptr::null_mut(), std::ptr::null(), Some(each), &mut found as *mut _ as LPARAM) };
+        let v = in_order(found);
+        if v.is_empty() { vec![MonitorBounds::primary()] } else { v }
+    }
+
+    #[cfg(unix)]
+    pub fn all() -> Vec<MonitorBounds> {
+        vec![MonitorBounds::primary()]
+    }
+
+    /// Monitor `n` (from 1, as `all` numbers them), else the main one, with why when `n`
+    /// wasn't there.
+    pub fn numbered(n: Option<u32>) -> (MonitorBounds, Option<String>) {
+        let all = MonitorBounds::all();
+        match n {
+            None | Some(1) => (all[0], None),
+            Some(n) => match all.get(n as usize - 1) {
+                Some(b) => (*b, None),
+                None => (all[0], Some(format!("monitor {n} was asked for, but this PC has {}: the session opens on the main one", all.len()))),
+            },
+        }
+    }
+}
+
+/// Monitors (each with whether it's the main one) in `MonitorBounds::all`'s order.
+#[allow(dead_code)]
+fn in_order(mut found: Vec<(bool, MonitorBounds)>) -> Vec<MonitorBounds> {
+    found.sort_by_key(|(main, b)| (!*main, b.x, b.y));
+    found.into_iter().map(|(_, b)| b).collect()
 }
 
 /// The presets `cycle_layout` goes through, in order.
@@ -548,7 +603,7 @@ mod win {
     use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
     use windows_sys::Win32::Graphics::Gdi::{BLACK_BRUSH, ClientToScreen, GetStockObject, HBRUSH, ScreenToClient};
     use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW};
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_F4, VK_MENU};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_F4};
     use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
     use super::super::gpu::{Gpu, PaneDraw, RingBlock, SharedSurface};
@@ -764,9 +819,7 @@ mod win {
     }
 
     fn is_session_chord(vk: usize) -> bool {
-        let ctrl = unsafe { GetKeyState(i32::from(VK_CONTROL)) } < 0;
-        let alt = unsafe { GetKeyState(i32::from(VK_MENU)) } < 0;
-        ctrl && alt && matches!(vk as u32, 0x4C | 0x5A | 0x31..=0x34)
+        crate::host::ctrl_alt(|k| unsafe { GetKeyState(k) } < 0) && matches!(vk as u32, 0x4C | 0x5A | 0x31..=0x34)
     }
 
     unsafe extern "system" fn proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
@@ -1023,12 +1076,14 @@ mod win {
                 q.clear();
             }
             let (w, h) = (i32::try_from(bounds.width).unwrap_or(i32::MAX), i32::try_from(bounds.height).unwrap_or(i32::MAX));
+            // A test's session stays out of sight (PEERPARTY_SESSION_HIDDEN).
+            let hidden = std::env::var(peerparty_protocol::env::SESSION_HIDDEN).is_ok_and(|v| v.trim() == "1");
             let hwnd = unsafe {
                 CreateWindowExW(
                     WS_EX_APPWINDOW,
                     class.as_ptr(),
                     title_w.as_ptr(),
-                    COMPOSITOR_STYLE,
+                    if hidden { COMPOSITOR_STYLE & !WS_VISIBLE } else { COMPOSITOR_STYLE },
                     bounds.x,
                     bounds.y,
                     w,
@@ -1051,8 +1106,13 @@ mod win {
                 if !icon_small.is_null() {
                     SendMessageW(hwnd, WM_SETICON, ICON_SMALL as WPARAM, icon_small as LPARAM);
                 }
-                SetWindowPos(hwnd, HWND_TOP, bounds.x, bounds.y, w, h, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
-                SetForegroundWindow(hwnd);
+                if hidden {
+                    SetWindowPos(hwnd, HWND_TOP, bounds.x, bounds.y, w, h, SWP_FRAMECHANGED | SWP_NOACTIVATE);
+                    eprintln!("peerparty: session: its window is hidden (PEERPARTY_SESSION_HIDDEN=1)");
+                } else {
+                    SetWindowPos(hwnd, HWND_TOP, bounds.x, bounds.y, w, h, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+                    SetForegroundWindow(hwnd);
+                }
             }
             let gpu = Gpu::start(hwnd);
             Some(HostWindow { hwnd, shown: Vec::new(), gpu, surfaces: Vec::new(), hidden_for_minimize: false, icon_big, icon_small, cursor_screen: Vec::new(), confined: None, display: Vec::new(), pressed: Vec::new(), notes: Vec::new() })
@@ -1482,7 +1542,9 @@ mod win {
                 unsafe { ClipCursor(std::ptr::null()) };
                 HIDE_POINTER.store(false, Ordering::Relaxed);
             }
-            // The drawing thread goes before the window it draws in.
+            // The drawing thread goes before the window it draws in; one that won't stop
+            // keeps the window (hidden), rather than presenting to a destroyed one.
+            let stopped = self.gpu.as_mut().is_none_or(|g| g.stop());
             self.gpu = None;
             for s in self.shown.drain(..).flatten() {
                 if s.thumbnail != 0
@@ -1504,7 +1566,11 @@ mod win {
                 }
             }
             unsafe {
-                DestroyWindow(self.hwnd);
+                if stopped {
+                    DestroyWindow(self.hwnd);
+                } else {
+                    ShowWindow(self.hwnd, SW_HIDE);
+                }
                 if !self.icon_big.is_null() {
                     DestroyIcon(self.icon_big);
                 }
@@ -1573,6 +1639,20 @@ mod tests {
     }
 
     const HD: MonitorBounds = MonitorBounds { x: 0, y: 0, width: 1920, height: 1080, dpi: 96 };
+
+    /// `--monitor`'s numbers: the main monitor 1, the rest left to right, then top down.
+    #[test]
+    fn monitors_numbered_main_first_then_left_to_right() {
+        let at = |x: i32, y: i32| MonitorBounds { x, y, ..HD };
+        let found = vec![(false, at(1920, 0)), (false, at(-1920, 0)), (true, at(0, 0)), (false, at(0, -1080))];
+        let v = in_order(found);
+        assert_eq!(v.iter().map(|b| (b.x, b.y)).collect::<Vec<_>>(), [(0, 0), (-1920, 0), (0, -1080), (1920, 0)]);
+        assert!(!MonitorBounds::all().is_empty(), "always one, the main one at least");
+        let (main, why) = MonitorBounds::numbered(Some(99));
+        assert_eq!(main, MonitorBounds::all()[0]);
+        assert!(why.is_some_and(|w| w.contains("monitor 99")));
+        assert_eq!(MonitorBounds::numbered(None), (MonitorBounds::all()[0], None));
+    }
 
     #[test]
     fn layouts_switch_live() {

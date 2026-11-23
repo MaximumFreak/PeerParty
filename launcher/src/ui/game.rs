@@ -94,6 +94,11 @@ impl App {
                         stacked(ui, t!("game.split_screen"), t!("game.split_screen_sub"), |ui| {
                             if widgets::switch(ui, &mut split).changed() {
                                 o.split_screen = split;
+                                // Turned on again later, two players start side by side
+                                // rather than in the grid three or four had.
+                                if !split {
+                                    o.split_layout.clear();
+                                }
                                 if !split && o.players > 2 {
                                     o.players = 2;
                                 }
@@ -113,6 +118,29 @@ impl App {
                                     o.split_layout = layout.to_string();
                                 }
                             });
+                            // Which monitor, once there's more than one.
+                            let monitors = monitors();
+                            if monitors.len() >= 2 || o.split_monitor >= 2 {
+                                ui.add_space(6.0);
+                                ui.label(egui::RichText::new(t!("game.monitor")).size(13.5).color(TEXT));
+                                let mut labels: Vec<String> = monitors
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, b)| {
+                                        let size = format!("{}×{}", b.width, b.height);
+                                        if i == 0 { t!("game.monitor_main", size = size) } else { t!("game.monitor_n", n = i + 1, size = size) }
+                                    })
+                                    .collect();
+                                // One chosen that isn't plugged in now stays chosen.
+                                let want = usize::from(o.split_monitor.max(1));
+                                while labels.len() < want {
+                                    labels.push(t!("game.monitor_gone", n = labels.len() + 1));
+                                }
+                                let mut i = want - 1;
+                                if widgets::stepper(ui, "split-monitor", &labels, &mut i, ui.available_width()).changed() {
+                                    o.split_monitor = if i == 0 { 0 } else { (i + 1) as u8 };
+                                }
+                            }
                             ui.add_space(6.0);
                             ui.label(egui::RichText::new(t!("game.player_inputs")).size(13.5).color(TEXT));
                             let input_opts = [("auto", t!("game.input_auto")), ("kbm", t!("game.input_kbm")), ("pad", t!("game.input_pad"))];
@@ -196,6 +224,27 @@ impl App {
                         if name != self.settings.prefs.other_name {
                             self.settings.prefs.other_name = name;
                             self.save_settings();
+                        }
+                        // Players 3 and 4: split screen alone starts them.
+                        if o.uses_split_screen() && running.is_empty() {
+                            for n in 3..=o.players.min(4) {
+                                let saved = if n == 3 { &self.settings.prefs.third_name } else { &self.settings.prefs.fourth_name };
+                                let mut name = saved.clone();
+                                ui.add_space(4.0);
+                                ui.add(egui::Label::new(egui::RichText::new(t!("game.player_name", n = n)).size(13.5).color(TEXT)).wrap());
+                                ui.add_space(2.0);
+                                ui.push_id(("player-name", n), |ui| {
+                                    widgets::text_field(ui, &mut name, &format!("{main} ({n})"), ui.available_width().min(260.0), 32);
+                                });
+                                if name != *saved {
+                                    if n == 3 {
+                                        self.settings.prefs.third_name = name;
+                                    } else {
+                                        self.settings.prefs.fourth_name = name;
+                                    }
+                                    self.save_settings();
+                                }
+                            }
                         }
                     }
                 } else {
@@ -422,6 +471,9 @@ impl App {
                 }
             }
         }
+        if o.uses_split_screen() && g.source != Source::Xbox {
+            advanced_split(ui, o);
+        }
         widgets::section(ui, t!("game.adv_program"));
         let exe = o.exe.clone().unwrap_or_else(|| g.exe.clone());
         ui.add(egui::Label::new(egui::RichText::new(exe.display().to_string()).monospace().size(12.0).color(TEXT2)).wrap());
@@ -463,9 +515,60 @@ impl App {
     }
 }
 
+/// Split screen's rarely needed parts: how the window shows the copies
+/// (`PEERPARTY_COMPOSITOR`), and Direct3D 9 drawn through DXVK (`PEERPARTY_DXVK`).
+fn advanced_split(ui: &mut egui::Ui, o: &mut GameOptions) {
+    widgets::section(ui, t!("game.adv_split"));
+    ui.label(egui::RichText::new(t!("game.adv_compositor")).size(13.0).color(TEXT2));
+    let mut how = match o.compositor.as_str() {
+        "dwm" => "dwm",
+        "pixels" => "pixels",
+        _ => "",
+    };
+    let opts = [("", t!("game.adv_compositor_frames")), ("dwm", t!("game.adv_compositor_windows")), ("pixels", t!("game.adv_compositor_pixels"))];
+    ui.push_id("compositor", |ui| {
+        if widgets::segmented(ui, &mut how, &opts) {
+            o.compositor = how.to_string();
+        }
+    });
+    ui.add(egui::Label::new(egui::RichText::new(t!("game.adv_compositor_sub")).size(12.0).color(TEXT3)).wrap());
+    ui.add_space(6.0);
+    ui.label(egui::RichText::new(t!("game.adv_dxvk")).size(13.0).color(TEXT2));
+    ui.add(egui::Label::new(egui::RichText::new(t!("game.adv_dxvk_sub")).size(12.0).color(TEXT3)).wrap());
+    if !o.dxvk.is_empty() {
+        ui.add(egui::Label::new(egui::RichText::new(&o.dxvk).monospace().size(12.0).color(TEXT2)).wrap());
+    }
+    ui.horizontal_wrapped(|ui| {
+        if widgets::button(ui, Some(Icon::Folder), t!("game.adv_dxvk_pick"), Kind::Secondary).clicked()
+            && let Some(dir) = rfd::FileDialog::new().set_title(t!("game.adv_dxvk")).pick_folder()
+        {
+            o.dxvk = dir.to_string_lossy().into_owned();
+        }
+        if !o.dxvk.is_empty() && widgets::button(ui, None, t!("game.adv_dxvk_off"), Kind::Ghost).clicked() {
+            o.dxvk.clear();
+        }
+    });
+}
+
 /// Anything under a game's Advanced that differs from the recommended.
 fn advanced_changed(o: &GameOptions) -> bool {
-    !o.modes.is_empty() || !o.skip.is_empty() || !o.game_key.is_empty() || o.exe.is_some() || !o.args.trim().is_empty()
+    !o.modes.is_empty() || !o.skip.is_empty() || !o.game_key.is_empty() || o.exe.is_some() || !o.args.trim().is_empty() || !o.compositor.is_empty() || !o.dxvk.is_empty()
+}
+
+/// This PC's monitors, as `--monitor` numbers them, looked at every few seconds (one
+/// plugged in while the page shows is listed soon after).
+fn monitors() -> Vec<crate::host::MonitorBounds> {
+    type Seen = Option<(std::time::Instant, Vec<crate::host::MonitorBounds>)>;
+    static SEEN: std::sync::Mutex<Seen> = std::sync::Mutex::new(None);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    match seen.as_ref() {
+        Some((at, v)) if at.elapsed() < Duration::from_secs(3) => v.clone(),
+        _ => {
+            let v = crate::host::MonitorBounds::all();
+            *seen = Some((std::time::Instant::now(), v.clone()));
+            v
+        }
+    }
 }
 
 /// A line of "who can join": an icon, who, and how it stands.

@@ -64,9 +64,15 @@ fn arm<T: retour::Function + Copy>(cell: &OnceLock<GenericDetour<T>>, addr: usiz
     })
 }
 
+/// Hands a completed (or failed) result to its watchers, the call's last error kept: a
+/// game reads it after a failure (ERROR_IO_INCOMPLETE, ERROR_OPERATION_ABORTED), and what
+/// the watchers call may set another.
 fn dispatch(h: usize, ol: *mut Overlapped, n: *mut u32, ok: bool) {
+    use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+    let error = unsafe { GetLastError() };
     crate::net::ipfwd::overlapped_result(ol as usize, ok);
     crate::input::hid::on_overlapped_result(h, ol, n, ok);
+    unsafe { SetLastError(error) };
 }
 
 unsafe extern "system" fn get_result(h: usize, ol: *mut Overlapped, n: *mut u32, wait: i32) -> i32 {

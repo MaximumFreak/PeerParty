@@ -74,7 +74,17 @@ use crate::sys::read;
 
 /// `--copy-saves`.
 pub fn enabled() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_COPY_SAVES.with(std::cell::Cell::get) {
+        return on;
+    }
     crate::config::HookConfig::global().copy_saves
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `--copy-saves` for a test on this thread, over the process's settings.
+    static TEST_COPY_SAVES: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// Whether a game given a SteamID of its own starts from the saves under steam_api's
@@ -1394,6 +1404,28 @@ mod tests {
         make_twin(&saves.to_string_lossy(), &twin.to_string_lossy());
         assert_eq!(std::fs::read(twin.join("savegame.dat")).unwrap(), b"second");
         assert_eq!(std::fs::read(saves.join("savegame.dat")).unwrap(), b"first");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// With `--copy-saves`, a twin already there is replaced by the first copy's save,
+    /// and the copy's own is kept beside it as a backup.
+    #[test]
+    fn copy_saves_replaces_an_existing_twin_and_keeps_it_as_a_backup() {
+        let base = std::env::temp_dir().join(format!("peerparty-twin-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let saves = base.join("Saves");
+        std::fs::create_dir_all(&saves).unwrap();
+        std::fs::write(saves.join("savegame.dat"), b"first").unwrap();
+        let twin = base.join("Saves.peerparty-2");
+        std::fs::create_dir_all(&twin).unwrap();
+        std::fs::write(twin.join("savegame.dat"), b"own").unwrap();
+        TEST_COPY_SAVES.with(|c| c.set(Some(true)));
+        let got = make_twin(&saves.to_string_lossy(), &twin.to_string_lossy());
+        TEST_COPY_SAVES.with(|c| c.set(None));
+        assert_eq!(got, twin.to_string_lossy());
+        assert_eq!(std::fs::read(twin.join("savegame.dat")).unwrap(), b"first", "the first copy's save");
+        assert_eq!(std::fs::read(backup_name(&twin, 1).join("savegame.dat")).unwrap(), b"own", "the copy's own, kept");
+        assert_eq!(std::fs::read(saves.join("savegame.dat")).unwrap(), b"first", "the first copy's left as it was");
         let _ = std::fs::remove_dir_all(&base);
     }
 

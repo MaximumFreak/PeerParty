@@ -131,6 +131,9 @@ pub const PREVIEW_DIR: &str = "PEERPARTY_PREVIEW_DIR";
 pub const PREVIEW_SIZE: &str = "PEERPARTY_PREVIEW_SIZE";
 /// Arguments for the window's own tests.
 pub const TEST_ARGV: &str = "PEERPARTY_TEST_ARGV";
+/// `1`: a split-screen session's window is made but never shown or put in front (the
+/// split-screen smoke test, tests/sdk/split_screen_test.py, which mustn't cover the screen).
+pub const SESSION_HIDDEN: &str = "PEERPARTY_SESSION_HIDDEN";
 /// Where the core's integration tests log.
 pub const TEST_LOG: &str = "PEERPARTY_TEST_LOG";
 

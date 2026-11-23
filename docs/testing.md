@@ -26,6 +26,10 @@
   (`steam_legacy`): `SteamMatchmaking()`'s object wrapped whatever the DLL names (its
   class's RTTI says the version), a lobby created through it, and LobbyCreated_t and
   LobbyEnter_t reaching the game through classic `SteamAPI_RunCallbacks` dispatch.
+- Split screen (`tests/sdk/split_screen_test.py`, no DLL): one hidden two-player
+  session (`peerparty --split-screen --instances 2`, `PEERPARTY_SESSION_HIDDEN=1`).
+  Each copy is a starter that hands over to its game. The test checks both games
+  start and outlive their starters, then Close all ends them and the session.
 - Typed-IP games on async sockets (`tests/sdk/ipfwd_test.py`, no DLL): two copies in a
   fresh room over loopback, with LAN discovery off so each sees the other only at its
   stand-in address. Each answer's overlapped receive is collected seven ways (completion

@@ -1,9 +1,12 @@
 # Runs a two-copy test under peerparty: run_pair.ps1 <test.py> [-Env NAME=VALUE,...]
-# [-RoleEnv A:NAME=VALUE,...] [-Roles A[,B]] [-PeerParty exe] [-Game key] [-Work dir]
-# Each copy is `peerparty --multi-instance python <test.py> A|B`. Prints both outputs
-# and the peerparty log lines that matter. Work files stay in $env:PPTEST_DIR. -RoleEnv
-# values are set for that copy only. -Game is PEERPARTY_GAME, so parallel pairs don't
-# meet. Both copies are started together; the test waits until the other shows up.
+# [-RoleEnv A:NAME=VALUE,...] [-Roles A[,B]] [-PeerParty exe] [-Game key] [-Work dir] [-Direct]
+# Each copy is `peerparty --multi-instance python <test.py> A|B`. With -Direct, each role
+# is `python <test.py> A` alone, and PPTEST_PEERPARTY names the exe: the test starts
+# peerparty itself (a split-screen session is one peerparty for all of its copies).
+# Prints both outputs and the peerparty log lines that matter. Work files stay in
+# $env:PPTEST_DIR. -RoleEnv values are set for that copy only. -Game is PEERPARTY_GAME,
+# so parallel pairs don't meet. Both copies are started together; the test waits until
+# the other shows up.
 param(
     [string]$Test,
     [string[]]$Env = @(),
@@ -11,7 +14,8 @@ param(
     [string[]]$Roles = @('A', 'B'),
     [string]$PeerParty = '',
     [string]$Game = '',
-    [string]$Work = ''
+    [string]$Work = '',
+    [switch]$Direct
 )
 $ErrorActionPreference = 'Stop'
 $pp = if ($PeerParty) { $PeerParty } elseif ($env:CARGO_TARGET_DIR) { Join-Path $env:CARGO_TARGET_DIR 'testexe\peerparty.exe' } else { "$env:TEMP\cargo-target\peerparty\testexe\peerparty.exe" }
@@ -36,8 +40,16 @@ if (Test-Path -LiteralPath $pyw) { $py = $pyw }
 $procs = foreach ($role in $Roles) {
     $mine = foreach ($re in $RoleEnv) { $r, $kv = $re -split ':', 2; if ($r -eq $role) { $kv } }
     foreach ($kv in $mine) { $k, $v = $kv -split '=', 2; Set-Item "env:$k" $v }
-    Start-Process -FilePath $pp -ArgumentList @('--multi-instance', '--log-dir', "$dir\logs", $py, "`"$Test`"", $role) `
-        -RedirectStandardError "$dir\$role.err" -PassThru -NoNewWindow -WorkingDirectory (Split-Path $Test)
+    if ($Direct) {
+        # The role starts peerparty (one session for every copy), so it needs the exe.
+        $env:PPTEST_PEERPARTY = $pp
+        Start-Process -FilePath $py -ArgumentList @("`"$Test`"", $role) `
+            -RedirectStandardError "$dir\$role.err" -PassThru -NoNewWindow -WorkingDirectory (Split-Path $Test)
+    }
+    else {
+        Start-Process -FilePath $pp -ArgumentList @('--multi-instance', '--log-dir', "$dir\logs", $py, "`"$Test`"", $role) `
+            -RedirectStandardError "$dir\$role.err" -PassThru -NoNewWindow -WorkingDirectory (Split-Path $Test)
+    }
     foreach ($kv in $mine) { $k, $v = $kv -split '=', 2; Remove-Item "env:$k" -ErrorAction SilentlyContinue }
 }
 # Everything this pair's peerparty processes started, and what those started in turn (a

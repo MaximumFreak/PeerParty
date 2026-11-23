@@ -189,7 +189,16 @@ pub fn start_session(t: Target, base_env: ChildEnv, split: &SplitScreen, prefs: 
 
     // Enable DPI awareness before measuring the monitor so every game starts with the
     // exact physical pane dimensions in `PEERPARTY_INSTANCE` before creating its window.
-    let bounds = host::initial_session_bounds();
+    let bounds = host::initial_session_bounds(split.monitor);
+    // How the session's window shows the copies: the environment's or the game's setting
+    // (`settings_env` put the game's in the environment unless one was there).
+    let compositor = base_env.get(penv::COMPOSITOR).map(|v| v.to_string_lossy().into_owned());
+    let dwm = compositor.as_deref().is_some_and(|v| v.trim().eq_ignore_ascii_case("dwm"));
+    let pixels = host::pixel_frames(compositor.as_deref());
+    eprintln!(
+        "peerparty: the session's window shows {}",
+        if dwm { "the copies' windows (PEERPARTY_COMPOSITOR=dwm)" } else if pixels { "the copies' frames, read back as pixels (PEERPARTY_COMPOSITOR=pixels)" } else { "the copies' frames, drawn on the GPU" }
+    );
     let panes = split.layout.compute_panes(bounds.width, bounds.height, count as usize);
 
     for slot in 0..count {
@@ -204,7 +213,7 @@ pub fn start_session(t: Target, base_env: ChildEnv, split: &SplitScreen, prefs: 
         spec.focus_spoof = count > 1;
         // The session's window draws the copy's frames itself (host/gpu.rs), unless told
         // to show the copies' windows.
-        spec.compositor_capture = !std::env::var(penv::COMPOSITOR).is_ok_and(|v| v.trim().eq_ignore_ascii_case("dwm"));
+        spec.compositor_capture = !dwm;
         spec.input_assignment = split.input(slot).assignment(slot);
         spec.identity_override = split.name(slot);
         if let Some(&pane) = panes.get(slot as usize) {
@@ -265,7 +274,7 @@ pub fn start_session(t: Target, base_env: ChildEnv, split: &SplitScreen, prefs: 
     // Close all in the launcher's window goes through the session, as its own window's
     // Close does: each copy asked, then ended after a while.
     listen_for_close_with(host::close_session);
-    host::run_session(launches, split.layout.clone(), &exe, prefs, false);
+    host::run_session(launches, host::SessionLook { layout: split.layout.clone(), bounds, pixels }, &exe, prefs, false);
 
     // PeerParty's exit code is the first player's, unless another player's game crashed:
     // a session is as good as its worst copy.

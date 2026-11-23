@@ -50,7 +50,7 @@ pub fn attach(name: &str) -> bool {
 /// mapped, so a frame can't be read past the block's end whatever its header says.
 fn open(name: &str) -> Option<(usize, usize)> {
     use windows_sys::Win32::System::Memory::{
-        FILE_MAP_READ, MEMORY_BASIC_INFORMATION, MapViewOfFile, OpenFileMappingW, VirtualQuery,
+        FILE_MAP_READ, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, VirtualQuery,
     };
     let (base, file_size) = match ShmBacking::parse(name) {
         Some(ShmBacking::FileMmap { path }) => map_file(&path)?,
@@ -75,6 +75,10 @@ fn open(name: &str) -> Option<(usize, usize)> {
     // SAFETY: mapped and readable for `size` bytes, and never unmapped (see VIEW).
     let header = unsafe { FrameHeader::from_raw(base as *const u8, size) };
     if !header.is_some_and(FrameHeader::valid_magic) {
+        // Not a frame block (or not one yet): its view goes, or each retry would map
+        // another for the game's life.
+        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: base as *mut _ }) };
+        log!("video: overlay frame {name} isn't a frame block ({size} bytes, no PeerParty header); not used");
         return None;
     }
     log!("video: overlay frame {name} mapped ({size} bytes)");
@@ -254,6 +258,22 @@ mod tests {
                 windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: base as *mut _ },
             )
         };
+        shm.remove().unwrap();
+    }
+
+    /// A block without a frame header isn't used (and its view is let go).
+    #[test]
+    fn a_block_with_no_header_is_let_go() {
+        let path = FileShm::path_in(&std::env::temp_dir(), std::process::id(), &[0x5a, 0x11, 0x77, 0x03]);
+        let _ = std::fs::remove_file(&path);
+        let size = block_size(8).unwrap();
+        let shm = FileShm::create(&path, size as u64).unwrap();
+        {
+            use std::io::Write;
+            (&shm.file).write_all(&vec![0xAB; HEADER_SIZE]).unwrap();
+        }
+        let name = ShmBacking::FileMmap { path: path.display().to_string() }.to_env_string();
+        assert_eq!(open(&name), None);
         shm.remove().unwrap();
     }
 }

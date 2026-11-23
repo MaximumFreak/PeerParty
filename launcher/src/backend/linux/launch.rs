@@ -225,7 +225,8 @@ mod run {
         let mut waiters = Vec::with_capacity(count as usize);
         let mut pids = Vec::with_capacity(count as usize);
 
-        let bounds = host::initial_session_bounds();
+        let bounds = host::initial_session_bounds(split.monitor);
+        let compositor = base_env.get(penv::COMPOSITOR).map(|v| v.to_string_lossy().into_owned());
         let panes = split.layout.compute_panes(bounds.width, bounds.height, count as usize);
 
         for slot in 0..count {
@@ -244,7 +245,7 @@ mod run {
             spec.focus_spoof = count > 1;
             // The session's window draws the copy's frames itself (host/x11.rs), read back
             // into a file by its hook, unless told to leave the copies' windows be.
-            spec.compositor_capture = !std::env::var(penv::COMPOSITOR).is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "dwm" | "off" | "none"));
+            spec.compositor_capture = !compositor.as_deref().is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "dwm" | "off" | "none"));
             spec.input_assignment = split.input(slot).assignment(slot);
             spec.identity_override = split.name(slot);
             if let Some(&pane) = panes.get(slot as usize) {
@@ -286,7 +287,8 @@ mod run {
 
         launch::remember(&t.listed);
         let _control = control::listen(|| false, host::close_session);
-        host::run_session(launches, split.layout.clone(), &t.exe, prefs, false);
+        let look = host::SessionLook { layout: split.layout.clone(), bounds, pixels: host::pixel_frames(compositor.as_deref()) };
+        host::run_session(launches, look, &t.exe, prefs, false);
 
         // The first player's exit, unless another player's game ended with an error.
         let mut exits = Vec::with_capacity(waiters.len());

@@ -239,6 +239,8 @@ pub struct Gpu {
     /// The frame event's name, for the copies' hooks (`HostMsg::Capture`).
     pub event_name: String,
     thread: Option<JoinHandle<()>>,
+    /// `stop` gave up waiting for the thread.
+    left_running: bool,
 }
 
 impl Gpu {
@@ -261,7 +263,7 @@ impl Gpu {
         let (frames, wake) = (Arc::new(Handle(frames)), Arc::new(Handle(wake)));
         let (s, f, w, h) = (shared.clone(), frames.clone(), wake.clone(), hwnd as usize);
         let thread = std::thread::Builder::new().name("peerparty-compositor".into()).spawn(move || run(h, &s, f.0, w.0)).ok()?;
-        Some(Gpu { shared, wake, frames, event_name, thread: Some(thread) })
+        Some(Gpu { shared, wake, frames, event_name, thread: Some(thread), left_running: false })
     }
 
     /// The panes to draw, by copy.
@@ -283,10 +285,18 @@ impl Gpu {
 
 impl Drop for Gpu {
     fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+impl Gpu {
+    /// Ends the drawing thread, waiting a few seconds at most: whether it has ended (and
+    /// no longer draws in the window). Once is enough; later calls say the same.
+    pub fn stop(&mut self) -> bool {
         use windows_sys::Win32::UI::WindowsAndMessaging::{DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage};
         self.shared.quit.store(true, Ordering::Release);
         unsafe { SetEvent(self.wake.0) };
-        let Some(t) = self.thread.take() else { return };
+        let Some(t) = self.thread.take() else { return !self.left_running };
         // DXGI may be sending the window a message from that thread: this one (the
         // window's) keeps answering them while it waits, for a few seconds at most.
         let start = std::time::Instant::now();
@@ -306,12 +316,23 @@ impl Drop for Gpu {
                 CloseHandle(self.wake.0);
                 CloseHandle(self.frames.0);
             }
+            return true;
         }
         // Else it's left to finish on its own, with its events.
+        eprintln!("peerparty: session: the window's drawing thread hasn't stopped after 3 s; it is left to finish on its own");
+        self.left_running = true;
+        false
     }
 }
 
 // --- The drawing thread ----------------------------------------------------------------
+
+/// Present's answer when the window can't be seen.
+const DXGI_STATUS_OCCLUDED: i32 = 0x087A_0001;
+/// Present's flag for asking whether it could be seen, presenting nothing.
+const DXGI_PRESENT_TEST: u32 = 1;
+/// How often an occluded window is asked whether it can be seen again.
+const OCCLUDED_RETRY: std::time::Duration = std::time::Duration::from_millis(250);
 
 const HLSL: &str = r#"
 struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
@@ -994,6 +1015,10 @@ fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE) {
     // How many times the device was given up (logged the first few).
     let mut lost = 0u32;
     let mut dirty = true;
+    // Since when Present has said the window can't be seen (DXGI_STATUS_OCCLUDED: the
+    // screen locked, another window full screen over it): nothing is drawn meanwhile,
+    // and a test present every OCCLUDED_RETRY says when it can be again.
+    let mut occluded: Option<std::time::Instant> = None;
     loop {
         let events = [frames, wake];
         unsafe { WaitForMultipleObjects(2, events.as_ptr(), 0, 250) };
@@ -1094,6 +1119,20 @@ fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE) {
             set_live(shared, &panes);
             continue;
         }
+        // Not seen: as minimized, until a test present (DXGI_PRESENT_TEST, nothing shown)
+        // says it is again. Without vsync to wait on, drawing would only spin.
+        if let Some(since) = occluded {
+            if since.elapsed() < OCCLUDED_RETRY || vcall!(r.swap, 8, fn(u32, u32) -> i32, 0, DXGI_PRESENT_TEST) == DXGI_STATUS_OCCLUDED {
+                if since.elapsed() >= OCCLUDED_RETRY {
+                    occluded = Some(std::time::Instant::now());
+                }
+                set_live(shared, &panes);
+                continue;
+            }
+            eprintln!("peerparty: session: the window can be seen again; drawing resumes");
+            occluded = None;
+            dirty = true;
+        }
         // The newest frames; `taken`: the pane's frame is its current set's, taken now
         // (only those are released: an old set's fence means nothing to the copy now).
         let mut fresh = false;
@@ -1152,6 +1191,10 @@ fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE) {
         let drawn = r.draw(rtv, &panes, &take);
         // IDXGISwapChain::Present (8): vsync.
         let hr = vcall!(r.swap, 8, fn(u32, u32) -> i32, 1, 0);
+        if hr == DXGI_STATUS_OCCLUDED && occluded.is_none() {
+            eprintln!("peerparty: session: the window can't be seen (the screen is locked, or a full-screen window covers it); nothing is drawn until it can");
+            occluded = Some(std::time::Instant::now());
+        }
         for (i, slot) in drawn {
             let p = &mut panes[i];
             let Some(ring) = p.draw.ring.as_ref() else { continue };

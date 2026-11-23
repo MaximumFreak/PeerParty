@@ -56,8 +56,9 @@ static WGI_READS: AtomicU32 = AtomicU32::new(0);
 pub(super) fn take_reads() -> u32 {
     WGI_READS.swap(0, Ordering::Relaxed)
 }
-/// Raw controllers' axes when held, per controller.
+/// Raw controllers' axes when held, per controller (`MAX_HELD_RAW` of them at most).
 static AXES: Mutex<Vec<(usize, Vec<f64>)>> = Mutex::new(Vec::new());
+const MAX_HELD_RAW: usize = 16;
 /// Where each raw controller's axes sit while passing through.
 static REST: Mutex<Vec<(usize, Vec<Rest>)>> = Mutex::new(Vec::new());
 
@@ -535,13 +536,18 @@ unsafe extern "system" fn raw_reading(
     if !switches.is_null() {
         unsafe { std::ptr::write_bytes(switches, 0, n_switches as usize) };
     }
-    if !axes.is_null() && n_axes > 0 {
+    if !axes.is_null() && n_axes > 0 && n_axes <= 64 {
         let now = unsafe { std::slice::from_raw_parts_mut(axes, n_axes as usize) };
         let mut held = AXES.lock().unwrap();
         let at_open = match held.iter().find(|(c, _)| *c == this) {
             Some((_, a)) if a.len() == now.len() => a.clone(),
             Some(_) => return hr,
             None => {
+                // A game that makes a new controller object for each read can't grow the
+                // list without end: the oldest goes.
+                if held.len() >= MAX_HELD_RAW {
+                    held.remove(0);
+                }
                 held.push((this, now.to_vec()));
                 now.to_vec()
             }

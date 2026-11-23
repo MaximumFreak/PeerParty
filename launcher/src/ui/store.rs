@@ -41,6 +41,15 @@ pub struct GameOptions {
     /// What each split-screen player plays with, by player: "auto", "kbm" or "pad"
     /// (`launch::SlotInput`); missing ones are "auto".
     pub split_inputs: Vec<String>,
+    /// The monitor the split-screen window opens on (`--monitor`, from 1:
+    /// `MonitorBounds::all`'s numbers); 0 or 1 is the main one.
+    pub split_monitor: u8,
+    /// How the split-screen window shows the copies (`PEERPARTY_COMPOSITOR`): "" (the
+    /// default: their frames, drawn on the GPU), "dwm" (their windows) or "pixels".
+    pub compositor: String,
+    /// A DXVK release's folder (`PEERPARTY_DXVK`): a Direct3D 9 game's split-screen copies
+    /// draw through it. Empty: off.
+    pub dxvk: String,
     // "Copy Player 1's saves to Player N" isn't kept here: it is for one start (the window's
     // `App::copy_saves`). A `copy_saves` an older ui.json has is ignored on reading and
     // gone at the next save.
@@ -116,6 +125,9 @@ impl Default for GameOptions {
             split_screen: false,
             split_layout: String::new(),
             split_inputs: Vec::new(),
+            split_monitor: 0,
+            compositor: String::new(),
+            dxvk: String::new(),
             args: String::new(),
             exe: None,
             auto_accept: None,
@@ -165,6 +177,10 @@ pub struct Prefs {
     /// third onwards numbered). Empty: `name` with "(2)". Shown only on a game page set
     /// to two players, or with a copy running.
     pub other_name: String,
+    /// The names split screen's players 3 and 4 go by (`--names` over them). Empty:
+    /// `name` with "(3)", "(4)". Shown on a game page set to three or four players.
+    pub third_name: String,
+    pub fourth_name: String,
     /// Invites from other players are accepted without asking. Off: the overlay asks.
     pub auto_accept: bool,
     /// Controller buttons that invite every other player: "", "guide", "combo" or "both".
@@ -218,6 +234,8 @@ impl Default for Prefs {
         Prefs {
             name: String::new(),
             other_name: String::new(),
+            third_name: String::new(),
+            fourth_name: String::new(),
             auto_accept: false,
             invite_buttons: String::new(),
             overlay: true,

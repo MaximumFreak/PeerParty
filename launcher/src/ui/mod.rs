@@ -694,6 +694,10 @@ impl App {
                 args.push("--inputs".into());
                 args.push(inputs);
             }
+            if o.split_monitor >= 2 {
+                args.push("--monitor".into());
+                args.push(o.split_monitor.to_string());
+            }
         } else if o.players >= 2 && g.source != Source::Xbox {
             args.push("--multi-instance".into());
         }
@@ -861,7 +865,9 @@ impl App {
             if code != Some(0) && s.started.elapsed() < Duration::from_secs(20) {
                 let text = s.stderr.lock().unwrap().clone();
                 let why = why_text(&text).unwrap_or_else(|| t!("snack.exited_at_once").to_string());
-                self.say(t!("snack.didnt_start", game = s.name, n = s.player, why = why), false);
+                // A split-screen session is one start, not player 1's alone.
+                let text = if s.split_players >= 2 { t!("snack.didnt_start_split", game = s.name, why = why) } else { t!("snack.didnt_start", game = s.name, n = s.player, why = why) };
+                self.say(text, false);
             }
             self.lib.reload_recent();
         }

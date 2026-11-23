@@ -81,6 +81,7 @@ use peerparty_protocol::ipc::{HookMsg, HostMsg};
 use peerparty_protocol::session::{InputAssignment, InstanceId, InstanceSpec};
 
 pub use compositor::{CompositorWindow, MonitorBounds};
+pub use ring::pixel_frames;
 pub use desktop::Ended;
 use desktop::Rect;
 pub use peerparty_protocol::session::LayoutPreset;
@@ -96,8 +97,6 @@ use prefs_sync::PrefsSync;
 use ui::{Cmd, Nav, Overlay, Page};
 
 const VK_SHIFT: i32 = 0x10;
-const VK_CONTROL: i32 = 0x11;
-const VK_MENU: i32 = 0x12;
 const VK_TAB: u32 = 0x09;
 const VK_F1: u32 = 0x70;
 const VK_F2: u32 = 0x71;
@@ -367,17 +366,41 @@ pub fn run(process: Ended, pid: u32, pipe: pipe::Pipe, exe: &Path, prefs: Prefs,
     host.run();
 }
 
-/// Enables DPI awareness and measures the primary monitor for initial split-screen panes
-/// before spawning child processes.
-pub fn initial_session_bounds() -> MonitorBounds {
+/// Enables DPI awareness and measures the monitor a split-screen session opens on
+/// (`--monitor`'s number, else the main one) before the copies start, so each is told
+/// its pane in real pixels.
+pub fn initial_session_bounds(monitor: Option<u32>) -> MonitorBounds {
     desktop::dpi_aware();
-    MonitorBounds::primary()
+    let (b, why) = MonitorBounds::numbered(monitor);
+    let n = if why.is_some() { 1 } else { monitor.unwrap_or(1) };
+    if let Some(why) = why {
+        eprintln!("peerparty: {why}");
+    }
+    eprintln!(
+        "peerparty: split screen on monitor {n} of {}: {}x{} at ({}, {}), {}% scale",
+        MonitorBounds::all().len(),
+        b.width,
+        b.height,
+        b.x,
+        b.y,
+        b.dpi * 100 / 96
+    );
+    b
+}
+
+/// How a split-screen session's window looks: its layout, where it opens (the bounds
+/// `initial_session_bounds` gave the copies' panes), and whether the copies' frames come
+/// as pixels (`ring::pixel_frames`).
+pub struct SessionLook {
+    pub layout: LayoutPreset,
+    pub bounds: MonitorBounds,
+    pub pixels: bool,
 }
 
 /// Runs a split-screen session until every copy in it has ended: one window shows them
 /// in panes cut by `layout` (each copy told its pane and given a virtual input block),
 /// and each copy has an overlay of its own, as `run` gives one.
-pub fn run_session(instances: Vec<SessionLaunch>, layout: LayoutPreset, exe: &Path, prefs: Prefs, packaged: bool) {
+pub fn run_session(instances: Vec<SessionLaunch>, look: SessionLook, exe: &Path, prefs: Prefs, packaged: bool) {
     if instances.is_empty() {
         return;
     }
@@ -395,7 +418,7 @@ pub fn run_session(instances: Vec<SessionLaunch>, layout: LayoutPreset, exe: &Pa
     let name = exe.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let title = game_title(exe, &name);
     // The window is made on this thread, which hands it its messages (desktop::wait).
-    let compositor = CompositorWindow::open(layout, MonitorBounds::primary(), copies.len(), &title, exe);
+    let compositor = CompositorWindow::open(look.layout, look.bounds, copies.len(), &title, exe);
     let mut host = SessionHost::new(copies, Some(compositor), exe, prefs, packaged);
     host.set_inputs(inputs);
     let event = host.compositor.as_ref().and_then(|c| c.frame_event());
@@ -406,7 +429,7 @@ pub fn run_session(instances: Vec<SessionLaunch>, layout: LayoutPreset, exe: &Pa
         // thumbnail) copies them into shared textures, or pixels in a file, said in its
         // ring block.
         if draws {
-            inst.make_ring();
+            inst.make_ring(look.pixels);
             inst.send_capture(event.as_deref());
         }
     }
@@ -993,7 +1016,7 @@ impl SessionHost {
         let mut focus = c.take_click().and_then(|(x, y)| c.pane_at(x, y));
         let ours = c.hwnd() != 0 && desktop::in_front(std::process::id());
         let held = ours || self.instances.iter().any(|i| i.in_front());
-        let chord = held && down(VK_CONTROL) && down(VK_MENU);
+        let chord = held && ctrl_alt(down);
         for (k, vk) in SESSION_KEYS.iter().enumerate() {
             let d = chord && down(*vk);
             if d && !self.nav.session_keys[k] {
@@ -1962,6 +1985,15 @@ fn down(vk: i32) -> bool {
     desktop::key_down(vk)
 }
 
+/// Ctrl+Alt for the session's keys, by `down` (each side's key: VK_LCONTROL ... VK_RMENU):
+/// left Alt with either Ctrl, or right Alt with right Ctrl. AltGr is right Alt with a
+/// left Ctrl Windows adds itself, and types characters on many keyboards (AltGr+Z is a
+/// letter on a Polish one): it isn't the chord.
+pub(crate) fn ctrl_alt(down: impl Fn(i32) -> bool) -> bool {
+    let (lctrl, rctrl, lalt, ralt) = (down(0xA2), down(0xA3), down(0xA4), down(0xA5));
+    (lalt && (lctrl || rctrl)) || (ralt && rctrl)
+}
+
 /// Whether Home / Guide opens the overlay: on, and not taken by inviting everyone.
 pub(super) fn guide_opens(prefs: &Prefs) -> bool {
     prefs.hotkeys.guide && !matches!(prefs.invite_buttons.as_str(), "guide" | "both")
@@ -2000,6 +2032,19 @@ fn pads_let_go(pad: u32, since: Instant, now: Instant) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Ctrl+Alt from either Ctrl with left Alt, or both right keys; AltGr (right Alt with
+    /// Windows' own left Ctrl) isn't it.
+    #[test]
+    fn altgr_is_not_ctrl_alt() {
+        let held = |keys: &'static [i32]| move |vk: i32| keys.contains(&vk);
+        assert!(super::ctrl_alt(held(&[0xA2, 0xA4])), "left Ctrl + left Alt");
+        assert!(super::ctrl_alt(held(&[0xA3, 0xA4])), "right Ctrl + left Alt");
+        assert!(super::ctrl_alt(held(&[0xA3, 0xA5])), "right Ctrl + right Alt");
+        assert!(!super::ctrl_alt(held(&[0xA2, 0xA5])), "AltGr");
+        assert!(!super::ctrl_alt(held(&[0xA4])), "Alt alone");
+        assert!(!super::ctrl_alt(held(&[0xA2])), "Ctrl alone");
+    }
+
     use super::*;
     use crate::firewall::{Rule, Verdict};
     use peerparty_protocol::Json;

@@ -17,8 +17,9 @@
 #   4. the two-copy SDK tests (tests/sdk/run_pair.ps1): EOS RTC, EOS lobby voice, EOS custom
 #      invites, PlayFab Party chat, PlayFabCore sign-in, PlayFab's web API, Unity Gaming
 #      Services, Vivox voice (Unity's VivoxNative.dll), GOG Galaxy, Steam licence checks (with the Steam client running), an older SDK's steam_api (old accessors,
-#      classic dispatch), a starter handing over to the game, and
-#      typed-IP games on async sockets (two copies in a room)
+#      classic dispatch), a starter handing over to the game, a two-player split-screen
+#      session from start to Close all (its window hidden), and typed-IP games on async
+#      sockets (two copies in a room)
 #
 # Two runs at once (two checkouts, a second terminal) never meet: each run has its own id
 # ($RunId), and with it its own work folder (%TEMP%\ppwork\run-<id>), its own game keys
@@ -241,6 +242,7 @@ function Write-Spec($path, $job) {
         "`$PeerParty = $(Quote $job.PeerParty)"
         "`$Game = $(Quote $job.Game)"
         "`$Work = $(Quote $job.Work)"
+        "`$Direct = `$$([bool]$job.Direct)"
         '$Session = @{'
     )
     foreach ($k in @($session.Keys)) { $body += "    $(Quote $k) = $(Quote ([string]$session[$k]))" }
@@ -426,7 +428,7 @@ function New-PairJob($name, $p, $dll, $python, $x86) {
         Runner = (Join-Path $PSScriptRoot 'sdk\run_pair.ps1')
         Var = $p.Var; DllPath = $dll; File = [bool]$p.File; Python = $python; X86 = [bool]$x86
         Env = @(Env-List $p.Env); RoleEnv = @(Env-List $p.RoleEnv); Roles = $roles
-        Probe = [bool]$p.Probe; ProbeOf = $p.ProbeOf; NeedsRoom = [bool]$p.NeedsRoom
+        Probe = [bool]$p.Probe; ProbeOf = $p.ProbeOf; NeedsRoom = [bool]$p.NeedsRoom; Direct = [bool]$p.Direct
     }
 }
 
@@ -516,6 +518,10 @@ try {
         @{ Name = 'starter'; Dlls = 'steam_own_id'; Py = 'starter_test.py'; Var = 'PPTEST_STARTER_DLL'; Files = @('steam_api64.dll'); File = $true; Env = @("PEERPARTY_ROOM=starter-$RunId-1", 'PEERPARTY_INET_DHT=0', 'PEERPARTY_INET_STUN=0', 'PEERPARTY_INET_PORTMAP=0'); Roles = @('A') },
         # The same with a menu first (5 s): the starter starts its LAN, then gives it up.
         @{ Name = 'starter_menu'; Dlls = 'steam_own_id'; Py = 'starter_test.py'; Var = 'PPTEST_STARTER_DLL'; Files = @('steam_api64.dll'); File = $true; Env = @("PEERPARTY_ROOM=starter-$RunId-2", 'PEERPARTY_INET_DHT=0', 'PEERPARTY_INET_STUN=0', 'PEERPARTY_INET_PORTMAP=0', 'PPTEST_STARTER_MENU=5'); Roles = @('A') },
+        # One peerparty, two copies, a starter in each that hands over to the game, then
+        # Close all. The test starts peerparty itself; the session window stays hidden.
+        # No SDK DLL.
+        @{ Name = 'split_screen'; Py = 'split_screen_test.py'; Var = $null; Files = @(); File = $false; Env = @(); Roles = @('A'); Direct = $true },
         @{ Name = 'ipfwd'; Py = 'ipfwd_test.py'; Var = $null; Files = @(); File = $false; Env = @($inet + "PPTEST_IPFWD_PORT=$($p1 + 2)"); NeedsRoom = $true; RoleEnv = @("A:PEERPARTY_INET_PORT=$p1", "B:PEERPARTY_INET_PORT=$($p1 + 1)", "B:PEERPARTY_INET_PEERS=127.0.0.1:$p1") }
     )
     foreach ($p in $pairs) {

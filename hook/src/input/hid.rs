@@ -567,6 +567,24 @@ pub(crate) fn on_overlapped_result(h: usize, ol: *mut Overlapped, n: *mut u32, o
 mod tests {
     use super::*;
 
+    /// Files aren't devices, and aren't remembered: a game reading thousands of files
+    /// never fills `KNOWN`, pushing its controllers out.
+    #[test]
+    fn files_are_not_devices_and_not_kept() {
+        use std::os::windows::io::AsRawHandle;
+        let path = std::env::temp_dir().join(format!("peerparty-hid-test-{}.bin", std::process::id()));
+        std::fs::write(&path, b"not a controller").unwrap();
+        let files: Vec<std::fs::File> = (0..KNOWN_MAX + 8).map(|_| std::fs::File::open(&path).unwrap()).collect();
+        for f in &files {
+            assert!(device_of(f.as_raw_handle() as usize).is_none());
+        }
+        let known = KNOWN.lock().unwrap();
+        assert!(!files.iter().any(|f| known.iter().any(|(k, _)| *k == f.as_raw_handle() as usize)), "no file handle is kept");
+        drop(known);
+        drop(files);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// While the overlay holds the controllers, a read of a held device gets the report
     /// kept for it, the same each time, and only one that fits; a device with none kept
     /// yet gets none (its first real read is kept).

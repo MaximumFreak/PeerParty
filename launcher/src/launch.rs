@@ -240,8 +240,12 @@ pub struct SplitScreen {
     /// What each player plays with (`--inputs`), by player; missing ones are `Auto`.
     pub inputs: Vec<SlotInput>,
     /// Each player's name (`--names`), by player; blank or missing: the PC's naming
-    /// (player 1 the PC's, player 2 the second player's name, then "<name> (3)").
+    /// (player 1 the PC's, player 2 the second player's name, players 3 and 4 theirs from
+    /// Settings, else "<name> (3)").
     pub names: Vec<String>,
+    /// The monitor the session's window opens on (`--monitor`, from 1:
+    /// `MonitorBounds::all`'s numbers); None is the main one.
+    pub monitor: Option<u32>,
 }
 
 /// What a split-screen player plays with (`--inputs auto,kbm,pad`).
@@ -321,11 +325,27 @@ impl SplitScreen {
     pub fn name(&self, slot: u32) -> Option<String> {
         self.names.get(slot as usize).filter(|n| !n.trim().is_empty()).cloned()
     }
+
+    /// Players 3 and 4 with no `--names` of their own get the ones in Settings
+    /// (`Prefs::third_name`, `fourth_name`); players 1 and 2 have theirs from the
+    /// environment (`PEERPARTY_NAME`, `PEERPARTY_OTHER_NAME`).
+    pub fn fill_names(&mut self, prefs: &Prefs) {
+        for (slot, saved) in [(2u32, &prefs.third_name), (3, &prefs.fourth_name)] {
+            let saved = saved.trim();
+            if slot >= self.instances || saved.is_empty() || self.name(slot).is_some() {
+                continue;
+            }
+            if self.names.len() <= slot as usize {
+                self.names.resize(slot as usize + 1, String::new());
+            }
+            self.names[slot as usize] = saved.chars().take(32).collect();
+        }
+    }
 }
 
 impl Default for SplitScreen {
     fn default() -> Self {
-        SplitScreen { instances: 2, layout: LayoutPreset::Horizontal, inputs: Vec::new(), names: Vec::new() }
+        SplitScreen { instances: 2, layout: LayoutPreset::Horizontal, inputs: Vec::new(), names: Vec::new(), monitor: None }
     }
 }
 
@@ -427,7 +447,9 @@ pub fn start(l: Launch) -> Result<Exited, LaunchError> {
         // `Identity::ensure_first`). Under Proton the copies keep theirs inside Wine.
         #[cfg(windows)]
         peerparty_core::Identity::ensure_first(&peerparty_core::Identity::default_dir());
-        return backend::start_session(target, env, split, prefs, &log_dir, root.as_deref());
+        let mut split = split.clone();
+        split.fill_names(&prefs);
+        return backend::start_session(target, env, &split, prefs, &log_dir, root.as_deref());
     }
     // The overlay's connection to the hook. On Linux it is also how `--invite` reaches
     // the game (backend/linux/control.rs), so it is made whether the overlay is on or not.
@@ -454,6 +476,14 @@ fn settings_env(env: &mut ChildEnv, prefs: &Prefs, game: &store::GameOptions) ->
     }
     if !prefs.other_name.trim().is_empty() {
         env.set_default(penv::OTHER_NAME, prefs.other_name.trim());
+    }
+    // How a split-screen session shows its copies, and Direct3D 9 through DXVK in them:
+    // the game's own choice, unless the environment says.
+    if !game.compositor.trim().is_empty() {
+        env.set_default(penv::COMPOSITOR, game.compositor.trim());
+    }
+    if !game.dxvk.trim().is_empty() {
+        env.set_default(penv::DXVK, game.dxvk.trim());
     }
     env.set_default(penv::INVITES, if prefs.auto_accept { "auto" } else { "ask" });
     env.set_default(penv::INVITE_BUTTONS, &prefs.invite_buttons);
@@ -511,6 +541,8 @@ pub fn apply_set(p: &mut Prefs, k: &str, v: &str) {
     match k {
         "name" => p.name = v.to_string(),
         "other_name" => p.other_name = v.to_string(),
+        "third_name" => p.third_name = v.to_string(),
+        "fourth_name" => p.fourth_name = v.to_string(),
         "auto_accept" | "invites" => p.auto_accept = on,
         "overlay" => p.overlay = on,
         "voice" => p.voice = on,
@@ -838,7 +870,7 @@ mod tests {
         assert_eq!(SplitScreen::layout_named("Vertical"), Some(LayoutPreset::Vertical));
         assert_eq!(SplitScreen::layout_named("grid"), Some(LayoutPreset::Grid2x2));
         assert_eq!(SplitScreen::layout_named("diagonal"), None);
-        assert_eq!(SplitScreen::default(), SplitScreen { instances: 2, layout: LayoutPreset::Horizontal, inputs: Vec::new(), names: Vec::new() });
+        assert_eq!(SplitScreen::default(), SplitScreen { instances: 2, layout: LayoutPreset::Horizontal, inputs: Vec::new(), names: Vec::new(), monitor: None });
     }
 
     #[test]
@@ -850,5 +882,21 @@ mod tests {
         assert_eq!((split.input(0), split.input(1)), (SlotInput::KeyboardMouse, SlotInput::Auto));
         assert_eq!(SlotInput::KeyboardMouse.assignment(0), InputAssignment::KeyboardMouse { device_id: ANY_KEYBOARD });
         assert_eq!(SlotInput::Auto.assignment(2), InputAssignment::Controller { index: 2 });
+    }
+
+    /// Players 3 and 4 take their names from Settings unless `--names` gave them one;
+    /// players 1 and 2 never do (theirs come through the environment).
+    #[test]
+    fn players_three_and_four_get_their_saved_names() {
+        let prefs = Prefs { third_name: " Robin ".into(), fourth_name: "Kim".into(), ..Prefs::default() };
+        let mut split = SplitScreen { instances: 4, names: vec!["".into(), "".into(), "".into(), "Lee".into()], ..SplitScreen::default() };
+        split.fill_names(&prefs);
+        assert_eq!((split.name(0), split.name(1), split.name(2), split.name(3)), (None, None, Some("Robin".into()), Some("Lee".into())));
+        let mut three = SplitScreen { instances: 3, ..SplitScreen::default() };
+        three.fill_names(&prefs);
+        assert_eq!(three.names, ["", "", "Robin"], "no fourth player, no fourth name");
+        let mut two = SplitScreen::default();
+        two.fill_names(&prefs);
+        assert!(two.names.is_empty());
     }
 }

@@ -191,12 +191,12 @@ impl InstanceConn {
     }
 
     /// A block for its frames' ring, if its frames are the session's to draw: a file in
-    /// the frames' directory when they come as pixels.
-    pub fn make_ring(&mut self) {
+    /// the frames' directory when they come as `pixels` (`ring::pixel_frames`).
+    pub fn make_ring(&mut self, pixels: bool) {
         if !self.spec.compositor_capture || self.ring.is_some() {
             return;
         }
-        if super::ring::pixel_frames() {
+        if pixels {
             self.ring = super::ring::RingBlock::create_file(&desktop::frame_dir(), self.pid);
             return;
         }
