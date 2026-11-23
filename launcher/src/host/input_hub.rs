@@ -373,6 +373,12 @@ impl Kbm {
                     self.presses += 1;
                 }
                 k.set(vk, down);
+                // A left or right Shift, Ctrl or Alt is also the key either side reads
+                // as (VK_SHIFT ...), down while either is.
+                if let 0xA0..=0xA5 = vk {
+                    let left = vk & !1;
+                    k.set(0x10 + (vk - 0xA0) / 2, k.is_down(left) || k.is_down(left + 1));
+                }
             }
             RawEvent::Motion { device, dx, dy } => {
                 let bounds = self.bounds.get(&device).copied();
@@ -618,11 +624,28 @@ mod raw {
     const RIM_TYPEMOUSE: u32 = 0;
     const RIM_TYPEKEYBOARD: u32 = 1;
     const RI_KEY_BREAK: u16 = 1;
+    const RI_KEY_E0: u16 = 2;
     const MOUSE_MOVE_ABSOLUTE: u16 = 1;
     const RI_MOUSE_WHEEL: u16 = 0x0400;
     /// `RI_MOUSE_*` down and up bits, each with its `MOUSE_*` button.
     const BUTTONS: [(u16, u16, u32); 5] =
         [(0x0001, 0x0002, MOUSE_LEFT), (0x0004, 0x0008, MOUSE_RIGHT), (0x0010, 0x0020, MOUSE_MIDDLE), (0x0040, 0x0080, MOUSE_X1), (0x0100, 0x0200, MOUSE_X2)];
+
+    /// A keyboard's raw report as a key: Shift, Ctrl and Alt as the side they are
+    /// (VK_LSHIFT ... VK_RMENU: raw input says only VK_SHIFT, the scan code or the E0
+    /// prefix tells the side). None for the 0xFF Windows sends for a key that is part
+    /// of another (an escape sequence's first half).
+    pub(super) fn key_event(device: u64, vkey: u16, make: u16, flags: u16) -> Option<RawEvent> {
+        let e0 = flags & RI_KEY_E0 != 0;
+        let vk = match vkey {
+            0x10 => if make == 0x36 { 0xA1 } else { 0xA0 },
+            0x11 => if e0 { 0xA3 } else { 0xA2 },
+            0x12 => if e0 { 0xA5 } else { 0xA4 },
+            0xFF => return None,
+            v => u8::try_from(v).ok()?,
+        };
+        Some(RawEvent::Key { device, vk, down: flags & RI_KEY_BREAK == 0 })
+    }
 
     /// The events in a mouse's raw report: its button changes, wheel and motion.
     pub(super) fn mouse_events(device: u64, flags: u16, button_flags: u16, button_data: u16, dx: i32, dy: i32) -> Vec<RawEvent> {
@@ -651,7 +674,7 @@ mod raw {
                 let events = match raw.header.dwType {
                     RIM_TYPEKEYBOARD => {
                         let k = unsafe { raw.data.keyboard };
-                        u8::try_from(k.VKey).ok().map(|vk| RawEvent::Key { device, vk, down: k.Flags & RI_KEY_BREAK == 0 }).into_iter().collect()
+                        key_event(device, k.VKey, k.MakeCode, k.Flags).into_iter().collect()
                     }
                     RIM_TYPEMOUSE => {
                         let ms = unsafe { raw.data.mouse };
@@ -826,6 +849,26 @@ mod tests {
         assert_eq!(k.presses - before, 2);
         k.set_bounds(6, 4, 4);
         assert_eq!((k.mice[&6].cursor_x, k.mice[&6].cursor_y), (3, 3), "a smaller screen pulls the cursor in");
+    }
+
+    /// Raw input's Shift / Ctrl / Alt read as their side, and as the either-side key
+    /// while one side is down.
+    #[cfg(windows)]
+    #[test]
+    fn modifiers_have_sides() {
+        assert_eq!(raw::key_event(1, 0x10, 0x36, 0), Some(RawEvent::Key { device: 1, vk: 0xA1, down: true }));
+        assert_eq!(raw::key_event(1, 0x11, 0x1D, 2 | 1), Some(RawEvent::Key { device: 1, vk: 0xA3, down: false }));
+        assert_eq!(raw::key_event(1, 0x12, 0x38, 0), Some(RawEvent::Key { device: 1, vk: 0xA4, down: true }));
+        assert_eq!(raw::key_event(1, 0xFF, 0x2A, 0), None);
+        let mut k = Kbm::default();
+        k.apply(RawEvent::Key { device: 1, vk: 0xA0, down: true });
+        k.apply(RawEvent::Key { device: 1, vk: 0xA1, down: true });
+        k.apply(RawEvent::Key { device: 1, vk: 0xA0, down: false });
+        assert!(k.keyboards[&1].is_down(0x10), "the right one still holds Shift");
+        k.apply(RawEvent::Key { device: 1, vk: 0xA1, down: false });
+        assert!(!k.keyboards[&1].is_down(0x10));
+        k.apply(RawEvent::Key { device: 1, vk: 0xA5, down: true });
+        assert!(k.keyboards[&1].is_down(0x12) && k.keyboards[&1].is_down(0xA5));
     }
 
     #[cfg(windows)]

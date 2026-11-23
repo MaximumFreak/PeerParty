@@ -95,6 +95,8 @@ pub struct InstanceConn {
     hwnd_checked: Option<Instant>,
     /// Whether it was told it plays as a later slot (`toast.later_slot`).
     pub slot_told: bool,
+    /// Its game locked its cursor (`HookMsg::CursorLock`).
+    pub cursor_locked: bool,
     /// Invites and players at its last state, so each new one toasts once.
     pub seen_pending: Vec<u64>,
     pub seen_peers: Vec<String>,
@@ -137,6 +139,7 @@ impl InstanceConn {
             game_window: GameWindow::none(),
             hwnd_checked: None,
             slot_told: false,
+            cursor_locked: false,
             seen_pending: Vec::new(),
             seen_peers: Vec::new(),
             first_state: true,

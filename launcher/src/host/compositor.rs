@@ -394,14 +394,27 @@ impl CompositorWindow {
         None
     }
 
-    /// The last mouse cursor position mapped into the focused game window's screen
-    /// coordinates (for `GetCursorPos` spoofing via virtual input SHM).
-    pub fn cursor_screen(&self) -> Option<(i32, i32)> {
+    /// Where the mouse is in copy `i`'s window, on screen as the game counts it (for
+    /// `GetCursorPos` through its input block): where the session's mouse last was over
+    /// its pane, else the middle of its window.
+    pub fn cursor_screen(&self, i: usize) -> Option<(i32, i32)> {
         #[cfg(windows)]
         if let Some(w) = &self.window {
-            return w.cursor_screen;
+            return w.cursor_for(i);
         }
+        let _ = i;
         None
+    }
+
+    /// Keeps the real mouse inside pane `i` (and the pointer hidden over it), for a game
+    /// that locked its cursor, or lets it go (None). Whether that changed.
+    pub fn confine_cursor(&mut self, i: Option<usize>) -> bool {
+        #[cfg(windows)]
+        if let Some(w) = self.window.as_mut() {
+            return w.confine(i);
+        }
+        let _ = i;
+        false
     }
 
     /// Notifies copy `i`'s window that it is active/focused so engines like Unity accept
@@ -622,7 +635,46 @@ mod win {
     enum ForwardedInput {
         Mouse { msg: u32, w: WPARAM, cx: i32, cy: i32, is_wheel: bool, is_button_down: bool },
         Key { msg: u32, w: WPARAM, l: LPARAM },
+        /// The session's window lost the keyboard (Alt+Tab, a menu, a dialog): what's
+        /// down in the games is let go, as its releases go elsewhere now.
+        ReleaseAll,
     }
+
+    /// The message that lets `held` go, for a game window it went down in with `lp`.
+    fn release_of(held: Held, lp: LPARAM) -> (u32, WPARAM, LPARAM) {
+        match held {
+            // A key's release: the previous state and transition bits set.
+            Held::Key(vk) => (WM_KEYUP, vk, lp | 0xC000_0000u32 as i32 as LPARAM | peerparty_protocol::session::FORWARDED_KEY),
+            Held::Button(msg, x) => (msg, (x as WPARAM) << 16, lp),
+        }
+    }
+
+    /// Whether client point `(x, y)` is on the frames drawn in `dest` (not in the bars
+    /// beside them, or an empty grid cell).
+    fn on_frames(dest: PaneRect, x: i32, y: i32) -> bool {
+        x >= dest.x && y >= dest.y && i64::from(x) < i64::from(dest.x) + i64::from(dest.width) && i64::from(y) < i64::from(dest.y) + i64::from(dest.height)
+    }
+
+    /// Runs `f` with this thread's DPI awareness the game window `h`'s own, so window
+    /// coordinates come out as the game counts them: a game that isn't DPI aware works
+    /// in scaled pixels, and a mouse message or cursor position in real ones would land
+    /// off where the player pointed.
+    fn in_dpi_of<T>(h: HWND, f: impl FnOnce() -> T) -> T {
+        use windows_sys::Win32::UI::HiDpi::{GetWindowDpiAwarenessContext, SetThreadDpiAwarenessContext};
+        let ctx = unsafe { GetWindowDpiAwarenessContext(h) };
+        if ctx.is_null() {
+            return f();
+        }
+        let was = unsafe { SetThreadDpiAwarenessContext(ctx) };
+        let out = f();
+        if !was.is_null() {
+            unsafe { SetThreadDpiAwarenessContext(was) };
+        }
+        out
+    }
+
+    /// The pointer is hidden over the session's window (a game locked its cursor).
+    static HIDE_POINTER: AtomicBool = AtomicBool::new(false);
 
     /// A key or mouse button down in a game window, until it's let go.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -709,6 +761,12 @@ mod win {
                 }
             }
             WM_MOVE | WM_DPICHANGED => RESIZED.store(true, Ordering::Release),
+            WM_KILLFOCUS | WM_CANCELMODE => push_input(ForwardedInput::ReleaseAll),
+            WM_ACTIVATE if w & 0xffff == WA_INACTIVE as usize => push_input(ForwardedInput::ReleaseAll),
+            WM_SETCURSOR if HIDE_POINTER.load(Ordering::Relaxed) && (l & 0xffff) as u32 == HTCLIENT => {
+                unsafe { SetCursor(std::ptr::null_mut()) };
+                return 1;
+            }
             WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_RBUTTONDBLCLK | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_XBUTTONDOWN | WM_XBUTTONUP => {
                 let (x, y) = (i32::from(l as u16 as i16), i32::from((l >> 16) as u16 as i16));
                 let is_button_down = matches!(m, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN);
@@ -891,7 +949,11 @@ mod win {
         hidden_for_minimize: bool,
         icon_big: HICON,
         icon_small: HICON,
-        pub cursor_screen: Option<(i32, i32)>,
+        /// Where the mouse last was over each copy's pane, on screen as that game counts
+        /// it (`cursor_for`).
+        cursor_screen: Vec<Option<(i32, i32)>>,
+        /// The real cursor is kept inside this copy's pane (`confine`).
+        confined: Option<usize>,
         /// Keys and buttons down in a game window, where (and how) they went.
         pressed: Vec<(Held, isize, LPARAM)>,
         /// What changed in each copy's pane, for its log (`take_notes`).
@@ -918,6 +980,10 @@ mod win {
                 unsafe { RegisterClassW(&wc) };
             });
             CLOSE_REQUESTED.store(false, Ordering::Release);
+            // A session before this one may have left these set.
+            RESIZED.store(false, Ordering::Release);
+            CLICK.store(NO_CLICK, Ordering::Release);
+            HIDE_POINTER.store(false, Ordering::Relaxed);
             if let Ok(mut q) = input_queue().lock() {
                 q.clear();
             }
@@ -954,7 +1020,54 @@ mod win {
                 SetForegroundWindow(hwnd);
             }
             let gpu = Gpu::start(hwnd);
-            Some(HostWindow { hwnd, shown: Vec::new(), gpu, surfaces: Vec::new(), hidden_for_minimize: false, icon_big, icon_small, cursor_screen: None, pressed: Vec::new(), notes: Vec::new() })
+            Some(HostWindow { hwnd, shown: Vec::new(), gpu, surfaces: Vec::new(), hidden_for_minimize: false, icon_big, icon_small, cursor_screen: Vec::new(), confined: None, pressed: Vec::new(), notes: Vec::new() })
+        }
+
+        /// Where the mouse is in copy `i`'s window, on screen as the game counts it: where
+        /// it last was over its pane, else the middle of its window (a pane given the
+        /// keyboard and mouse by Ctrl+Alt+1-4 hasn't had the mouse over it yet).
+        pub fn cursor_for(&self, i: usize) -> Option<(i32, i32)> {
+            if let Some(p) = self.cursor_screen.get(i).copied().flatten() {
+                return Some(p);
+            }
+            let src = self.shown.get(i)?.as_ref()?.source as HWND;
+            Some(in_dpi_of(src, || {
+                let (w, h) = client_size(src);
+                let mut pt = POINT { x: (w / 2) as i32, y: (h / 2) as i32 };
+                unsafe { ClientToScreen(src, &mut pt) };
+                (pt.x, pt.y)
+            }))
+        }
+
+        /// Keeps the real cursor inside copy `i`'s frames (None: lets it go), and hides
+        /// the pointer over the window meanwhile. Whether that changed.
+        pub fn confine(&mut self, i: Option<usize>) -> bool {
+            let dest = i.and_then(|i| self.shown.get(i)?.as_ref()).map(|s| s.dest).filter(|d| d.width > 0 && d.height > 0);
+            let i = i.filter(|_| dest.is_some());
+            if let Some(d) = dest {
+                let mut tl = POINT { x: d.x, y: d.y };
+                unsafe { ClientToScreen(self.hwnd, &mut tl) };
+                let r = RECT { left: tl.x, top: tl.y, right: tl.x.saturating_add(d.width as i32), bottom: tl.y.saturating_add(d.height as i32) };
+                // Again every tick: Windows lets a clip go when another window takes the
+                // foreground for a moment.
+                unsafe { ClipCursor(&r) };
+            }
+            if i == self.confined {
+                return false;
+            }
+            if dest.is_none() {
+                unsafe { ClipCursor(std::ptr::null()) };
+            }
+            self.confined = i;
+            HIDE_POINTER.store(i.is_some(), Ordering::Relaxed);
+            // The pointer's look is asked for again when it next moves; this shows the
+            // change at once.
+            let mut pt = POINT { x: 0, y: 0 };
+            unsafe {
+                GetCursorPos(&mut pt);
+                SetCursorPos(pt.x, pt.y);
+            }
+            true
         }
 
         /// The client area on screen, with the window's monitor's DPI.
@@ -1129,6 +1242,16 @@ mod win {
                 })
             };
             for ev in events {
+                if let ForwardedInput::ReleaseAll = ev {
+                    if !self.pressed.is_empty() {
+                        self.notes.push((focus, format!("session: the session's window lost the keyboard: {} key(s) and button(s) still down in the games let go", self.pressed.len())));
+                    }
+                    for (held, hwnd, lp) in self.pressed.drain(..) {
+                        let (msg, w, l) = release_of(held, lp);
+                        unsafe { PostMessageW(hwnd as HWND, msg, w, l) };
+                    }
+                    continue;
+                }
                 // A key or button let go goes to the copy that got it pressed, wherever the
                 // focus is now and even while an overlay has the keyboard: else it stays
                 // down in that copy for good.
@@ -1144,6 +1267,7 @@ mod win {
                     let (msg, w, lp) = match ev {
                         ForwardedInput::Mouse { msg, w, .. } => (msg, w, lp),
                         ForwardedInput::Key { msg, w, l } => (msg, w, l | peerparty_protocol::session::FORWARDED_KEY),
+                        ForwardedInput::ReleaseAll => continue,
                     };
                     unsafe { PostMessageW(hwnd as HWND, msg, w, lp) };
                     continue;
@@ -1174,11 +1298,34 @@ mod win {
                     }
                     let Some(Some(s)) = self.shown.get(*focus) else { return false };
                     let src = s.source as HWND;
-                    let (cw, ch) = client_size(src);
-                    let Some((gx, gy)) = map_point_to_source(cx, cy, s.dest, cw, ch) else { return false };
-                    let mut screen_pt = POINT { x: gx, y: gy };
-                    unsafe { ClientToScreen(src, &mut screen_pt) };
-                    self.cursor_screen = Some((screen_pt.x, screen_pt.y));
+                    // A click or wheel turn on the bars beside the frames, or on an empty
+                    // grid cell, is on nothing of the game's: dropped, not moved onto the
+                    // frames' edge.
+                    let clicks = is_button_down || is_wheel || matches!(msg, WM_LBUTTONDBLCLK | WM_RBUTTONDBLCLK);
+                    if clicks && !on_frames(s.dest, cx, cy) {
+                        // The first few, for the log.
+                        static TOLD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        if TOLD.fetch_add(1, Ordering::Relaxed) < 3 {
+                            let d = s.dest;
+                            self.notes.push((*focus, format!("session: a click at ({cx}, {cy}) beside the frames (drawn at {}x{} at ({}, {})) went to no game", d.width, d.height, d.x, d.y)));
+                        }
+                        return false;
+                    }
+                    let dest = s.dest;
+                    let Some((gx, gy, sx, sy)) = in_dpi_of(src, || {
+                        let (cw, ch) = client_size(src);
+                        let (gx, gy) = map_point_to_source(cx, cy, dest, cw, ch)?;
+                        let mut screen_pt = POINT { x: gx, y: gy };
+                        unsafe { ClientToScreen(src, &mut screen_pt) };
+                        Some((gx, gy, screen_pt.x, screen_pt.y))
+                    }) else {
+                        return false;
+                    };
+                    let screen_pt = POINT { x: sx, y: sy };
+                    if self.cursor_screen.len() <= *focus {
+                        self.cursor_screen.resize(*focus + 1, None);
+                    }
+                    self.cursor_screen[*focus] = Some((screen_pt.x, screen_pt.y));
                     let lp = if is_wheel {
                         ((screen_pt.x as u16 as u32) | ((screen_pt.y as u16 as u32) << 16)) as LPARAM
                     } else {
@@ -1201,6 +1348,7 @@ mod win {
                     }
                     unsafe { PostMessageW(src as HWND, msg, w, l) };
                 }
+                ForwardedInput::ReleaseAll => return false,
             }
             true
         }
@@ -1260,6 +1408,10 @@ mod win {
 
     impl Drop for HostWindow {
         fn drop(&mut self) {
+            if self.confined.is_some() {
+                unsafe { ClipCursor(std::ptr::null()) };
+                HIDE_POINTER.store(false, Ordering::Relaxed);
+            }
             // The drawing thread goes before the window it draws in.
             self.gpu = None;
             if let Some(dwm) = dwm() {

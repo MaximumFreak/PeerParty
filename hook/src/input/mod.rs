@@ -52,6 +52,7 @@ macro_rules! per_slot {
 }
 
 mod audio;
+mod cursor;
 mod device;
 mod dinput;
 mod gameinput;
@@ -1258,7 +1259,7 @@ fn hook_kbm() -> usize {
     if let Some(a) = proc_addr(m, c"GetCursorPos".as_ptr().cast()) {
         n += arm_once(&CURSOR_POS, a, cursor_pos as GetCursorPosFn, "GetCursorPos");
     }
-    n
+    n + cursor::hook()
 }
 
 const RID_INPUT: u32 = 0x1000_0003;
@@ -1457,6 +1458,30 @@ pub(crate) fn virtual_async_key_state(vkey: i32, snap: &InputSnapshot) -> i16 {
     if down { i16::MIN } else { 0 }
 }
 
+/// Keys seen down at the last `GetAsyncKeyState` and `GetKeyState` of a `Virtual` copy,
+/// and each key's toggle as `GetKeyState` counts presses.
+static ASYNC_DOWN: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
+static STATE_DOWN: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
+static TOGGLED: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
+
+/// Pure helper: `GetAsyncKeyState`'s low bit (pressed since the last call) from whether
+/// the key is `down` now and was at the last call (`seen`, updated).
+fn pressed_since(down: bool, seen: &AtomicBool) -> i16 {
+    let was = seen.swap(down, Ordering::Relaxed);
+    i16::from(down && !was)
+}
+
+/// Pure helper: `GetKeyState`'s low bit for a key a `Virtual` copy's keyboard has: it
+/// flips at each press (`seen`: down at the last call; `toggled` updated).
+fn toggle_on_press(down: bool, seen: &AtomicBool, toggled: &AtomicBool) -> i16 {
+    if down && !seen.swap(down, Ordering::Relaxed) {
+        toggled.fetch_xor(true, Ordering::Relaxed);
+    } else if !down {
+        seen.store(false, Ordering::Relaxed);
+    }
+    i16::from(toggled.load(Ordering::Relaxed))
+}
+
 unsafe extern "system" fn async_key_state(vkey: i32) -> i16 {
     match policy() {
         Policy::PassThrough => ASYNC_KEY.get().map_or(0, |h| unsafe { h.call(vkey) }),
@@ -1467,7 +1492,13 @@ unsafe extern "system" fn async_key_state(vkey: i32) -> i16 {
                 ASYNC_KEY.get().map_or(0, |h| unsafe { h.call(vkey) })
             }
         }
-        Policy::Virtual(snap) => virtual_async_key_state(vkey, &snap),
+        Policy::Virtual(snap) => {
+            let v = virtual_async_key_state(vkey, &snap);
+            match usize::try_from(vkey).ok().and_then(|k| ASYNC_DOWN.get(k)) {
+                Some(seen) => v | pressed_since(v < 0, seen),
+                None => v,
+            }
+        }
     }
 }
 
@@ -1490,7 +1521,16 @@ unsafe extern "system" fn key_state(vkey: i32) -> i16 {
                 KEY_STATE.get().map_or(0, |h| unsafe { h.call(vkey) })
             }
         }
-        Policy::Virtual(snap) => virtual_async_key_state(vkey, &snap) | toggle_of(vkey),
+        Policy::Virtual(snap) => {
+            let v = virtual_async_key_state(vkey, &snap);
+            // The lock keys' toggles are the keyboard's own (`toggle_of`); any other
+            // key's flips at each of this copy's presses of it.
+            let toggle = match usize::try_from(vkey).ok().filter(|_| !matches!(vkey, 0x14 | 0x90 | 0x91)) {
+                Some(k) if k < 256 => toggle_on_press(v < 0, &STATE_DOWN[k], &TOGGLED[k]),
+                _ => toggle_of(vkey),
+            };
+            v | toggle
+        }
     }
 }
 
@@ -1524,6 +1564,11 @@ unsafe extern "system" fn keyboard_state(out: *mut u8) -> i32 {
 /// The last cursor position a split-screen copy was given while it had the mouse, packed
 /// (x in the low half); u64::MAX for none yet.
 static LAST_CURSOR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// The copy's cursor is at `(x, y)` now (it had the mouse, or its game put it there).
+fn remember_cursor(x: i32, y: i32) {
+    LAST_CURSOR.store(u64::from(x as u32) | (u64::from(y as u32) << 32), Ordering::Relaxed);
+}
 /// Where a copy that has never had the mouse sees the cursor: Windows' own "nowhere"
 /// (where it puts minimized windows), off every screen.
 const OFF_WINDOW: (i32, i32) = (-32000, -32000);
@@ -1539,11 +1584,12 @@ unsafe extern "system" fn cursor_pos(pt: *mut POINT) -> i32 {
         && !pt.is_null()
     {
         if snap.mouse.active {
+            let (x, y) = cursor::now(&snap);
             unsafe {
-                (*pt).x = snap.mouse.cursor_x;
-                (*pt).y = snap.mouse.cursor_y;
+                (*pt).x = x;
+                (*pt).y = y;
             }
-            LAST_CURSOR.store(u64::from(snap.mouse.cursor_x as u32) | (u64::from(snap.mouse.cursor_y as u32) << 32), Ordering::Relaxed);
+            remember_cursor(x, y);
             return 1;
         }
         // Another pane has the mouse: this copy's cursor stays where it last was (the
@@ -1577,6 +1623,17 @@ mod tests {
     }
 
     pub(super) static GAMEINPUT_TESTS: Mutex<()> = Mutex::new(());
+
+    /// `GetAsyncKeyState`'s low bit is a press since the last call; `GetKeyState`'s
+    /// flips at each press.
+    #[test]
+    fn key_state_low_bits_follow_presses() {
+        let seen = AtomicBool::new(false);
+        assert_eq!((pressed_since(true, &seen), pressed_since(true, &seen), pressed_since(false, &seen), pressed_since(true, &seen)), (1, 0, 0, 1));
+        let (seen, toggled) = (AtomicBool::new(false), AtomicBool::new(false));
+        let t: Vec<i16> = [true, true, false, true, false].iter().map(|d| toggle_on_press(*d, &seen, &toggled)).collect();
+        assert_eq!(t, [1, 1, 1, 0, 0]);
+    }
 
     /// A copy without the keyboard and mouse gets their releases alone.
     #[test]

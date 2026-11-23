@@ -541,6 +541,9 @@ pub enum HookMsg {
     LocalSaves { service: String, path: String },
     /// The game closed its overlay page.
     Close,
+    /// A split-screen copy's game locked its cursor to its window (`ClipCursor`), or let
+    /// it go: the session keeps the real mouse in its pane meanwhile.
+    CursorLock { on: bool },
     /// A line for the launcher's log.
     Log(String),
     /// The game's frames: their size in pixels, its window (0: none known) and the
@@ -567,6 +570,7 @@ impl HookMsg {
                 Json::obj(vec![("t", Json::str("local_saves")), ("service", Json::str(service.as_str())), ("path", Json::str(path.as_str()))])
             }
             HookMsg::Close => Json::obj(vec![("t", Json::str("close"))]),
+            HookMsg::CursorLock { on } => Json::obj(vec![("t", Json::str("cursor_lock")), ("on", Json::Bool(*on))]),
             HookMsg::Log(text) => Json::obj(vec![("t", Json::str("log")), ("text", Json::str(text.as_str()))]),
             HookMsg::Viewport { width, height, hwnd, api } => Json::obj(vec![
                 ("t", Json::str("viewport")),
@@ -601,6 +605,7 @@ impl HookMsg {
             "note" => HookMsg::Note(Notice::from_json(v)),
             "local_saves" => HookMsg::LocalSaves { service: text(v, "service")?, path: text(v, "path").unwrap_or_default() },
             "close" => HookMsg::Close,
+            "cursor_lock" => HookMsg::CursorLock { on: v.get("on").as_bool()? },
             "log" => HookMsg::Log(text(v, "text")?),
             "viewport" => HookMsg::Viewport {
                 width: u32_of(v, "width")?,
@@ -772,6 +777,7 @@ mod tests {
             HookMsg::Open { page: "friends".into(), peer: None },
             HookMsg::LocalSaves { service: "PlayFab".into(), path: r"C:\Users\Alex\AppData\Local\peerparty".into() },
             HookMsg::Close,
+            HookMsg::CursorLock { on: true },
             HookMsg::Log("hello".into()),
         ] {
             assert_eq!(HookMsg::from_line(&m.to_line()), Some(m));

@@ -8,8 +8,9 @@
 //!
 //! So the copy is told pointer messages are on (without asking Windows), and its game
 //! window's procedure (window.rs `focus_proc`) gets each forwarded mouse message as the
-//! pointer message Windows would have sent; `GetPointerInfo` and `GetPointerType`
-//! answer for that pointer from what the forwarded messages said.
+//! pointer message Windows would have sent; `GetPointerInfo` (and its frame and history
+//! forms), `GetPointerType` and `GetPointerCursorId` answer for that pointer as it was
+//! at the message being handled.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -84,7 +85,13 @@ pub struct Pointer {
     pub frame: u32,
     /// A pointer message has been made (the first one says the pointer entered).
     pub entered: bool,
+    /// Shift and Ctrl as the mouse message had them (`MK_SHIFT`, `MK_CONTROL`: the same
+    /// bits as `POINTER_MOD_SHIFT`, `POINTER_MOD_CTRL`).
+    pub keys: u32,
 }
+
+/// `MK_SHIFT | MK_CONTROL`.
+const MODS: usize = 0x4 | 0x8;
 
 /// Which button a mouse message is about (0 left .. 4 X2), and whether it went down.
 fn button_of(m: u32, w: usize) -> Option<(u32, bool)> {
@@ -102,15 +109,23 @@ fn button_of(m: u32, w: usize) -> Option<(u32, bool)> {
     })
 }
 
+/// Whether `m` is a mouse message pointer mode makes pointer messages of.
+fn is_mouse(m: u32, w: usize) -> bool {
+    matches!(m, WM_MOUSEMOVE | WM_MOUSEWHEEL | WM_MOUSEHWHEEL) || button_of(m, w).is_some()
+}
+
 /// Pure helper: the pointer messages mouse message `m` (`w`, at screen point `(x, y)`)
-/// becomes, as Windows sends them for a mouse in pointer mode, with `p` moved on. None
-/// for a message that isn't the mouse's.
-pub fn translate(p: &mut Pointer, m: u32, w: usize, x: i32, y: i32) -> Option<Vec<(u32, usize, isize)>> {
+/// becomes, as Windows sends them for a mouse in pointer mode, each with the pointer as
+/// `GetPointerInfo` reads it while that message is handled, with `p` moved on. None for
+/// a message that isn't the mouse's.
+pub fn translate(p: &mut Pointer, m: u32, w: usize, x: i32, y: i32) -> Option<Vec<(u32, usize, isize, Pointer)>> {
     let is_wheel = matches!(m, WM_MOUSEWHEEL | WM_MOUSEHWHEEL);
-    if m != WM_MOUSEMOVE && !is_wheel && button_of(m, w).is_none() {
+    if !is_mouse(m, w) {
         return None;
     }
     let mut out = Vec::with_capacity(2);
+    // The wheel's low word has the keys too, as the buttons' do.
+    p.keys = (w & MODS) as u32;
     let lp = ((x as u16 as u32) | ((y as u16 as u32) << 16)) as isize;
     let mut first = 0;
     if !p.entered {
@@ -155,19 +170,32 @@ pub fn translate(p: &mut Pointer, m: u32, w: usize, x: i32, y: i32) -> Option<Ve
     };
     p.flags = first | INRANGE | PRIMARY | contact | held | kind;
     if first != 0 {
-        out.push((WM_POINTERENTER, (MOUSE_ID as usize) | (((first | INRANGE | PRIMARY) as usize) << 16), lp));
+        // Entering: in range, nothing down or changing yet (the message after says that).
+        let enter = Pointer { flags: first | INRANGE | PRIMARY, buttons: before, change: 0, wheel: 0, ..*p };
+        out.push((WM_POINTERENTER, (MOUSE_ID as usize) | (((first | INRANGE | PRIMARY) as usize) << 16), lp, enter));
     }
     let high = if is_wheel { (p.wheel as u16) as usize } else { (p.flags & 0xffff) as usize };
-    out.push((msg, (MOUSE_ID as usize) | (high << 16), lp));
+    out.push((msg, (MOUSE_ID as usize) | (high << 16), lp, *p));
     Some(out)
 }
 
-static POINTER: Mutex<Pointer> = Mutex::new(Pointer { x: 0, y: 0, buttons: 0, flags: 0, change: 0, wheel: 0, frame: 0, entered: false });
+const NO_POINTER: Pointer = Pointer { x: 0, y: 0, buttons: 0, flags: 0, change: 0, wheel: 0, frame: 0, entered: false, keys: 0 };
+/// The pointer as the forwarded messages moved it on.
+static POINTER: Mutex<Pointer> = Mutex::new(NO_POINTER);
+/// The pointer as the message being handled has it (`show`): what `GetPointerInfo` says.
+static SHOWN: Mutex<Pointer> = Mutex::new(NO_POINTER);
+
+/// The game window is about to handle a pointer message made with pointer `p`.
+pub fn show(p: Pointer) {
+    *SHOWN.lock().unwrap_or_else(|e| e.into_inner()) = p;
+}
 
 /// Mouse message `m` the game window `h` got as the pointer messages it stands for
-/// (its point is in `h`'s client area, the wheel's on screen). None: hand it on as it is.
-pub fn convert(h: windows_sys::Win32::Foundation::HWND, m: u32, w: usize, l: isize) -> Option<Vec<(u32, usize, isize)>> {
-    if !on() {
+/// (its point is in `h`'s client area, the wheel's on screen), each with the pointer
+/// to `show` while it's handled. None: hand it on as it is.
+pub fn convert(h: windows_sys::Win32::Foundation::HWND, m: u32, w: usize, l: isize) -> Option<Vec<(u32, usize, isize, Pointer)>> {
+    // Every message the window gets comes here: the cheap checks first.
+    if !on() || !is_mouse(m, w) {
         return None;
     }
     let mut pt = windows_sys::Win32::Foundation::POINT { x: i32::from(l as u16 as i16), y: i32::from((l >> 16) as u16 as i16) };
@@ -207,12 +235,18 @@ unsafe extern "system" {
 }
 
 type GetInfo = unsafe extern "system" fn(u32, *mut PointerInfo) -> i32;
+/// `GetPointerFrameInfo` / `GetPointerInfoHistory`: an id, a count in and out, the array.
+type GetMany = unsafe extern "system" fn(u32, *mut u32, *mut PointerInfo) -> i32;
+type GetCursorId = unsafe extern "system" fn(u32, *mut u32) -> i32;
 type GetType = unsafe extern "system" fn(u32, *mut u32) -> i32;
 type GetOther = unsafe extern "system" fn(u32, *mut u8) -> i32;
 type Enable = unsafe extern "system" fn(i32) -> i32;
 type IsOn = unsafe extern "system" fn() -> i32;
 
 static GET_INFO: OnceLock<GenericDetour<GetInfo>> = OnceLock::new();
+static GET_FRAME: OnceLock<GenericDetour<GetMany>> = OnceLock::new();
+static GET_HISTORY: OnceLock<GenericDetour<GetMany>> = OnceLock::new();
+static GET_CURSOR_ID: OnceLock<GenericDetour<GetCursorId>> = OnceLock::new();
 static GET_TYPE: OnceLock<GenericDetour<GetType>> = OnceLock::new();
 static GET_PEN: OnceLock<GenericDetour<GetOther>> = OnceLock::new();
 static GET_TOUCH: OnceLock<GenericDetour<GetOther>> = OnceLock::new();
@@ -223,8 +257,11 @@ pub static IS_ON: OnceLock<GenericDetour<IsOn>> = OnceLock::new();
 /// has them, and gets them made from the forwarded mouse.
 unsafe extern "system" fn enable(on: i32) -> i32 {
     if crate::window::focus_spoofed() {
-        if on != 0 && !ON.swap(true, Ordering::Relaxed) {
+        let was = ON.swap(on != 0, Ordering::Relaxed);
+        if on != 0 && !was {
             log!("window: the game takes the mouse as pointer messages: the session's forwarded mouse reaches it as those");
+        } else if on == 0 && was {
+            log!("window: the game turned pointer messages off: the forwarded mouse reaches it as mouse messages again");
         }
         return 1;
     }
@@ -238,33 +275,79 @@ unsafe extern "system" fn is_on() -> i32 {
     IS_ON.get().map_or(0, |h| unsafe { h.call() })
 }
 
+/// The mouse pointer's `POINTER_INFO` as the message being handled has it.
+fn info_now() -> PointerInfo {
+    let p = *SHOWN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut count = 0i64;
+    unsafe { QueryPerformanceCounter(&mut count) };
+    // HIMETRIC: hundredths of a millimetre, at 96 pixels to the inch.
+    let himetric = [p.x * 2540 / 96, p.y * 2540 / 96];
+    PointerInfo {
+        kind: PT_MOUSE,
+        id: MOUSE_ID,
+        frame: p.frame,
+        flags: p.flags,
+        device: 1,
+        hwnd: TARGET.load(Ordering::Relaxed) as isize,
+        pixel: [p.x, p.y],
+        himetric,
+        pixel_raw: [p.x, p.y],
+        himetric_raw: himetric,
+        time: unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount() },
+        history: 1,
+        input_data: p.wheel,
+        key_states: p.keys,
+        performance_count: count as u64,
+        change: p.change,
+    }
+}
+
+/// A frame or a history of the mouse pointer: one entry, the message's (Windows keeps
+/// no more for a pointer it didn't make). Asked with no room, the count it needs.
+unsafe fn one_entry(count: *mut u32, out: *mut PointerInfo) -> i32 {
+    if count.is_null() {
+        return 0;
+    }
+    let room = unsafe { *count };
+    unsafe { *count = 1 };
+    if out.is_null() {
+        return 1;
+    }
+    if room < 1 {
+        // ERROR_INSUFFICIENT_BUFFER.
+        unsafe { windows_sys::Win32::Foundation::SetLastError(122) };
+        return 0;
+    }
+    unsafe { out.write(info_now()) };
+    1
+}
+
+unsafe extern "system" fn get_frame(id: u32, count: *mut u32, out: *mut PointerInfo) -> i32 {
+    if on() && id == MOUSE_ID {
+        return unsafe { one_entry(count, out) };
+    }
+    GET_FRAME.get().map_or(0, |h| unsafe { h.call(id, count, out) })
+}
+
+unsafe extern "system" fn get_history(id: u32, count: *mut u32, out: *mut PointerInfo) -> i32 {
+    if on() && id == MOUSE_ID {
+        return unsafe { one_entry(count, out) };
+    }
+    GET_HISTORY.get().map_or(0, |h| unsafe { h.call(id, count, out) })
+}
+
+/// The mouse's cursor: id 0, the system's one.
+unsafe extern "system" fn get_cursor_id(id: u32, out: *mut u32) -> i32 {
+    if on() && id == MOUSE_ID && !out.is_null() {
+        unsafe { *out = 0 };
+        return 1;
+    }
+    GET_CURSOR_ID.get().map_or(0, |h| unsafe { h.call(id, out) })
+}
+
 unsafe extern "system" fn get_info(id: u32, out: *mut PointerInfo) -> i32 {
     if on() && id == MOUSE_ID && !out.is_null() {
-        let p = *POINTER.lock().unwrap_or_else(|e| e.into_inner());
-        let mut count = 0i64;
-        unsafe { QueryPerformanceCounter(&mut count) };
-        // HIMETRIC: hundredths of a millimetre, at 96 pixels to the inch.
-        let himetric = [p.x * 2540 / 96, p.y * 2540 / 96];
-        unsafe {
-            out.write(PointerInfo {
-                kind: PT_MOUSE,
-                id: MOUSE_ID,
-                frame: p.frame,
-                flags: p.flags,
-                device: 1,
-                hwnd: TARGET.load(Ordering::Relaxed) as isize,
-                pixel: [p.x, p.y],
-                himetric,
-                pixel_raw: [p.x, p.y],
-                himetric_raw: himetric,
-                time: windows_sys::Win32::System::SystemInformation::GetTickCount(),
-                history: 1,
-                input_data: p.wheel,
-                key_states: 0,
-                performance_count: count as u64,
-                change: p.change,
-            })
-        };
+        unsafe { out.write(info_now()) };
         return 1;
     }
     GET_INFO.get().map_or(0, |h| unsafe { h.call(id, out) })
@@ -301,6 +384,9 @@ pub fn hook_exports(exports: &[Export]) -> usize {
     n += hook_one(exports, "window", "IsMouseInPointerEnabled", |a| arm(&IS_ON, unsafe { std::mem::transmute::<*const (), IsOn>(a) }, is_on, "window", "IsMouseInPointerEnabled"));
     n += hook_one(exports, "window", "GetPointerInfo", |a| arm(&GET_INFO, unsafe { std::mem::transmute::<*const (), GetInfo>(a) }, get_info, "window", "GetPointerInfo"));
     n += hook_one(exports, "window", "GetPointerType", |a| arm(&GET_TYPE, unsafe { std::mem::transmute::<*const (), GetType>(a) }, get_type, "window", "GetPointerType"));
+    n += hook_one(exports, "window", "GetPointerFrameInfo", |a| arm(&GET_FRAME, unsafe { std::mem::transmute::<*const (), GetMany>(a) }, get_frame, "window", "GetPointerFrameInfo"));
+    n += hook_one(exports, "window", "GetPointerInfoHistory", |a| arm(&GET_HISTORY, unsafe { std::mem::transmute::<*const (), GetMany>(a) }, get_history, "window", "GetPointerInfoHistory"));
+    n += hook_one(exports, "window", "GetPointerCursorId", |a| arm(&GET_CURSOR_ID, unsafe { std::mem::transmute::<*const (), GetCursorId>(a) }, get_cursor_id, "window", "GetPointerCursorId"));
     n += hook_one(exports, "window", "GetPointerPenInfo", |a| arm(&GET_PEN, unsafe { std::mem::transmute::<*const (), GetOther>(a) }, get_pen, "window", "GetPointerPenInfo"));
     n += hook_one(exports, "window", "GetPointerTouchInfo", |a| arm(&GET_TOUCH, unsafe { std::mem::transmute::<*const (), GetOther>(a) }, get_touch, "window", "GetPointerTouchInfo"));
     n
@@ -323,6 +409,9 @@ pub fn hook_loaded(proc: impl Fn(&std::ffi::CStr) -> Option<usize>) -> usize {
     one!(IS_ON, c"IsMouseInPointerEnabled", IsOn, is_on);
     one!(GET_INFO, c"GetPointerInfo", GetInfo, get_info);
     one!(GET_TYPE, c"GetPointerType", GetType, get_type);
+    one!(GET_FRAME, c"GetPointerFrameInfo", GetMany, get_frame);
+    one!(GET_HISTORY, c"GetPointerInfoHistory", GetMany, get_history);
+    one!(GET_CURSOR_ID, c"GetPointerCursorId", GetCursorId, get_cursor_id);
     one!(GET_PEN, c"GetPointerPenInfo", GetOther, get_pen);
     one!(GET_TOUCH, c"GetPointerTouchInfo", GetOther, get_touch);
     n
@@ -340,11 +429,13 @@ mod tests {
         let m = translate(&mut p, WM_MOUSEMOVE, 0, 100, 50).unwrap();
         assert_eq!(m.len(), 2);
         assert_eq!(m[0].0, WM_POINTERENTER);
+        assert_eq!(m[0].3.flags & (DOWN | UPDATE | INCONTACT), 0, "entering says nothing of what comes next");
         assert_eq!((m[1].0, m[1].1 & 0xffff, m[1].2), (WM_POINTERUPDATE, MOUSE_ID as usize, 100 | (50 << 16)));
         assert_eq!(hi(m[1].1) & (INRANGE | PRIMARY | NEW), INRANGE | PRIMARY | NEW);
         assert_eq!(p.flags & (INCONTACT | UPDATE), UPDATE);
-        // Left down: the pointer goes down, in contact, the first button.
-        let m = translate(&mut p, WM_LBUTTONDOWN, 1, 100, 50).unwrap();
+        // Left down (Shift held): the pointer goes down, in contact, the first button.
+        let m = translate(&mut p, WM_LBUTTONDOWN, 1 | 0x4, 100, 50).unwrap();
+        assert_eq!((m[0].3.keys, m[0].3.flags & DOWN), (0x4, DOWN));
         assert_eq!((m.len(), m[0].0), (1, WM_POINTERDOWN));
         assert_eq!(p.flags & (INCONTACT | FIRSTBUTTON | DOWN | NEW), INCONTACT | FIRSTBUTTON | DOWN);
         assert_eq!(p.change, 1, "POINTER_CHANGE_FIRSTBUTTON_DOWN");

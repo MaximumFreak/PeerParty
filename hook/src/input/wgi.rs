@@ -697,7 +697,9 @@ mod tests {
         unsafe { windows_sys::Win32::System::LibraryLoader::LoadLibraryW(wide.as_ptr()) };
         install();
         let until = std::time::Instant::now() + std::time::Duration::from_millis(1500);
-        while !both() && std::time::Instant::now() < until {
+        // Both reads hooked, and the pass that hooked them done: it goes on to the UI
+        // navigation controller after them.
+        while (!both() || BUSY.load(Ordering::Relaxed)) && std::time::Instant::now() < until {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let Some(pad) = first("Windows.Gaming.Input.Gamepad", &IID_GAMEPAD_STATICS) else {

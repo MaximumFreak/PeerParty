@@ -551,6 +551,25 @@ impl SessionHost {
         })
     }
 
+    /// Keeps the real mouse in the focused pane while its game has locked its cursor (an
+    /// aiming game), the session's window is in front and no overlay is open there; the
+    /// game's locked cursor isn't the real one (its hook answers for it), so without
+    /// this the mouse would wander into another pane and click it.
+    fn confine_cursor(&mut self, front: bool) {
+        let f = self.focus;
+        let Some(c) = self.compositor.as_mut() else { return };
+        let ours = front && c.hwnd() != 0 && desktop::in_front(std::process::id());
+        let lock = ours && !self.panes[f].visible && self.instances.get(f).is_some_and(|i| i.cursor_locked && !i.gone);
+        if c.confine_cursor(lock.then_some(f)) {
+            let text = if lock {
+                "session: the game locked its cursor: the mouse stays in its pane, the pointer hidden, while the session is in front".to_string()
+            } else {
+                "session: the mouse is free of the pane again (the cursor unlocked, the overlay opened, or the session left the front)".to_string()
+            };
+            self.instances[f].send(&HostMsg::Note { text });
+        }
+    }
+
     /// What each player plays with, for a session just started: each one's said in
     /// their game's log, and the session starts with the keyboard player's pane focused.
     fn set_inputs(&mut self, inputs: Vec<SlotInput>) {
@@ -877,9 +896,13 @@ impl SessionHost {
         }
         self.frame_toasts();
         let open: Vec<bool> = self.panes.iter().map(|p| p.visible).collect();
-        let focus = self.compositor.as_ref().map(|_| self.focus);
-        let focus_cursor = self.compositor.as_ref().and_then(|c| c.cursor_screen());
+        // The keyboard and mouse are the focused player's only while the session is in
+        // front: typed into another program, they'd reach that player's game too (raw
+        // input reads them wherever they go), and stay down there after Alt+Tab.
+        let focus = self.compositor.as_ref().map(|_| self.focus).filter(|_| front);
+        let focus_cursor = self.compositor.as_ref().and_then(|c| c.cursor_screen(self.focus));
         self.input.publish_session(&mut self.instances, &open, focus, focus_cursor);
+        self.confine_cursor(front);
     }
 
     /// Every copy's messages since the last tick.
@@ -1026,6 +1049,7 @@ impl SessionHost {
                 }
             }
             HookMsg::Log(_) => {}
+            HookMsg::CursorLock { on } => self.instances[i].cursor_locked = on,
             HookMsg::Viewport { width, height, hwnd, api } => {
                 let v = Viewport { width, height, hwnd, api };
                 let inst = &mut self.instances[i];

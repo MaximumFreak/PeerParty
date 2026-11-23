@@ -45,6 +45,27 @@ static ANCHOR_Y: AtomicI32 = AtomicI32::new(0);
 static ALT: AtomicBool = AtomicBool::new(false);
 /// Keys whose press the hook took, by virtual-key code.
 static TAKEN: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
+/// Mouse buttons (left, right, middle, X1, X2) whose press the hook took: the release
+/// of one that was already down when the overlay opened goes on, or the game (and the
+/// session's raw input reader) would see it held for good.
+static BUTTONS_TAKEN: [AtomicBool; 5] = [const { AtomicBool::new(false) }; 5];
+
+/// The button a low-level mouse message is about (`BUTTONS_TAKEN`'s index), and
+/// whether it went down.
+fn mouse_button(msg: u32, data: u32) -> Option<(usize, bool)> {
+    let x = if (data >> 16) & 0xffff == 2 { 4 } else { 3 };
+    Some(match msg {
+        WM_LBUTTONDOWN => (0, true),
+        WM_LBUTTONUP => (0, false),
+        WM_RBUTTONDOWN => (1, true),
+        WM_RBUTTONUP => (1, false),
+        WM_MBUTTONDOWN => (2, true),
+        WM_MBUTTONUP => (2, false),
+        WM_XBUTTONDOWN => (x, true),
+        WM_XBUTTONUP => (x, false),
+        _ => return None,
+    })
+}
 static HEARTBEAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Watching for the opening hotkeys (`watch_hotkeys`), and which keys they are.
 static WATCHING: AtomicBool = AtomicBool::new(false);
@@ -279,6 +300,14 @@ unsafe extern "system" fn keyboard(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
 unsafe extern "system" fn mouse_proc(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
     if code == HC_ACTION as i32 && taking() {
         let m = unsafe { &*(l as *const MSLLHOOKSTRUCT) };
+        if let Some((b, down)) = mouse_button(w as u32, m.mouseData) {
+            if down {
+                BUTTONS_TAKEN[b].store(true, Ordering::Relaxed);
+            } else if !BUTTONS_TAKEN[b].swap(false, Ordering::Relaxed) {
+                // Down before the overlay opened: its release isn't the overlay's.
+                return unsafe { CallNextHookEx(std::ptr::null_mut(), code, w, l) };
+            }
+        }
         match w as u32 {
             WM_MOUSEMOVE => {
                 let dx = m.pt.x - ANCHOR_X.load(Ordering::Relaxed);

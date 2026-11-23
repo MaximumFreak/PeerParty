@@ -268,7 +268,8 @@ unsafe extern "system" fn focus_proc(h: HWND, m: u32, w: usize, l: isize) -> isi
     // (pointer.rs).
     if let Some(msgs) = crate::pointer::convert(h, m, w, l) {
         let mut rc = 0;
-        for (m, w, l) in msgs {
+        for (m, w, l, p) in msgs {
+            crate::pointer::show(p);
             rc = call(m, w, l);
         }
         return rc;
