@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::{fs, mem, ptr};
 
 use peerparty_protocol::env as penv;
-use peerparty_protocol::session::{InputAssignment, InstanceId, InstanceSpec};
+use peerparty_protocol::session::{InstanceId, InstanceSpec};
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED};
 use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
@@ -206,7 +206,7 @@ pub fn start_session(t: Target, base_env: ChildEnv, split: &SplitScreen, prefs: 
         // The session's window draws the copy's frames itself (host/gpu.rs), unless told
         // to show the copies' windows.
         spec.compositor_capture = !std::env::var(penv::COMPOSITOR).is_ok_and(|v| v.trim().eq_ignore_ascii_case("dwm"));
-        spec.input_assignment = InputAssignment::Controller { index: slot };
+        spec.input_assignment = split.input(slot).assignment(slot);
         if let Some(&pane) = panes.get(slot as usize) {
             spec.pane = Some(peerparty_protocol::session::PaneRect {
                 x: bounds.x.saturating_add(pane.x),
@@ -235,7 +235,7 @@ pub fn start_session(t: Target, base_env: ChildEnv, split: &SplitScreen, prefs: 
                     pi.dwProcessId,
                     if x86 { "x86" } else { "x64" }
                 );
-                launches.push(SessionLaunch { process: pi.hProcess, pid: pi.dwProcessId, pipe, spec });
+                launches.push(SessionLaunch { process: pi.hProcess, pid: pi.dwProcessId, pipe, spec, input: split.input(slot) });
                 procs.push(pi);
             }
             Err(e) => {

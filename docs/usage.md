@@ -223,12 +223,20 @@ both.
   as a single-instance check (Unity's, or one whose name says "instance" or holds the
   game's program name; stores' and Windows' own are left alone) is made per copy, and
   FindWindow doesn't find the other copy's windows.
-- `--split-screen` (`--instances 2..4`, `--layout horizontal|vertical|grid`): start two to
-  four copies on this PC in one shared split-screen window. Each pane gets its own
-  controller (assigned when a controller is first used, and kept across unplugging), its
-  own in-game overlay when that player presses the overlay button, and its own audio and
-  rumble; `Ctrl+Alt+L` cycles the layout, `Ctrl+Alt+Z` zooms the focused pane, and
-  `Ctrl+Alt+1`–`4` focuses a pane for the keyboard and mouse.
+- `--split-screen` (`--instances 2..4`, `--layout horizontal|vertical|grid`,
+  `--inputs auto|kbm|pad,...`): start two to four copies on this PC in one shared
+  split-screen window. Each pane gets its own controller (assigned when a controller is
+  first used, and kept across unplugging), its own in-game overlay when that player
+  presses the overlay button, and its own audio and rumble; `Ctrl+Alt+L` cycles the
+  layout, `Ctrl+Alt+Z` zooms the focused pane, and `Ctrl+Alt+1`–`4` focuses a pane for
+  the keyboard and mouse. `--inputs` says what each player plays with, in player order:
+  `kbm` the keyboard and mouse and never a controller (the session starts with that
+  pane focused), `pad` a controller, `auto` (the default) a controller, passing over a
+  player who has already been playing with the keyboard and mouse while another player
+  has none. One controller read twice (a remapper's virtual pad beside the real one)
+  takes one seat. The overlay's Players page lists this PC's players: swap two players'
+  controllers, free one for the next controller pressed, or hand the keyboard and mouse
+  to another player.
 - `--copy-saves`: this copy starts from player 1's progress, for games that don't
   offer multiplayer from a fresh save. A second copy plays under LAN ids (SteamID, EOS
   id, PlayFab id); the first time the game touches a path that contains one, the same

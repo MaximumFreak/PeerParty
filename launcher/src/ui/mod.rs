@@ -690,6 +690,10 @@ impl App {
             args.push(o.players.clamp(2, 4).to_string());
             args.push("--layout".into());
             args.push(o.effective_split_layout().into());
+            if let Some(inputs) = o.split_inputs_arg() {
+                args.push("--inputs".into());
+                args.push(inputs);
+            }
         } else if o.players >= 2 && g.source != Source::Xbox {
             args.push("--multi-instance".into());
         }
@@ -1458,7 +1462,7 @@ fn strip_split_flags(args: &[String]) -> Vec<String> {
     while i < args.len() {
         match args[i].as_str() {
             "--split-screen" => i += 1,
-            "--instances" | "--layout" => i += 2,
+            "--instances" | "--layout" | "--inputs" => i += 2,
             _ => break,
         }
     }
@@ -2033,6 +2037,13 @@ mod tests {
         let o = GameOptions { players: 2, ..GameOptions::default() };
         assert!(!app.command(&g, &o).iter().any(|a| a == "--copy-saves"));
         let o_split = GameOptions { players: 4, split_screen: true, split_layout: "vertical".into(), ..GameOptions::default() };
+        let mut o_inputs = o_split.clone();
+        o_inputs.set_split_input(1, "kbm");
+        assert_eq!(o_inputs.split_inputs_arg().as_deref(), Some("auto,kbm,auto,auto"));
+        assert_eq!(o_split.split_inputs_arg(), None, "all auto: no --inputs");
+        o_inputs.players = 2;
+        o_inputs.set_split_input(3, "pad");
+        assert_eq!(o_inputs.split_inputs_arg().as_deref(), Some("auto,kbm"), "only the players there are");
         let cmd = app.command(&g, &o_split);
         assert_eq!(&cmd[..5], ["--split-screen", "--instances", "4", "--layout", "vertical"]);
         assert!(!cmd.iter().any(|a| a == "--copy-saves"));

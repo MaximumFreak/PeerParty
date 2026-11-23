@@ -368,6 +368,13 @@ pub enum Cmd {
     Prefs,
     /// Record a controller chord from the buttons held next (mod.rs).
     RecordChord,
+    /// A split-screen session: player `k`'s controller trades places with the next
+    /// player's who plays with one.
+    SwapSeat(usize),
+    /// Player `k`'s controller is let go: the next controller used takes their seat.
+    FreeSeat(usize),
+    /// The keyboard and mouse go to the next (1) or previous (-1) player.
+    KeyboardStep(i32),
     /// Let the game through Windows Firewall (on public networks too, when true).
     FixFirewall(bool),
 }
@@ -375,6 +382,10 @@ pub enum Cmd {
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Action {
     InviteAll,
+    /// A split-screen session's seats (`Cmd::SwapSeat` and the others).
+    SwapSeat(usize),
+    FreeSeat(usize),
+    KeyboardStep(i32),
     /// Copy the room code we're in; type the copied one into the game.
     CopyCode,
     PasteCode,
@@ -552,6 +563,30 @@ pub struct Overlay {
     block_armed: Option<(String, Instant)>,
     /// The player just blocked (id, name): the Players page offers Undo for BLOCK_UNDO.
     blocked: Option<(String, String, Instant)>,
+    /// A split-screen session's players on this PC, for the Players page (the host
+    /// fills it in while the overlay is open).
+    pub seats: Option<Seats>,
+}
+
+/// The players of a split-screen session on this PC (`Overlay::seats`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Seats {
+    pub players: Vec<PlayerSeat>,
+    /// This overlay's player.
+    pub me: usize,
+    /// The player the keyboard and mouse go to (the pane with the focus).
+    pub keyboard: usize,
+}
+
+/// One player of a split-screen session (`Seats`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlayerSeat {
+    /// What they play with now, in words.
+    pub detail: String,
+    /// Their controller can trade places with another player's.
+    pub can_swap: bool,
+    /// They hold a controller that can be let go.
+    pub can_free: bool,
 }
 
 /// The opening hotkeys, in `Prefs.hotkeys`' order.
@@ -668,6 +703,7 @@ impl Overlay {
             paints_background: true,
             block_armed: None,
             blocked: None,
+            seats: None,
         }
     }
 
@@ -817,6 +853,38 @@ impl Overlay {
         Row::action(title, detail, Action::Open(PageRef::Network), t!("overlay.open")).icon(Icon::Globe, tone)
     }
 
+    /// A split-screen session's players on this PC: each one's input, with Swap and
+    /// Free for their controllers, and who has the keyboard and mouse.
+    fn seat_rows(&self) -> Vec<Row> {
+        let Some(s) = self.seats.as_ref().filter(|s| s.players.len() > 1) else { return Vec::new() };
+        let mut rows = vec![Row::header(t!("overlay.this_pc"))];
+        for (k, p) in s.players.iter().enumerate() {
+            let title = if k == s.me { t!("overlay.player_you", n = k + 1) } else { t!("overlay.player_n", n = k + 1) };
+            let mut row = if p.can_swap {
+                Row::action(title, p.detail.clone(), Action::SwapSeat(k), t!("overlay.seat_swap"))
+            } else if p.can_free {
+                Row::action(title, p.detail.clone(), Action::FreeSeat(k), t!("overlay.seat_free"))
+            } else {
+                Row::info(title, p.detail.clone())
+            };
+            if p.can_swap && p.can_free {
+                row = row.second(Action::FreeSeat(k), t!("overlay.seat_free"));
+            }
+            rows.push(Row { id: format!("seat {k}"), ..row.icon(Icon::Gamepad, Tone::Plain) });
+        }
+        rows.push(
+            Row::setting(
+                t!("overlay.keyboard_to"),
+                t!("overlay.keyboard_to_detail"),
+                t!("overlay.player_n", n = s.keyboard + 1),
+                Action::KeyboardStep(1),
+                (Action::KeyboardStep(-1), Action::KeyboardStep(1)),
+            )
+            .icon(Icon::Keyboard, Tone::Plain),
+        );
+        rows
+    }
+
     fn rows(&self, prefs: &Prefs) -> Vec<Row> {
         let st = &self.state;
         match &self.page {
@@ -891,6 +959,9 @@ impl Overlay {
                 }
                 if st.voice_in_use {
                     rows.push(Row::toggle(t!("overlay.mic"), t!("overlay.mic_detail"), st.mic_on, Action::ToggleMic).icon(Icon::Mic, Tone::Plain));
+                }
+                if !self.invite_mode {
+                    rows.extend(self.seat_rows());
                 }
                 if st.peers.is_empty() {
                     rows.push(Row::info(t!("overlay.no_players"), t!("overlay.no_players_detail")));
@@ -1214,6 +1285,9 @@ impl Overlay {
                 out.push(Cmd::Prefs);
             }
             Action::RecordChord => out.push(Cmd::RecordChord),
+            Action::SwapSeat(k) => out.push(Cmd::SwapSeat(k)),
+            Action::FreeSeat(k) => out.push(Cmd::FreeSeat(k)),
+            Action::KeyboardStep(d) => out.push(Cmd::KeyboardStep(d)),
             Action::FixFirewall(public) => out.push(Cmd::FixFirewall(public)),
             Action::ClearChord => {
                 prefs.hotkeys.chord = 0;

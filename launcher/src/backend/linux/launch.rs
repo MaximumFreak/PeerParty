@@ -98,7 +98,7 @@ mod run {
 
     use peerparty_protocol::env as penv;
     use peerparty_protocol::ipc::HostMsg;
-    use peerparty_protocol::session::{InputAssignment, InstanceId, InstanceSpec};
+    use peerparty_protocol::session::{InstanceId, InstanceSpec};
 
     use super::{WINDOWS_EXE_VAR, WINE_VAR, game_exe_in, inject_via, is_windows_program, linux_to_wine_path, wine_paths};
     use crate::backend::linux::control;
@@ -242,7 +242,7 @@ mod run {
             // The session's window draws the copy's frames itself (host/x11.rs), read back
             // into a file by its hook, unless told to leave the copies' windows be.
             spec.compositor_capture = !std::env::var(penv::COMPOSITOR).is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "dwm" | "off" | "none"));
-            spec.input_assignment = InputAssignment::Controller { index: slot };
+            spec.input_assignment = split.input(slot).assignment(slot);
             if let Some(&pane) = panes.get(slot as usize) {
                 spec.pane = Some(peerparty_protocol::session::PaneRect {
                     x: bounds.x.saturating_add(pane.x),
@@ -271,7 +271,7 @@ mod run {
             });
             pids.push((pid, ended.clone()));
             waiters.push((pid, waiter));
-            launches.push(SessionLaunch { process: ended, pid, pipe, spec });
+            launches.push(SessionLaunch { process: ended, pid, pipe, spec, input: split.input(slot) });
         }
 
         launch::remember(&t.listed);

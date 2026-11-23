@@ -131,6 +131,10 @@ pub enum InputDeviceKind {
     Wheel,
 }
 
+/// `InputAssignment::KeyboardMouse`'s device for every keyboard and mouse together (a
+/// split-screen player who plays with the keyboard and mouse, not one of several).
+pub const ANY_KEYBOARD: u64 = 0;
+
 /// Which input reaches a copy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum InputAssignment {
@@ -140,7 +144,8 @@ pub enum InputAssignment {
     None,
     /// One controller, by its index.
     Controller { index: u32 },
-    /// A keyboard and mouse, by device id.
+    /// A keyboard and mouse, by device id; `ANY_KEYBOARD`: the PC's keyboards and mice
+    /// together, while the copy's pane has the focus.
     KeyboardMouse { device_id: u64 },
     /// A wheel, by device id.
     Wheel { device_id: u64 },

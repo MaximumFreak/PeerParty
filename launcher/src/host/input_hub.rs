@@ -11,6 +11,7 @@
 //! | `None` | `BlockAll` |
 //! | `Controller { index }` | `Virtual`: that controller (`Pads::readings`' seat) as its only pad |
 //! | `KeyboardMouse { device_id }` | `Virtual`: that keyboard, and the mouse paired with it (`pair_mouse`; the mouse of the same id unpaired) |
+//! | `KeyboardMouse { ANY_KEYBOARD }` | `Virtual`, no controller: every keyboard and mouse together while its pane has the focus |
 //! | `Wheel { device_id }` | `Virtual`: that wheel |
 //!
 //! While the overlay is open every block says `BlockAll`: the overlay has the input.
@@ -22,7 +23,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use peerparty_protocol::input_shm::{INPUT_BLOCK_SIZE, InputHeader, InputMode, InputSnapshot, VirtualKeyboard, VirtualMouse, VirtualPad, VirtualWheel};
-use peerparty_protocol::session::InputAssignment;
+use peerparty_protocol::session::{ANY_KEYBOARD, InputAssignment};
 use peerparty_protocol::transport::{FileShm, ShmBacking, token_from_bytes};
 
 use super::instance::InstanceConn;
@@ -339,6 +340,15 @@ pub struct Kbm {
     pub mice: HashMap<u64, VirtualMouse>,
     /// The client size of the copy each mouse moves in, its cursor kept inside.
     bounds: HashMap<u64, (u32, u32)>,
+    /// Keys and mouse buttons gone down so far (a held key's repeats and the modifiers
+    /// not counted): a session sees from it which player plays with the keyboard.
+    pub presses: u64,
+}
+
+/// Shift, Ctrl, Alt and the Windows keys, either side: held for a hotkey (Ctrl+Alt+1
+/// focusing a pane), not playing.
+fn modifier(vk: u8) -> bool {
+    matches!(vk, 0x10..=0x12 | 0xA0..=0xA5 | 0x5B | 0x5C)
 }
 
 /// One raw input event, by device. (Off Windows nothing reads keyboards and mice apart
@@ -357,7 +367,13 @@ pub enum RawEvent {
 impl Kbm {
     pub fn apply(&mut self, e: RawEvent) {
         match e {
-            RawEvent::Key { device, vk, down } => self.keyboards.entry(device).or_default().set(vk, down),
+            RawEvent::Key { device, vk, down } => {
+                let k = self.keyboards.entry(device).or_default();
+                if down && !k.is_down(vk) && !modifier(vk) {
+                    self.presses += 1;
+                }
+                k.set(vk, down);
+            }
             RawEvent::Motion { device, dx, dy } => {
                 let bounds = self.bounds.get(&device).copied();
                 let m = self.mice.entry(device).or_default();
@@ -370,6 +386,9 @@ impl Kbm {
             }
             RawEvent::Buttons { device, down, up } => {
                 let m = self.mice.entry(device).or_default();
+                if down & !m.buttons != 0 {
+                    self.presses += 1;
+                }
                 m.buttons = (m.buttons | down) & !up;
             }
             RawEvent::Wheel { device, delta } => {
@@ -465,6 +484,11 @@ impl InputHub {
         }
     }
 
+    /// Keys and mouse buttons pressed so far (`Kbm::presses`).
+    pub fn kbm_presses(&mut self) -> u64 {
+        self.with_kbm(|k| k.presses)
+    }
+
     /// The devices now: the controllers as the last poll read them (a packet number
     /// moves on for each one whose state changed), the keyboards and mice, the wheels.
     pub fn devices(&mut self) -> Devices {
@@ -501,8 +525,9 @@ impl InputHub {
 
     /// Writes each copy's block from its assignment (`route`; `open[i]`: copy `i`'s
     /// overlay is open, and has its input), and in a split-screen session (`focus:
-    /// Some(i)`) also routes combined keyboard and mouse state to the focused pane while
-    /// keeping unfocused panes isolated.
+    /// Some(i)`) also routes combined keyboard and mouse state to the focused pane (a
+    /// controller player's, or the keyboard player's: `ANY_KEYBOARD`) while keeping
+    /// unfocused panes isolated.
     pub fn publish_session(&mut self, instances: &mut [InstanceConn], open: &[bool], focus: Option<usize>, focus_cursor: Option<(i32, i32)>) {
         if !instances.iter().any(|i| i.input.is_some()) {
             return;
@@ -511,7 +536,9 @@ impl InputHub {
             self.want_kbm();
         }
         for inst in instances.iter().filter(|i| i.input.is_some()) {
-            if let InputAssignment::KeyboardMouse { device_id } = inst.spec.input_assignment {
+            if let InputAssignment::KeyboardMouse { device_id } = inst.spec.input_assignment
+                && device_id != ANY_KEYBOARD
+            {
                 self.want_kbm();
                 let mouse = self.pairs.get(&device_id).copied().unwrap_or(device_id);
                 if let Some((w, h)) = inst.screen_size() {
@@ -526,7 +553,7 @@ impl InputHub {
             let mut snapshot = route(&inst.spec.input_assignment, is_open(idx), &devices);
             if let Some((kb, ms)) = focused_kbm
                 && focus == Some(idx)
-                && matches!(inst.spec.input_assignment, InputAssignment::Controller { .. })
+                && matches!(inst.spec.input_assignment, InputAssignment::Controller { .. } | InputAssignment::KeyboardMouse { device_id: ANY_KEYBOARD })
             {
                 snapshot.keyboard = kb;
                 snapshot.mouse = ms;
@@ -790,6 +817,13 @@ mod tests {
         k.apply(RawEvent::Wheel { device: 5, delta: -120 });
         k.apply(RawEvent::Wheel { device: 5, delta: 240 });
         assert_eq!(k.mice[&5].wheel_delta, 120);
+        // Presses: a key going down once (not its repeats, not a modifier), a button.
+        let before = k.presses;
+        k.apply(RawEvent::Key { device: 1, vk: 0x41, down: true });
+        k.apply(RawEvent::Key { device: 1, vk: 0x41, down: true });
+        k.apply(RawEvent::Key { device: 1, vk: 0xA2, down: true });
+        k.apply(RawEvent::Buttons { device: 5, down: MOUSE_LEFT, up: 0 });
+        assert_eq!(k.presses - before, 2);
         k.set_bounds(6, 4, 4);
         assert_eq!((k.mice[&6].cursor_x, k.mice[&6].cursor_y), (3, 3), "a smaller screen pulls the cursor in");
     }

@@ -24,14 +24,19 @@
 //! The scan and the readers are threads `Pads` owns (`Threads`): dropping it stops them
 //! and waits for them (a reader blocked on a quiet device is woken), so none outlives it.
 //! `readings` gives each controller apart, by seat, for a session that hands controllers
-//! out by index (host/input_hub.rs). A controller takes a seat the first time it's used
-//! (a button, or a stick or trigger pushed past half way), not when it's first seen: a
-//! controller app that swaps its virtual pad as a game starts (a virtual Xbox pad for a
-//! virtual DualSense, Steam Input's pad for the real one) can leave the old one plugged
-//! in and idle, and that one mustn't take a player's seat. A controller keeps its seat
-//! for as long as `Pads` lives, so one going away (asleep, out of battery, a wireless
-//! drop) leaves its seat empty instead of handing the next player's controller to its
-//! copy.
+//! out by index (host/input_hub.rs); in a split-screen session seat `k` is player `k`'s,
+//! and the session says which seats a controller may take (`set_open`: not a keyboard
+//! player's). A controller takes a seat the first time it's used (a button, or a stick
+//! or trigger pushed past half way), not when it's first seen: a controller app that
+//! swaps its virtual pad as a game starts (a virtual Xbox pad for a virtual DualSense,
+//! Steam Input's pad for the real one) can leave the old one plugged in and idle, and
+//! that one mustn't take a player's seat. One pad read twice (a remapper's virtual pad
+//! and the real one under it, both pressed at once with the same buttons) takes one
+//! seat: the other is its twin, and takes the seat over if the first goes. A controller
+//! keeps its seat while it's away (asleep, out of battery, a wireless drop), found again
+//! by its slot, path or serial number, so the next player's controller isn't handed to
+//! its copy; a seat whose controller is away goes to a new controller only when no
+//! other seat is free.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -245,19 +250,106 @@ fn wake(t: &JoinHandle<()>) {
 #[cfg(not(windows))]
 fn wake(_t: &JoinHandle<()>) {}
 
-/// Which controller a seat is (`Pads::readings`): an XInput slot, or a HID (evdev)
-/// device by its path.
+/// Which controller a seat holds (`Pads::readings`): an XInput slot, or a HID (evdev)
+/// device by where it's plugged in and, when it has one no other device shares, its
+/// serial number's key (`input_shm::hid_key`). The serial finds a pad again after it
+/// was plugged back in elsewhere, or came back over Bluetooth on another path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Seat {
     XInput(u32),
-    Device(String),
+    Device { path: String, serial: u64 },
+}
+
+impl Seat {
+    /// Whether `other` is the same controller: the same slot, the same path, or the
+    /// same serial.
+    fn same(&self, other: &Seat) -> bool {
+        match (self, other) {
+            (Seat::XInput(a), Seat::XInput(b)) => a == b,
+            (Seat::Device { path: p, serial: s }, Seat::Device { path: q, serial: t }) => p == q || (*s != 0 && s == t),
+            _ => false,
+        }
+    }
+}
+
+/// Whether a seat may be given to a controller used for the first time (`Pads::set_open`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Open {
+    /// Yes: a player who plays with a controller, or may.
+    Yes,
+    /// Only when no `Yes` seat is free: a player who may use a controller but has been
+    /// playing with the keyboard and mouse.
+    Later,
+    /// Never: a player on the keyboard and mouse, or a copy that ended.
+    No,
+}
+
+/// Whether two controllers' buttons read as one pad's seen twice: something down, the
+/// same on both.
+fn alike(a: u32, b: u32) -> bool {
+    a != 0 && a == b
+}
+
+/// Polls a twin may disagree with its pad in a row before it counts as a controller of
+/// its own (about half a second): a second player who pressed the same button at the
+/// same moment as the first, and was taken for the first's pad seen twice.
+const TWIN_DISAGREES: u32 = 15;
+
+/// A controller seen since `Pads` started, and what the last poll read of it.
+#[derive(Clone, Debug)]
+struct Known {
+    id: Seat,
+    /// "XInput slot 0", "HID 054c:0ce6": the log's name for it.
+    name: String,
+    style: Style,
+    /// In use at the last poll (`State::in_use`).
+    used: bool,
+    buttons: u32,
+    /// The poll at which a button last went down on it (`Pads::polls`).
+    pressed_at: u64,
+    /// Another controller this one is the same pad as (a remapper's virtual pad for a
+    /// real one, or the real one under a remapper's): it takes no seat of its own.
+    twin_of: Option<Seat>,
+    /// Polls in a row it disagreed with that pad (`TWIN_DISAGREES`).
+    disagrees: u32,
+}
+
+/// One controller as this poll read it.
+struct Live {
+    id: Seat,
+    name: String,
+    style: Style,
+    state: State,
+    /// Its stick as a d-pad direction (`State::stick`).
+    dir: u32,
+    /// Home went down (after it was seen up).
+    home: bool,
+}
+
+/// What one seat holds now, for the overlay's list of this PC's players.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SeatInfo {
+    pub style: Style,
+    /// "XInput slot 0", "HID 054c:0ce6".
+    pub name: String,
+    /// Connected now (a seat keeps a controller that went away, for its return).
+    pub here: bool,
 }
 
 pub struct Pads {
     xinput: Option<GetStateFn>,
-    /// Every controller used, in the order they were first used: a controller's index
-    /// in `per`, `homes` and `readings` is its place here.
-    seats: Vec<Seat>,
+    /// Each seat's controller, None for a seat no controller holds: a controller's index
+    /// in `per` and `readings` is its seat. In a split-screen session seat `k` is pane
+    /// `k`'s (`set_open`); a copy alone hands seats out in the order controllers are
+    /// first used.
+    seats: Vec<Option<Seat>>,
+    /// Which seats a controller used for the first time may take (`set_open`); empty:
+    /// any, a new one at the end when they're all held.
+    open: Vec<Open>,
+    /// Every controller seen, seated or not.
+    known: Vec<Known>,
+    /// Polls so far (`Known::pressed_at`).
+    polls: u64,
     /// When each XInput slot was last tried while disconnected (a call on an empty slot
     /// is slow, so those are tried every two seconds).
     tried: [Option<Instant>; 4],
@@ -279,15 +371,20 @@ pub struct Pads {
     x_home: [bool; 4],
     /// The direction each XInput pad's stick gave at the last poll (`State::stick`).
     x_stick: [u32; 4],
-    /// Each controller's buttons at the last poll, the stick folded into the d-pad, by
-    /// seat (`readings()` index; 0 for one away now): a split-screen player's overlay
-    /// reads their own.
+    /// Each seat's controller's buttons at the last poll, the stick folded into the
+    /// d-pad (0 for one away now): a split-screen player's overlay reads their own.
     pub per: Vec<u32>,
-    /// Every controller whose Home went down since the last poll: its seat and its name
-    /// for the log (two players can press at once).
-    pub homes: Vec<(usize, String)>,
-    /// Controllers that first took a seat during the last poll: `(seat, name)`.
+    /// The buttons of the controllers in use that hold no seat (more controllers than
+    /// players, or none of the seats open): the focused player's overlay reads them.
+    pub spare: u32,
+    /// Every controller whose Home went down since the last poll: its seat (None for one
+    /// without) and its name for the log (two players can press at once).
+    pub homes: Vec<(Option<usize>, String)>,
+    /// Controllers that took a seat during the last poll: `(seat, name)`.
     pub newly_seated: Vec<(usize, String)>,
+    /// What the last poll decided about seats besides that, for the game's log: a
+    /// controller taken for another one seen twice, a seat handed on.
+    pub notes: Vec<String>,
 }
 
 impl Pads {
@@ -295,6 +392,9 @@ impl Pads {
         Pads {
             xinput: xinput(),
             seats: Vec::new(),
+            open: Vec::new(),
+            known: Vec::new(),
+            polls: 0,
             tried: [None; 4],
             connected: [false; 4],
             hid: Arc::new(Mutex::new(Vec::new())),
@@ -309,8 +409,10 @@ impl Pads {
             x_home: [true; 4],
             x_stick: [0; 4],
             per: Vec::new(),
+            spare: 0,
             homes: Vec::new(),
             newly_seated: Vec::new(),
+            notes: Vec::new(),
         }
     }
 
@@ -322,11 +424,63 @@ impl Pads {
         }
     }
 
+    /// A split-screen session's seats, one per pane: which of them a controller used for
+    /// the first time may take. A seat that turns `No` lets its controller go (it takes
+    /// another seat at its next use, if one is open).
+    pub fn set_open(&mut self, open: Vec<Open>) {
+        if self.seats.len() < open.len() {
+            self.seats.resize(open.len(), None);
+        }
+        for (k, o) in open.iter().enumerate() {
+            if *o == Open::No && self.seats[k].is_some() {
+                let name = self.name_of(self.seats[k].as_ref());
+                self.seats[k] = None;
+                self.notes.push(format!("input: {name} let go of seat {k}: that player takes no controller now"));
+            }
+        }
+        self.open = open;
+    }
+
+    /// Swaps the controllers of seats `a` and `b` (a player's overlay asked).
+    pub fn swap(&mut self, a: usize, b: usize) {
+        let n = self.seats.len().max(a + 1).max(b + 1);
+        self.seats.resize(n, None);
+        self.seats.swap(a, b);
+    }
+
+    /// Seat `k` lets its controller go: the next controller used takes it (that one
+    /// included).
+    pub fn free(&mut self, k: usize) {
+        if let Some(s) = self.seats.get_mut(k) {
+            *s = None;
+        }
+    }
+
+    /// What each seat holds now (None: no controller).
+    pub fn seat_info(&self) -> Vec<Option<SeatInfo>> {
+        let hid = self.hid.lock().unwrap();
+        self.seats
+            .iter()
+            .map(|s| {
+                let s = s.as_ref()?;
+                let k = self.known.iter().find(|k| k.id.same(s))?;
+                let here = match s {
+                    Seat::XInput(slot) => self.connected.get(*slot as usize).copied().unwrap_or(false),
+                    Seat::Device { .. } => hid.iter().any(|h| h.alive.load(Ordering::Relaxed) && device_seat(h, &hid).same(s)),
+                };
+                Some(SeatInfo { style: k.style, name: k.name.clone(), here })
+            })
+            .collect()
+    }
+
+    /// A seat's controller's name for the log.
+    fn name_of(&self, s: Option<&Seat>) -> String {
+        s.and_then(|s| self.known.iter().find(|k| k.id.same(s))).map_or_else(|| "a controller".to_string(), |k| k.name.clone())
+    }
+
     /// Every pad's buttons together, the stick folded into the d-pad.
     pub fn poll(&mut self) -> u32 {
-        let mut all = 0u32;
-        self.per.clear();
-        self.per.resize(self.seats.len(), 0);
+        self.polls += 1;
         self.homes.clear();
         self.newly_seated.clear();
         if self.last_scan.is_none_or(|t| t.elapsed() > Duration::from_secs(3)) && self.scan.as_ref().is_none_or(|t| t.is_finished()) {
@@ -343,6 +497,7 @@ impl Pads {
                 })
                 .ok();
         }
+        let mut live: Vec<Live> = Vec::new();
         if let Some(get) = self.xinput {
             for pad in 0..4u32 {
                 let i = pad as usize;
@@ -363,76 +518,191 @@ impl Pads {
                 let b = from_xinput(&s);
                 self.x_state[i] = b;
                 self.x_raw[i].copy_from_slice(&s[4..16]);
-                let seat = self.seat(Seat::XInput(pad), b.in_use(), || format!("XInput slot {pad}"));
                 let home = b.buttons & HOME != 0;
-                if home
-                    && !self.x_home[i]
-                    && let Some(seat) = seat
-                {
-                    self.pressed_home(seat, format!("XInput slot {pad}"));
-                }
+                let pressed = home && !self.x_home[i];
                 self.x_home[i] = home;
-                if b.buttons != 0 && b.buttons != self.last_buttons {
-                    self.style = Style::Xbox;
-                }
                 self.x_stick[i] = b.stick(self.x_stick[i]);
-                if let Some(seat) = seat {
-                    self.per[seat] = b.buttons | self.x_stick[i];
-                }
-                all |= b.buttons | self.x_stick[i];
+                live.push(Live { id: Seat::XInput(pad), name: format!("XInput slot {pad}"), style: Style::Xbox, state: b, dir: self.x_stick[i], home: pressed });
             }
         }
-        let hid = self.hid.clone();
-        let mut hid = hid.lock().unwrap();
-        hid.retain(|h| h.alive.load(Ordering::Relaxed));
-        for h in hid.iter_mut() {
-            let s = *h.state.lock().unwrap();
-            let seat = self.seat(Seat::Device(h.path.clone()), s.in_use(), || format!("HID {:04x}:{:04x}", h.vid, h.pid));
-            let home = s.buttons & HOME != 0;
-            if home
-                && !h.home
-                && let Some(seat) = seat
-            {
-                self.pressed_home(seat, format!("HID {:04x}:{:04x}", h.vid, h.pid));
+        {
+            let hid = self.hid.clone();
+            let mut hid = hid.lock().unwrap();
+            hid.retain(|h| h.alive.load(Ordering::Relaxed));
+            let ids: Vec<Seat> = hid.iter().map(|h| device_seat(h, &hid)).collect();
+            for (h, id) in hid.iter_mut().zip(ids) {
+                let s = *h.state.lock().unwrap();
+                let home = s.buttons & HOME != 0;
+                let pressed = home && !h.home;
+                h.home = home;
+                h.stick = s.stick(h.stick);
+                live.push(Live { id, name: format!("HID {:04x}:{:04x}", h.vid, h.pid), style: h.style, state: s, dir: h.stick, home: pressed });
             }
-            h.home = home;
-            h.stick = s.stick(h.stick);
-            let b = s.buttons | h.stick;
-            if s.buttons != 0 && s.buttons != self.last_buttons {
-                self.style = h.style;
-            }
-            if let Some(seat) = seat {
-                self.per[seat] = b;
-            }
+        }
+        self.place(&live);
+        self.per.clear();
+        self.per.resize(self.seats.len(), 0);
+        self.spare = 0;
+        let mut all = 0u32;
+        for l in &live {
+            let b = l.state.buttons | l.dir;
             all |= b;
+            if l.state.buttons != 0 && l.state.buttons != self.last_buttons {
+                self.style = l.style;
+            }
+            let twin = self.known.iter().any(|k| k.id.same(&l.id) && k.twin_of.is_some());
+            let seat = self.seat_of(&l.id);
+            match seat {
+                Some(k) => self.per[k] = b,
+                None if !twin && l.state.in_use() => self.spare |= b,
+                None => {}
+            }
+            // A twin's Home is its pad's, which has one of its own.
+            if l.home && !twin {
+                self.homes.push((seat, l.name.clone()));
+            }
         }
         self.last_buttons = all;
         all
     }
 
-    /// Controller `seat`'s index. One without a seat yet gets a new one at the end (with
-    /// its place in `per`) if it's `used` now, and none otherwise.
-    fn seat(&mut self, seat: Seat, used: bool, label: impl FnOnce() -> String) -> Option<usize> {
-        let i = match self.seats.iter().position(|s| *s == seat) {
-            Some(i) => i,
-            None if used => {
-                self.seats.push(seat);
-                let idx = self.seats.len() - 1;
-                self.newly_seated.push((idx, label()));
-                idx
-            }
-            None => return None,
-        };
-        if self.per.len() <= i {
-            self.per.resize(i + 1, 0);
-        }
-        Some(i)
+    /// The seat controller `id` holds.
+    fn seat_of(&self, id: &Seat) -> Option<usize> {
+        self.seats.iter().position(|s| s.as_ref().is_some_and(|s| s.same(id)))
     }
 
-    /// Controller `index` (its `readings()` index), named `name`, had Home go down.
-    fn pressed_home(&mut self, index: usize, name: String) {
-        self.homes.push((index, name));
+    /// The seat a controller used for the first time takes: the first open one free, then
+    /// the first open one whose controller is away, `Yes` ones before `Later` ones. With
+    /// no seats set (a copy alone), the first free one, or a new one at the end.
+    fn free_seat(&mut self, live: &[Live]) -> Option<usize> {
+        let away = |s: &Option<Seat>| s.as_ref().is_some_and(|s| !live.iter().any(|l| l.id.same(s)));
+        if self.open.is_empty() {
+            if let Some(k) = self.seats.iter().position(Option::is_none) {
+                return Some(k);
+            }
+            self.seats.push(None);
+            return Some(self.seats.len() - 1);
+        }
+        for want in [Open::Yes, Open::Later] {
+            let open = |k: usize| self.open.get(k) == Some(&want);
+            if let Some(k) = (0..self.seats.len()).find(|&k| open(k) && self.seats[k].is_none()) {
+                return Some(k);
+            }
+            if let Some(k) = (0..self.seats.len()).find(|&k| open(k) && away(&self.seats[k])) {
+                return Some(k);
+            }
+        }
+        None
     }
+
+    /// Seats the controllers used for the first time this poll, and keeps track of the
+    /// ones that are another's twin. A controller takes a seat the moment it starts being
+    /// used (a button down, a stick or trigger pushed past half way), not when it's
+    /// first seen: a controller app's idle virtual pad mustn't take a player's seat.
+    fn place(&mut self, live: &[Live]) {
+        // Known ones follow their device to its path now.
+        for l in live {
+            match self.known.iter_mut().find(|k| k.id.same(&l.id)) {
+                Some(k) => k.id = l.id.clone(),
+                None => self.known.push(Known { id: l.id.clone(), name: l.name.clone(), style: l.style, used: false, buttons: 0, pressed_at: 0, twin_of: None, disagrees: 0 }),
+            }
+        }
+        for s in self.seats.iter_mut().flatten() {
+            if let Some(l) = live.iter().find(|l| l.id.same(s)) {
+                *s = l.id.clone();
+            }
+        }
+        // When a button last went down on each, before anything is decided: a pad and
+        // its twin are pressed in the same poll, or one poll apart.
+        let polls = self.polls;
+        for l in live {
+            if let Some(k) = self.known.iter_mut().find(|k| k.id.same(&l.id))
+                && l.state.buttons & !k.buttons != 0
+            {
+                k.pressed_at = polls;
+            }
+        }
+        let known = |me: &Pads, id: &Seat| me.known.iter().position(|k| k.id.same(id)).expect("every live controller is known");
+        for l in live {
+            let i = known(self, &l.id);
+            if let Some(of) = self.known[i].twin_of.clone() {
+                self.twin(i, l, &of, live);
+            } else if l.state.in_use() && !self.known[i].used && self.seat_of(&l.id).is_none() {
+                self.first_use(i, l, live);
+            }
+            let k = &mut self.known[i];
+            k.used = l.state.in_use();
+            k.buttons = l.state.buttons;
+        }
+    }
+
+    /// Controller `known[i]` (`l`) started being used and holds no seat: it's another
+    /// controller's twin, or it takes a seat if one is open.
+    fn first_use(&mut self, i: usize, l: &Live, live: &[Live]) {
+        let polls = self.polls;
+        // The same pad seen twice (a remapper's virtual pad beside the real one, both
+        // read here): pressed with a controller that holds a seat, the same buttons down.
+        let partner = live.iter().find(|o| {
+            !o.id.same(&l.id)
+                && self.seat_of(&o.id).is_some()
+                && alike(o.state.buttons, l.state.buttons)
+                && self.known.iter().any(|k| k.id.same(&o.id) && k.twin_of.is_none() && k.pressed_at + 1 >= polls)
+        });
+        if let Some(o) = partner {
+            self.known[i].twin_of = Some(o.id.clone());
+            self.known[i].disagrees = 0;
+            self.notes.push(format!(
+                "input: {} went down with {} (the same buttons, the same moment): one pad seen twice (a controller app's virtual pad beside the real one), so it takes no seat of its own",
+                l.name, o.name
+            ));
+            return;
+        }
+        let Some(k) = self.free_seat(live) else {
+            if !self.open.is_empty() {
+                self.notes.push(format!("input: {} was used, but no player's seat is open for a controller: it works the focused player's overlay only", l.name));
+            }
+            return;
+        };
+        if let Some(old) = self.seats[k].take() {
+            let name = self.name_of(Some(&old));
+            self.notes.push(format!("input: seat {k}'s controller ({name}) is away, so {} takes it", l.name));
+        }
+        self.seats[k] = Some(l.id.clone());
+        self.newly_seated.push((k, l.name.clone()));
+    }
+
+    /// Twin `known[i]` (`l`) of controller `of`: it takes `of`'s seat when `of` goes
+    /// (the remapper closed), and is a controller of its own again once it has
+    /// disagreed with `of` for a while.
+    fn twin(&mut self, i: usize, l: &Live, of: &Seat, live: &[Live]) {
+        let Some(o) = live.iter().find(|o| o.id.same(of)) else {
+            self.known[i].twin_of = None;
+            if let Some(k) = self.seat_of(of) {
+                self.seats[k] = Some(l.id.clone());
+                self.notes.push(format!("input: {} went away; {}, the same pad seen twice, keeps its seat {k}", self.name_of(Some(of)), l.name));
+            }
+            return;
+        };
+        let (mine, theirs) = (l.state.buttons, o.state.buttons);
+        let k = &mut self.known[i];
+        if mine != 0 && !alike(mine, theirs) {
+            k.disagrees += 1;
+        } else if mine != 0 {
+            k.disagrees = 0;
+        }
+        if k.disagrees >= TWIN_DISAGREES {
+            k.twin_of = None;
+            k.disagrees = 0;
+            self.notes.push(format!("input: {} isn't {} seen twice after all (their buttons differ): it takes a seat of its own at its next use", l.name, o.name));
+        }
+    }
+}
+
+/// A HID (evdev) device's seat: its path, and its serial's key unless another device
+/// that's there has the same one (identical pads with one serial number).
+fn device_seat(h: &Hid, all: &[Hid]) -> Seat {
+    let shared = all.iter().any(|o| !Arc::ptr_eq(&o.alive, &h.alive) && o.alive.load(Ordering::Relaxed) && o.serial_key == h.serial_key);
+    Seat::Device { path: h.path.clone(), serial: if shared { 0 } else { h.serial_key } }
 }
 
 impl Drop for Pads {
@@ -447,15 +717,15 @@ impl Drop for Pads {
 }
 
 impl Pads {
-    /// Every controller used, by seat (the order they were first used in), as the last
-    /// poll read it: None for one away now. A seat is never handed to another
-    /// controller, so a copy given seat 0 never gets the next player's.
+    /// Each seat's controller as the last poll read it: None for a seat with none, or
+    /// whose controller is away now. A seat isn't handed to another controller while
+    /// one is open (`free_seat`), so a copy given seat 0 doesn't get the next player's.
     pub fn readings(&self) -> Vec<Option<Reading>> {
         let hid = self.hid.lock().unwrap();
         let mut out: Vec<Option<Reading>> = self
             .seats
             .iter()
-            .map(|seat| match seat {
+            .map(|seat| match seat.as_ref()? {
                 Seat::XInput(slot) => {
                     let i = *slot as usize;
                     (self.xinput.is_some() && self.connected[i]).then(|| Reading {
@@ -466,7 +736,7 @@ impl Pads {
                         hid_key: 0,
                     })
                 }
-                Seat::Device(path) => hid.iter().find(|h| h.path == *path && h.alive.load(Ordering::Relaxed)).map(|h| Reading {
+                s @ Seat::Device { .. } => hid.iter().find(|h| h.alive.load(Ordering::Relaxed) && device_seat(h, &hid).same(s)).map(|h| Reading {
                     name: format!("HID {:04x}:{:04x}", h.vid, h.pid),
                     style: h.style,
                     state: *h.state.lock().unwrap(),
@@ -672,6 +942,9 @@ struct Ranges {
     rx: Option<Range>,
     ry: Option<Range>,
     hat: Option<Range>,
+    /// Simulation Controls' Brake / Accelerator: the triggers, on pads that have them.
+    brake: Option<Range>,
+    accel: Option<Range>,
 }
 
 /// A stick value as -1..1 across its range. Without one (a descriptor Windows
@@ -703,13 +976,13 @@ fn hat_in(v: u32, r: Option<Range>) -> u32 {
     if r.max - r.min == 3 { hat(pos * 2) } else { hat(pos) }
 }
 
-/// The logical range of Generic Desktop `usage` in a pad's input reports.
+/// The logical range of usage `page`:`usage` in a pad's input reports.
 #[cfg(windows)]
-fn value_range(pre: isize, usage: u16) -> Option<Range> {
+fn value_range(pre: isize, page: u16, usage: u16) -> Option<Range> {
     use windows_sys::Win32::Devices::HumanInterfaceDevice::{HIDP_VALUE_CAPS, HidP_GetSpecificValueCaps, HidP_Input};
     let mut caps: [HIDP_VALUE_CAPS; 4] = unsafe { std::mem::zeroed() };
     let mut n = caps.len() as u16;
-    let rc = unsafe { HidP_GetSpecificValueCaps(HidP_Input, 0x01, 0, usage, caps.as_mut_ptr(), &mut n, pre) };
+    let rc = unsafe { HidP_GetSpecificValueCaps(HidP_Input, page, 0, usage, caps.as_mut_ptr(), &mut n, pre) };
     (rc == 0x0011_0000 && n >= 1).then(|| Range::new(caps[0].LogicalMin, caps[0].LogicalMax, caps[0].BitSize))
 }
 
@@ -763,7 +1036,11 @@ fn parse_known(vid: u16, pid: u16, report: &[u8]) -> Option<State> {
                 buttons |= map0.iter().filter(|(x, _)| b0 & x != 0).fold(0, |a, (_, l)| a | l);
                 let map1 = [(0x01, BACK), (0x02, START), (0x04, LSTICK), (0x08, RSTICK), (0x10, HOME)];
                 buttons |= map1.iter().filter(|(x, _)| b1 & x != 0).fold(0, |a, (_, l)| a | l);
-                Some(State { buttons, lt: pulled(b0 & 0x40 != 0), rt: pulled(b0 & 0x80 != 0), ..Default::default() })
+                // The sticks after the hat: four 16-bit values, centred on 0x8000, down
+                // positive.
+                let at = |i: usize| ((f32::from(u16::from_le_bytes([r[i], r[i + 1]])) - 32768.0) / 32767.0).clamp(-1.0, 1.0);
+                let (lx, ly, rx, ry) = if r.len() >= 11 { (at(3), -at(5), at(7), -at(9)) } else { (0.0, 0.0, 0.0, 0.0) };
+                Some(State { buttons, lx, ly, rx, ry, lt: pulled(b0 & 0x40 != 0), rt: pulled(b0 & 0x80 != 0) })
             }
             0x30 if r.len() >= 11 => {
                 let (right, shared, left) = (r[2], r[3], r[4]);
@@ -906,13 +1183,15 @@ fn open_hid(list: &Arc<Mutex<Vec<Hid>>>, threads: &Arc<Threads>, path: String) {
     let entry = Hid { path, vid: attr.VendorID, pid: attr.ProductID, style: style_of(attr.VendorID), state: state.clone(), alive: alive.clone(), home: true, stick: 0, serial_key, inst_key };
     let (vid, pid, len) = (attr.VendorID, attr.ProductID, caps.InputReportByteLength as usize);
     let ranges = Ranges {
-        x: value_range(pre, 0x30),
-        y: value_range(pre, 0x31),
-        z: value_range(pre, 0x32),
-        rz: value_range(pre, 0x35),
-        rx: value_range(pre, 0x33),
-        ry: value_range(pre, 0x34),
-        hat: value_range(pre, 0x39),
+        x: value_range(pre, 0x01, 0x30),
+        y: value_range(pre, 0x01, 0x31),
+        z: value_range(pre, 0x01, 0x32),
+        rz: value_range(pre, 0x01, 0x35),
+        rx: value_range(pre, 0x01, 0x33),
+        ry: value_range(pre, 0x01, 0x34),
+        hat: value_range(pre, 0x01, 0x39),
+        brake: value_range(pre, 0x02, 0xC5),
+        accel: value_range(pre, 0x02, 0xC4),
     };
     let (h, pre) = (h as usize, pre);
     let stop = threads.clone();
@@ -920,6 +1199,10 @@ fn open_hid(list: &Arc<Mutex<Vec<Hid>>>, threads: &Arc<Threads>, path: String) {
     let read = move || {
         let alive = reader_alive;
         let mut buf = vec![0u8; len.max(64)];
+        // A generic pad's trigger axes count only if they rest at the bottom of their
+        // range in its first report: an axis that's really a stick's rests half way,
+        // and would read as a trigger held half down.
+        let mut triggers_rest: Option<bool> = None;
         // Ends when the device goes, or when `Pads` is dropped (`Threads::stop_all`
         // cancels a read that waits).
         while !stop.stopping() {
@@ -931,7 +1214,13 @@ fn open_hid(list: &Arc<Mutex<Vec<Hid>>>, threads: &Arc<Threads>, path: String) {
                 break;
             }
             let report = &buf[..got as usize];
-            let parsed = parse_known(vid, pid, report).or_else(|| parse_generic(pre, ranges, report));
+            let parsed = parse_known(vid, pid, report).or_else(|| {
+                let mut s = parse_generic(pre, ranges, report)?;
+                if !*triggers_rest.get_or_insert(s.lt < 0.25 && s.rt < 0.25) {
+                    (s.lt, s.rt) = (0.0, 0.0);
+                }
+                Some(s)
+            });
             if let Some(s) = parsed {
                 *state.lock().unwrap() = s;
             }
@@ -966,8 +1255,11 @@ fn serial_of(h: windows_sys::Win32::Foundation::HANDLE) -> String {
 /// Any other gamepad, through Windows' HID parser: buttons 1-4 as the face buttons
 /// (south, east, west, north: the common order), 5-6 shoulders, 7-8 back / start, 9-10
 /// the stick clicks, 13 home; the hat switch as the d-pad; X / Y as the left stick, and
-/// Z / Rz as the right one (DirectInput's usual), else Rx / Ry. Triggers aren't read:
-/// pads put them on different axes, and a wrong guess would hold one half down. Home is also whichever of the
+/// Z / Rz as the right one (DirectInput's usual) unless it has Rx / Ry too. The triggers:
+/// Simulation Controls' Brake and Accelerator where it has them, else Z and Rz beside an
+/// Rx / Ry right stick, else Z alone beside one (both triggers on one axis, the left
+/// above its middle); pads without any of those have digital ones among their buttons.
+/// (A trigger axis that doesn't rest at its bottom is dropped by the reader.) Home is also whichever of the
 /// usages pads give it instead of a button number: Generic Desktop's System Main Menu
 /// (0x85) and Consumer's AC Home (0x223). Sticks and hat are read by their descriptor's
 /// `ranges`: a centred stick isn't always 128, and a released hat isn't always 8.
@@ -1024,13 +1316,46 @@ fn parse_generic(pre: isize, ranges: Ranges, report: &[u8]) -> Option<State> {
         _ => None,
     };
     let (lx, ly) = pair(0x30, ranges.x, 0x31, ranges.y).unwrap_or_default();
-    let right = if ranges.z.is_some() && ranges.rz.is_some() {
+    let rxry = ranges.rx.is_some() && ranges.ry.is_some();
+    let right = if ranges.z.is_some() && ranges.rz.is_some() && !rxry {
         pair(0x32, ranges.z, 0x35, ranges.rz)
     } else {
         pair(0x33, ranges.rx, 0x34, ranges.ry)
     };
     let (rx, ry) = right.unwrap_or_default();
-    Some(State { buttons, lx, ly, rx, ry, ..Default::default() })
+    let sim = |usage: u16, r: Option<Range>| -> Option<f32> {
+        let mut v = 0u32;
+        let rc = unsafe { HidP_GetUsageValue(HidP_Input, 0x02, 0, usage, &mut v, pre, report.as_ptr() as *mut _, report.len() as u32) };
+        (rc == 0x0011_0000).then(|| pulled_by(v, r))
+    };
+    let (lt, rt) = if ranges.brake.is_some() || ranges.accel.is_some() {
+        (sim(0xC5, ranges.brake).unwrap_or(0.0), sim(0xC4, ranges.accel).unwrap_or(0.0))
+    } else if rxry && ranges.z.is_some() && ranges.rz.is_some() {
+        (value(0x32).map_or(0.0, |v| pulled_by(v, ranges.z)), value(0x35).map_or(0.0, |v| pulled_by(v, ranges.rz)))
+    } else if rxry && ranges.z.is_some() {
+        value(0x32).map_or((0.0, 0.0), |v| shared_triggers(stick(v, ranges.z)))
+    } else {
+        (0.0, 0.0)
+    };
+    Some(State { buttons, lx, ly, rx, ry, lt, rt })
+}
+
+/// A trigger axis, 0 at the bottom of its range to 1 at the top. Without a range, a
+/// guess: 8 or 16 bits.
+#[cfg(any(windows, test))]
+fn pulled_by(v: u32, r: Option<Range>) -> f32 {
+    match r {
+        Some(r) if r.max > r.min => ((r.signed(v).clamp(r.min as i64, r.max as i64) - r.min as i64) as f64 / (r.max as f64 - r.min as f64)) as f32,
+        _ if v <= 255 => trigger(v as u8),
+        _ => (v as f32 / 65535.0).clamp(0.0, 1.0),
+    }
+}
+
+/// Both triggers on one axis (`stick`'s -1..1): the left one above its middle, the
+/// right one below.
+#[cfg(any(windows, test))]
+fn shared_triggers(z: f32) -> (f32, f32) {
+    (z.max(0.0), (-z).max(0.0))
 }
 
 #[cfg(test)]
@@ -1318,7 +1643,7 @@ mod tests {
         assert!(!press(&mut pads, 0x0400));
         assert!(!press(&mut pads, 0));
         assert!(press(&mut pads, 0x0400));
-        assert_eq!(pads.homes, [(0, "XInput slot 0".to_string())]);
+        assert_eq!(pads.homes, [(Some(0), "XInput slot 0".to_string())]);
         assert_eq!(pads.per, [HOME], "its buttons apart");
         assert!(!press(&mut pads, 0x0400));
         // Still down when the game comes back to the front: nothing until it comes up.
@@ -1327,5 +1652,205 @@ mod tests {
         assert!(!press(&mut pads, 0x0400));
         assert!(!press(&mut pads, 0));
         assert!(press(&mut pads, 0x0400));
+    }
+
+    /// XInput slots as the tests set them: `u32::MAX` for an empty slot, else its
+    /// `wButtons`.
+    static FAKE_PADS: [std::sync::atomic::AtomicU32; 4] = [const { std::sync::atomic::AtomicU32::new(u32::MAX) }; 4];
+    /// The tests that use FAKE_PADS run one at a time.
+    static FAKE_PADS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    unsafe extern "system" fn fake_pads(pad: u32, s: *mut [u8; STATE_LEN]) -> u32 {
+        match FAKE_PADS.get(pad as usize).map(|b| b.load(Ordering::Relaxed)) {
+            Some(b) if b != u32::MAX => {
+                unsafe { (&mut *s)[4..6].copy_from_slice(&(b as u16).to_le_bytes()) };
+                0
+            }
+            _ => 1167,
+        }
+    }
+
+    /// Pads reading `FAKE_PADS` (all empty) and the HID devices the test adds.
+    fn fake_session() -> (std::sync::MutexGuard<'static, ()>, Pads) {
+        let g = FAKE_PADS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for p in &FAKE_PADS {
+            p.store(u32::MAX, Ordering::Relaxed);
+        }
+        let mut pads = Pads::new();
+        pads.xinput = Some(fake_pads);
+        pads.last_scan = Some(Instant::now());
+        (g, pads)
+    }
+
+    /// A poll, with every empty slot tried again (no two-second wait).
+    fn poll(pads: &mut Pads) {
+        pads.tried = [None; 4];
+        pads.notes.clear();
+        pads.poll();
+    }
+
+    fn set_x(slot: usize, buttons: u32) {
+        FAKE_PADS[slot].store(buttons, Ordering::Relaxed);
+    }
+
+    /// A HID device on the list, as the scan adds one: its state and liveness to set.
+    fn add_hid(pads: &Pads, path: &str, serial_key: u64) -> (Arc<Mutex<State>>, Arc<AtomicBool>) {
+        let (state, alive) = (Arc::new(Mutex::new(State::default())), Arc::new(AtomicBool::new(true)));
+        let h = Hid { path: path.into(), vid: 0x054c, pid: 0x09cc, style: Style::PlayStation, state: state.clone(), alive: alive.clone(), home: true, stick: 0, serial_key, inst_key: 0 };
+        pads.hid.lock().unwrap().push(h);
+        (state, alive)
+    }
+
+    fn names(pads: &Pads) -> Vec<Option<String>> {
+        pads.readings().iter().map(|r| r.as_ref().map(|r| r.name.clone())).collect()
+    }
+
+    /// A keyboard player's seat takes no controller; one that has been playing with the
+    /// keyboard (`Later`) takes one only once the others are held.
+    #[test]
+    fn controllers_take_the_open_seats_in_order() {
+        let (_g, mut pads) = fake_session();
+        pads.set_open(vec![Open::Later, Open::No, Open::Yes]);
+        set_x(0, 0x1000);
+        poll(&mut pads);
+        assert_eq!(pads.newly_seated, [(2, "XInput slot 0".to_string())], "past the keyboard players, to player 3");
+        set_x(1, 0x2000);
+        poll(&mut pads);
+        assert_eq!(pads.newly_seated, [(0, "XInput slot 1".to_string())], "the one who was on the keyboard takes the next");
+        set_x(2, 0x4000);
+        poll(&mut pads);
+        assert!(pads.newly_seated.is_empty(), "no seat left");
+        assert_eq!(pads.per, [EAST, 0, SOUTH]);
+        assert_eq!(pads.spare, WEST, "the seatless one works the focused overlay");
+        assert!(pads.notes.iter().any(|n| n.contains("no player's seat is open")), "{:?}", pads.notes);
+        // A seat closed lets its controller go.
+        pads.set_open(vec![Open::No, Open::No, Open::Yes]);
+        assert_eq!(names(&pads), [None, None, Some("XInput slot 0".to_string())]);
+    }
+
+    /// One pad read twice (a remapper's virtual Xbox pad and the real one) takes one
+    /// seat; the twin takes it over when the first goes away.
+    #[test]
+    fn one_pad_seen_twice_takes_one_seat() {
+        let (_g, mut pads) = fake_session();
+        pads.set_open(vec![Open::Yes, Open::Yes]);
+        let (ds4, _alive) = add_hid(&pads, "hid-ds4", 7);
+        set_x(0, 0x1000);
+        *ds4.lock().unwrap() = State { buttons: SOUTH, ..Default::default() };
+        poll(&mut pads);
+        assert_eq!(names(&pads), [Some("XInput slot 0".to_string()), None], "one seat, not two");
+        assert!(pads.notes.iter().any(|n| n.contains("one pad seen twice")), "{:?}", pads.notes);
+        assert!(pads.spare == 0, "the twin works nothing of its own");
+        set_x(0, 0);
+        *ds4.lock().unwrap() = State::default();
+        poll(&mut pads);
+        // The real one's press a poll behind the virtual one's is the same pad's too.
+        set_x(0, 0x2000);
+        poll(&mut pads);
+        *ds4.lock().unwrap() = State { buttons: EAST, ..Default::default() };
+        poll(&mut pads);
+        assert_eq!(names(&pads), [Some("XInput slot 0".to_string()), None]);
+        // The remapper closes: its pad goes, the real one keeps the seat.
+        set_x(0, u32::MAX);
+        poll(&mut pads);
+        assert_eq!(names(&pads), [Some("HID 054c:09cc".to_string()), None]);
+        assert!(pads.notes.iter().any(|n| n.contains("keeps its seat 0")), "{:?}", pads.notes);
+    }
+
+    /// Two players who happened to press the same button at once: the second is taken
+    /// for the first's pad seen twice until their buttons differ, then takes a seat.
+    #[test]
+    fn a_twin_that_disagrees_is_a_controller_of_its_own() {
+        let (_g, mut pads) = fake_session();
+        pads.set_open(vec![Open::Yes, Open::Yes]);
+        set_x(0, 0x1000);
+        set_x(1, 0x1000);
+        poll(&mut pads);
+        assert_eq!(names(&pads), [Some("XInput slot 0".to_string()), None]);
+        set_x(0, 0);
+        set_x(1, 0x2000);
+        let mut told = false;
+        for _ in 0..TWIN_DISAGREES {
+            poll(&mut pads);
+            told |= pads.notes.iter().any(|n| n.contains("after all"));
+        }
+        assert!(told);
+        set_x(1, 0);
+        poll(&mut pads);
+        set_x(1, 0x2000);
+        poll(&mut pads);
+        assert_eq!(names(&pads), [Some("XInput slot 0".to_string()), Some("XInput slot 1".to_string())]);
+    }
+
+    /// A HID pad is found again by its serial after coming back on another path; a seat
+    /// whose controller is away goes to a new one only when no other seat is free.
+    #[test]
+    fn seats_follow_serials_and_are_reused_last() {
+        let (_g, mut pads) = fake_session();
+        pads.set_open(vec![Open::Yes, Open::Yes]);
+        let (a, a_alive) = add_hid(&pads, "usb-path-a", 42);
+        *a.lock().unwrap() = State { buttons: NORTH, ..Default::default() };
+        poll(&mut pads);
+        assert_eq!(pads.newly_seated, [(0, "HID 054c:09cc".to_string())]);
+        // Unplugged, back over Bluetooth on another path.
+        a_alive.store(false, Ordering::Relaxed);
+        poll(&mut pads);
+        assert_eq!(names(&pads), [None, None]);
+        let (b, b_alive) = add_hid(&pads, "bt-path-b", 42);
+        *b.lock().unwrap() = State { buttons: NORTH, ..Default::default() };
+        poll(&mut pads);
+        assert!(pads.newly_seated.is_empty(), "{:?}", pads.newly_seated);
+        assert_eq!(names(&pads), [Some("HID 054c:09cc".to_string()), None], "its own seat again");
+        // Player 1's pad away and player 2 seated: a third pad takes player 1's seat.
+        set_x(0, 0x1000);
+        poll(&mut pads);
+        assert_eq!(pads.newly_seated, [(1, "XInput slot 0".to_string())]);
+        b_alive.store(false, Ordering::Relaxed);
+        poll(&mut pads);
+        set_x(1, 0x2000);
+        poll(&mut pads);
+        assert_eq!(pads.newly_seated, [(0, "XInput slot 1".to_string())]);
+        assert!(pads.notes.iter().any(|n| n.contains("is away, so XInput slot 1 takes it")), "{:?}", pads.notes);
+    }
+
+    /// The overlay swaps two players' controllers, or frees one's for the next pressed.
+    #[test]
+    fn seats_swap_and_free() {
+        let (_g, mut pads) = fake_session();
+        pads.set_open(vec![Open::Yes, Open::Yes]);
+        set_x(0, 0x1000);
+        poll(&mut pads);
+        set_x(1, 0x2000);
+        poll(&mut pads);
+        pads.swap(0, 1);
+        poll(&mut pads);
+        assert_eq!(names(&pads), [Some("XInput slot 1".to_string()), Some("XInput slot 0".to_string())]);
+        assert_eq!(pads.per, [EAST, SOUTH]);
+        let info = pads.seat_info();
+        assert_eq!(info[0].as_ref().map(|i| (i.name.as_str(), i.here)), Some(("XInput slot 1", true)));
+        pads.free(1);
+        assert_eq!(pads.seat_info()[1], None);
+        set_x(0, 0);
+        poll(&mut pads);
+        set_x(0, 0x1000);
+        poll(&mut pads);
+        assert_eq!(pads.newly_seated, [(1, "XInput slot 0".to_string())], "the next one pressed takes it");
+    }
+
+    /// Generic pads' triggers: one axis each, or both on one; the Switch Pro's simple
+    /// Bluetooth report has its sticks after the hat.
+    #[test]
+    fn generic_triggers_and_switch_sticks() {
+        let near = |a: f32, b: f32| (a - b).abs() < 0.01;
+        let r = Some(Range::new(0, 1023, 10));
+        assert!(near(pulled_by(0, r), 0.0) && near(pulled_by(1023, r), 1.0) && near(pulled_by(512, r), 0.5));
+        assert!(near(pulled_by(255, None), 1.0) && near(pulled_by(65535, None), 1.0));
+        assert_eq!(shared_triggers(0.8), (0.8, 0.0));
+        assert_eq!(shared_triggers(-0.5), (0.0, 0.5));
+        let mut r = vec![0x3f, 0, 0, 8];
+        for v in [0xFFFFu16, 0x8000, 0x0000, 0x8000] {
+            r.extend_from_slice(&v.to_le_bytes());
+        }
+        let s = parse_known(0x057e, 0x2009, &r).unwrap();
+        assert!(near(s.lx, 1.0) && near(s.ly, 0.0) && near(s.rx, -1.0) && near(s.ry, 0.0), "{s:?}");
     }
 }

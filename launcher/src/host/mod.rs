@@ -86,6 +86,7 @@ use desktop::Rect;
 pub use peerparty_protocol::session::LayoutPreset;
 
 use crate::firewall;
+use crate::launch::SlotInput;
 use crate::ui::store::Prefs;
 use firewall_watch::{FirewallEvent, FirewallWatcher};
 use input_hub::InputHub;
@@ -137,6 +138,23 @@ pub struct SessionLaunch {
     pub pid: u32,
     pub pipe: pipe::Pipe,
     pub spec: InstanceSpec,
+    /// What the player plays with (their spec's `input_assignment` says it to the hook).
+    pub input: SlotInput,
+}
+
+/// Keys and mouse buttons pressed in a player's pane, with no controller of theirs, that
+/// make them a keyboard player (`SessionHost::watch_keyboard`): more than a click that
+/// focuses the pane or a hotkey.
+const KBM_PLAYER_PRESSES: u64 = 4;
+
+/// Where the keyboard's presses were counted (`SessionHost::watch_keyboard`).
+#[derive(Default)]
+struct KbmSeen {
+    /// `InputHub::kbm_presses` at the last tick.
+    last: u64,
+    /// The pane they were counted for, and how many.
+    pane: usize,
+    count: u64,
 }
 
 /// One copy's overlay: its pages and notifications, whether it's open, and how it's
@@ -233,7 +251,7 @@ const TWIN_HOME: Duration = Duration::from_millis(150);
 /// on both: a press on a controller no copy was given, with or just after one on a
 /// controller a copy was, is that one's (opened on the focused copy, it would open a
 /// second overlay on another player's pane).
-fn real_homes(homes: Vec<(usize, String, bool)>, given_at: &mut Option<Instant>, now: Instant) -> (Vec<(usize, String)>, Vec<String>) {
+fn real_homes(homes: Vec<(Option<usize>, String, bool)>, given_at: &mut Option<Instant>, now: Instant) -> (Vec<(Option<usize>, String)>, Vec<String>) {
     if homes.iter().any(|(_, _, given)| *given) {
         *given_at = Some(now);
     }
@@ -249,6 +267,15 @@ fn real_homes(homes: Vec<(usize, String, bool)>, given_at: &mut Option<Instant>,
     (keep, twins)
 }
 
+/// A controller's kind as the overlay names it.
+fn style_word(s: pad::Style) -> &'static str {
+    match s {
+        pad::Style::Xbox => "Xbox",
+        pad::Style::PlayStation => "PlayStation",
+        pad::Style::Nintendo => "Nintendo",
+    }
+}
+
 /// The controllers as this tick's one poll read them (a second poll would lose a Home
 /// press): every controller's buttons together, each one's apart (`Pads::readings`
 /// order), and the Home presses.
@@ -256,7 +283,9 @@ fn real_homes(homes: Vec<(usize, String, bool)>, given_at: &mut Option<Instant>,
 struct PadFrame {
     all: u32,
     per: Vec<u32>,
-    homes: Vec<(usize, String)>,
+    /// The controllers in use that hold no seat (`Pads::spare`).
+    spare: u32,
+    homes: Vec<(Option<usize>, String)>,
 }
 
 struct SessionHost {
@@ -294,6 +323,12 @@ struct SessionHost {
     pads_logged: Option<Vec<String>>,
     /// Ticks that panicked (each is caught; the first few go to the game's log).
     panics: u32,
+    /// What each player plays with (`SessionLaunch::input`).
+    inputs: Vec<SlotInput>,
+    /// Each player seen playing with the keyboard and mouse before a controller of
+    /// theirs was used (`watch_keyboard`): a controller goes to another player first.
+    kbm_player: Vec<bool>,
+    kbm_seen: KbmSeen,
 }
 
 /// Runs until the game has ended: `process` says so then (on Windows the game's process,
@@ -321,12 +356,14 @@ pub fn run_session(instances: Vec<SessionLaunch>, layout: LayoutPreset, exe: &Pa
         return;
     }
     prepare(&prefs);
+    let inputs: Vec<SlotInput> = instances.iter().map(|l| l.input).collect();
     let copies: Vec<InstanceConn> = instances.into_iter().map(|l| InstanceConn::new(l.spec, l.process, l.pid, l.pipe)).collect();
     let name = exe.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let title = game_title(exe, &name);
     // The window is made on this thread, which hands it its messages (desktop::wait).
     let compositor = CompositorWindow::open(layout, MonitorBounds::primary(), copies.len(), &title, exe);
     let mut host = SessionHost::new(copies, Some(compositor), exe, prefs, packaged);
+    host.set_inputs(inputs);
     let event = host.compositor.as_ref().and_then(|c| c.frame_event());
     let draws = host.compositor.as_ref().is_some_and(|c| c.draws_frames());
     for inst in &mut host.instances {
@@ -377,7 +414,12 @@ impl SessionHost {
             key_left_told: false,
             pads_logged: None,
             panics: 0,
+            inputs: Vec::new(),
+            kbm_player: Vec::new(),
+            kbm_seen: KbmSeen::default(),
         };
+        host.inputs = vec![SlotInput::Auto; host.instances.len()];
+        host.kbm_player = vec![false; host.instances.len()];
         host.refresh_hints();
         host
     }
@@ -509,15 +551,152 @@ impl SessionHost {
         })
     }
 
+    /// What each player plays with, for a session just started: each one's said in
+    /// their game's log, and the session starts with the keyboard player's pane focused.
+    fn set_inputs(&mut self, inputs: Vec<SlotInput>) {
+        self.inputs = inputs;
+        self.inputs.resize(self.instances.len(), SlotInput::Auto);
+        for k in 0..self.instances.len() {
+            let what = match self.inputs[k] {
+                SlotInput::Auto => "a controller (the first one used that no other player has), and the keyboard and mouse while their pane has the focus",
+                SlotInput::KeyboardMouse => "the keyboard and mouse, never a controller",
+                SlotInput::Controller => "a controller; the keyboard and mouse only while their pane has the focus",
+            };
+            self.instances[k].send(&HostMsg::Note { text: format!("input: player {} plays with {what}", k + 1) });
+        }
+        if let Some(k) = self.inputs.iter().position(|i| *i == SlotInput::KeyboardMouse) {
+            self.instances[k].send(&HostMsg::Note { text: format!("input: the session starts with player {}'s pane focused: theirs are the keyboard and mouse", k + 1) });
+            self.set_focus(k);
+        }
+    }
+
+    /// Whether a split-screen session's seat `k` may take a controller now (`Pads::set_open`);
+    /// None for a copy alone.
+    fn seat_open(&self) -> Option<Vec<pad::Open>> {
+        if self.compositor.is_none() || self.instances.len() <= 1 {
+            return None;
+        }
+        let open = (0..self.instances.len()).map(|k| match self.inputs.get(k).copied().unwrap_or_default() {
+            _ if self.instances[k].gone => pad::Open::No,
+            SlotInput::KeyboardMouse => pad::Open::No,
+            SlotInput::Controller => pad::Open::Yes,
+            SlotInput::Auto if self.kbm_player.get(k) == Some(&true) => pad::Open::Later,
+            SlotInput::Auto => pad::Open::Yes,
+        });
+        Some(open.collect())
+    }
+
     /// Reads the controllers, once for the tick.
     fn poll_pads(&mut self) {
+        let open = self.seat_open();
         let pads = self.input.pads();
+        if let Some(open) = open {
+            pads.set_open(open);
+        }
         let all = pads.poll();
         let seated = std::mem::take(&mut pads.newly_seated);
-        self.pads = PadFrame { all, per: pads.per.clone(), homes: std::mem::take(&mut pads.homes) };
+        let notes = std::mem::take(&mut pads.notes);
+        self.pads = PadFrame { all, per: pads.per.clone(), spare: pads.spare, homes: std::mem::take(&mut pads.homes) };
         for (seat, name) in seated {
-            let text = format!("input: {name} claimed seat {seat}");
+            let text = format!("input: {name} claimed seat {seat} (player {})", seat + 1);
+            let to = if seat < self.instances.len() { seat } else { self.focus };
+            self.instances[to].send(&HostMsg::Note { text });
+        }
+        for text in notes {
             self.cur().send(&HostMsg::Note { text });
+        }
+    }
+
+    /// A split-screen session: a player with no controller yet who presses keys and
+    /// mouse buttons in their pane (while it has the focus) plays with the keyboard and
+    /// mouse, so a controller used next goes to another player first (`seat_open`).
+    fn watch_keyboard(&mut self, front: bool) {
+        if self.compositor.is_none() || self.instances.len() <= 1 {
+            return;
+        }
+        let presses = self.input.kbm_presses();
+        let new = presses.saturating_sub(self.kbm_seen.last);
+        self.kbm_seen.last = presses;
+        let f = self.focus;
+        if new == 0 || !front || self.kbm_player.get(f) != Some(&false) || self.inputs.get(f) != Some(&SlotInput::Auto) {
+            return;
+        }
+        if self.kbm_seen.pane != f {
+            self.kbm_seen.pane = f;
+            self.kbm_seen.count = 0;
+        }
+        if self.input.pads().seat_info().get(f).is_some_and(Option::is_some) {
+            return;
+        }
+        self.kbm_seen.count += new;
+        if self.kbm_seen.count >= KBM_PLAYER_PRESSES {
+            self.kbm_player[f] = true;
+            let text = format!(
+                "input: player {} plays with the keyboard and mouse ({} presses in their pane, no controller of theirs used yet): a controller used next goes to another player first",
+                f + 1,
+                self.kbm_seen.count
+            );
+            self.instances[f].send(&HostMsg::Note { text });
+        }
+    }
+
+    /// The players on this PC, for an open overlay's Players page.
+    fn seats(&mut self, me: usize) -> Option<ui::Seats> {
+        if self.compositor.is_none() || self.instances.len() <= 1 {
+            return None;
+        }
+        let info = self.input.pads().seat_info();
+        let n = self.instances.len();
+        let takes_pad = |k: usize, s: &SessionHost| !s.instances[k].gone && s.inputs.get(k) != Some(&SlotInput::KeyboardMouse);
+        let pad_players = (0..n).filter(|&k| takes_pad(k, self)).count();
+        let players = (0..n)
+            .map(|k| {
+                let seat = info.get(k).cloned().flatten();
+                let detail = if self.instances[k].gone {
+                    crate::t!("overlay.seat_gone").to_string()
+                } else if self.inputs.get(k) == Some(&SlotInput::KeyboardMouse) {
+                    crate::t!("overlay.seat_kbm").to_string()
+                } else {
+                    match &seat {
+                        Some(s) if s.here => crate::t!("overlay.seat_pad", kind = style_word(s.style)),
+                        Some(s) => crate::t!("overlay.seat_away", kind = style_word(s.style)),
+                        None if self.kbm_player.get(k) == Some(&true) => crate::t!("overlay.seat_later").to_string(),
+                        None => crate::t!("overlay.seat_none").to_string(),
+                    }
+                };
+                ui::PlayerSeat { detail, can_swap: takes_pad(k, self) && pad_players > 1, can_free: takes_pad(k, self) && seat.is_some() }
+            })
+            .collect();
+        Some(ui::Seats { players, me, keyboard: self.focus })
+    }
+
+    /// Player `k`'s controller trades places with the next player's who plays with one.
+    fn swap_seat(&mut self, k: usize, asked_by: usize) {
+        let n = self.instances.len();
+        let takes_pad = |j: usize| !self.instances[j].gone && self.inputs.get(j) != Some(&SlotInput::KeyboardMouse);
+        let Some(other) = (1..n).map(|d| (k + d) % n).find(|&j| takes_pad(j)) else { return };
+        self.input.pads().swap(k, other);
+        let text = format!("input: player {} and player {} traded controllers (asked from player {}'s overlay)", k + 1, other + 1, asked_by + 1);
+        for j in [k, other] {
+            self.instances[j].send(&HostMsg::Note { text: text.clone() });
+        }
+    }
+
+    /// Player `k`'s controller is let go: the next controller used takes their seat.
+    fn free_seat(&mut self, k: usize, asked_by: usize) {
+        self.input.pads().free(k);
+        let text = format!("input: player {}'s controller let go (asked from player {}'s overlay): the next controller used takes their seat", k + 1, asked_by + 1);
+        self.instances[k].send(&HostMsg::Note { text });
+    }
+
+    /// The keyboard and mouse go `d` players on (wrapping), past the ones that ended.
+    fn keyboard_step(&mut self, d: i32) {
+        let n = self.instances.len() as i32;
+        let next = (1..n).map(|s| (self.focus as i32 + d * s).rem_euclid(n) as usize).find(|&j| !self.instances[j].gone);
+        if let Some(j) = next {
+            let text = format!("input: the keyboard and mouse go to player {} (from the overlay)", j + 1);
+            self.instances[j].send(&HostMsg::Note { text });
+            self.set_focus(j);
         }
     }
 
@@ -533,20 +712,20 @@ impl SessionHost {
             _ => 0,
         };
         let spare = if i == self.focus {
-            self.pads.per.iter().enumerate().filter(|(k, _)| self.instance_for_pad(*k).is_none()).fold(0, |a, (_, b)| a | b)
+            self.pads.per.iter().enumerate().filter(|(k, _)| self.instance_for_pad(*k).is_none()).fold(self.pads.spare, |a, (_, b)| a | b)
         } else {
             0
         };
         own | spare
     }
 
-    /// Whose overlay controller `k`'s Home press is for: the copy it was given, else the
-    /// focused one.
-    fn pane_for_pad(&self, k: usize) -> usize {
+    /// Whose overlay a Home press on the controller of seat `k` (None: one without a
+    /// seat) is for: the copy that seat was given, else the focused one.
+    fn pane_for_pad(&self, k: Option<usize>) -> usize {
         if self.compositor.is_none() {
             return self.focus;
         }
-        self.instance_for_pad(k).unwrap_or(self.focus)
+        k.and_then(|k| self.instance_for_pad(k)).unwrap_or(self.focus)
     }
 
     /// The hotkeys that open the overlay in this game: the ones that are on, but not one
@@ -649,6 +828,7 @@ impl SessionHost {
         let front = self.in_front();
         self.track_focus(front);
         self.poll_pads();
+        self.watch_keyboard(front);
         let rect = if front { self.game_rect() } else { None };
         let gamebar = front && self.gamebar.open(rect);
         if gamebar != self.under_gamebar {
@@ -1091,8 +1271,8 @@ impl SessionHost {
         self.log_pads();
         if self.guide_opens() {
             let split = self.compositor.is_some() && self.instances.len() > 1;
-            let homes: Vec<(usize, String, bool)> =
-                self.pads.homes.iter().map(|(k, name)| (*k, name.clone(), split && self.instance_for_pad(*k).is_some())).collect();
+            let homes: Vec<(Option<usize>, String, bool)> =
+                self.pads.homes.iter().map(|(k, name)| (*k, name.clone(), split && k.and_then(|k| self.instance_for_pad(k)).is_some())).collect();
             let (homes, twins) = real_homes(homes, &mut self.nav.given_home_at, Instant::now());
             for name in twins {
                 self.cur().send(&HostMsg::Note {
@@ -1409,6 +1589,11 @@ impl SessionHost {
                 p.render.dirty = true;
             }
         }
+        let seats = self.seats(i);
+        if self.panes[i].overlay.seats != seats {
+            self.panes[i].overlay.seats = seats;
+            self.panes[i].render.dirty = true;
+        }
         let (nav, events, moved) = self.gather(i);
         let mut cmds = Vec::new();
         let mut prefs = self.prefs.clone();
@@ -1478,6 +1663,9 @@ impl SessionHost {
                         self.firewall.fix(public);
                     }
                 }
+                Cmd::SwapSeat(k) => self.swap_seat(k, i),
+                Cmd::FreeSeat(k) => self.free_seat(k, i),
+                Cmd::KeyboardStep(d) => self.keyboard_step(d),
                 Cmd::RecordChord => {
                     let now = Instant::now();
                     let p = &mut self.panes[i];
@@ -1708,10 +1896,10 @@ mod tests {
         let t0 = Instant::now();
         let at = |ms: u64| t0 + Duration::from_millis(ms);
         let mut given = None;
-        let ps = (0, "HID 054c:0ce6".to_string(), true);
-        let twin = (2, "XInput slot 0".to_string(), false);
+        let ps = (Some(0), "HID 054c:0ce6".to_string(), true);
+        let twin = (Some(2), "XInput slot 0".to_string(), false);
         let (keep, twins) = real_homes(vec![ps.clone(), twin.clone()], &mut given, t0);
-        assert_eq!(keep, [(0, "HID 054c:0ce6".to_string())]);
+        assert_eq!(keep, [(Some(0), "HID 054c:0ce6".to_string())]);
         assert_eq!(twins, ["XInput slot 0"]);
         let (keep, _) = real_homes(vec![ps], &mut given, at(2000));
         assert_eq!(keep.len(), 1);
@@ -1862,18 +2050,48 @@ mod tests {
         let bounds = MonitorBounds { x: 0, y: 0, width: 1920, height: 1080, dpi: 96 };
         let compositor = CompositorWindow::new(LayoutPreset::Grid2x2, bounds, 3);
         let mut host = SessionHost::new(copies, Some(compositor), Path::new(r"C:\Games\Some Game\game.exe"), Prefs::default(), false);
-        host.pads = PadFrame { all: pad::SOUTH | pad::EAST | pad::NORTH, per: vec![pad::SOUTH, 0, pad::EAST, pad::NORTH], homes: vec![] };
-        assert_eq!(host.pane_pad(0), pad::SOUTH | pad::NORTH, "its own, and the spare fourth as the focused copy");
+        host.pads = PadFrame { all: pad::SOUTH | pad::EAST | pad::NORTH | pad::WEST, per: vec![pad::SOUTH, 0, pad::EAST, pad::NORTH], spare: pad::WEST, homes: vec![] };
+        assert_eq!(host.pane_pad(0), pad::SOUTH | pad::NORTH | pad::WEST, "its own, and the spare ones as the focused copy");
         assert_eq!(host.pane_pad(1), 0);
         assert_eq!(host.pane_pad(2), pad::EAST);
         host.set_focus(1);
-        assert_eq!((host.pane_pad(0), host.pane_pad(1)), (pad::SOUTH, pad::NORTH));
-        assert_eq!(host.pane_for_pad(2), 2);
-        assert_eq!(host.pane_for_pad(3), 1, "a spare controller's press is the focused copy's");
+        assert_eq!((host.pane_pad(0), host.pane_pad(1)), (pad::SOUTH, pad::NORTH | pad::WEST));
+        assert_eq!(host.pane_for_pad(Some(2)), 2);
+        assert_eq!(host.pane_for_pad(Some(3)), 1, "a spare controller's press is the focused copy's");
+        assert_eq!(host.pane_for_pad(None), 1);
         // A copy alone reads them all.
         let mut solo = session(1);
-        solo.pads = PadFrame { all: pad::SOUTH | pad::EAST, per: vec![pad::SOUTH, pad::EAST], homes: vec![] };
+        solo.pads = PadFrame { all: pad::SOUTH | pad::EAST, per: vec![pad::SOUTH, pad::EAST], spare: 0, homes: vec![] };
         assert_eq!(solo.pane_pad(0), pad::SOUTH | pad::EAST);
-        assert_eq!(solo.pane_for_pad(1), 0);
+        assert_eq!(solo.pane_for_pad(Some(1)), 0);
+    }
+
+    /// Which seats take a controller: none for a keyboard player or a copy that ended;
+    /// a player who has been on the keyboard, only after the others.
+    #[test]
+    fn seats_open_by_what_players_play_with() {
+        let copies = (0..4)
+            .map(|i| {
+                let mut spec = InstanceSpec::solo(InstanceId(i), i);
+                spec.input_assignment = InputAssignment::Controller { index: i };
+                InstanceConn::detached(spec)
+            })
+            .collect();
+        let bounds = MonitorBounds { x: 0, y: 0, width: 1920, height: 1080, dpi: 96 };
+        let compositor = CompositorWindow::new(LayoutPreset::Grid2x2, bounds, 4);
+        let mut host = SessionHost::new(copies, Some(compositor), Path::new(r"C:\Games\Some Game\game.exe"), Prefs::default(), false);
+        host.set_inputs(vec![SlotInput::Auto, SlotInput::KeyboardMouse, SlotInput::Controller]);
+        assert_eq!(host.focus, 1, "the keyboard player's pane has the focus");
+        host.kbm_player[0] = true;
+        host.instances[3].gone = true;
+        assert_eq!(host.seat_open(), Some(vec![pad::Open::Later, pad::Open::No, pad::Open::Yes, pad::Open::No]));
+        assert_eq!(session(1).seat_open(), None, "a copy alone hands seats out as controllers come");
+        let seats = host.seats(0).unwrap();
+        assert_eq!((seats.me, seats.keyboard), (0, 1));
+        assert!(seats.players[0].can_swap && !seats.players[1].can_swap && !seats.players[3].can_swap);
+        host.keyboard_step(1);
+        assert_eq!(host.focus, 2);
+        host.keyboard_step(1);
+        assert_eq!(host.focus, 0, "past the one that ended");
     }
 }

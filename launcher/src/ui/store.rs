@@ -38,6 +38,9 @@ pub struct GameOptions {
     /// Split-screen layout preset: "" (auto: side by side for 2, grid for 3–4),
     /// "horizontal", "vertical", or "grid".
     pub split_layout: String,
+    /// What each split-screen player plays with, by player: "auto", "kbm" or "pad"
+    /// (`launch::SlotInput`); missing ones are "auto".
+    pub split_inputs: Vec<String>,
     // "Copy Player 1's saves to Player N" isn't kept here: it is for one start (the window's
     // `App::copy_saves`). A `copy_saves` an older ui.json has is ignored on reading and
     // gone at the next save.
@@ -75,6 +78,25 @@ impl GameOptions {
         }
     }
 
+    /// Split-screen player `k`'s input: "auto", "kbm" or "pad".
+    pub fn split_input(&self, k: usize) -> &'static str {
+        crate::launch::SlotInput::named(self.split_inputs.get(k).map_or("", String::as_str)).unwrap_or_default().as_str()
+    }
+
+    pub fn set_split_input(&mut self, k: usize, v: &str) {
+        if self.split_inputs.len() <= k {
+            self.split_inputs.resize(k + 1, "auto".into());
+        }
+        self.split_inputs[k] = v.into();
+    }
+
+    /// `--inputs`' value for the players there are, or None when they're all "auto".
+    pub fn split_inputs_arg(&self) -> Option<String> {
+        let n = usize::from(self.players.clamp(2, 4));
+        let v: Vec<&str> = (0..n).map(|k| self.split_input(k)).collect();
+        v.iter().any(|i| *i != "auto").then(|| v.join(","))
+    }
+
     /// The settings a game can answer for itself (`None` follows `Prefs`), each with its
     /// field in `Prefs`.
     fn own_answers(&self) -> [(Option<bool>, fn(&mut Prefs) -> &mut bool); 4] {
@@ -93,6 +115,7 @@ impl Default for GameOptions {
             players: 1,
             split_screen: false,
             split_layout: String::new(),
+            split_inputs: Vec::new(),
             args: String::new(),
             exe: None,
             auto_accept: None,

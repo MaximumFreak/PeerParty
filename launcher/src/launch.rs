@@ -18,7 +18,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use peerparty_protocol::env as penv;
-use peerparty_protocol::session::LayoutPreset;
+use peerparty_protocol::session::{ANY_KEYBOARD, InputAssignment, LayoutPreset};
 
 use crate::ui::store::{self, Prefs};
 use crate::{anticheat, backend, gameroot, host, platform, steamid};
@@ -237,6 +237,50 @@ impl ChildEnv {
 pub struct SplitScreen {
     pub instances: u32,
     pub layout: LayoutPreset,
+    /// What each player plays with (`--inputs`), by player; missing ones are `Auto`.
+    pub inputs: Vec<SlotInput>,
+}
+
+/// What a split-screen player plays with (`--inputs auto,kbm,pad`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SlotInput {
+    /// A controller, the first one used that no other player has; the keyboard and
+    /// mouse too while their pane has the focus. A player who has been playing with the
+    /// keyboard and mouse is passed over by a controller while another player has none.
+    #[default]
+    Auto,
+    /// The keyboard and mouse, never a controller.
+    KeyboardMouse,
+    /// A controller; the keyboard and mouse only while their pane has the focus.
+    Controller,
+}
+
+impl SlotInput {
+    pub fn named(name: &str) -> Option<SlotInput> {
+        Some(match name.trim().to_ascii_lowercase().as_str() {
+            "auto" | "" => SlotInput::Auto,
+            "kbm" | "keyboard" | "mouse" => SlotInput::KeyboardMouse,
+            "pad" | "controller" | "gamepad" => SlotInput::Controller,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SlotInput::Auto => "auto",
+            SlotInput::KeyboardMouse => "kbm",
+            SlotInput::Controller => "pad",
+        }
+    }
+
+    /// The copy's input in its spec: player `slot`'s controller seat, or the keyboard
+    /// and mouse (`ANY_KEYBOARD`) with no controller.
+    pub fn assignment(self, slot: u32) -> InputAssignment {
+        match self {
+            SlotInput::KeyboardMouse => InputAssignment::KeyboardMouse { device_id: ANY_KEYBOARD },
+            SlotInput::Auto | SlotInput::Controller => InputAssignment::Controller { index: slot },
+        }
+    }
 }
 
 impl SplitScreen {
@@ -252,11 +296,22 @@ impl SplitScreen {
             _ => return None,
         })
     }
+
+    /// `--inputs`' list: one per player, comma-separated.
+    pub fn inputs_named(list: &str) -> Option<Vec<SlotInput>> {
+        let v = list.split(',').map(SlotInput::named).collect::<Option<Vec<_>>>()?;
+        (v.len() <= Self::MAX_INSTANCES as usize).then_some(v)
+    }
+
+    /// Player `slot`'s input.
+    pub fn input(&self, slot: u32) -> SlotInput {
+        self.inputs.get(slot as usize).copied().unwrap_or_default()
+    }
 }
 
 impl Default for SplitScreen {
     fn default() -> Self {
-        SplitScreen { instances: 2, layout: LayoutPreset::Horizontal }
+        SplitScreen { instances: 2, layout: LayoutPreset::Horizontal, inputs: Vec::new() }
     }
 }
 
@@ -765,6 +820,17 @@ mod tests {
         assert_eq!(SplitScreen::layout_named("Vertical"), Some(LayoutPreset::Vertical));
         assert_eq!(SplitScreen::layout_named("grid"), Some(LayoutPreset::Grid2x2));
         assert_eq!(SplitScreen::layout_named("diagonal"), None);
-        assert_eq!(SplitScreen::default(), SplitScreen { instances: 2, layout: LayoutPreset::Horizontal });
+        assert_eq!(SplitScreen::default(), SplitScreen { instances: 2, layout: LayoutPreset::Horizontal, inputs: Vec::new() });
+    }
+
+    #[test]
+    fn split_screen_inputs_by_name() {
+        assert_eq!(SplitScreen::inputs_named("kbm,PAD,auto"), Some(vec![SlotInput::KeyboardMouse, SlotInput::Controller, SlotInput::Auto]));
+        assert_eq!(SplitScreen::inputs_named("kbm,wheel"), None);
+        assert_eq!(SplitScreen::inputs_named("pad,pad,pad,pad,pad"), None, "more than a session has");
+        let split = SplitScreen { inputs: vec![SlotInput::KeyboardMouse], ..SplitScreen::default() };
+        assert_eq!((split.input(0), split.input(1)), (SlotInput::KeyboardMouse, SlotInput::Auto));
+        assert_eq!(SlotInput::KeyboardMouse.assignment(0), InputAssignment::KeyboardMouse { device_id: ANY_KEYBOARD });
+        assert_eq!(SlotInput::Auto.assignment(2), InputAssignment::Controller { index: 2 });
     }
 }

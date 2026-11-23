@@ -113,6 +113,23 @@ impl App {
                                     o.split_layout = layout.to_string();
                                 }
                             });
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new(t!("game.player_inputs")).size(13.5).color(TEXT));
+                            let input_opts = [("auto", t!("game.input_auto")), ("kbm", t!("game.input_kbm")), ("pad", t!("game.input_pad"))];
+                            for k in 0..usize::from(o.players.clamp(2, 4)) {
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(t!("game.input_player", n = k + 1)).size(13.0).color(TEXT2));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        let mut v = o.split_input(k);
+                                        ui.push_id(("split-input", k), |ui| {
+                                            if widgets::segmented(ui, &mut v, &input_opts) {
+                                                o.set_split_input(k, v);
+                                            }
+                                        });
+                                    });
+                                });
+                            }
+                            ui.add(egui::Label::new(egui::RichText::new(t!("game.inputs_note")).size(12.0).color(TEXT3)).wrap());
                             ui.add_space(2.0);
                             ui.add(egui::Label::new(egui::RichText::new(t!("game.split_screen_note")).size(12.0).color(TEXT3)).wrap());
                         } else {
