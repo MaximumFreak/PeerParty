@@ -29,7 +29,7 @@ fn view() -> (usize, usize) {
 /// Opens and maps `name` (a `ShmBacking` string or Win32 mapping name). Returns true if
 /// mapped (or already mapped under `name`).
 pub fn attach(name: &str) -> bool {
-    let mut known = VIEW_NAME.lock().unwrap();
+    let mut known = crate::sys::lock(&VIEW_NAME);
     if *known == name && !VIEW.load(Ordering::Acquire).is_null() {
         return true;
     }

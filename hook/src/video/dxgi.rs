@@ -307,8 +307,17 @@ fn on_present(swap: usize) {
     let mut desc: SwapChainDesc = unsafe { std::mem::zeroed() };
     vcall!(swap, 12, fn(*mut SwapChainDesc) -> i32, &mut desc);
 
-    // Drawn with Vulkan underneath: the Vulkan hooks draw into and copy these frames.
-    let (f, cap) = if super::lower_layer_presents() { (None, false) } else { (f, cap) };
+    // Drawn with Vulkan underneath: the Vulkan hooks draw into and copy these frames, and
+    // what this side made for the swap chain goes (or the session would get two sets).
+    let lower = super::lower_layer_presents(|| desc.window);
+    if lower {
+        let mut st = crate::sys::lock(&STATES);
+        if let Some(i) = st.iter().position(|s| s.swap == swap) {
+            st.remove(i);
+            log!("video: this swap chain's frames go through Vulkan underneath (a translation layer): drawn into and copied there; this side's drawing and copying let go");
+        }
+    }
+    let (f, cap) = if lower { (None, false) } else { (f, cap) };
     if f.is_none() && !cap {
         let api = if let Some(dev) = Some(device(swap, &IID_ID3D11DEVICE)).filter(|d| *d != 0) {
             release(dev);
@@ -397,6 +406,12 @@ fn before_resize(swap: usize, w: u32, h: u32) {
     }
 }
 
+/// The window `swap` presents to.
+fn window_of(swap: usize) -> usize {
+    let mut desc: SwapChainDesc = unsafe { std::mem::zeroed() };
+    if vcall!(swap, 12, fn(*mut SwapChainDesc) -> i32, &mut desc) < 0 { 0 } else { desc.window }
+}
+
 thread_local! {
     /// Inside one of our present hooks: a present that calls the other one internally
     /// draws once.
@@ -406,7 +421,7 @@ thread_local! {
 fn presenting(swap: usize, flags: u32, real: impl FnOnce() -> i32) -> i32 {
     let outer = !IN_PRESENT.with(|p| p.replace(true));
     if outer && flags & 1 == 0 {
-        if !super::lower_layer_presents() {
+        if !super::lower_layer_presents(|| window_of(swap)) {
             super::presented();
         }
 

@@ -6,7 +6,8 @@
 //!
 //! A Vulkan device can't signal a Direct3D fence without more extensions, so a slot is
 //! published once its copy is finished: a thread of PeerParty's waits on each copy's fence
-//! and publishes it then (`ready` 0: the session's GPU has nothing to wait for).
+//! and publishes it then (`ready` 0: the session's GPU has nothing to wait for). Until
+//! then the slot is held (`in_flight`), so the next frame doesn't pick it again.
 //!
 //! When the session asks for pixels (`capture::pixels`: a game under Wine, where DXVK and
 //! VKD3D bring every Direct3D game here too), each present's image is copied into a
@@ -15,14 +16,14 @@
 //! the import extensions still has its frames read back.
 
 use std::ffi::{CStr, c_char};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, mpsc};
 
 use peerparty_protocol::frame_ring::SLOTS;
 
 use super::super::capture::{self, D3d11Ring, Kind, private_device};
 use super::super::pixels::CpuFrames;
-use super::{Funcs, ImageBarrier, ImageInfo, MemAlloc, PresentInfo, SubmitInfo, Flagged, AllocInfo, BeginInfo, Pfn, WORLD, com, memory_type};
+use super::{BeginInfo, Funcs, ImageBarrier, ImageInfo, MemAlloc, Pfn, PresentInfo, SubmitInfo, WORLD, com, command_ring, destroy_ring, made, memory_type};
 use crate::log;
 
 /// What importing a Direct3D 11 texture takes, by name (core from Vulkan 1.1 but the
@@ -217,8 +218,8 @@ struct Entry {
 
 /// What the thread does once a copy's fence is signalled.
 enum Done {
-    /// Publish the slot it went into.
-    Publish { generation: u32, slot: usize },
+    /// Publish the slot it went into, and let it go (`in_flight`).
+    Publish { generation: u32, slot: usize, in_flight: Arc<[AtomicU32; SLOTS]> },
     /// Hand the rows read back (at `bits`, `stride` apart) to the frames' sink.
     Deliver { bits: usize, kind: Kind, stride: u32, frames: Arc<std::sync::Mutex<CpuFrames>> },
 }
@@ -238,8 +239,8 @@ struct Readback {
     frames: Arc<std::sync::Mutex<CpuFrames>>,
 }
 
-/// One device's capture state.
-#[derive(Default)]
+/// One device's capture state. The Vulkan objects go with `destroy` (with the device's
+/// functions); dropped, it ends its thread and lets go of its Direct3D 11 device.
 pub(super) struct VkCapture {
     luid: Option<(u32, i32)>,
     /// PeerParty's Direct3D 11 device and context (made at the first frame).
@@ -248,13 +249,18 @@ pub(super) struct VkCapture {
     /// Per slot: the imported image and its memory.
     images: Vec<(u64, u64)>,
     /// The swap chain, size, format and colour space the ring is for (also when it
-    /// couldn't be made).
-    made_for: (u64, u32, u32, u32, u32),
+    /// couldn't be made), and the session's setup (`capture::epoch`).
+    made_for: (u64, u32, u32, u32, u32, u64),
     vk_format: u32,
     pool: Option<(u32, u64)>,
     entries: Vec<Entry>,
     next: usize,
     tx: Option<mpsc::Sender<Job>>,
+    /// The thread publishing finished copies, and what tells it to stop waiting.
+    thread: Option<std::thread::JoinHandle<()>>,
+    stop: Arc<AtomicBool>,
+    /// Per slot: the generation a copy into it is under way for (0: none).
+    in_flight: Arc<[AtomicU32; SLOTS]>,
     more: Option<More>,
     /// The device can import shared textures (else its frames can only be read back).
     can_import: bool,
@@ -265,7 +271,51 @@ unsafe impl Send for VkCapture {}
 
 impl VkCapture {
     pub(super) fn new(luid: Option<(u32, i32)>, can_import: bool) -> VkCapture {
-        VkCapture { luid, can_import, ..VkCapture::default() }
+        VkCapture {
+            luid,
+            private: None,
+            ring: None,
+            images: Vec::new(),
+            made_for: (0, 0, 0, 0, 0, 0),
+            vk_format: 0,
+            pool: None,
+            entries: Vec::new(),
+            next: 0,
+            tx: None,
+            thread: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            in_flight: Arc::new([const { AtomicU32::new(0) }; SLOTS]),
+            more: None,
+            can_import,
+            readback: None,
+        }
+    }
+
+    /// Whether it made anything (on the device or its own).
+    pub(super) fn made_anything(&self) -> bool {
+        self.private.is_some() || self.pool.is_some() || self.readback.is_some()
+    }
+
+    /// Everything it made on `dev` (idle): the thread ends first.
+    pub(super) fn destroy(&mut self, fx: &Funcs, dev: usize) {
+        self.idle();
+        self.end_thread();
+        self.drop_images(fx, dev);
+        self.drop_readback(fx, dev);
+        if let Some((_, pool)) = self.pool.take() {
+            let ring = self.entries.drain(..).map(|e| (e.cmd, e.fence, e.sem)).collect();
+            destroy_ring(fx, dev, pool, ring);
+        }
+    }
+
+    /// Tells the thread to stop (it finishes the copy it waits on, a tenth of a second at
+    /// most once the device is idle) and waits for it.
+    fn end_thread(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.tx = None;
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
     }
 
     fn drop_readback(&mut self, fx: &Funcs, dev: usize) {
@@ -312,7 +362,7 @@ impl VkCapture {
     }
 
     /// Waits (a second at most) for every copy in flight, so images can go.
-    fn idle(&self) {
+    pub(super) fn idle(&self) {
         let start = std::time::Instant::now();
         while self.entries.iter().any(|e| e.busy.load(Ordering::Acquire)) && start.elapsed().as_millis() < 1000 {
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -334,7 +384,7 @@ impl VkCapture {
     /// `color_space`).
     #[allow(clippy::too_many_arguments)]
     fn ensure(&mut self, fx: &Funcs, dev: usize, phys: usize, swap: u64, w: u32, h: u32, format: u32, color_space: u32) -> bool {
-        let want = (swap, w, h, format, color_space);
+        let want = (swap, w, h, format, color_space, capture::epoch());
         if self.made_for == want {
             return self.ring.is_some();
         }
@@ -374,38 +424,24 @@ impl VkCapture {
             return true;
         }
         if self.pool.is_some() {
-            return false; // presents from another family: kept simple, not copied
-        }
-        let pool_info = Flagged { s_type: 39, next: 0, flags: 0x2, extra: family };
-        let mut pool = 0u64;
-        if unsafe { (fx.create_pool)(dev, &pool_info, 0, &mut pool) } != 0 {
+            // Presents from another family: kept simple, not copied.
+            crate::log::throttled("video: vk capture family", 1, |_| {
+                log!("video: the game presents on Vulkan queues of more than one family; frames presented on family {family} aren't copied for the session")
+            });
             return false;
         }
-        for _ in 0..SLOTS + 1 {
-            let mut cmd = 0usize;
-            let ai = AllocInfo { s_type: 40, next: 0, pool, level: 0, count: 1 };
-            let (mut fence, mut sem) = (0u64, 0u64);
-            let fence_info = Flagged { s_type: 8, next: 0, flags: 0, extra: 0 };
-            let sem_info = Flagged { s_type: 9, next: 0, flags: 0, extra: 0 };
-            unsafe {
-                if (fx.alloc_cmd)(dev, &ai, &mut cmd) != 0 || (fx.create_fence)(dev, &fence_info, 0, &mut fence) != 0 || (fx.create_semaphore)(dev, &sem_info, 0, &mut sem) != 0 {
-                    return false;
-                }
-                // A dispatchable handle made outside the loader carries the device's dispatch.
-                *(cmd as *mut usize) = *(dev as *const usize);
-            }
-            self.entries.push(Entry { cmd, fence, sem, busy: Arc::new(AtomicBool::new(false)) });
-        }
+        let Some((pool, ring, _)) = command_ring(fx, dev, family, SLOTS + 1, false) else { return false };
         let (tx, rx) = mpsc::channel::<Job>();
         let wait = fx.wait_fences as usize;
+        let stop = self.stop.clone();
         let spawned = std::thread::Builder::new().name("peerparty-vkframes".into()).spawn(move || {
             let wait: unsafe extern "system" fn(usize, u32, *const u64, u32, u64) -> i32 = unsafe { std::mem::transmute(wait) };
             for job in rx {
                 loop {
-                    let r = unsafe { wait(dev, 1, &job.fence, 1, 1_000_000_000) };
+                    let r = unsafe { wait(dev, 1, &job.fence, 1, 100_000_000) };
                     if r == 0 {
                         match &job.done {
-                            Done::Publish { generation, slot } => capture::publish(*generation, *slot, 0),
+                            Done::Publish { generation, slot, .. } => capture::publish(*generation, *slot, 0),
                             Done::Deliver { bits, kind, stride, frames } => {
                                 let mut f = crate::sys::lock(frames);
                                 unsafe { f.deliver(*kind, *bits as *const u8, *stride as usize) };
@@ -413,19 +449,40 @@ impl VkCapture {
                         }
                         break;
                     }
-                    if r < 0 {
-                        break; // the device is lost
+                    // The device is lost, or going (`end_thread`): not waited on any more.
+                    if r < 0 || stop.load(Ordering::Acquire) {
+                        break;
                     }
+                }
+                if let Done::Publish { generation, slot, in_flight } = &job.done {
+                    let _ = in_flight[*slot].compare_exchange(*generation, 0, Ordering::AcqRel, Ordering::Acquire);
                 }
                 job.busy.store(false, Ordering::Release);
             }
         });
-        if spawned.is_err() {
+        let Ok(thread) = spawned else {
+            destroy_ring(fx, dev, pool, ring);
             return false;
-        }
+        };
+        self.entries = ring.into_iter().map(|(cmd, fence, sem)| Entry { cmd, fence, sem, busy: Arc::new(AtomicBool::new(false)) }).collect();
         self.tx = Some(tx);
+        self.thread = Some(thread);
         self.pool = Some((family, pool));
         true
+    }
+}
+
+impl Drop for VkCapture {
+    fn drop(&mut self) {
+        // Its Vulkan objects went with `destroy`, or go with the device; the thread is
+        // told to stop and ends on its own.
+        self.stop.store(true, Ordering::Release);
+        self.tx = None;
+        self.ring = None;
+        if let Some((device, ctx)) = self.private.take() {
+            com::release(ctx);
+            com::release(device);
+        }
     }
 }
 
@@ -450,7 +507,7 @@ fn import(fx: &Funcs, more: &More, dev: usize, phys: usize, handle: usize, w: u3
         initial_layout: 0,
     };
     let mut image = 0u64;
-    if unsafe { (fx.create_image)(dev, &ii, 0, &mut image) } != 0 {
+    if !made(unsafe { (fx.create_image)(dev, &ii, 0, &mut image) }, &mut image) {
         return None;
     }
     let mut reqs = [0u64; 3];
@@ -500,7 +557,7 @@ pub(super) fn capture(queue: usize, info: &PresentInfo, wait: Option<u64>) -> Op
     if capture::pixels() {
         return read_back(queue, info, wait);
     }
-    let mut w = WORLD.lock().unwrap();
+    let mut w = crate::sys::lock(&WORLD);
     let (dev, family) = *w.queues.get(&queue)?;
     let swap_id = unsafe { *info.swaps };
     let index = unsafe { *info.indices } as usize;
@@ -510,6 +567,9 @@ pub(super) fn capture(queue: usize, info: &PresentInfo, wait: Option<u64>) -> Op
         return None;
     }
     let d = world.devices.get_mut(&dev)?;
+    if !copies_on(d, family) {
+        return None;
+    }
     if d.funcs.is_none() {
         d.funcs = super::funcs(dev);
     }
@@ -530,8 +590,9 @@ pub(super) fn capture(queue: usize, info: &PresentInfo, wait: Option<u64>) -> Op
         return None;
     }
     let ring = c.ring.as_ref()?;
-    let slot = ring.pick()?;
     let generation = ring.generation;
+    let in_flight = c.in_flight.clone();
+    let slot = ring.pick_except(|s| in_flight[s].load(Ordering::Acquire) == generation)?;
     let e = (0..c.entries.len()).map(|i| (c.next + i) % c.entries.len()).find(|&i| !c.entries[i].busy.load(Ordering::Acquire))?;
     c.next = (e + 1) % c.entries.len();
     let (cmd, fence, sem) = (c.entries[e].cmd, c.entries[e].fence, c.entries[e].sem);
@@ -573,22 +634,39 @@ pub(super) fn capture(queue: usize, info: &PresentInfo, wait: Option<u64>) -> Op
     };
     let stages = vec![0x1000u32; wait_count as usize];
     let submit = SubmitInfo { s_type: 4, next: 0, wait_count, waits, stages: stages.as_ptr(), cmd_count: 1, cmds: &cmd, signal_count: 1, signals: &sem };
+    in_flight[slot].store(generation, Ordering::Release);
     if unsafe { (fx.submit)(queue, 1, &submit, fence) } != 0 {
+        in_flight[slot].store(0, Ordering::Release);
+        crate::log::throttled("video: vk copy submit", 3, |n| log!("video: a Vulkan frame's copy couldn't be submitted (call {n}); the session keeps the one before"));
         return None;
     }
     c.entries[e].busy.store(true, Ordering::Release);
-    let job = Job { fence, done: Done::Publish { generation, slot }, busy: c.entries[e].busy.clone() };
+    let job = Job { fence, done: Done::Publish { generation, slot, in_flight: in_flight.clone() }, busy: c.entries[e].busy.clone() };
     if c.tx.as_ref().is_none_or(|tx| tx.send(job).is_err()) {
         c.entries[e].busy.store(false, Ordering::Release);
+        in_flight[slot].store(0, Ordering::Release);
     }
     Some(sem)
+}
+
+/// Whether frames presented on queue `family` of `d` can be copied: not on a queue that
+/// can only present (no graphics, compute or transfer), which takes no copy.
+fn copies_on(d: &mut super::Dev, family: u32) -> bool {
+    let flags = d.family_flags(family);
+    if flags != 0 && flags & 0x7 == 0 {
+        crate::log::throttled("video: vk present-only queue copy", 1, |_| {
+            log!("video: the game presents on a Vulkan queue that can't copy (family {family}, flags {flags:#x}); its frames aren't copied for the session")
+        });
+        return false;
+    }
+    true
 }
 
 /// Pixel mode: copies the image `info` presents into a host-visible buffer, after `wait`
 /// or the game's semaphores; the thread hands it over once finished. The semaphore the
 /// present must wait on instead, or None when this frame isn't copied.
 fn read_back(queue: usize, info: &PresentInfo, wait: Option<u64>) -> Option<u64> {
-    let mut w = WORLD.lock().unwrap();
+    let mut w = crate::sys::lock(&WORLD);
     let (dev, family) = *w.queues.get(&queue)?;
     let swap_id = unsafe { *info.swaps };
     let index = unsafe { *info.indices } as usize;
@@ -598,6 +676,9 @@ fn read_back(queue: usize, info: &PresentInfo, wait: Option<u64>) -> Option<u64>
         return None;
     }
     let d = world.devices.get_mut(&dev)?;
+    if !copies_on(d, family) {
+        return None;
+    }
     if d.funcs.is_none() {
         d.funcs = super::funcs(dev);
     }
@@ -677,9 +758,8 @@ fn read_back(queue: usize, info: &PresentInfo, wait: Option<u64>) -> Option<u64>
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Dev, GetProc, GetQueue, Swap, funcs_with};
+    use super::super::{AllocInfo, Dev, Flagged, GetProc, GetQueue, Swap, funcs_with};
     use super::*;
-    use std::collections::HashMap;
 
     #[repr(C)]
     struct AppInfo {
@@ -810,13 +890,14 @@ mod tests {
         let luid = luid(phys);
         let swap_id = 0x7777u64;
         {
-            let mut world = WORLD.lock().unwrap();
-            let cap = VkCapture { more: more(dp), ..VkCapture::new(luid, true) };
-
-            world.devices.insert(dev, Dev { phys, funcs: funcs_with(dp, m), pools: HashMap::new(), gfx: None, capture: Some(cap) });
+            let mut world = crate::sys::lock(&WORLD);
+            let mut cap = VkCapture::new(luid, true);
+            cap.more = more(dp);
+            let mut d = Dev::new(phys, Some(cap));
+            d.funcs = funcs_with(dp, m);
+            world.devices.insert(dev, d);
             world.queues.insert(queue, (dev, family));
-            world.swaps.insert(swap_id, Swap { format: 44, color_space: 0, width: w, height: h, capturable: true, images: vec![image], targets: vec![(0, 0)] });
-
+            world.swaps.insert(swap_id, Swap { dev, format: 44, color_space: 0, width: w, height: h, drawable: true, capturable: true, images: vec![image], targets: vec![(0, 0)] });
         }
         let index = 0u32;
         let info = PresentInfo { s_type: 1000001001, next: 0, wait_count: 0, waits: std::ptr::null(), swap_count: 1, swaps: &swap_id, indices: &index, results: std::ptr::null_mut() };
@@ -831,8 +912,13 @@ mod tests {
         };
         assert_eq!((p.slot, p.ready), (0, 0), "published once finished");
         unsafe { idle(queue) };
+        let start = std::time::Instant::now();
+        while crate::sys::lock(&WORLD).devices[&dev].capture.as_ref().unwrap().in_flight.iter().any(|g| g.load(Ordering::Acquire) != 0) {
+            assert!(start.elapsed().as_secs() < 5, "the published slot is let go");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
 
-        let handle = WORLD.lock().unwrap().devices[&dev].capture.as_ref().unwrap().ring.as_ref().unwrap().handle(p.slot);
+        let handle = crate::sys::lock(&WORLD).devices[&dev].capture.as_ref().unwrap().ring.as_ref().unwrap().handle(p.slot);
         let (other, octx) = private_device(luid).expect("a Direct3D 11 device on the adapter");
         let dev1 = com::query(other, &com::IID_ID3D11DEVICE1);
         let mut tex = 0usize;
@@ -860,10 +946,20 @@ mod tests {
         assert_eq!(&bytes[mid..mid + 4], &[0, 0xff, 0, 0xff], "green (BGRA) in the pixel file");
 
         capture::configure(false, None, None);
-        let mut world = WORLD.lock().unwrap();
-        world.swaps.remove(&swap_id);
-        world.queues.remove(&queue);
-        world.devices.remove(&dev);
+        // The game destroys its device: PeerParty's objects on it go first, its copies'
+        // thread ends, and nothing of the device is kept.
+        super::super::forget_device(dev);
+        {
+            let world = crate::sys::lock(&WORLD);
+            assert!(!world.devices.contains_key(&dev) && !world.queues.contains_key(&queue) && !world.swaps.contains_key(&swap_id));
+        }
+        unsafe {
+            (fx.destroy_pool)(dev, pool, 0);
+            (fx.destroy_image)(dev, image, 0);
+            (fx.free_mem)(dev, mem, 0);
+        }
+        let destroy_dev: unsafe extern "system" fn(usize, usize) = unsafe { std::mem::transmute(dp(c"vkDestroyDevice")) };
+        unsafe { destroy_dev(dev, 0) };
         for o in [tex, dev1, octx, other] {
             com::release(o);
         }

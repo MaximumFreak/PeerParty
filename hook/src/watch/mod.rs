@@ -318,10 +318,8 @@ fn consider(m: Mod) {
         }
     } else if let Some(vr) = crate::vr::identify(names.iter().copied()) {
         crate::vr::attach(&m.full, vr, &table.code);
-    } else if m.name.eq_ignore_ascii_case("vulkan-1.dll") || m.name.eq_ignore_ascii_case("winevulkan.dll") {
-        crate::video::vulkan_loaded();
-    } else if m.name.eq_ignore_ascii_case("d3d9.dll") {
-        crate::video::d3d9_loaded(m.base);
+    } else if crate::video::is_graphics_module(&m.name) {
+        crate::video::module_loaded(&m.name, m.base);
     } else if m.name.to_ascii_lowercase().starts_with("xinput")
         || m.name.eq_ignore_ascii_case("dinput8.dll")
         || m.name.eq_ignore_ascii_case("gameinput.dll")

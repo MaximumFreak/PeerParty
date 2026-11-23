@@ -370,6 +370,14 @@ pub(super) fn release_all() {
     *crate::sys::lock(&CAPTURE) = None;
 }
 
+/// The device's frames go through Vulkan underneath (DXVK) and are copied there: this
+/// side's copy goes, or the session would get two sets.
+pub(super) fn lower_layer_took_over() {
+    if crate::sys::lock(&CAPTURE).take().is_some() {
+        log!("video: this Direct3D 9 device's frames go through Vulkan underneath (DXVK): copied there; this side's copy let go");
+    }
+}
+
 // --- DXVK (opt-in) ----------------------------------------------------------------------
 
 type Create9 = unsafe extern "system" fn(u32) -> usize;

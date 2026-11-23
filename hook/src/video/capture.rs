@@ -192,7 +192,12 @@ fn with_ring<T>(f: impl FnOnce(&RingHeader) -> T) -> Option<T> {
 
 /// A free slot of `generation` (`RingHeader::pick`), given how far the release fence got.
 pub fn pick(generation: u32, release_completed: u64) -> Option<usize> {
-    with_ring(|r| r.pick(generation, |v| v <= release_completed)).flatten()
+    pick_except(generation, release_completed, |_| false)
+}
+
+/// `pick`, never a slot `taken` names (a copy into it still under way, not published yet).
+pub fn pick_except(generation: u32, release_completed: u64, taken: impl Fn(usize) -> bool) -> Option<usize> {
+    with_ring(|r| r.pick_except(generation, |v| v <= release_completed, taken)).flatten()
 }
 
 /// The copy into `slot` is submitted, finished at content-fence value `ready`: the
@@ -437,6 +442,11 @@ impl D3d11Ring {
     /// A slot to copy the next frame into, or None to skip this one.
     pub fn pick(&self) -> Option<usize> {
         pick(self.generation, self.released())
+    }
+
+    /// `pick`, never a slot `taken` names.
+    pub fn pick_except(&self, taken: impl Fn(usize) -> bool) -> Option<usize> {
+        pick_except(self.generation, self.released(), taken)
     }
 
     /// The copy into `slot` was queued on this device's context: signal the content fence

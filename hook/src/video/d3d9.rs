@@ -354,7 +354,12 @@ fn presenting(dev: usize, wnd: usize, real: impl FnOnce() -> i32) -> i32 {
         // other APIs do: the pane is fitted to it.
         let _ = std::panic::catch_unwind(|| report_size(dev, wnd));
     }
-    if outer && !super::lower_layer_presents() {
+    // Drawn with Vulkan underneath (DXVK): drawn into and copied there.
+    let lower = outer && super::lower_layer_presents(|| device_hwnd(dev, wnd));
+    if lower {
+        d3d9capture::lower_layer_took_over();
+    }
+    if outer && !lower {
         super::presented();
         let _ = std::panic::catch_unwind(|| draw(dev, wnd));
         // After the overlay: the session shows the frame as the window would.

@@ -170,12 +170,18 @@ impl RingHeader {
     /// another generation (other fences) doesn't hold a slot of this one. None: skip this
     /// frame's copy (the compositor still shows the one before).
     pub fn pick(&self, generation: u32, released_done: impl Fn(u64) -> bool) -> Option<usize> {
+        self.pick_except(generation, released_done, |_| false)
+    }
+
+    /// `pick`, never a slot `taken` names: one the hook's copy into is still under way,
+    /// though not published yet (a copy whose slot is published later, by another thread).
+    pub fn pick_except(&self, generation: u32, released_done: impl Fn(u64) -> bool, taken: impl Fn(usize) -> bool) -> Option<usize> {
         let newest = unpack(self.published.load(Ordering::SeqCst)).filter(|p| p.0 == generation).map(|p| p.2);
         let reading = self.reading.load(Ordering::SeqCst);
         let sampled = (reading != NONE && (reading >> 32) as u32 == generation).then_some((reading & 0xff) as usize);
         let start = newest.map_or(0, |n| n + 1);
         let free = |s: usize| self.released_gen[s].load(Ordering::SeqCst) != generation || released_done(self.released[s].load(Ordering::SeqCst));
-        (0..SLOTS).map(|i| (start + i) % SLOTS).find(|&s| Some(s) != newest && Some(s) != sampled && free(s))
+        (0..SLOTS).map(|i| (start + i) % SLOTS).find(|&s| Some(s) != newest && Some(s) != sampled && !taken(s) && free(s))
     }
 
     /// The copy into `slot` of `generation` is submitted: finished when the content fence
@@ -309,6 +315,20 @@ mod tests {
         r.release(2, 2, 3);
         assert_eq!(r.pick(2, |v| v <= 0), None, "both other slots wait on generation 2's fence");
         assert_eq!(r.pick(2, |v| v <= 1), Some(0));
+    }
+
+    /// A copy published later (by another thread) still holds its slot: the next frame
+    /// doesn't pick it again while it's being written.
+    #[test]
+    fn a_slot_still_being_copied_isnt_picked_again() {
+        let r = block();
+        assert_eq!(r.pick(1, |_| true), Some(0));
+        assert_eq!(r.pick(1, |_| true), Some(0), "plain pick doesn't know the copy is under way");
+        assert_eq!(r.pick_except(1, |_| true, |s| s == 0), Some(1));
+        assert_eq!(r.pick_except(1, |_| true, |s| s <= 1), Some(2));
+        r.publish(1, 0, 0);
+        assert_eq!(r.pick_except(1, |_| true, |s| s == 1), Some(2), "not the newest, not the one in flight");
+        assert_eq!(r.pick_except(1, |_| true, |s| s >= 1), None, "every slot busy: the frame isn't copied");
     }
 
     #[test]

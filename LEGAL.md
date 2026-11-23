@@ -80,7 +80,7 @@ Code taken from other projects keeps its licence beside it:
 |---|---|---|
 | `vendor/retour` | retour (crates.io), with local fixes | BSD-2-Clause |
 | `hook/src/photon` (protocol layer) | Luxon and Luxon Server | BSD-3-Clause (`hook/src/photon/LICENSE-Luxon`) |
-| `hook/src/video/vkshaders.rs` | Dear ImGui's precompiled Vulkan shaders | MIT |
+| `hook/src/video/vkshaders.rs` (`VERT`, `FRAG`) | Dear ImGui's precompiled Vulkan shaders | MIT |
 
 Every dependency's licence, and the notices those licences require, are in
 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md), which also ships with each release.

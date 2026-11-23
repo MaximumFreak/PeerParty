@@ -9,6 +9,12 @@
 //!   usage includes COLOR_ATTACHMENT (every surface supports it) so the overlay can be
 //!   drawn into them.
 //! - `vkDestroySwapchainKHR`: PeerParty's views and framebuffers of its images go first.
+//! - `vkDestroyDevice`: everything PeerParty made on the device goes first (after the
+//!   device is idle), and the thread publishing its copies ends.
+//! - `vkCreateWin32SurfaceKHR`: which window each surface is of, so a swap chain's window
+//!   is known: reported with the viewport, and a translation layer's (DXVK, Zink) frames
+//!   are drawn into and copied here rather than by the hooks of the API above, from its
+//!   first frame (`presents_to`).
 //! - `vkQueuePresentKHR`: with the overlay showing, a small command buffer uploads the
 //!   frame (when it changed) into a texture and draws it over the image being presented
 //!   as one quad with premultiplied-alpha blending, like the other APIs: the dimmed
@@ -16,7 +22,9 @@
 //!   signals its own, which the real present then waits on.
 //!
 //! The shaders are Dear ImGui's precompiled SPIR-V (vkshaders.rs): this build has no
-//! shader compiler.
+//! shader compiler. HDR swap chains take PeerParty's own, generated the same way ahead of
+//! time (tools/vk_shaders.py): an scRGB one gets the frame in linear light at SDR white,
+//! an HDR10 one PQ-encoded BT.2020, as the Direct3D overlay draws them (d3d11.rs).
 //!
 //! These hooks go in when the game loads vulkan-1.dll (with the overlay on), because a
 //! game creates its swap chain once, at start-up; until the overlay shows, each costs a
@@ -29,6 +37,7 @@
 
 use std::collections::HashMap;
 use std::ffi::{CStr, c_char};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 
 use retour::GenericDetour;
@@ -48,12 +57,14 @@ type GetQueue2 = unsafe extern "system" fn(usize, *const QueueInfo2, *mut usize)
 type CreateSwapchain = unsafe extern "system" fn(usize, *const SwapchainInfo, usize, *mut u64) -> i32;
 type QueuePresent = unsafe extern "system" fn(usize, *const PresentInfo) -> i32;
 type DestroySwapchain = unsafe extern "system" fn(usize, u64, usize);
+type DestroyDevice = unsafe extern "system" fn(usize, usize);
+type CreateSurface = unsafe extern "system" fn(usize, *const SurfaceInfo, usize, *mut u64) -> i32;
 
 static GET_DEVICE_PROC: OnceLock<GenericDetour<GetProc>> = OnceLock::new();
 static GET_INSTANCE_PROC: OnceLock<GenericDetour<GetProc>> = OnceLock::new();
 
-/// The real functions behind PeerParty's versions (the last ones the game was given).
-#[derive(Default)]
+/// The real functions behind PeerParty's versions.
+#[derive(Clone, Copy, Default)]
 struct Real {
     create_device: Pfn,
     get_queue: Pfn,
@@ -61,10 +72,55 @@ struct Real {
     create_swapchain: Pfn,
     destroy_swapchain: Pfn,
     present: Pfn,
+    destroy_device: Pfn,
+    create_surface: Pfn,
 }
 
-static REAL: Mutex<Real> =
-    Mutex::new(Real { create_device: 0, get_queue: 0, get_queue2: 0, create_swapchain: 0, destroy_swapchain: 0, present: 0 });
+/// The last ones the game was given by either lookup. `vkGetInstanceProcAddr`'s are the
+/// loader's, which work for every device; `vkGetDeviceProcAddr`'s are one device's driver
+/// functions, which must only be called for that device (`DEV_REAL`).
+static REAL: Mutex<Real> = Mutex::new(Real {
+    create_device: 0,
+    get_queue: 0,
+    get_queue2: 0,
+    create_swapchain: 0,
+    destroy_swapchain: 0,
+    present: 0,
+    destroy_device: 0,
+    create_surface: 0,
+});
+
+/// Per device: the real functions `vkGetDeviceProcAddr` gave for it.
+static DEV_REAL: LazyLock<Mutex<HashMap<usize, Real>>> = LazyLock::new(Mutex::default);
+
+/// The real `which` for `dev`: its own driver's when the game looked it up on that device,
+/// else the last one handed out.
+fn real_for(dev: Option<usize>, which: fn(&Real) -> Pfn) -> Pfn {
+    if let Some(d) = dev
+        && let Some(r) = crate::sys::lock(&DEV_REAL).get(&d)
+        && which(r) != 0
+    {
+        return which(r);
+    }
+    which(&crate::sys::lock(&REAL))
+}
+
+/// `VkWin32SurfaceCreateInfoKHR`.
+#[repr(C)]
+struct SurfaceInfo {
+    s_type: u32,
+    next: usize,
+    flags: u32,
+    instance: usize,
+    hwnd: usize,
+}
+
+/// The surfaces made, and their windows (the most recent last, a few kept).
+static SURFACES: Mutex<Vec<(u64, usize)>> = Mutex::new(Vec::new());
+const MAX_SURFACES: usize = 32;
+/// The swap chains alive and their windows (0 when not known), and how many have one.
+static WINDOWS: Mutex<Vec<(u64, usize)>> = Mutex::new(Vec::new());
+static WINDOWED: AtomicUsize = AtomicUsize::new(0);
 
 #[repr(C)]
 struct QueueInfo2 {
@@ -112,16 +168,36 @@ struct PresentInfo {
 }
 
 struct Swap {
+    /// The device it was made on.
+    dev: usize,
     format: u32,
     /// Its `VkColorSpaceKHR`.
     color_space: u32,
     width: u32,
     height: u32,
+    /// Its images can be drawn into (COLOR_ATTACHMENT).
+    drawable: bool,
     /// Its images can be copied from (TRANSFER_SRC).
     capturable: bool,
     images: Vec<u64>,
     /// Per image: PeerParty's view of it and framebuffer (0 until first drawn into).
     targets: Vec<(u64, u64)>,
+}
+
+impl Swap {
+    fn new(dev: usize, info: &SwapchainInfo) -> Swap {
+        Swap {
+            dev,
+            format: info.format,
+            color_space: info.color_space,
+            width: info.width,
+            height: info.height,
+            drawable: info.usage & 0x10 != 0,
+            capturable: info.usage & 0x1 != 0,
+            images: Vec::new(),
+            targets: Vec::new(),
+        }
+    }
 }
 
 /// Per device: what drawing needs.
@@ -133,9 +209,65 @@ struct Dev {
     gfx: Option<Gfx>,
     /// Its frames for the session's window, when it can import shared textures.
     capture: Option<vkcapture::VkCapture>,
+    /// Its queue families' `VkQueueFlags` (read the first time they're needed).
+    families: Vec<u32>,
 }
 
 unsafe impl Send for Dev {}
+
+impl Dev {
+    fn new(phys: usize, capture: Option<vkcapture::VkCapture>) -> Dev {
+        Dev { phys, funcs: None, pools: HashMap::new(), gfx: None, capture, families: Vec::new() }
+    }
+
+    /// Queue family `family`'s `VkQueueFlags` (0 when not known).
+    fn family_flags(&mut self, family: u32) -> u32 {
+        if self.families.is_empty() {
+            type Families = unsafe extern "system" fn(usize, *mut u32, *mut [u32; 6]);
+            if let Some(f) = com::proc(module(), c"vkGetPhysicalDeviceQueueFamilyProperties") {
+                let f: Families = unsafe { std::mem::transmute(f) };
+                let mut n = 0u32;
+                unsafe { f(self.phys, &mut n, std::ptr::null_mut()) };
+                let mut props = vec![[0u32; 6]; n as usize];
+                unsafe { f(self.phys, &mut n, props.as_mut_ptr()) };
+                self.families = props.iter().take(n as usize).map(|p| p[0]).collect();
+            }
+        }
+        self.families.get(family as usize).copied().unwrap_or(0)
+    }
+
+    /// Everything PeerParty made on the device (`dev`, idle), and the views of `swaps`'
+    /// images; the copies' thread ends first.
+    fn destroy(mut self, dev: usize, swaps: Vec<Swap>) {
+        let Some(fx) = self.funcs.take() else {
+            // Nothing drawn or copied: nothing of PeerParty's on the device.
+            return;
+        };
+        unsafe { (fx.device_wait_idle)(dev) };
+        if let Some(mut c) = self.capture.take() {
+            c.destroy(&fx, dev);
+        }
+        for s in swaps {
+            destroy_targets(&fx, dev, s.targets);
+        }
+        for (_, (pool, ring, _)) in self.pools.drain() {
+            destroy_ring(&fx, dev, pool, ring);
+        }
+        if let Some(g) = self.gfx.take() {
+            g.destroy(&fx, dev);
+        }
+    }
+}
+
+/// PeerParty's views and framebuffers of a swap chain's images.
+fn destroy_targets(fx: &Funcs, dev: usize, targets: Vec<(u64, u64)>) {
+    for (view, fb) in targets {
+        unsafe {
+            (fx.destroy_framebuffer)(dev, fb, 0);
+            (fx.destroy_view)(dev, view, 0);
+        }
+    }
+}
 
 #[derive(Default)]
 struct World {
@@ -164,10 +296,36 @@ pub(super) fn module() -> windows_sys::Win32::Foundation::HMODULE {
     com::module("vulkan-1.dll")
 }
 
-/// The game loaded vulkan-1.dll, or winevulkan.dll under Wine (watch.rs), with the overlay
-/// on. The hooks go in once.
+/// Hooks going in (`loaded` from a load notification and from the session's thread at
+/// once go in one after the other).
+static LOADING: Mutex<()> = Mutex::new(());
+static EXPORTS_PATCHED: AtomicBool = AtomicBool::new(false);
+
+/// The present hooks are wanted with vulkan-1.dll (or winevulkan.dll under Wine) loaded.
+/// The hooks go in once; the loader's other exports too once capture is wanted.
 pub fn loaded() {
+    let _one = crate::sys::lock(&LOADING);
+    install_now();
+}
+
+/// The game loaded vulkan-1.dll, or winevulkan.dll under Wine (watch.rs, under the loader
+/// lock), with the overlay on or capture wanted: as `loaded`, but left to the thread that
+/// is putting the hooks in already, if one is (it may need the loader lock this thread
+/// holds, to load winevulkan.dll).
+pub fn loaded_in_loader() {
+    let _one = match LOADING.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return,
+    };
+    install_now();
+}
+
+fn install_now() {
     if GET_DEVICE_PROC.get().is_some() {
+        if super::capture::wanted() && !EXPORTS_PATCHED.swap(true, Ordering::AcqRel) {
+            patch_exports(module());
+        }
         return;
     }
     if crate::sys::wine::is_wine() && com::module("winevulkan.dll").is_null() {
@@ -180,15 +338,22 @@ pub fn loaded() {
     }
     let (Some(gdpa), Some(gipa)) = (com::proc(m, c"vkGetDeviceProcAddr"), com::proc(m, c"vkGetInstanceProcAddr")) else { return };
     {
-        let mut r = REAL.lock().unwrap();
+        let mut r = crate::sys::lock(&REAL);
         r.create_device = com::proc(m, c"vkCreateDevice").unwrap_or(0);
         r.get_queue = com::proc(m, c"vkGetDeviceQueue").unwrap_or(0);
         r.get_queue2 = com::proc(m, c"vkGetDeviceQueue2").unwrap_or(0);
         r.create_swapchain = com::proc(m, c"vkCreateSwapchainKHR").unwrap_or(0);
         r.destroy_swapchain = com::proc(m, c"vkDestroySwapchainKHR").unwrap_or(0);
         r.present = com::proc(m, c"vkQueuePresentKHR").unwrap_or(0);
+        r.destroy_device = com::proc(m, c"vkDestroyDevice").unwrap_or(0);
+        r.create_surface = com::proc(m, c"vkCreateWin32SurfaceKHR").unwrap_or(0);
     }
-    if super::capture::wanted() {
+    // The surface export always: a game calling it directly still has its windows known.
+    let surface = with_lock(|| patch(&X_CREATE_SURFACE, m, c"vkCreateWin32SurfaceKHR", create_surface_export as CreateSurface));
+    if surface == 0 {
+        log!("present: Vulkan's vkCreateWin32SurfaceKHR export not patched (a surface made through it has no window known)");
+    }
+    if super::capture::wanted() && !EXPORTS_PATCHED.swap(true, Ordering::AcqRel) {
         patch_exports(m);
     }
     let ok = with_lock(|| {
@@ -212,6 +377,8 @@ static X_GET_QUEUE2: ExportDetour<GetQueue2> = OnceLock::new();
 static X_CREATE_SWAPCHAIN: ExportDetour<CreateSwapchain> = OnceLock::new();
 static X_DESTROY_SWAPCHAIN: ExportDetour<DestroySwapchain> = OnceLock::new();
 static X_PRESENT: ExportDetour<QueuePresent> = OnceLock::new();
+static X_DESTROY_DEVICE: ExportDetour<DestroyDevice> = OnceLock::new();
+static X_CREATE_SURFACE: ExportDetour<CreateSurface> = OnceLock::new();
 /// The loader exports patched (`patch_exports`): a lookup that hands one out isn't
 /// wrapped again.
 static PATCHED: Mutex<Vec<Pfn>> = Mutex::new(Vec::new());
@@ -223,9 +390,11 @@ where
     let Some(addr) = com::proc(m, name) else { return 0 };
     let target: T = unsafe { T::from_ptr(addr as *const ()) };
     let Ok(h) = (unsafe { GenericDetour::new(target, detour) }) else { return 0 };
-    let _ = slot.set(h);
+    if slot.set(h).is_err() {
+        return 0; // patched already
+    }
     if crate::sys::hook::frozen(addr, || unsafe { slot.get().unwrap().enable() }).is_ok() {
-        PATCHED.lock().unwrap().push(addr);
+        crate::sys::lock(&PATCHED).push(addr);
         1
     } else {
         0
@@ -241,59 +410,115 @@ fn patch_exports(m: windows_sys::Win32::Foundation::HMODULE) {
             + patch(&X_CREATE_SWAPCHAIN, m, c"vkCreateSwapchainKHR", create_swapchain_export as CreateSwapchain)
             + patch(&X_DESTROY_SWAPCHAIN, m, c"vkDestroySwapchainKHR", destroy_swapchain_export as DestroySwapchain)
             + patch(&X_PRESENT, m, c"vkQueuePresentKHR", queue_present_export as QueuePresent)
+            + patch(&X_DESTROY_DEVICE, m, c"vkDestroyDevice", destroy_device_export as DestroyDevice)
     });
     log!("present: {n} of Vulkan's exports patched too (the session's window draws this copy's frames)");
 }
 
-/// Our version of `name`, after noting the real one.
-fn ours(name: &str, real: Pfn) -> Option<Pfn> {
-    if real == 0 || PATCHED.lock().unwrap().contains(&real) {
+/// Our version of `name`, after noting the real one: for every device, or (a
+/// `vkGetDeviceProcAddr` lookup) for `dev`'s.
+fn ours(name: &str, real: Pfn, dev: Option<usize>) -> Option<Pfn> {
+    if real == 0 || crate::sys::lock(&PATCHED).contains(&real) {
         return None;
     }
-    let mut r = REAL.lock().unwrap();
-    Some(match name {
-        "vkCreateDevice" => {
-            r.create_device = real;
-            create_device as *const () as usize
-        }
-        "vkGetDeviceQueue" => {
-            r.get_queue = real;
-            get_queue as *const () as usize
-        }
-        "vkGetDeviceQueue2" => {
-            r.get_queue2 = real;
-            get_queue2 as *const () as usize
-        }
-        "vkCreateSwapchainKHR" => {
-            r.create_swapchain = real;
-            create_swapchain as *const () as usize
-        }
-        "vkDestroySwapchainKHR" => {
-            r.destroy_swapchain = real;
-            destroy_swapchain as *const () as usize
-        }
-        "vkQueuePresentKHR" => {
-            r.present = real;
-            queue_present as *const () as usize
-        }
+    type Set = fn(&mut Real, Pfn);
+    let (set, mine): (Set, Pfn) = match name {
+        "vkCreateDevice" => (|r, p| r.create_device = p, create_device as *const () as usize),
+        "vkGetDeviceQueue" => (|r, p| r.get_queue = p, get_queue as *const () as usize),
+        "vkGetDeviceQueue2" => (|r, p| r.get_queue2 = p, get_queue2 as *const () as usize),
+        "vkCreateSwapchainKHR" => (|r, p| r.create_swapchain = p, create_swapchain as *const () as usize),
+        "vkDestroySwapchainKHR" => (|r, p| r.destroy_swapchain = p, destroy_swapchain as *const () as usize),
+        "vkQueuePresentKHR" => (|r, p| r.present = p, queue_present as *const () as usize),
+        "vkDestroyDevice" => (|r, p| r.destroy_device = p, destroy_device as *const () as usize),
+        "vkCreateWin32SurfaceKHR" => (|r, p| r.create_surface = p, create_surface as *const () as usize),
         _ => return None,
-    })
+    };
+    set(&mut crate::sys::lock(&REAL), real);
+    if let Some(d) = dev {
+        set(crate::sys::lock(&DEV_REAL).entry(d).or_default(), real);
+    }
+    Some(mine)
+}
+
+fn name_of<'a>(name: *const c_char) -> &'a str {
+    if name.is_null() { "" } else { unsafe { CStr::from_ptr(name) }.to_str().unwrap_or("") }
 }
 
 unsafe extern "system" fn get_device_proc(dev: usize, name: *const c_char) -> Pfn {
     let real = unsafe { GET_DEVICE_PROC.get().unwrap().call(dev, name) };
-    let n = if name.is_null() { "" } else { unsafe { CStr::from_ptr(name) }.to_str().unwrap_or("") };
-    ours(n, real).unwrap_or(real)
+    std::panic::catch_unwind(|| ours(name_of(name), real, Some(dev))).ok().flatten().unwrap_or(real)
 }
 
 unsafe extern "system" fn get_instance_proc(inst: usize, name: *const c_char) -> Pfn {
     let real = unsafe { GET_INSTANCE_PROC.get().unwrap().call(inst, name) };
-    let n = if name.is_null() { "" } else { unsafe { CStr::from_ptr(name) }.to_str().unwrap_or("") };
-    ours(n, real).unwrap_or(real)
+    std::panic::catch_unwind(|| ours(name_of(name), real, None)).ok().flatten().unwrap_or(real)
+}
+
+unsafe extern "system" fn create_surface(inst: usize, info: *const SurfaceInfo, alloc: usize, out: *mut u64) -> i32 {
+    let real: CreateSurface = unsafe { std::mem::transmute(real_for(None, |r| r.create_surface)) };
+    let r = unsafe { real(inst, info, alloc, out) };
+    note_surface(r, info, out);
+    r
+}
+
+unsafe extern "system" fn create_surface_export(inst: usize, info: *const SurfaceInfo, alloc: usize, out: *mut u64) -> i32 {
+    let r = unsafe { X_CREATE_SURFACE.get().unwrap().call(inst, info, alloc, out) };
+    note_surface(r, info, out);
+    r
+}
+
+fn note_surface(r: i32, info: *const SurfaceInfo, out: *mut u64) {
+    if r != 0 || info.is_null() || out.is_null() {
+        return;
+    }
+    let (surface, hwnd) = unsafe { (*out, (*info).hwnd) };
+    let mut s = crate::sys::lock(&SURFACES);
+    s.retain(|e| e.0 != surface);
+    if s.len() >= MAX_SURFACES {
+        s.remove(0);
+    }
+    s.push((surface, hwnd));
+}
+
+fn surface_window(surface: u64) -> usize {
+    crate::sys::lock(&SURFACES).iter().rev().find(|e| e.0 == surface).map_or(0, |e| e.1)
+}
+
+/// Whether a swap chain alive presents to `hwnd` (a translation layer's, when the game
+/// draws with another API).
+pub fn presents_to(hwnd: usize) -> bool {
+    hwnd != 0 && crate::sys::lock(&WINDOWS).iter().any(|w| w.1 == hwnd)
+}
+
+/// Whether Vulkan presents at all: a swap chain alive on a known window, or a present in
+/// the last second.
+pub fn presents_anywhere() -> bool {
+    WINDOWED.load(Ordering::Acquire) > 0 || presented_recently()
+}
+
+fn note_window(swap: u64, hwnd: usize) {
+    if hwnd == 0 {
+        return;
+    }
+    let mut w = crate::sys::lock(&WINDOWS);
+    w.retain(|e| e.0 != swap);
+    if !w.iter().any(|e| e.1 == hwnd) {
+        crate::log::throttled("video: vk window", 4, |n| {
+            log!("video: a Vulkan swap chain presents to window 0x{hwnd:x}: drawn into and copied with Vulkan; the API above it, if any, leaves its frames alone (window {n})")
+        });
+    }
+    w.push((swap, hwnd));
+    WINDOWED.store(w.len(), Ordering::Release);
+}
+
+fn forget_window(swaps: &[u64]) {
+    let mut w = crate::sys::lock(&WINDOWS);
+    w.retain(|e| !swaps.contains(&e.0));
+    WINDOWED.store(w.len(), Ordering::Release);
 }
 
 unsafe extern "system" fn create_device(phys: usize, info: *const u8, alloc: usize, out: *mut usize) -> i32 {
-    let real: CreateDevice = unsafe { std::mem::transmute(REAL.lock().unwrap().create_device) };
+    let real: CreateDevice = unsafe { std::mem::transmute(real_for(None, |r| r.create_device)) };
     creating_device(&|p, i, a, o| unsafe { real(p, i, a, o) }, phys, info, alloc, out)
 }
 
@@ -327,13 +552,13 @@ fn creating_device(real: &dyn Fn(usize, *const u8, usize, *mut usize) -> i32, ph
         let d = unsafe { *out };
         // Without importing, its frames can still be read back (pixel mode).
         let capture = super::capture::wanted().then(|| vkcapture::VkCapture::new(vkcapture::luid(phys), can_capture));
-        WORLD.lock().unwrap().devices.insert(d, Dev { phys, funcs: None, pools: HashMap::new(), gfx: None, capture });
+        crate::sys::lock(&WORLD).devices.insert(d, Dev::new(phys, capture));
     }
     r
 }
 
 unsafe extern "system" fn get_queue(dev: usize, family: u32, index: u32, out: *mut usize) {
-    let real: GetQueue = unsafe { std::mem::transmute(REAL.lock().unwrap().get_queue) };
+    let real: GetQueue = unsafe { std::mem::transmute(real_for(Some(dev), |r| r.get_queue)) };
     unsafe { real(dev, family, index, out) };
     note_queue(out, dev, family);
 }
@@ -345,12 +570,12 @@ unsafe extern "system" fn get_queue_export(dev: usize, family: u32, index: u32, 
 
 fn note_queue(out: *mut usize, dev: usize, family: u32) {
     if !out.is_null() && unsafe { *out } != 0 {
-        WORLD.lock().unwrap().queues.insert(unsafe { *out }, (dev, family));
+        crate::sys::lock(&WORLD).queues.insert(unsafe { *out }, (dev, family));
     }
 }
 
 unsafe extern "system" fn get_queue2(dev: usize, info: *const QueueInfo2, out: *mut usize) {
-    let real: GetQueue2 = unsafe { std::mem::transmute(REAL.lock().unwrap().get_queue2) };
+    let real: GetQueue2 = unsafe { std::mem::transmute(real_for(Some(dev), |r| r.get_queue2)) };
     unsafe { real(dev, info, out) };
     if !info.is_null() {
         note_queue(out, dev, unsafe { (*info).family });
@@ -365,7 +590,7 @@ unsafe extern "system" fn get_queue2_export(dev: usize, info: *const QueueInfo2,
 }
 
 unsafe extern "system" fn create_swapchain(dev: usize, info: *const SwapchainInfo, alloc: usize, out: *mut u64) -> i32 {
-    let real: CreateSwapchain = unsafe { std::mem::transmute(REAL.lock().unwrap().create_swapchain) };
+    let real: CreateSwapchain = unsafe { std::mem::transmute(real_for(Some(dev), |r| r.create_swapchain)) };
     creating_swapchain(&|d, i, a, o| unsafe { real(d, i, a, o) }, dev, info, alloc, out)
 }
 
@@ -373,40 +598,67 @@ unsafe extern "system" fn create_swapchain_export(dev: usize, info: *const Swapc
     creating_swapchain(&|d, i, a, o| unsafe { X_CREATE_SWAPCHAIN.get().unwrap().call(d, i, a, o) }, dev, info, alloc, out)
 }
 
+/// The image usages `surface` supports for swap chains of `dev` (None when not known).
+fn surface_usage(dev: usize, surface: u64) -> Option<u32> {
+    let phys = crate::sys::lock(&WORLD).devices.get(&dev)?.phys;
+    type Caps = unsafe extern "system" fn(usize, u64, *mut [u32; 13]) -> i32;
+    let caps: Caps = unsafe { std::mem::transmute(com::proc(module(), c"vkGetPhysicalDeviceSurfaceCapabilitiesKHR")?) };
+    let mut c = [0u32; 13];
+    // VkSurfaceCapabilitiesKHR: supportedUsageFlags is its last field.
+    (unsafe { caps(phys, surface, &mut c) } == 0).then_some(c[12])
+}
+
 /// Makes the swap chain with COLOR_ATTACHMENT (the overlay draws into its images) and,
-/// for a copy whose frames the session draws, TRANSFER_SRC; with less if the surface
-/// refuses, down to what the game asked.
+/// for a copy whose frames the session draws, TRANSFER_SRC, as far as the surface
+/// supports them. Tried once when the surface says what it supports, or when the game
+/// hands an old swap chain over (a failed try retires it, and a retired one can't be
+/// handed over again); else with less if the surface refuses, down to what the game
+/// asked.
 fn creating_swapchain(real: &dyn Fn(usize, *const SwapchainInfo, usize, *mut u64) -> i32, dev: usize, info: *const SwapchainInfo, alloc: usize, out: *mut u64) -> i32 {
     if info.is_null() {
         return real(dev, info, alloc, out);
     }
     let given = unsafe { *info };
-    let mut extras = vec![0x10u32]; // COLOR_ATTACHMENT
-    if super::capture::wanted() {
-        extras.insert(0, 0x10 | 0x1); // and TRANSFER_SRC
-    }
-    for extra in extras {
-        let copy = SwapchainInfo { usage: given.usage | extra, ..given };
-        if real(dev, &copy, alloc, out) == 0 {
+    let wanted = if super::capture::wanted() { 0x10 | 0x1 } else { 0x10 }; // COLOR_ATTACHMENT, TRANSFER_SRC
+    let tries = match std::panic::catch_unwind(|| surface_usage(dev, given.surface)).ok().flatten() {
+        Some(supported) => vec![given.usage | wanted & supported],
+        // Every surface supports COLOR_ATTACHMENT.
+        None if given.old != 0 => vec![given.usage | 0x10],
+        None if wanted != 0x10 => vec![given.usage | wanted, given.usage | 0x10, given.usage],
+        None => vec![given.usage | 0x10, given.usage],
+    };
+    let mut r = 0;
+    for usage in tries {
+        let copy = SwapchainInfo { usage, ..given };
+        r = real(dev, &copy, alloc, out);
+        if r == 0 {
             if !out.is_null() {
-                super::report_viewport(copy.width, copy.height, 0, "vulkan");
-                let swap = Swap {
-                    format: copy.format,
-                    color_space: copy.color_space,
-                    width: copy.width,
-                    height: copy.height,
-                    capturable: copy.usage & 0x1 != 0,
-                    images: Vec::new(),
-                    targets: Vec::new(),
-                };
-
-                WORLD.lock().unwrap().swaps.insert(unsafe { *out }, swap);
+                let _ = std::panic::catch_unwind(|| note_swapchain(dev, unsafe { *out }, &copy));
             }
             return 0;
         }
+        if given.old != 0 {
+            log!("video: the Vulkan swap chain couldn't be made with usage {usage:#x} ({r}); not tried again, its old one is retired");
+            return r;
+        }
     }
-    // The surface refused the extra usage: create it as the game asked.
-    real(dev, info, alloc, out)
+    r
+}
+
+fn note_swapchain(dev: usize, swap: u64, info: &SwapchainInfo) {
+    let hwnd = surface_window(info.surface);
+    super::report_viewport(info.width, info.height, hwnd, "vulkan");
+    let s = Swap::new(dev, info);
+    if !s.drawable || super::capture::wanted() && !s.capturable {
+        log!(
+            "video: a Vulkan swap chain made without {} (usage {:#x}): {}",
+            if s.drawable { "TRANSFER_SRC" } else { "COLOR_ATTACHMENT" },
+            info.usage,
+            if s.drawable { "its frames aren't copied for the session" } else { "the overlay isn't drawn into it" }
+        );
+    }
+    crate::sys::lock(&WORLD).swaps.insert(swap, s);
+    note_window(swap, hwnd);
 }
 
 /// The device functions drawing uses.
@@ -458,6 +710,17 @@ struct Funcs {
     set_viewport: unsafe extern "system" fn(usize, u32, u32, *const [f32; 6]),
     set_scissor: unsafe extern "system" fn(usize, u32, u32, *const [u32; 4]),
     draw: unsafe extern "system" fn(usize, u32, u32, u32, u32),
+    device_wait_idle: unsafe extern "system" fn(usize) -> i32,
+    destroy_pool: unsafe extern "system" fn(usize, u64, usize),
+    destroy_fence: unsafe extern "system" fn(usize, u64, usize),
+    destroy_semaphore: unsafe extern "system" fn(usize, u64, usize),
+    destroy_sampler: unsafe extern "system" fn(usize, u64, usize),
+    destroy_set_layout: unsafe extern "system" fn(usize, u64, usize),
+    destroy_desc_pool: unsafe extern "system" fn(usize, u64, usize),
+    destroy_pipeline_layout: unsafe extern "system" fn(usize, u64, usize),
+    destroy_shader: unsafe extern "system" fn(usize, u64, usize),
+    destroy_pipeline: unsafe extern "system" fn(usize, u64, usize),
+    destroy_render_pass: unsafe extern "system" fn(usize, u64, usize),
 }
 
 /// sType, pNext, flags and one more u32: command pool (queue family), fence and
@@ -924,6 +1187,17 @@ fn funcs_with(get: impl Fn(&CStr) -> Pfn, m: windows_sys::Win32::Foundation::HMO
         set_viewport: f!(c"vkCmdSetViewport"),
         set_scissor: f!(c"vkCmdSetScissor"),
         draw: f!(c"vkCmdDraw"),
+        device_wait_idle: f!(c"vkDeviceWaitIdle"),
+        destroy_pool: f!(c"vkDestroyCommandPool"),
+        destroy_fence: f!(c"vkDestroyFence"),
+        destroy_semaphore: f!(c"vkDestroySemaphore"),
+        destroy_sampler: f!(c"vkDestroySampler"),
+        destroy_set_layout: f!(c"vkDestroyDescriptorSetLayout"),
+        destroy_desc_pool: f!(c"vkDestroyDescriptorPool"),
+        destroy_pipeline_layout: f!(c"vkDestroyPipelineLayout"),
+        destroy_shader: f!(c"vkDestroyShaderModule"),
+        destroy_pipeline: f!(c"vkDestroyPipeline"),
+        destroy_render_pass: f!(c"vkDestroyRenderPass"),
     })
 }
 
@@ -941,16 +1215,43 @@ fn srgb(format: u32) -> bool {
     matches!(format, 29 | 36 | 43 | 50 | 57)
 }
 
+/// How a swap chain's images take the frame's (sRGB-encoded) pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Encoding {
+    /// As they are (or through the texture's sRGB view, for an sRGB format).
+    Plain,
+    /// R16G16B16A16_SFLOAT: scRGB, linear light where 1.0 is 80 nits.
+    ScRgb,
+    /// A2B10G10R10 / A2R10G10B10 in HDR10_ST2084: PQ-encoded BT.2020.
+    Pq,
+}
+
+/// A swap chain's `Encoding`, from its `VkFormat` and `VkColorSpaceKHR` (a float one is
+/// taken as scRGB whatever its colour space says, as on DXGI).
+fn encoding(format: u32, color_space: u32) -> Encoding {
+    match (format, color_space) {
+        (97, _) => Encoding::ScRgb,
+        (58 | 64, 1000104008) => Encoding::Pq,
+        _ => Encoding::Plain,
+    }
+}
+
 /// The overlay's texture and pipeline objects on one device.
 struct Gfx {
     phys: usize,
     sampler: u64,
+    set_layout: u64,
+    desc_pool: u64,
     set: u64,
     layout: u64,
     vert: u64,
     frag: u64,
-    /// (swap chain format, layout the image is in) -> (render pass, pipeline).
-    passes: HashMap<(u32, u32), (u64, u64)>,
+    /// PeerParty's own, for HDR swap chains (`Encoding`).
+    hdr_vert: u64,
+    scrgb_frag: u64,
+    pq_frag: u64,
+    /// (swap chain format, layout the image is in, encoding) -> (render pass, pipeline).
+    passes: HashMap<(u32, u32, Encoding), (u64, u64)>,
     /// The texture: image, memory, size, its UNORM and sRGB views, whether it holds a
     /// frame (so is in SHADER_READ_ONLY), and which view the set points at.
     tex: Option<(u64, u64, u32, u32, [u64; 2], bool, Option<usize>)>,
@@ -975,31 +1276,107 @@ fn memory_type(fx: &Funcs, phys: usize, bits: u64, wanted: u32) -> Option<u32> {
     })
 }
 
-/// A host-visible, coherent, mapped buffer.
+/// Whether a `vkCreate*` / `vkAllocate*` call (result `r`) made its object; when not, its
+/// output is set to no object (a failed call leaves it undefined), so cleanup can't free
+/// something that isn't ours.
+fn made(r: i32, out: &mut u64) -> bool {
+    if r != 0 {
+        *out = 0;
+    }
+    r == 0
+}
+
+/// A host-visible, coherent, mapped buffer; nothing left behind when it can't be made.
 fn host_buffer(fx: &Funcs, dev: usize, phys: usize, size: usize, usage: u32) -> Option<(u64, u64, *mut u8)> {
     let bi = BufferInfo { s_type: 12, next: 0, flags: 0, size: size as u64, usage, sharing: 0, family_count: 0, families: 0 };
     let mut buf = 0u64;
-    if unsafe { (fx.create_buffer)(dev, &bi, 0, &mut buf) } != 0 {
+    if !made(unsafe { (fx.create_buffer)(dev, &bi, 0, &mut buf) }, &mut buf) {
         return None;
     }
     let mut reqs = [0u64; 3]; // size, alignment, memoryTypeBits
     unsafe { (fx.buffer_reqs)(dev, buf, &mut reqs) };
-    let type_index = memory_type(fx, phys, reqs[2], 0x2 | 0x4)?; // HOST_VISIBLE | HOST_COHERENT
-    let ma = MemAlloc { s_type: 5, next: 0, size: reqs[0], type_index };
     let mut mem = 0u64;
     let mut ptr = std::ptr::null_mut();
-    if unsafe { (fx.alloc_mem)(dev, &ma, 0, &mut mem) } != 0
-        || unsafe { (fx.bind)(dev, buf, mem, 0) } != 0
-        || unsafe { (fx.map)(dev, mem, 0, u64::MAX, 0, &mut ptr) } != 0
-    {
+    // HOST_VISIBLE | HOST_COHERENT
+    let ok = memory_type(fx, phys, reqs[2], 0x2 | 0x4).is_some_and(|type_index| {
+        let ma = MemAlloc { s_type: 5, next: 0, size: reqs[0], type_index };
+        made(unsafe { (fx.alloc_mem)(dev, &ma, 0, &mut mem) }, &mut mem)
+            && unsafe { (fx.bind)(dev, buf, mem, 0) } == 0
+            && unsafe { (fx.map)(dev, mem, 0, u64::MAX, 0, &mut ptr) } == 0
+    });
+    if !ok {
+        // What was made goes (freeing memory unmaps it; 0 is no object).
+        unsafe {
+            (fx.destroy_buffer)(dev, buf, 0);
+            (fx.free_mem)(dev, mem, 0);
+        }
         return None;
     }
     Some((buf, mem, ptr))
 }
 
 impl Gfx {
-    /// The objects that don't depend on the swap chain or the frame.
+    /// The objects that don't depend on the swap chain or the frame; none left behind
+    /// when one can't be made.
     fn new(fx: &Funcs, dev: usize, phys: usize) -> Option<Gfx> {
+        let mut g = Gfx {
+            phys,
+            sampler: 0,
+            set_layout: 0,
+            desc_pool: 0,
+            set: 0,
+            layout: 0,
+            vert: 0,
+            frag: 0,
+            hdr_vert: 0,
+            scrgb_frag: 0,
+            pq_frag: 0,
+            passes: HashMap::new(),
+            tex: None,
+            quad: None,
+            staging: None,
+            staged: None,
+            uploaded: None,
+        };
+        if g.make(fx, dev) {
+            Some(g)
+        } else {
+            log!("video: the overlay's Vulkan objects couldn't be made; it isn't drawn into this device's frames");
+            g.destroy(fx, dev);
+            None
+        }
+    }
+
+    /// Everything it made on `dev` (idle, or done with all of it).
+    fn destroy(self, fx: &Funcs, dev: usize) {
+        unsafe {
+            for (_, (pass, pipeline)) in self.passes {
+                (fx.destroy_pipeline)(dev, pipeline, 0);
+                (fx.destroy_render_pass)(dev, pass, 0);
+            }
+            if let Some((image, mem, _, _, views, _, _)) = self.tex {
+                for v in views {
+                    (fx.destroy_view)(dev, v, 0);
+                }
+                (fx.destroy_image)(dev, image, 0);
+                (fx.free_mem)(dev, mem, 0);
+            }
+            for (buf, mem) in [self.quad.map(|q| (q.0, q.1)), self.staging.map(|s| (s.0, s.1))].into_iter().flatten() {
+                (fx.destroy_buffer)(dev, buf, 0);
+                (fx.free_mem)(dev, mem, 0);
+            }
+            for m in [self.vert, self.frag, self.hdr_vert, self.scrgb_frag, self.pq_frag] {
+                (fx.destroy_shader)(dev, m, 0);
+            }
+            (fx.destroy_pipeline_layout)(dev, self.layout, 0);
+            // Its set goes with it.
+            (fx.destroy_desc_pool)(dev, self.desc_pool, 0);
+            (fx.destroy_set_layout)(dev, self.set_layout, 0);
+            (fx.destroy_sampler)(dev, self.sampler, 0);
+        }
+    }
+
+    fn make(&mut self, fx: &Funcs, dev: usize) -> bool {
         let si = SamplerInfo {
             s_type: 31,
             next: 0,
@@ -1018,64 +1395,62 @@ impl Gfx {
             border: 0,
             unnormalized: 0,
         };
-        let mut sampler = 0u64;
-        if unsafe { (fx.create_sampler)(dev, &si, 0, &mut sampler) } != 0 {
-            return None;
+        if !made(unsafe { (fx.create_sampler)(dev, &si, 0, &mut self.sampler) }, &mut self.sampler) {
+            return false;
         }
-        // One combined image sampler for the fragment shader.
-        let binding = SetLayoutBinding { binding: 0, kind: 1, count: 1, stages: 0x10, immutable: 0 };
-        let sli = SetLayoutInfo { s_type: 32, next: 0, flags: 0, count: 1, bindings: &binding };
-        let mut set_layout = 0u64;
-        if unsafe { (fx.create_set_layout)(dev, &sli, 0, &mut set_layout) } != 0 {
-            return None;
+        // For the fragment shaders: a combined image sampler (ImGui's), and the same texture
+        // and sampler apart (PeerParty's HDR ones).
+        let bindings = [
+            SetLayoutBinding { binding: 0, kind: 1, count: 1, stages: 0x10, immutable: 0 },
+            SetLayoutBinding { binding: 1, kind: 2, count: 1, stages: 0x10, immutable: 0 },
+            SetLayoutBinding { binding: 2, kind: 0, count: 1, stages: 0x10, immutable: 0 },
+        ];
+        let sli = SetLayoutInfo { s_type: 32, next: 0, flags: 0, count: bindings.len() as u32, bindings: bindings.as_ptr() };
+        if !made(unsafe { (fx.create_set_layout)(dev, &sli, 0, &mut self.set_layout) }, &mut self.set_layout) {
+            return false;
         }
-        let size = [1u32, 1];
-        let dpi = DescPoolInfo { s_type: 33, next: 0, flags: 0, max_sets: 1, size_count: 1, sizes: &size };
-        let mut pool = 0u64;
-        if unsafe { (fx.create_desc_pool)(dev, &dpi, 0, &mut pool) } != 0 {
-            return None;
+        // (type, count): COMBINED_IMAGE_SAMPLER, SAMPLED_IMAGE, SAMPLER.
+        let sizes = [[1u32, 1], [2, 1], [0, 1]];
+        let dpi = DescPoolInfo { s_type: 33, next: 0, flags: 0, max_sets: 1, size_count: sizes.len() as u32, sizes: sizes.as_ptr() };
+        if !made(unsafe { (fx.create_desc_pool)(dev, &dpi, 0, &mut self.desc_pool) }, &mut self.desc_pool) {
+            return false;
         }
-        let sai = SetAllocInfo { s_type: 34, next: 0, pool, count: 1, layouts: &set_layout };
-        let mut set = 0u64;
-        if unsafe { (fx.alloc_sets)(dev, &sai, &mut set) } != 0 {
-            return None;
+        let sai = SetAllocInfo { s_type: 34, next: 0, pool: self.desc_pool, count: 1, layouts: &self.set_layout };
+        if !made(unsafe { (fx.alloc_sets)(dev, &sai, &mut self.set) }, &mut self.set) {
+            return false;
         }
         // uScale, uTranslate for the vertex shader.
         let push = [0x1u32, 0, 16];
-        let pli = PipelineLayoutInfo { s_type: 30, next: 0, flags: 0, set_count: 1, sets: &set_layout, push_count: 1, pushes: &push };
-        let mut layout = 0u64;
-        if unsafe { (fx.create_pipeline_layout)(dev, &pli, 0, &mut layout) } != 0 {
-            return None;
+        let pli = PipelineLayoutInfo { s_type: 30, next: 0, flags: 0, set_count: 1, sets: &self.set_layout, push_count: 1, pushes: &push };
+        if !made(unsafe { (fx.create_pipeline_layout)(dev, &pli, 0, &mut self.layout) }, &mut self.layout) {
+            return false;
         }
-        let shader = |code: &[u32]| {
+        for (code, out) in [
+            (&vkshaders::VERT[..], &mut self.vert),
+            (&vkshaders::FRAG[..], &mut self.frag),
+            (&vkshaders::HDR_VERT[..], &mut self.hdr_vert),
+            (&vkshaders::SCRGB_FRAG[..], &mut self.scrgb_frag),
+            (&vkshaders::PQ_FRAG[..], &mut self.pq_frag),
+        ] {
             let info = ShaderInfo { s_type: 16, next: 0, flags: 0, size: code.len() * 4, code: code.as_ptr() };
-            let mut m = 0u64;
-            (unsafe { (fx.create_shader)(dev, &info, 0, &mut m) } == 0).then_some(m)
-        };
-        let vert = shader(&vkshaders::VERT)?;
-        let frag = shader(&vkshaders::FRAG)?;
-        Some(Gfx {
-            phys,
-            sampler,
-            set,
-            layout,
-            vert,
-            frag,
-            passes: HashMap::new(),
-            tex: None,
-            quad: None,
-            staging: None,
-            staged: None,
-            uploaded: None,
-        })
+            if !made(unsafe { (fx.create_shader)(dev, &info, 0, &mut *out) }, out) {
+                return false;
+            }
+        }
+        true
     }
 
     /// A render pass that keeps what's in the image (in `layout` before and after) and
-    /// its pipeline, per format.
-    fn pass(&mut self, fx: &Funcs, dev: usize, format: u32, layout: u32) -> Option<(u64, u64)> {
-        if let Some(p) = self.passes.get(&(format, layout)) {
+    /// its pipeline, per format and encoding.
+    fn pass(&mut self, fx: &Funcs, dev: usize, format: u32, layout: u32, enc: Encoding) -> Option<(u64, u64)> {
+        if let Some(p) = self.passes.get(&(format, layout, enc)) {
             return Some(*p);
         }
+        let (vert, frag) = match enc {
+            Encoding::Plain => (self.vert, self.frag),
+            Encoding::ScRgb => (self.hdr_vert, self.scrgb_frag),
+            Encoding::Pq => (self.hdr_vert, self.pq_frag),
+        };
         // LOAD, STORE; stencil DONT_CARE.
         let attachment = [0u32, format, 1, 0, 0, 2, 1, layout, layout];
         let color = [0u32, 2]; // COLOR_ATTACHMENT_OPTIMAL
@@ -1106,13 +1481,13 @@ impl Gfx {
             dependencies: &dependency,
         };
         let mut pass = 0u64;
-        if unsafe { (fx.create_render_pass)(dev, &rpi, 0, &mut pass) } != 0 {
+        if !made(unsafe { (fx.create_render_pass)(dev, &rpi, 0, &mut pass) }, &mut pass) {
             return None;
         }
         let main = c"main";
         let stages = [
-            StageInfo { s_type: 18, next: 0, flags: 0, stage: 0x1, module: self.vert, name: main.as_ptr(), specialization: 0 },
-            StageInfo { s_type: 18, next: 0, flags: 0, stage: 0x10, module: self.frag, name: main.as_ptr(), specialization: 0 },
+            StageInfo { s_type: 18, next: 0, flags: 0, stage: 0x1, module: vert, name: main.as_ptr(), specialization: 0 },
+            StageInfo { s_type: 18, next: 0, flags: 0, stage: 0x10, module: frag, name: main.as_ptr(), specialization: 0 },
         ];
         // Position and UV (2 floats each), colour (4 bytes): 20 bytes a vertex.
         let binding = [0u32, 20, 0];
@@ -1172,9 +1547,13 @@ impl Gfx {
         };
         let mut pipeline = 0u64;
         if unsafe { (fx.create_pipelines)(dev, 0, 1, &pi, 0, &mut pipeline) } != 0 {
+            unsafe { (fx.destroy_render_pass)(dev, pass, 0) };
             return None;
         }
-        self.passes.insert((format, layout), (pass, pipeline));
+        if enc != Encoding::Plain {
+            log!("video: the overlay is drawn into an HDR Vulkan swap chain (format {format}, {enc:?}): at SDR white, encoded for it");
+        }
+        self.passes.insert((format, layout, enc), (pass, pipeline));
         Some((pass, pipeline))
     }
 
@@ -1210,25 +1589,29 @@ impl Gfx {
                 initial_layout: 0,
             };
             let mut image = 0u64;
-            if unsafe { (fx.create_image)(dev, &ii, 0, &mut image) } != 0 {
+            if !made(unsafe { (fx.create_image)(dev, &ii, 0, &mut image) }, &mut image) {
                 return false;
             }
             let mut reqs = [0u64; 3];
             unsafe { (fx.image_reqs)(dev, image, &mut reqs) };
-            let Some(type_index) = memory_type(fx, self.phys, reqs[2], 0x1).or_else(|| memory_type(fx, self.phys, reqs[2], 0)) else {
-                return false;
-            };
-            let ma = MemAlloc { s_type: 5, next: 0, size: reqs[0], type_index };
             let mut mem = 0u64;
-            if unsafe { (fx.alloc_mem)(dev, &ma, 0, &mut mem) } != 0 || unsafe { (fx.bind_image)(dev, image, mem, 0) } != 0 {
-                return false;
-            }
             let mut views = [0u64; 2];
-            for (i, format) in [BGRA_UNORM, BGRA_SRGB].into_iter().enumerate() {
+            let ok = memory_type(fx, self.phys, reqs[2], 0x1).or_else(|| memory_type(fx, self.phys, reqs[2], 0)).is_some_and(|type_index| {
+                let ma = MemAlloc { s_type: 5, next: 0, size: reqs[0], type_index };
+                made(unsafe { (fx.alloc_mem)(dev, &ma, 0, &mut mem) }, &mut mem) && unsafe { (fx.bind_image)(dev, image, mem, 0) } == 0
+            }) && [BGRA_UNORM, BGRA_SRGB].into_iter().zip(views.iter_mut()).all(|(format, view)| {
                 let vi = ViewInfo { s_type: 15, next: 0, flags: 0, image, view_type: 1, format, components: [0; 4], range: [1, 0, 1, 0, 1] };
-                if unsafe { (fx.create_view)(dev, &vi, 0, &mut views[i]) } != 0 {
-                    return false;
+                made(unsafe { (fx.create_view)(dev, &vi, 0, &mut *view) }, view)
+            });
+            if !ok {
+                unsafe {
+                    for v in views {
+                        (fx.destroy_view)(dev, v, 0);
+                    }
+                    (fx.destroy_image)(dev, image, 0);
+                    (fx.free_mem)(dev, mem, 0);
                 }
+                return false;
             }
             self.tex = Some((image, mem, w, h, views, false, None));
             self.uploaded = None;
@@ -1254,7 +1637,9 @@ impl Gfx {
         true
     }
 
-    /// Points the descriptor set at the texture's view for this swap chain's encoding.
+    /// Points the descriptor set at the texture's view for this swap chain's encoding
+    /// (the combined sampler; the HDR shaders' texture is always the UNORM view, which
+    /// they decode themselves).
     fn bind_view(&mut self, fx: &Funcs, dev: usize, srgb: bool, wait: &dyn Fn()) {
         let Some(t) = self.tex.as_mut() else { return };
         let which = usize::from(srgb);
@@ -1264,9 +1649,12 @@ impl Gfx {
         if t.6.is_some() {
             wait();
         }
-        let image = ImageDesc { sampler: self.sampler, view: t.4[which], layout: SHADER_READ };
-        let write = WriteSet { s_type: 35, next: 0, set: self.set, binding: 0, element: 0, count: 1, kind: 1, images: &image, buffers: 0, texel_views: 0 };
-        unsafe { (fx.update_sets)(dev, 1, &write, 0, 0) };
+        let combined = ImageDesc { sampler: self.sampler, view: t.4[which], layout: SHADER_READ };
+        let texture = ImageDesc { sampler: 0, view: t.4[0], layout: SHADER_READ };
+        let sampler = ImageDesc { sampler: self.sampler, view: 0, layout: 0 };
+        let write = |binding, kind, image: &ImageDesc| WriteSet { s_type: 35, next: 0, set: self.set, binding, element: 0, count: 1, kind, images: image, buffers: 0, texel_views: 0 };
+        let writes = [write(0, 1, &combined), write(1, 2, &texture), write(2, 0, &sampler)];
+        unsafe { (fx.update_sets)(dev, writes.len() as u32, writes.as_ptr(), 0, 0) };
         t.6 = Some(which);
     }
 
@@ -1387,13 +1775,24 @@ fn draw(queue: usize, info: &PresentInfo) -> Option<u64> {
     if info.swap_count == 0 {
         return None;
     }
-    let mut w = WORLD.lock().unwrap();
+    let mut w = crate::sys::lock(&WORLD);
     let (dev, family) = *w.queues.get(&queue)?;
     let swap_id = unsafe { *info.swaps };
     let index = unsafe { *info.indices } as usize;
     let world = &mut *w;
     let swap = world.swaps.get_mut(&swap_id)?;
+    if !swap.drawable {
+        return None;
+    }
     let d = world.devices.get_mut(&dev)?;
+    let flags = d.family_flags(family);
+    if flags != 0 && flags & 0x1 == 0 {
+        // A queue that only presents: no drawing can be recorded for it.
+        crate::log::throttled("video: vk present-only queue", 1, |_| {
+            log!("video: the game presents on a Vulkan queue without graphics (family {family}, flags {flags:#x}); the overlay isn't drawn into its frames")
+        });
+        return None;
+    }
     if d.funcs.is_none() {
         d.funcs = funcs(dev);
     }
@@ -1403,31 +1802,8 @@ fn draw(queue: usize, info: &PresentInfo) -> Option<u64> {
     let (sw, sh) = (swap.width, swap.height);
     // Command pool and ring for this queue family.
     if !d.pools.contains_key(&family) {
-        // RESET_COMMAND_BUFFER, on the presenting queue's family.
-        let pool_info = Flagged { s_type: 39, next: 0, flags: 0x2, extra: family };
-        let mut pool = 0u64;
-        if unsafe { (fx.create_pool)(dev, &pool_info, 0, &mut pool) } != 0 {
-            return None;
-        }
-        let mut ring = Vec::new();
-        for _ in 0..RING {
-            let mut cmd = 0usize;
-            let ai = AllocInfo { s_type: 40, next: 0, pool, level: 0, count: 1 };
-            let mut fence = 0u64;
-            let mut sem = 0u64;
-            let fence_info = Flagged { s_type: 8, next: 0, flags: 1, extra: 0 }; // signalled
-            let sem_info = Flagged { s_type: 9, next: 0, flags: 0, extra: 0 };
-            unsafe {
-                (fx.alloc_cmd)(dev, &ai, &mut cmd);
-                (fx.create_fence)(dev, &fence_info, 0, &mut fence);
-                (fx.create_semaphore)(dev, &sem_info, 0, &mut sem);
-            }
-            // A command buffer is dispatchable: it carries the device's dispatch pointer,
-            // which the loader expects to find set when it's allocated outside the loader.
-            unsafe { *(cmd as *mut usize) = *(dev as *const usize) };
-            ring.push((cmd, fence, sem));
-        }
-        d.pools.insert(family, (pool, ring, 0));
+        let ring = command_ring(fx, dev, family, RING, true)?;
+        d.pools.insert(family, ring);
     }
     let all_fences: Vec<u64> = d.pools.values().flat_map(|p| p.1.iter().map(|r| r.1)).collect();
     let wait = || unsafe {
@@ -1440,8 +1816,9 @@ fn draw(queue: usize, info: &PresentInfo) -> Option<u64> {
     if !g.stage(fx, dev, &f, &wait) || !g.ensure_frame_objects(fx, dev, f.w, f.h, &wait) {
         return None;
     }
-    g.bind_view(fx, dev, srgb(swap.format), &wait);
-    let pass = g.pass(fx, dev, swap.format, PRESENT_SRC)?;
+    let enc = encoding(swap.format, swap.color_space);
+    g.bind_view(fx, dev, enc == Encoding::Plain && srgb(swap.format), &wait);
+    let pass = g.pass(fx, dev, swap.format, PRESENT_SRC, enc)?;
     // A view and framebuffer per swap chain image, made the first time it's drawn into.
     let target = swap.targets.get_mut(index)?;
     if target.1 == 0 {
@@ -1456,7 +1833,8 @@ fn draw(queue: usize, info: &PresentInfo) -> Option<u64> {
     }
     let framebuffer = target.1;
     let (_, ring, next) = d.pools.get_mut(&family)?;
-    let (cmd, fence, sem) = ring[*next];
+    let at = *next;
+    let (cmd, fence, sem) = ring[at];
     *next = (*next + 1) % RING;
     unsafe {
         (fx.wait_fences)(dev, 1, &fence, 1, 1_000_000_000);
@@ -1480,44 +1858,132 @@ fn draw(queue: usize, info: &PresentInfo) -> Option<u64> {
         signals: &sem,
     };
     if unsafe { (fx.submit)(queue, 1, &submit, fence) } != 0 {
+        // The fence was reset for this submit and nothing will signal it now: a signalled
+        // one takes its place, or every later use of this entry would wait a second on it.
+        let fence_info = Flagged { s_type: 8, next: 0, flags: 1, extra: 0 };
+        let mut fresh = 0u64;
+        unsafe { (fx.destroy_fence)(dev, fence, 0) };
+        if made(unsafe { (fx.create_fence)(dev, &fence_info, 0, &mut fresh) }, &mut fresh) {
+            ring[at].1 = fresh;
+        } else {
+            // No fence: the ring goes, and is made again at the next frame.
+            if let Some((pool, ring, _)) = d.pools.remove(&family) {
+                destroy_ring(fx, dev, pool, ring);
+            }
+        }
+        crate::log::throttled("video: vk overlay submit", 3, |n| log!("video: the overlay's Vulkan commands couldn't be submitted (call {n}); the frame is shown without it"));
         return None;
     }
     Some(sem)
 }
 
+/// A command pool on queue `family` (its buffers resettable) and `n` entries of a
+/// command buffer, a fence (`signalled` or not) and a semaphore; none of it left behind
+/// when something can't be made.
+fn command_ring(fx: &Funcs, dev: usize, family: u32, n: usize, signalled: bool) -> Option<(u64, Vec<(usize, u64, u64)>, usize)> {
+    let pool_info = Flagged { s_type: 39, next: 0, flags: 0x2, extra: family };
+    let mut pool = 0u64;
+    if !made(unsafe { (fx.create_pool)(dev, &pool_info, 0, &mut pool) }, &mut pool) {
+        return None;
+    }
+    let mut ring = Vec::new();
+    for _ in 0..n {
+        let mut cmd = 0usize;
+        let ai = AllocInfo { s_type: 40, next: 0, pool, level: 0, count: 1 };
+        let (mut fence, mut sem) = (0u64, 0u64);
+        let fence_info = Flagged { s_type: 8, next: 0, flags: u32::from(signalled), extra: 0 };
+        let sem_info = Flagged { s_type: 9, next: 0, flags: 0, extra: 0 };
+        let ok = unsafe { (fx.alloc_cmd)(dev, &ai, &mut cmd) } == 0 && cmd != 0;
+        let ok = ok && made(unsafe { (fx.create_fence)(dev, &fence_info, 0, &mut fence) }, &mut fence);
+        let ok = ok && made(unsafe { (fx.create_semaphore)(dev, &sem_info, 0, &mut sem) }, &mut sem);
+        if !ok {
+            unsafe {
+                (fx.destroy_fence)(dev, fence, 0);
+            }
+            destroy_ring(fx, dev, pool, ring);
+            log!("video: Vulkan command buffers couldn't be made on queue family {family}");
+            return None;
+        }
+        // A command buffer is dispatchable: it carries the device's dispatch pointer,
+        // which the loader expects to find set when it's allocated outside the loader.
+        unsafe { *(cmd as *mut usize) = *(dev as *const usize) };
+        ring.push((cmd, fence, sem));
+    }
+    Some((pool, ring, 0))
+}
+
+/// A `command_ring`'s objects (none in use any more).
+fn destroy_ring(fx: &Funcs, dev: usize, pool: u64, ring: Vec<(usize, u64, u64)>) {
+    unsafe {
+        for (_, fence, sem) in ring {
+            (fx.destroy_fence)(dev, fence, 0);
+            (fx.destroy_semaphore)(dev, sem, 0);
+        }
+        // Its command buffers go with it.
+        (fx.destroy_pool)(dev, pool, 0);
+    }
+}
+
 unsafe extern "system" fn destroy_swapchain(dev: usize, swap: u64, alloc: usize) {
-    let real: DestroySwapchain = unsafe { std::mem::transmute(REAL.lock().unwrap().destroy_swapchain) };
-    forget_swapchain(dev, swap);
+    let real: DestroySwapchain = unsafe { std::mem::transmute(real_for(Some(dev), |r| r.destroy_swapchain)) };
+    let _ = std::panic::catch_unwind(|| forget_swapchain(dev, swap));
     unsafe { real(dev, swap, alloc) }
 }
 
 unsafe extern "system" fn destroy_swapchain_export(dev: usize, swap: u64, alloc: usize) {
-    forget_swapchain(dev, swap);
+    let _ = std::panic::catch_unwind(|| forget_swapchain(dev, swap));
     unsafe { X_DESTROY_SWAPCHAIN.get().unwrap().call(dev, swap, alloc) }
 }
 
-/// PeerParty's views and framebuffers of a swap chain's images go before it does.
+/// PeerParty's views and framebuffers of a swap chain's images go before it does, once
+/// the overlay's draws into them and the session's copies of them are done.
 fn forget_swapchain(dev: usize, swap: u64) {
-    if let Ok(mut w) = WORLD.lock() {
-        let world = &mut *w;
-        if let (Some(s), Some(d)) = (world.swaps.remove(&swap), world.devices.get(&dev)) {
-            if let Some(fx) = d.funcs.as_ref() {
-                let fences: Vec<u64> = d.pools.values().flat_map(|p| p.1.iter().map(|r| r.1)).collect();
-                if !fences.is_empty() {
-                    unsafe { (fx.wait_fences)(dev, fences.len() as u32, fences.as_ptr(), 1, 1_000_000_000) };
-                }
-                for (view, fb) in s.targets {
-                    unsafe {
-                        if fb != 0 {
-                            (fx.destroy_framebuffer)(dev, fb, 0);
-                        }
-                        if view != 0 {
-                            (fx.destroy_view)(dev, view, 0);
-                        }
-                    }
-                }
-            }
+    forget_window(&[swap]);
+    let mut w = crate::sys::lock(&WORLD);
+    let world = &mut *w;
+    if let (Some(s), Some(d)) = (world.swaps.remove(&swap), world.devices.get(&dev)) {
+        if let Some(c) = d.capture.as_ref() {
+            c.idle();
         }
+        if let Some(fx) = d.funcs.as_ref() {
+            let fences: Vec<u64> = d.pools.values().flat_map(|p| p.1.iter().map(|r| r.1)).collect();
+            if !fences.is_empty() {
+                unsafe { (fx.wait_fences)(dev, fences.len() as u32, fences.as_ptr(), 1, 1_000_000_000) };
+            }
+            destroy_targets(fx, dev, s.targets);
+        }
+    }
+}
+
+unsafe extern "system" fn destroy_device(dev: usize, alloc: usize) {
+    let real: DestroyDevice = unsafe { std::mem::transmute(real_for(Some(dev), |r| r.destroy_device)) };
+    let _ = std::panic::catch_unwind(|| forget_device(dev));
+    unsafe { real(dev, alloc) }
+}
+
+unsafe extern "system" fn destroy_device_export(dev: usize, alloc: usize) {
+    let _ = std::panic::catch_unwind(|| forget_device(dev));
+    unsafe { X_DESTROY_DEVICE.get().unwrap().call(dev, alloc) }
+}
+
+/// Everything PeerParty made on a device goes before it does (after it's idle), with
+/// what it knew of its queues and swap chains.
+fn forget_device(dev: usize) {
+    let (d, swaps) = {
+        let mut w = crate::sys::lock(&WORLD);
+        let Some(d) = w.devices.remove(&dev) else { return };
+        w.queues.retain(|_, q| q.0 != dev);
+        let ids: Vec<u64> = w.swaps.iter().filter(|(_, s)| s.dev == dev).map(|(id, _)| *id).collect();
+        let swaps: Vec<Swap> = ids.iter().filter_map(|id| w.swaps.remove(id)).collect();
+        forget_window(&ids);
+        (d, swaps)
+    };
+    let drew = d.gfx.is_some();
+    let copied = d.capture.as_ref().is_some_and(|c| c.made_anything());
+    d.destroy(dev, swaps);
+    crate::sys::lock(&DEV_REAL).remove(&dev);
+    if drew || copied {
+        log!("video: the game destroyed a Vulkan device; what PeerParty made on it (the overlay's objects, the frames' copies) went first");
     }
 }
 
@@ -1540,8 +2006,8 @@ pub fn presented_recently() -> bool {
 }
 
 unsafe extern "system" fn queue_present(queue: usize, info: *const PresentInfo) -> i32 {
-
-    let real: QueuePresent = unsafe { std::mem::transmute(REAL.lock().unwrap().present) };
+    let dev = crate::sys::lock(&WORLD).queues.get(&queue).map(|q| q.0);
+    let real: QueuePresent = unsafe { std::mem::transmute(real_for(dev, |r| r.present)) };
     presenting(&|q, i| unsafe { real(q, i) }, queue, info)
 }
 
@@ -1632,14 +2098,97 @@ mod tests {
         features: usize,
     }
 
-    /// A device of the PC's own (skipped without a Vulkan driver), an offscreen image
-    /// cleared blue, and a frame that is half clear and half 50% red: drawn the way a
-    /// present draws it, the blend must leave blue on the clear half and mix the other.
+    fn swapchain_info(surface: u64, old: u64) -> SwapchainInfo {
+        SwapchainInfo {
+            s_type: 1000001000,
+            next: 0,
+            flags: 0,
+            surface,
+            min_images: 2,
+            format: 44,
+            color_space: 0,
+            width: 64,
+            height: 32,
+            layers: 1,
+            usage: 0x10,
+            sharing: 0,
+            family_count: 0,
+            families: 0,
+            transform: 1,
+            alpha: 1,
+            mode: 2,
+            clipped: 1,
+            old,
+        }
+    }
+
+    /// A swap chain handed an old one is tried once (a failed try retires the old one,
+    /// which can't be handed over again); without one, with less until the surface takes
+    /// it, and it's known with the usage it got.
     #[test]
-    fn draws_a_blended_frame_over_an_image() {
+    fn a_swap_chain_replacing_another_is_tried_once() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let failing = |_: usize, i: *const SwapchainInfo, _: usize, _: *mut u64| {
+            calls.borrow_mut().push((unsafe { (*i).usage }, unsafe { (*i).old }));
+            -1000001004 // VK_ERROR_OUT_OF_DATE_KHR
+        };
+        let mut out = 0u64;
+        let info = SwapchainInfo { usage: 0x1, ..swapchain_info(0x51, 0x77) };
+        assert_eq!(creating_swapchain(&failing, 0xd1, &info, 0, &mut out), -1000001004);
+        assert_eq!(*calls.borrow(), vec![(0x11, 0x77)], "one try, with COLOR_ATTACHMENT");
+
+        // A surface that takes only what the game asked for (how many tries before it
+        // depends on whether capture is wanted, which another test may have turned on).
+        calls.borrow_mut().clear();
+        let exact = |_: usize, i: *const SwapchainInfo, _: usize, o: *mut u64| {
+            let usage = unsafe { (*i).usage };
+            calls.borrow_mut().push((usage, 0));
+            if usage != 0x2 {
+                return -3; // VK_ERROR_INITIALIZATION_FAILED
+            }
+            unsafe { *o = 0x5a5a };
+            0
+        };
+        let info = SwapchainInfo { usage: 0x2, ..swapchain_info(0x52, 0) };
+        assert_eq!(creating_swapchain(&exact, 0xd2, &info, 0, &mut out), 0);
+        let usages: Vec<u32> = calls.borrow().iter().map(|c| c.0).collect();
+        assert!(usages.len() >= 2 && usages[0] & 0x12 == 0x12, "with COLOR_ATTACHMENT first: {usages:x?}");
+        assert_eq!(*usages.last().unwrap(), 0x2, "as the game asked, the last try");
+        let world = crate::sys::lock(&WORLD);
+        let s = &world.swaps[&0x5a5a];
+        assert!(!s.drawable && !s.capturable && s.dev == 0xd2, "known, and not drawn into");
+        drop(world);
+        forget_swapchain(0xd2, 0x5a5a);
+    }
+
+    /// A swap chain made on a surface of a known window marks that window as presented
+    /// by Vulkan (the API above it leaves its frames alone) from the moment it's made,
+    /// until it's destroyed.
+    #[test]
+    fn a_vulkan_swap_chain_latches_its_window() {
+        let hwnd = 0x7e57_0001usize;
+        let mut surface = 0xabc0_0001u64;
+        let si = SurfaceInfo { s_type: 1000009000, next: 0, flags: 0, instance: 0, hwnd };
+        note_surface(0, &si, &mut surface);
+        assert!(!presents_to(hwnd));
+        assert_eq!(surface_window(surface), hwnd);
+        let swap = 0xabc0_0002u64;
+        // What `note_swapchain` does, without reporting a made-up window as the game's.
+        note_window(swap, surface_window(surface));
+        assert!(presents_to(hwnd) && presents_anywhere());
+        assert!(super::super::lower_layer_presents(|| hwnd), "latched, without a present yet");
+        assert!(!presents_to(hwnd + 1), "another window isn't");
+        forget_swapchain(0xd3, swap);
+        assert!(!presents_to(hwnd), "let go with the swap chain");
+    }
+
+    /// Draws a 64x32 `frame(x, y)` (premultiplied BGRA) the way a present draws it, over
+    /// an image of `format` (`bpp` bytes a pixel) cleared to `clear`, with the pipeline for
+    /// `enc`, on a device of the PC's own; the image's bytes after. None (skipped) without
+    /// a Vulkan driver, or one that can't blend into `format`.
+    fn draw_once(format: u32, bpp: u32, enc: Encoding, clear_to: [f32; 4], frame: impl Fn(usize, usize) -> u32) -> Option<Vec<u8>> {
         let m = com::load("vulkan-1.dll");
-        let Some(gipa) = com::proc(m, c"vkGetInstanceProcAddr") else { return };
-        let gipa: GetProc = unsafe { std::mem::transmute(gipa) };
+        let gipa: GetProc = unsafe { std::mem::transmute(com::proc(m, c"vkGetInstanceProcAddr")?) };
         let ip = |inst: usize, n: &CStr| unsafe { gipa(inst, n.as_ptr()) };
         type CreateInstance = unsafe extern "system" fn(*const InstanceInfo, usize, *mut usize) -> i32;
         let create_instance: CreateInstance = unsafe { std::mem::transmute(ip(0, c"vkCreateInstance")) };
@@ -1648,7 +2197,7 @@ mod tests {
         let mut inst = 0usize;
         if unsafe { create_instance(&ii, 0, &mut inst) } != 0 {
             eprintln!("no Vulkan instance: skipped");
-            return;
+            return None;
         }
         type Enumerate = unsafe extern "system" fn(usize, *mut u32, *mut usize) -> i32;
         let enumerate: Enumerate = unsafe { std::mem::transmute(ip(inst, c"vkEnumeratePhysicalDevices")) };
@@ -1657,7 +2206,16 @@ mod tests {
         unsafe { enumerate(inst, &mut n, &mut phys) };
         if phys == 0 {
             eprintln!("no Vulkan device: skipped");
-            return;
+            return None;
+        }
+        // optimalTilingFeatures: COLOR_ATTACHMENT_BLEND and TRANSFER_SRC.
+        type FormatProps = unsafe extern "system" fn(usize, u32, *mut [u32; 3]);
+        let format_props: FormatProps = unsafe { std::mem::transmute(ip(inst, c"vkGetPhysicalDeviceFormatProperties")) };
+        let mut fp = [0u32; 3];
+        unsafe { format_props(phys, format, &mut fp) };
+        if fp[1] & 0x100 == 0 {
+            eprintln!("this Vulkan device can't blend into format {format}: skipped");
+            return None;
         }
         type Families = unsafe extern "system" fn(usize, *mut u32, *mut [u32; 6]);
         let families: Families = unsafe { std::mem::transmute(ip(inst, c"vkGetPhysicalDeviceQueueFamilyProperties")) };
@@ -1682,14 +2240,14 @@ mod tests {
         let mut queue = 0usize;
         unsafe { get_queue(dev, family, 0, &mut queue) };
 
-        // The target: a 64x32 BGRA image, cleared blue.
+        // The target, standing in for a swap chain image.
         let (w, h) = (64u32, 32u32);
         let ii = ImageInfo {
             s_type: 14,
             next: 0,
             flags: 0,
             image_type: 1,
-            format: BGRA_UNORM,
+            format,
             extent: [w, h, 1],
             mips: 1,
             layers: 1,
@@ -1709,7 +2267,7 @@ mod tests {
         let mut tmem = 0u64;
         assert_eq!(unsafe { (fx.alloc_mem)(dev, &ma, 0, &mut tmem) }, 0);
         assert_eq!(unsafe { (fx.bind_image)(dev, target, tmem, 0) }, 0);
-        let vi = ViewInfo { s_type: 15, next: 0, flags: 0, image: target, view_type: 1, format: BGRA_UNORM, components: [0; 4], range: [1, 0, 1, 0, 1] };
+        let vi = ViewInfo { s_type: 15, next: 0, flags: 0, image: target, view_type: 1, format, components: [0; 4], range: [1, 0, 1, 0, 1] };
         let mut tview = 0u64;
         assert_eq!(unsafe { (fx.create_view)(dev, &vi, 0, &mut tview) }, 0);
 
@@ -1722,18 +2280,19 @@ mod tests {
         let px = unsafe { std::slice::from_raw_parts_mut(sptr as *mut u32, (w * h) as usize) };
         for y in 0..h as usize {
             for x in 0..w as usize {
-                px[y * w as usize + x] = if x >= w as usize / 2 { 0x8080_0000 } else { 0 };
+                px[y * w as usize + x] = frame(x, y);
             }
         }
         g.staging = Some((sbuf, smem, sptr, (w * h * 4) as usize));
         g.staged = Some(2);
         g.bind_view(&fx, dev, false, &wait);
         let general = 1;
-        let pass = g.pass(&fx, dev, BGRA_UNORM, general).expect("render pass and pipeline");
+        let pass = g.pass(&fx, dev, format, general, enc).expect("render pass and pipeline");
         let fbi = FramebufferInfo { s_type: 37, next: 0, flags: 0, pass: pass.0, count: 1, attachments: &tview, width: w, height: h, layers: 1 };
         let mut fb = 0u64;
         assert_eq!(unsafe { (fx.create_framebuffer)(dev, &fbi, 0, &mut fb) }, 0);
-        let (rbuf, _, rptr) = host_buffer(&fx, dev, phys, (w * h * 4) as usize, 0x2).unwrap();
+        let size = (w * h * bpp) as usize;
+        let (rbuf, _, rptr) = host_buffer(&fx, dev, phys, size, 0x2).unwrap();
 
         let pool_info = Flagged { s_type: 39, next: 0, flags: 0x2, extra: family };
         let mut pool = 0u64;
@@ -1766,7 +2325,7 @@ mod tests {
         unsafe {
             (fx.begin)(cmd, &begin);
             (fx.barrier)(cmd, 0x1, 0x1000, 0, 0, 0, 0, 0, 1, &barrier(0, general, 0, 0x1000));
-            clear(cmd, target, general, &[0.0, 0.0, 1.0, 1.0], 1, &[1, 0, 1, 0, 1]);
+            clear(cmd, target, general, &clear_to, 1, &[1, 0, 1, 0, 1]);
             (fx.barrier)(cmd, 0x1000, 0x400, 0, 0, 0, 0, 0, 1, &barrier(general, general, 0x1000, 0x80 | 0x100));
         }
         g.record(&fx, cmd, pass, fb, w, h);
@@ -1789,14 +2348,72 @@ mod tests {
         assert_eq!(unsafe { (fx.submit)(queue, 1, &submit, 0) }, 0);
         let idle: unsafe extern "system" fn(usize) -> i32 = unsafe { std::mem::transmute(dp(c"vkQueueWaitIdle")) };
         assert_eq!(unsafe { idle(queue) }, 0);
-        let out = unsafe { std::slice::from_raw_parts(rptr as *const u32, (w * h) as usize) };
-        let left = out[(h as usize / 2) * w as usize + 4];
-        let right = out[(h as usize / 2) * w as usize + w as usize - 4];
-        eprintln!("Vulkan blend: left {left:#010x}, right {right:#010x}");
-        assert_eq!(left & 0x00ff_ffff, 0x0000_00ff, "left {left:#x}");
-        let (rr, bb) = ((right >> 16) & 0xff, right & 0xff);
-        assert!((rr as i32 - 128).abs() <= 2 && (bb as i32 - 127).abs() <= 2, "right {right:#x}");
+        let out = unsafe { std::slice::from_raw_parts(rptr as *const u8, size) }.to_vec();
+        unsafe { (fx.device_wait_idle)(dev) };
+        g.destroy(&fx, dev);
         let destroy_dev: unsafe extern "system" fn(usize, usize) = unsafe { std::mem::transmute(dp(c"vkDestroyDevice")) };
         unsafe { destroy_dev(dev, 0) };
+        Some(out)
+    }
+
+    /// Pixel `(x, y)` of a 64-wide image read back, `bpp` bytes a pixel.
+    fn pixel(out: &[u8], x: usize, y: usize, bpp: usize) -> &[u8] {
+        let at = (y * 64 + x) * bpp;
+        &out[at..at + bpp]
+    }
+
+    fn half(b: &[u8]) -> f32 {
+        let h = u16::from_le_bytes([b[0], b[1]]);
+        let (sign, exp, frac) = ((h >> 15) as i32, ((h >> 10) & 0x1f) as i32, (h & 0x3ff) as f32);
+        let v = if exp == 0 { frac * 2f32.powi(-24) } else { (1.0 + frac / 1024.0) * 2f32.powi(exp - 15) };
+        if sign == 1 { -v } else { v }
+    }
+
+    /// An image cleared blue, and a frame that is half clear (left) and half 50% red: the
+    /// blend leaves blue on the clear half and mixes the other.
+    #[test]
+    fn draws_a_blended_frame_over_an_image() {
+        let Some(out) = draw_once(BGRA_UNORM, 4, Encoding::Plain, [0.0, 0.0, 1.0, 1.0], |x, _| if x >= 32 { 0x8080_0000 } else { 0 }) else { return };
+        let (left, right) = (pixel(&out, 4, 16, 4), pixel(&out, 60, 16, 4));
+        eprintln!("Vulkan blend: left {left:?}, right {right:?} (BGRA)");
+        assert_eq!(&left[..3], &[0xff, 0, 0], "left {left:?}");
+        assert!((right[2] as i32 - 128).abs() <= 2 && (right[0] as i32 - 127).abs() <= 2, "right {right:?}");
+    }
+
+    /// An scRGB image (float, linear light) cleared to half blue: where the frame is 50%
+    /// red (the top half) it arrives as red at SDR white (2.5) times its coverage, blended
+    /// in linear light; where it's clear (the bottom) the image is as it was.
+    #[test]
+    fn draws_the_frame_into_an_scrgb_image_at_sdr_white() {
+        let Some(out) = draw_once(97, 8, Encoding::ScRgb, [0.0, 0.0, 0.5, 1.0], |_, y| if y < 16 { 0x8080_0000 } else { 0 }) else { return };
+        let rgba = |x, y| {
+            let p = pixel(&out, x, y, 8);
+            [half(&p[0..2]), half(&p[2..4]), half(&p[4..6]), half(&p[6..8])]
+        };
+        let (top, bottom) = (rgba(32, 4), rgba(32, 28));
+        eprintln!("Vulkan scRGB: top {top:?}, bottom {bottom:?}");
+        let a = 128.0 / 255.0;
+        let near = |v: f32, want: f32| (v - want).abs() < 0.01;
+        assert!(near(top[0], 2.5 * a) && near(top[1], 0.0) && near(top[2], 0.5 * (1.0 - a)) && near(top[3], 1.0), "top {top:?}");
+        assert!(near(bottom[0], 0.0) && near(bottom[2], 0.5) && near(bottom[3], 1.0), "bottom (not flipped) {bottom:?}");
+    }
+
+    /// An HDR10 image (A2B10G10R10, PQ): the frame's opaque white (the top half) arrives
+    /// as SDR white (200 nits) PQ-encoded; its clear half (the bottom) leaves the image
+    /// black.
+    #[test]
+    fn draws_the_frame_into_an_hdr10_image_pq_encoded() {
+        let Some(out) = draw_once(64, 4, Encoding::Pq, [0.0, 0.0, 0.0, 0.0], |_, y| if y < 16 { 0xffff_ffff } else { 0 }) else { return };
+        let rgb = |x, y| {
+            let v = u32::from_le_bytes(pixel(&out, x, y, 4).try_into().unwrap());
+            [v & 0x3ff, (v >> 10) & 0x3ff, (v >> 20) & 0x3ff]
+        };
+        let (top, bottom) = (rgb(32, 4), rgb(32, 28));
+        // PQ of 200 / 10000 (BT.709 white is BT.2020 white).
+        let y = (200.0f64 / 10000.0).powf(0.1593017578125);
+        let want = (((0.8359375 + 18.8515625 * y) / (1.0 + 18.6875 * y)).powf(78.84375) * 1023.0).round() as i32;
+        eprintln!("Vulkan HDR10: top {top:?}, bottom {bottom:?}, white wanted {want}");
+        assert!(top.iter().all(|c| (*c as i32 - want).abs() <= 2), "top {top:?}, want {want}");
+        assert_eq!(bottom, [0, 0, 0], "bottom (not flipped)");
     }
 }

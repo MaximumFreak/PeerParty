@@ -23,7 +23,9 @@ it does and docs/usage.md how to use it; this file is about how changes get in.
   session) with the hook; `ui/` is the launcher window; `host/` runs beside the game,
   draws the overlay and composites split-screen frames. `build.rs` builds the hook for
   x64 and x86 and embeds both.
-- `tools`: generators for the vtable and EOS tables (`*_vtables.py`, `eos_table.py`). They
+- `tools`: generators for the vtable and EOS tables (`*_vtables.py`, `eos_table.py`), and
+  for the Vulkan overlay's HDR shaders (`vk_shaders.py`: GLSL in hook/src/video/glsl to
+  SPIR-V in vkshaders.rs, with naga; run it after changing a shader). The table ones
   read an SDK's headers from a folder you point them at; never commit those.
 - `docs`: how it works (`design.md`), how to use it (`usage.md`), internet play
   (`internet-dht.md`, `public-sessions.md`), testing (`testing.md`).

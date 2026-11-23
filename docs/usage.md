@@ -806,7 +806,10 @@ PeerParty's SDK answers and, while the overlay shows, its controllers held still
   only when first needed (Vulkan's at load, and only with `draw=ingame`: a hook at start-up
   is the one thing that touches a game that never opens the overlay), and while the overlay is
   closed a frame costs the game one flag check. Vulkan draws with a small pipeline of its
-  own (Dear ImGui's precompiled shaders), blended like the other APIs.
+  own (Dear ImGui's precompiled shaders), blended like the other APIs; into an HDR swap
+  chain (scRGB, or HDR10's PQ) with PeerParty's own shaders, which put the overlay at SDR
+  white as the Direct3D hooks do (hook/src/video/glsl, compiled ahead of time by
+  tools/vk_shaders.py).
 
 Friends and invites (hook/src/steamlan.rs, eos/, invite.rs):
 
