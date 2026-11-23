@@ -1,0 +1,7 @@
+# The toolchain PeerParty is built and tested with: rustup installs it (and the 32-bit
+# target the launcher's build script needs for the hook) on first use. Move it forward
+# on purpose, with a full test run, not whenever stable moves.
+[toolchain]
+channel = "1.100.0"
+targets = ["x86_64-pc-windows-msvc", "i686-pc-windows-msvc"]
+profile = "minimal"

@@ -1,0 +1,23 @@
+# cargo-nextest (`cargo nextest run --workspace`): every test in a process of its own, as
+# many at once as there are cores. A test can't change another's process-wide state (the
+# hook's detours and config, the input test policy), and one that hangs is stopped and
+# named instead of holding the run. tests\run_all.ps1 uses it when it's installed
+# (`cargo install cargo-nextest`, or the binary from https://get.nexte.st); `cargo test`
+# runs the same tests, threads in one process per binary.
+#
+# There are no doctests (nextest doesn't run them): add `cargo test --doc` to
+# run_all.ps1 if one appears.
+
+[profile.default]
+# A flaky test fails the run: a retry would hide the timing bug it points at.
+retries = 0
+# Reported as slow after 60 s; stopped after 5 periods (5 min). The longest tests wait
+# out production intervals of 15 s, and core's network tests may first wait for a turn
+# while other runs on this PC have them all (core/src/test_ports.rs `turn`): three runs
+# at once took about 70 s each for that binary.
+slow-timeout = { period = "60s", terminate-after = 5 }
+# Every failure, not only the first, and their output at the end too.
+fail-fast = false
+failure-output = "immediate-final"
+status-level = "fail"
+final-status-level = "slow"
