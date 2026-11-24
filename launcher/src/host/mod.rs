@@ -235,8 +235,6 @@ struct PaneNav {
     game_asked: Option<String>,
     chord_since: Option<Instant>,
     chord_fired: bool,
-    /// Recording a chord: when it started, the buttons held and since when.
-    recording: Option<(Instant, u32, Instant)>,
     repeat: crate::ui::shared::RepeatTimer,
 }
 
@@ -251,7 +249,6 @@ impl PaneNav {
             game_asked: None,
             chord_since: None,
             chord_fired: false,
-            recording: None,
             repeat: crate::ui::shared::RepeatTimer::default(),
         }
     }
@@ -351,6 +348,11 @@ struct SessionHost {
     nav: NavState,
     key: String,
     prefs: Prefs,
+    /// ui.json's settings for this game as last read, when it was last changed, and when
+    /// that was last looked at (`reload_prefs`).
+    file_prefs: Prefs,
+    file_seen: Option<std::time::SystemTime>,
+    file_checked: Instant,
     started: Instant,
     /// Game Bar's overlay over the game (it never takes the foreground), and whether it
     /// was open at the last tick: the overlays leave the input to it meanwhile.
@@ -511,6 +513,7 @@ impl SessionHost {
         let pid = instances.first().map_or(0, |i| i.pid);
         let title = game_title(exe, &name);
         let panes = (0..instances.len()).map(|_| PaneOverlay::new(title.clone())).collect();
+        let file = crate::ui::store::Settings::load();
         let mut host = SessionHost {
             instances,
             panes,
@@ -525,6 +528,9 @@ impl SessionHost {
             compositor,
             nav: NavState::new(),
             key: crate::ui::store::key_of(exe),
+            file_prefs: file.prefs.effective_for(&file.options(&crate::ui::store::key_of(exe))),
+            file_seen: crate::ui::store::Settings::modified(),
+            file_checked: Instant::now(),
             prefs,
             started: Instant::now(),
             gamebar: gamebar::GameBar::new(),
@@ -1316,6 +1322,7 @@ impl SessionHost {
     fn tick(&mut self) {
         input::heartbeat();
         self.messages();
+        self.reload_prefs();
         if let Some(i) = self.front_copy().filter(|&i| i != self.focus) {
             // Another copy came to the front: the keyboard follows it.
             self.set_focus(i);
@@ -1616,14 +1623,16 @@ impl SessionHost {
             HookMsg::Open { page, peer } => {
                 let asked = format!("{page} {}", peer.as_deref().unwrap_or(""));
                 let invite = page == "invite";
+                // Anything else (the game's "settings", its overlay's home) opens where
+                // the overlay opens by itself; its settings are the launcher window's.
+                let landing = self.landing(i);
                 let page = match page.as_str() {
                     "friends" | "invite" | "invites" => Page::Players,
-                    "settings" => Page::Settings,
                     "profile" => match peer {
                         Some(p) => Page::Profile(p),
                         None => Page::Players,
                     },
-                    _ => Page::Home,
+                    _ => landing,
                 };
                 // The game asked: its own copy's overlay opens, over its own pane. Asked
                 // again for the same page while it's open (a game pressing its invite
@@ -1929,7 +1938,8 @@ impl SessionHost {
                 self.prefs.guide_tip_shown = true;
                 self.save_prefs();
             }
-            self.show(i, Page::Home, false, &why);
+            let page = self.landing(i);
+            self.show(i, page, false, &why);
         }
     }
 
@@ -1953,6 +1963,62 @@ impl SessionHost {
                 }
             }
         }
+    }
+
+    /// Where copy `i`'s overlay opens by itself (`Overlay::landing`), with its session's
+    /// players known first.
+    fn landing(&mut self, i: usize) -> Page {
+        let seats = self.seats(i);
+        self.panes[i].overlay.seats = seats;
+        self.panes[i].overlay.landing()
+    }
+
+    /// Settings changed in the launcher window while the game runs (ui.json, looked at
+    /// about once a second): the overlay showing, its size and button pictures, what
+    /// opens it, notifications and accepting invites apply at once. Only what changed in
+    /// the file is taken, so a `--set` or environment answer for this run stays until
+    /// that very setting is changed.
+    fn reload_prefs(&mut self) {
+        if self.file_checked.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.file_checked = Instant::now();
+        let m = crate::ui::store::Settings::modified();
+        if m.is_none() || m == self.file_seen {
+            return;
+        }
+        let loaded = crate::ui::store::Settings::load();
+        if loaded.unread {
+            return;
+        }
+        self.file_seen = m;
+        let now = loaded.prefs.effective_for(&loaded.options(&self.key));
+        let was = std::mem::replace(&mut self.file_prefs, now.clone());
+        let mut p = self.prefs.clone();
+        let mut what = Vec::new();
+        macro_rules! take {
+            ($($f:ident),*) => {$(
+                if now.$f != was.$f && p.$f != now.$f {
+                    p.$f = now.$f.clone();
+                    what.push(stringify!($f));
+                }
+            )*};
+        }
+        take!(overlay, overlay_scale, glyphs, hotkeys, toasts, auto_accept);
+        if what.is_empty() {
+            return;
+        }
+        self.cur().send(&HostMsg::Note { text: format!("overlay: settings changed in the PeerParty window, applied now: {}", what.join(", ")) });
+        let accept = p.auto_accept != self.prefs.auto_accept;
+        self.prefs = p;
+        if accept {
+            for k in 0..self.instances.len() {
+                self.send_settings(k);
+            }
+        }
+        // The footers name the hotkeys; the size and pictures show at once.
+        self.refresh_hints();
+        self.redraw_all();
     }
 
     /// Opens copy `i`'s overlay on `page`. `why` goes into the game's log: what opened it.
@@ -2007,7 +2073,6 @@ impl SessionHost {
         let pad = self.pane_pad(i);
         let p = &mut self.panes[i];
         p.visible = false;
-        p.nav.recording = None;
         // Buttons still held when it closed don't reach the game as a fresh press
         // (`PAD_BUTTONS`).
         p.nav.pad_prev = pad;
@@ -2072,6 +2137,7 @@ impl SessionHost {
                         0x27 => nav.right = true,
                         0x0D | 0x20 => nav.select = true,
                         0x2E | 0x58 => nav.second = true,
+                        0x59 => nav.third = true,
                         0x1B | 0x08 => nav.back = true,
                         0x51 | 0x21 => nav.prev_tab = true,
                         0x45 | 0x22 => nav.next_tab = true,
@@ -2128,11 +2194,6 @@ impl SessionHost {
         if let Some(&style) = self.pane_styles().get(i) {
             self.panes[i].overlay.style = style;
         }
-        if self.panes[i].nav.recording.is_some() {
-            self.record_chord(i, pad);
-            self.panes[i].nav.pad_prev = pad;
-            return (Nav::default(), events, moved);
-        }
         let n = &mut self.panes[i].nav;
         let pressed = pad & !n.pad_prev;
         n.pad_prev = pad;
@@ -2145,6 +2206,7 @@ impl SessionHost {
         nav.right |= fire & pad::RIGHT != 0;
         nav.select |= pressed & pad::SOUTH != 0;
         nav.second |= pressed & pad::WEST != 0;
+        nav.third |= pressed & pad::NORTH != 0;
         nav.back |= pressed & pad::EAST != 0;
         nav.prev_tab |= pressed & pad::LB != 0;
         nav.next_tab |= pressed & pad::RB != 0;
@@ -2157,36 +2219,6 @@ impl SessionHost {
             events.push(egui::Event::PointerGone);
         }
         (nav, events, moved)
-    }
-
-    /// Recording a chord on copy `i`'s overlay: two or more buttons (Home aside) of its
-    /// controller held unchanged for a second become it. The controller doesn't
-    /// navigate meanwhile.
-    fn record_chord(&mut self, i: usize, pad: u32) {
-        let Some((started, held, since)) = self.panes[i].nav.recording else { return };
-        let now = Instant::now();
-        let buttons = pad & !pad::HOME;
-        self.panes[i].render.dirty = true;
-        if buttons.count_ones() >= 2 {
-            if buttons != held {
-                self.panes[i].nav.recording = Some((started, buttons, now));
-            } else if now - since >= CHORD_HOLD {
-                self.prefs.hotkeys.chord = buttons;
-                self.save_prefs();
-                let p = &mut self.panes[i];
-                p.nav.recording = None;
-                p.overlay.notice = Some((crate::t!("toast.chord_set", buttons = pad::names(buttons)), now + Duration::from_secs(5)));
-                // The buttons still held don't reopen it once it closes.
-                p.nav.chord_fired = true;
-                p.nav.chord_since = Some(now);
-            }
-        } else if buttons != held {
-            self.panes[i].nav.recording = Some((started, buttons, now));
-        } else if now - started >= RECORD_FOR {
-            let p = &mut self.panes[i];
-            p.nav.recording = None;
-            p.overlay.notice = Some((crate::t!("toast.chord_none").into(), now + Duration::from_secs(4)));
-        }
     }
 
     /// Copy `i`'s open overlay: its input, and a frame when something changed.
@@ -2297,13 +2329,6 @@ impl SessionHost {
                 Cmd::FreeSeat(k) => self.free_seat(k, i),
                 Cmd::KeyboardStep(d) => self.keyboard_step(d),
                 Cmd::OpenLayoutStudio => self.open_layout_studio(),
-                Cmd::RecordChord => {
-                    let now = Instant::now();
-                    let p = &mut self.panes[i];
-                    p.nav.recording = Some((now, 0, now));
-                    p.overlay.notice = Some((crate::t!("toast.hold_chord").into(), now + RECORD_FOR));
-                    p.render.dirty = true;
-                }
             }
         }
     }

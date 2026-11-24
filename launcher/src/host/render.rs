@@ -194,11 +194,11 @@ mod tests {
         let mut o = Overlay::new("Sample Game".into());
         o.state = state();
         o.paints_background = false;
-        o.open(Page::Home, false);
+        o.open(Page::Players, false);
         let mut o2 = Overlay::new("Sample Game".into());
         o2.state = state();
         o2.paints_background = false;
-        o2.open(Page::Home, false);
+        o2.open(Page::Players, false);
         let (mut prefs, mut prefs2) = (Prefs::default(), Prefs::default());
         let screen = egui::vec2(w as f32 / ppp, h as f32 / ppp);
         let down = Nav { down: true, ..Nav::default() };

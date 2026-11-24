@@ -2,15 +2,16 @@
 //!
 //! Built for controllers first: every page is a list of rows, one selected at a time.
 //! Up / down (d-pad, stick, arrow keys) moves, south (A / Cross, Enter, Space) does the
-//! row's main action, west (X / Square, the Delete key) its second one, left / right
-//! changes a setting, the shoulders (Q / E, Page Up / Down) switch pages, east (B /
-//! Circle, Escape) goes back and closes. The mouse works too: hovering selects a row,
-//! clicking acts.
+//! row's main action, west (X / Square, the Delete or X key) its second one, north (Y /
+//! Triangle, the Y key) its details, left / right changes a setting, the shoulders (Q /
+//! E, Page Up / Down) switch pages, east (B / Circle, Escape) goes back and closes. The
+//! mouse works too: hovering selects a row, clicking acts.
 //!
-//! Four pages: Home (what needs you now: what keeps players out, invites, inviting
-//! everyone, who's here, how you're connected), Players, Network (this PC's firewall,
-//! the home network, the internet) and Settings. A player's profile, the connection
-//! details and the opening hotkeys open from them, and B goes back.
+//! It's for what can be done in the game now; how it looks and opens is set in the
+//! launcher window. Two pages: Players (what keeps them out, invites, everyone once, in
+//! groups) and Network (this PC's firewall, the home network, the internet); a
+//! split-screen session has a third, Split screen, first. A player's page and the
+//! connection details open from them, and B goes back.
 
 use std::time::{Duration, Instant};
 
@@ -188,6 +189,8 @@ pub struct LobbyInfo {
 #[derive(Clone)]
 pub struct PendingInvite {
     pub id: u64,
+    /// The sender's peer id: their row on Players is this invite's.
+    pub from: String,
     pub name: String,
     pub kind: String,
     /// A room code to type into the game (an invite to a game that joins by code).
@@ -248,6 +251,7 @@ impl GameState {
                 .iter()
                 .map(|p| PendingInvite {
                     id: p.get("id").and_then(Value::as_u64).unwrap_or(0),
+                    from: s(p, "from"),
                     name: s(p, "name"),
                     kind: s(p, "kind"),
                     code: s(p, "code"),
@@ -295,15 +299,13 @@ impl GameState {
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum Page {
-    Home,
+    /// A split-screen session's players on this PC (only in a session of two or more).
+    SplitScreen,
     Players,
     Network,
-    Settings,
     Profile(String),
-    /// Network's connection details: the router, port forwarding, ping per player.
+    /// Network's connection details: the router, port forwarding, finding players.
     Details,
-    /// Settings' list of what opens the overlay.
-    Hotkeys,
 }
 
 impl Page {
@@ -312,29 +314,24 @@ impl Page {
         match self {
             Page::Profile(_) => Page::Players,
             Page::Details => Page::Network,
-            Page::Hotkeys => Page::Settings,
             p => p.clone(),
         }
     }
 }
 
-const TABS: [Page; 4] = [Page::Home, Page::Players, Page::Network, Page::Settings];
-
 fn tab_name(p: &Page) -> &'static str {
     match p {
-        Page::Home => t!("overlay.tab_home"),
+        Page::SplitScreen => t!("game.split_screen"),
         Page::Players => t!("overlay.tab_players"),
-        Page::Network => t!("overlay.tab_network"),
-        _ => t!("overlay.tab_settings"),
+        _ => t!("overlay.tab_network"),
     }
 }
 
 fn tab_icon(p: &Page) -> Icon {
     match p {
-        Page::Home => Icon::Home,
+        Page::SplitScreen => Icon::Gamepad,
         Page::Players => Icon::People,
-        Page::Network => Icon::Wifi,
-        _ => Icon::Settings,
+        _ => Icon::Wifi,
     }
 }
 
@@ -347,6 +344,8 @@ pub struct Nav {
     pub right: bool,
     pub select: bool,
     pub second: bool,
+    /// North (Y / Triangle): the row's details.
+    pub third: bool,
     pub back: bool,
     pub prev_tab: bool,
     pub next_tab: bool,
@@ -355,7 +354,7 @@ pub struct Nav {
 
 impl Nav {
     pub fn any(&self) -> bool {
-        self.up || self.down || self.left || self.right || self.select || self.second || self.back || self.prev_tab || self.next_tab || self.close
+        self.up || self.down || self.left || self.right || self.select || self.second || self.third || self.back || self.prev_tab || self.next_tab || self.close
     }
 }
 
@@ -366,8 +365,6 @@ pub enum Cmd {
     Close,
     /// The global settings changed: save them and tell the hook what it needs.
     Prefs,
-    /// Record a controller chord from the buttons held next (mod.rs).
-    RecordChord,
     /// A split-screen session: player `k`'s controller trades places with the next
     /// player's who plays with one.
     SwapSeat(usize),
@@ -404,27 +401,17 @@ enum Action {
     Unblock,
     Accept(usize),
     Decline(usize),
-    ToggleAutoAccept,
-    ToggleToasts,
     ToggleInternet,
-    Scale(i32),
-    Glyphs(i32),
-    Hotkey(usize),
-    RecordChord,
-    ClearChord,
     FixFirewall(bool),
     Open(PageRef),
-    Close,
     None,
 }
 
 /// A page a row opens (`Page` holds a String, so isn't Copy).
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum PageRef {
-    Players,
     Network,
     Details,
-    Hotkeys,
 }
 
 /// How a row reads: plainly, as a problem, or as good news.
@@ -442,13 +429,18 @@ struct Row {
     value: String,
     main: Action,
     second: Action,
+    /// North's: the row's details.
+    third: Action,
     /// left / right
     change: Option<(Action, Action)>,
     main_label: &'static str,
     second_label: &'static str,
+    third_label: &'static str,
     selectable: bool,
     /// A small heading over the rows after it.
     header: bool,
+    /// A quiet line of text, at the foot of a page.
+    note: bool,
     icon: Option<Icon>,
     tone: Tone,
     /// What the row is about, when its title doesn't say it alone (two invites or two
@@ -464,11 +456,14 @@ impl Row {
             value: String::new(),
             main: Action::None,
             second: Action::None,
+            third: Action::None,
             change: None,
             main_label: "",
             second_label: "",
+            third_label: "",
             selectable: false,
             header: false,
+            note: false,
             icon: None,
             tone: Tone::Plain,
             id: String::new(),
@@ -484,6 +479,10 @@ impl Row {
 
     fn header(title: impl Into<String>) -> Row {
         Row { header: true, ..Row::info(title, "") }
+    }
+
+    fn note(text: impl Into<String>) -> Row {
+        Row { note: true, ..Row::info(text, "") }
     }
 
     fn action(title: impl Into<String>, detail: impl Into<String>, main: Action, main_label: &'static str) -> Row {
@@ -511,6 +510,12 @@ impl Row {
         self
     }
 
+    fn third(mut self, a: Action, label: &'static str) -> Row {
+        self.third = a;
+        self.third_label = label;
+        self
+    }
+
     fn is_on(&self) -> bool {
         self.value == t!("common.on")
     }
@@ -518,6 +523,8 @@ impl Row {
 
 /// How long Select waits after the selected row went away (`Overlay::sel_moved`).
 const MOVED_HOLD: Duration = Duration::from_millis(300);
+/// Room each side of the rows, inside their scroll area, for the selected row's glow.
+const LIST_ROOM: f32 = 12.0;
 
 /// A small left (`dir` -1) or right (1) pointing triangle centred on `c`.
 fn arrow(p: &egui::Painter, c: Pos2, dir: f32) {
@@ -590,19 +597,6 @@ pub struct PlayerSeat {
     pub can_swap: bool,
     /// They hold a controller that can be let go.
     pub can_free: bool,
-}
-
-/// The opening hotkeys, in `Prefs.hotkeys`' order.
-const KEY_NAMES: [&str; 4] = ["Shift+Tab", "Shift+F3", "Shift+F1", "Shift+F2"];
-
-/// Which of the hotkeys open the overlay in a game with `foreign` store overlays: the
-/// host's rule (`usable_hotkeys`), with Home / Guide or a chord as the other ways in.
-fn usable_keys(prefs: &Prefs, foreign: &[String]) -> [bool; 4] {
-    let hk = &prefs.hotkeys;
-    // As the host decides it: Home / Guide or a chord that invites everyone instead
-    // doesn't open the overlay.
-    let other = super::guide_opens(prefs) || super::chord_opens(prefs);
-    super::usable_hotkeys([hk.shift_tab, hk.shift_f3, hk.shift_f1, hk.shift_f2], foreign, other)
 }
 
 /// How long Block waits for its second press, and how long Undo is offered after.
@@ -688,7 +682,7 @@ pub fn notice_text(note: &Notice) -> (String, String) {
 impl Overlay {
     pub fn new(game_name: String) -> Overlay {
         Overlay {
-            page: Page::Home,
+            page: Page::Players,
             invite_mode: false,
             sel: 0,
             scroll_to_sel: false,
@@ -799,32 +793,70 @@ impl Overlay {
         rows
     }
 
-    /// Invites waiting for an answer: Accept, or Decline from the second button.
-    fn invites(&self) -> Vec<Row> {
-        self.state
-            .pending
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                let row = if !p.code.is_empty() {
-                    Row::action(t!("overlay.code_from", name = p.name, code = p.code), t!("overlay.code_answer"), Action::Accept(i), t!("overlay.type_code"))
-                        .second(Action::Decline(i), t!("overlay.dismiss"))
-                } else {
-                    Row::action(invite_text(&p.name, &p.kind), t!("overlay.invite_answer"), Action::Accept(i), t!("overlay.accept")).second(Action::Decline(i), t!("overlay.decline"))
-                };
-                Row { id: format!("invite {}", p.id), ..row.icon(Icon::Bell, Tone::Good) }
-            })
-            .collect()
+    /// The tabs: Players and Network, with Split screen first in a split-screen session
+    /// of two or more players.
+    fn tabs(&self) -> Vec<Page> {
+        let mut tabs = vec![Page::Players, Page::Network];
+        if self.split() {
+            tabs.insert(0, Page::SplitScreen);
+        }
+        tabs
     }
 
-    /// Invite everyone on your network: a button when there's somewhere to invite to,
-    /// else just why not (host first, or this game has no invites and how to join it).
-    fn invite_all(&self, detail_when_able: &str) -> Row {
-        let st = &self.state;
-        if !st.can_invite {
-            return Row::info(t!("overlay.invite_all"), st.why_no_invite()).icon(Icon::People, Tone::Plain);
+    /// A split-screen session of two or more players on this PC.
+    fn split(&self) -> bool {
+        self.seats.as_ref().is_some_and(|s| s.players.len() > 1)
+    }
+
+    /// Where the overlay opens when nothing asked for a page: Split screen in a
+    /// split-screen session with no invite waiting, else Players.
+    pub fn landing(&self) -> Page {
+        if self.split() && self.state.pending.is_empty() { Page::SplitScreen } else { Page::Players }
+    }
+
+    /// What keeps players out, at the top of Players so it's seen on opening: the one
+    /// problem itself (the firewall's with Fix), or the first with a way to the rest on
+    /// Network.
+    fn alert(&self) -> Option<Row> {
+        let mut problems = self.problems();
+        if problems.len() <= 1 {
+            return problems.pop();
         }
-        Row::action(t!("overlay.invite_all"), detail_when_able.to_string(), Action::InviteAll, t!("overlay.invite")).icon(Icon::People, Tone::Plain)
+        let first = problems.remove(0);
+        Some(if first.selectable {
+            first.third(Action::Open(PageRef::Network), t!("overlay.tab_network"))
+        } else {
+            Row { main: Action::Open(PageRef::Network), main_label: t!("overlay.open"), selectable: true, detail: t!("overlay.more_problems").into(), ..first }
+        })
+    }
+
+    /// Invite everyone on your network: a button when the game has somewhere to invite to
+    /// and there's someone on the network to invite (or the game asked to invite);
+    /// otherwise why not, when that's worth knowing (a turned-off layer, an official
+    /// service, ...). "Host or join a game first" goes without saying.
+    fn invite_all(&self) -> Option<Row> {
+        let st = &self.state;
+        if st.can_invite {
+            let anyone = st.peers.iter().any(|p| !p.server && !p.with_me && (p.via.is_empty() || p.via == "lan"));
+            if !anyone && !self.invite_mode {
+                return None;
+            }
+            let room = st.lobby.as_ref().is_some_and(|l| l.kind == "photon.room");
+            let detail = if self.invite_mode {
+                t!("overlay.invite_asked")
+            } else if room {
+                t!("overlay.invite_code_detail")
+            } else {
+                t!("overlay.invite_all_detail")
+            };
+            return Some(Row::action(t!("overlay.invite_all"), detail, Action::InviteAll, t!("overlay.invite")).icon(Icon::People, Tone::Plain));
+        }
+        let worth = match &st.invite_block {
+            Some(InviteBlock::HostFirst) => false,
+            Some(_) => true,
+            None => !st.invite_note.is_empty(),
+        };
+        (worth || self.invite_mode).then(|| Row::info(t!("overlay.invite_all"), st.why_no_invite()).icon(Icon::People, Tone::Plain))
     }
 
     /// Types the room code on the clipboard into the game: closes the overlay first.
@@ -832,35 +864,174 @@ impl Overlay {
         Row::action(t!("overlay.paste_code"), t!("overlay.paste_code_detail"), Action::PasteCode, t!("overlay.paste")).icon(Icon::Link, Tone::Plain)
     }
 
-    /// How internet play stands, in one line, for Home.
-    fn online_line(&self) -> Row {
-        let st = &self.state;
-        let (title, detail, tone) = if !st.internet_configured {
-            (t!("overlay.online_unset").to_string(), t!("overlay.online_unset_detail").to_string(), Tone::Plain)
-        } else if !st.internet_on {
-            (t!("overlay.online_paused").to_string(), t!("overlay.online_paused_detail").to_string(), Tone::Plain)
-        } else {
-            let n: usize = st.internet.iter().map(|n| n.peers.len()).sum();
-            let online = st.internet.iter().any(|n| n.online);
-            let what = match (st.internet.iter().any(|n| n.mode == "room"), st.internet.iter().any(|n| n.mode == "public")) {
-                (true, true) => t!("overlay.via_both"),
-                (false, true) => t!("overlay.via_public"),
-                _ => t!("overlay.via_room"),
-            };
-            if online {
-                (t!("overlay.online_on", what = what, n = n), t!("overlay.online_on_detail").to_string(), Tone::Good)
-            } else {
-                (t!("overlay.online_looking", what = what), t!("overlay.online_on_detail").to_string(), Tone::Plain)
-            }
-        };
-        Row::action(title, detail, Action::Open(PageRef::Network), t!("overlay.open")).icon(Icon::Globe, tone)
+    /// The Photon room the game is in: its code to copy, and who's in it.
+    fn room_row(&self, l: &LobbyInfo) -> Row {
+        let members: Vec<String> = l.members.iter().map(|(_, n, owner)| if *owner { t!("overlay.host_name", name = n) } else { n.clone() }).collect();
+        let title = if l.max > 0 { t!("overlay.in_room_max", code = l.id, n = l.members.len(), max = l.max) } else { t!("overlay.in_room", code = l.id, n = l.members.len()) };
+        Row::action(title, members.join(", "), Action::CopyCode, t!("overlay.copy_code")).icon(Icon::Gamepad, Tone::Plain)
     }
 
-    /// A split-screen session's players on this PC: each one's input, with Swap and
-    /// Free for their controllers, and who has the keyboard and mouse.
-    fn seat_rows(&self) -> Vec<Row> {
+    /// The line under the Players tab: the lobby the game is in, its size and service.
+    /// A Photon room has a row of its own instead (its code to copy).
+    fn caption(&self) -> Option<String> {
+        if self.page != Page::Players {
+            return None;
+        }
+        let l = self.state.lobby.as_ref().filter(|l| l.kind != "photon.room")?;
+        let mut text = t!("overlay.in_lobby", n = l.members.len(), max = l.max.max(l.members.len() as u32));
+        if let Some(kind) = lobby_kind(&l.kind) {
+            text.push_str(&format!("  \u{b7}  {kind}"));
+        }
+        Some(text)
+    }
+
+    /// A player's round trip over the internet, as the hook measured it for the tunnel
+    /// of that name.
+    fn ping_of(&self, p: &Peer) -> Option<String> {
+        if !(p.public() || p.via == "room") {
+            return None;
+        }
+        let (_, rtt, _, _, v6) = self.state.internet.iter().flat_map(|n| &n.peers).find(|x| x.0 == p.name)?;
+        let ping = t!("overlay.d_ping", ms = (*rtt)?);
+        Some(if *v6 { t!("overlay.d_ipv6", ping = ping) } else { ping })
+    }
+
+    /// The stand-in address a game that asks for an IP reaches an internet player at.
+    fn ip_to_type(&self, p: &Peer) -> Option<String> {
+        let (.., address, _) = self.state.internet.iter().flat_map(|n| &n.peers).find(|x| x.0 == p.name)?;
+        (!address.is_empty() && address != "hidden").then(|| address.clone())
+    }
+
+    /// A player's line under their name: what they're doing, where they play from, their
+    /// ping over the internet, and a different version of the game.
+    fn peer_detail(&self, p: &Peer) -> String {
+        let mut parts = vec![if p.server {
+            t!("overlay.dedicated_server").to_string()
+        } else if p.with_me {
+            t!("overlay.in_your_lobby").to_string()
+        } else if p.status.is_empty() {
+            t!("overlay.playing").to_string()
+        } else {
+            p.status.clone()
+        }];
+        if p.public() {
+            parts.push(t!("overlay.public_player").to_string());
+        } else if p.via == "room" {
+            parts.push(t!("overlay.your_room").to_string());
+        } else if let Some(ip) = p.shown_ip() {
+            parts.push(ip);
+        }
+        parts.extend(self.ping_of(p));
+        if !p.same_build && !p.server {
+            parts.push(t!("overlay.other_version").to_string());
+        }
+        parts.join("  \u{b7}  ")
+    }
+
+    /// A player's one row, with the same buttons wherever it is: A does the likely thing
+    /// (join them; invite them when the game asked; their voice once they're with you),
+    /// X invites them here, Y their details.
+    fn peer_row(&self, i: usize) -> Row {
+        let st = &self.state;
+        let p = &st.peers[i];
+        let (name, detail) = (p.name.clone(), self.peer_detail(p));
+        let details = (Action::Profile(i), t!("overlay.details"));
+        let r = if p.server {
+            // Join asks the game to join the server (the hook's steamgs.rs).
+            let r = Row::action(name, detail, Action::Join(i), t!("overlay.join"));
+            if p.public() { r.third(details.0, details.1) } else { r }
+        } else if self.invite_mode {
+            Row::action(name, detail, Action::Invite(i), t!("overlay.invite")).third(details.0, details.1)
+        } else if p.with_me && st.voice_in_use {
+            Row::action(name, detail, Action::ToggleMute(i), if p.muted { t!("overlay.unmute") } else { t!("overlay.mute") }).third(details.0, details.1)
+        } else if p.with_me {
+            Row::action(name, detail, details.0, details.1)
+        } else {
+            let r = Row::action(name, detail, Action::Join(i), t!("overlay.join")).third(details.0, details.1);
+            if st.can_invite { r.second(Action::Invite(i), t!("overlay.invite")) } else { r }
+        };
+        let icon = if p.this_pc && !p.server {
+            Icon::Gamepad
+        } else if p.public() {
+            Icon::Globe
+        } else if p.via == "room" {
+            Icon::People
+        } else {
+            Icon::Home
+        };
+        Row { id: format!("peer {}", p.id), ..r.icon(icon, if p.with_me { Tone::Good } else { Tone::Plain }) }
+    }
+
+    /// Players: what keeps them out, what there is to do now (a room code, inviting
+    /// everyone, undoing a block, your microphone), then everyone once: invites first,
+    /// then this PC's other copies, your network, the internet, dedicated servers.
+    fn player_rows(&self) -> Vec<Row> {
+        let st = &self.state;
+        let mut rows: Vec<Row> = self.alert().into_iter().collect();
+        if let Some(l) = st.lobby.as_ref().filter(|l| l.kind == "photon.room") {
+            rows.push(self.room_row(l));
+        }
+        if st.codes {
+            rows.push(self.paste_row());
+        }
+        rows.extend(self.invite_all());
+        if let Some((_, name, _)) = self.blocked.as_ref().filter(|b| b.2.elapsed() < BLOCK_UNDO) {
+            rows.push(Row::action(t!("overlay.blocked_now", name = name), t!("overlay.blocked_now_detail"), Action::Unblock, t!("overlay.undo")).icon(Icon::Shield, Tone::Warn));
+        }
+        if st.voice_in_use {
+            rows.push(Row::toggle(t!("overlay.mic"), t!("overlay.mic_detail"), st.mic_on, Action::ToggleMic).icon(Icon::Mic, Tone::Plain));
+        }
+        // Who sent an invite is listed with it, not again below.
+        let mut listed = Vec::new();
+        if !st.pending.is_empty() {
+            rows.push(Row::header(t!("overlay.sec_invites")));
+        }
+        for (k, inv) in st.pending.iter().enumerate() {
+            let from = st.peers.iter().position(|p| !inv.from.is_empty() && p.id == inv.from);
+            listed.extend(from);
+            let row = if !inv.code.is_empty() {
+                Row::action(t!("overlay.code_from", name = inv.name, code = inv.code), t!("overlay.code_answer"), Action::Accept(k), t!("overlay.type_code"))
+                    .second(Action::Decline(k), t!("overlay.dismiss"))
+            } else {
+                let detail = from.map_or_else(|| t!("overlay.invite_answer").to_string(), |i| self.peer_detail(&st.peers[i]));
+                let r = Row::action(invite_text(&inv.name, &inv.kind), detail, Action::Accept(k), t!("overlay.accept")).second(Action::Decline(k), t!("overlay.decline"));
+                // Their details too: a stranger sending invites can be blocked from there.
+                match from {
+                    Some(i) => r.third(Action::Profile(i), t!("overlay.details")),
+                    None => r,
+                }
+            };
+            rows.push(Row { id: format!("invite {}", inv.id), ..row.icon(Icon::Bell, Tone::Good) });
+        }
+        let groups: [(&str, fn(&Peer) -> bool); 4] = [
+            (t!("overlay.net_pc"), |p| p.this_pc && !p.server),
+            (t!("overlay.net_home"), |p| !p.this_pc && !p.server && (p.via.is_empty() || p.via == "lan")),
+            (t!("overlay.net_internet"), |p| !p.this_pc && !p.server && (p.via == "room" || p.public())),
+            (t!("overlay.sec_servers"), |p| p.server),
+        ];
+        for (title, belongs) in groups {
+            // A server can't be invited anywhere.
+            let members: Vec<usize> = (0..st.peers.len()).filter(|&i| belongs(&st.peers[i]) && !listed.contains(&i) && !(st.peers[i].server && self.invite_mode)).collect();
+            if members.is_empty() {
+                continue;
+            }
+            rows.push(Row::header(title));
+            rows.extend(members.into_iter().map(|i| self.peer_row(i)));
+        }
+        if st.peers.is_empty() && st.pending.is_empty() {
+            rows.push(Row::info(t!("overlay.no_players"), t!("overlay.no_players_detail")));
+        }
+        rows
+    }
+
+    /// A split-screen session's players on this PC: Layout Studio, each player's
+    /// controller (Swap, Free), and who has the keyboard and mouse.
+    fn split_rows(&self) -> Vec<Row> {
         let Some(s) = self.seats.as_ref().filter(|s| s.players.len() > 1) else { return Vec::new() };
-        let mut rows = vec![Row::header(t!("overlay.this_pc"))];
+        let mut rows = vec![
+            Row::action(t!("overlay.arrange_panes"), t!("overlay.arrange_panes_detail"), Action::ArrangePanes, t!("overlay.open")).icon(Icon::Sliders, Tone::Plain),
+            Row::header(t!("overlay.sec_controllers")),
+        ];
         for (k, p) in s.players.iter().enumerate() {
             let title = if k == s.me { t!("overlay.player_you", n = k + 1) } else { t!("overlay.player_n", n = k + 1) };
             let mut row = if p.can_swap {
@@ -875,291 +1046,126 @@ impl Overlay {
             }
             rows.push(Row { id: format!("seat {k}"), ..row.icon(Icon::Gamepad, Tone::Plain) });
         }
+        rows.push(Row::header(t!("overlay.seat_kbm")));
         let kbm_val = match s.keyboard {
             Some(k) => t!("overlay.player_n", n = k + 1),
             None => t!("common.off").to_string(),
         };
         rows.push(
-            Row::setting(
-                t!("overlay.keyboard_to"),
-                t!("overlay.keyboard_to_detail"),
-                kbm_val,
-                Action::KeyboardStep(1),
-                (Action::KeyboardStep(-1), Action::KeyboardStep(1)),
-            )
-            .icon(Icon::Keyboard, Tone::Plain),
-        );
-        rows.push(
-            Row::action(t!("overlay.arrange_panes"), t!("overlay.arrange_panes_detail"), Action::ArrangePanes, t!("overlay.open"))
-                .icon(Icon::Sliders, Tone::Plain),
+            Row::setting(t!("overlay.keyboard_to"), t!("overlay.keyboard_to_detail"), kbm_val, Action::KeyboardStep(1), (Action::KeyboardStep(-1), Action::KeyboardStep(1)))
+                .icon(Icon::Keyboard, Tone::Plain),
         );
         rows
     }
 
-    fn rows(&self, prefs: &Prefs) -> Vec<Row> {
+    /// Network: this PC's problems (the firewall fixed here), the home network, internet
+    /// play and its switch.
+    fn network_rows(&self) -> Vec<Row> {
         let st = &self.state;
+        let mut rows = Vec::new();
+        let problems = self.problems();
+        if !problems.is_empty() || st.lan_unreachable.is_some() {
+            rows.push(Row::header(t!("overlay.net_pc")));
+        }
+        if problems.is_empty() && st.lan_unreachable.is_some() {
+            rows.push(Row::info(t!("overlay.net_fw_ok"), t!("overlay.net_fw_ok_detail")).icon(Icon::Shield, Tone::Good));
+        }
+        rows.extend(problems);
+        rows.push(Row::header(t!("overlay.net_home")));
+        let near = st.peers.iter().filter(|p| p.via.is_empty() || p.via == "lan").count();
+        rows.push(Row::info(t!("overlay.net_near", n = near), t!("overlay.net_near_detail")).icon(Icon::Home, if near > 0 { Tone::Good } else { Tone::Plain }));
+        rows.push(Row::header(t!("overlay.net_internet")));
+        // The switch has no left / right value, so those still switch pages from it.
+        if !st.internet_configured {
+            rows.push(Row::info(t!("overlay.net_unset"), t!("overlay.net_unset_detail")).icon(Icon::Globe, Tone::Plain));
+        } else {
+            rows.push(
+                Row::toggle(t!("overlay.net_switch"), if st.internet_on { t!("overlay.net_switch_on") } else { t!("overlay.net_switch_off") }, st.internet_on, Action::ToggleInternet)
+                    .icon(Icon::Globe, if st.internet_on { Tone::Good } else { Tone::Plain }),
+            );
+        }
+        if st.internet_on {
+            for n in &st.internet {
+                let title = if n.mode == "public" { t!("overlay.net_public", n = n.peers.len()) } else { t!("overlay.net_room", n = n.peers.len()) };
+                let detail = if n.online { t!("overlay.net_online", nat = if n.nat.is_empty() { t!("overlay.unknown").to_string() } else { n.nat.clone() }) } else { t!("overlay.net_looking").to_string() };
+                rows.push(Row::info(title, detail).icon(if n.mode == "public" { Icon::Globe } else { Icon::People }, if n.online { Tone::Good } else { Tone::Plain }));
+            }
+        }
+        if !st.internet.is_empty() || !st.sdks.is_empty() {
+            rows.push(Row::action(t!("overlay.details_title"), t!("overlay.details_sub"), Action::Open(PageRef::Details), t!("overlay.open")).icon(Icon::Info, Tone::Plain));
+        }
+        rows.push(Row::note(t!("overlay.no_addresses")));
+        rows
+    }
+
+    /// Connection details: per kind of internet play, the router, port forwarding and
+    /// finding players; and the game's services PeerParty answers for. Each player's
+    /// ping is on their own row and page.
+    fn details_rows(&self) -> Vec<Row> {
+        let st = &self.state;
+        let mut rows = Vec::new();
+        for n in &st.internet {
+            rows.push(Row::header(if n.mode == "public" { t!("overlay.via_public") } else { t!("overlay.via_room") }));
+            rows.push(Row::info(t!("overlay.d_router"), if n.nat.is_empty() { t!("overlay.unknown").to_string() } else { n.nat.clone() }));
+            rows.push(Row::info(t!("overlay.d_ports"), if n.port_map.is_empty() { t!("overlay.d_ports_none").to_string() } else { n.port_map.clone() }));
+            rows.push(Row::info(t!("overlay.d_dht"), t!("overlay.d_dht_detail", nodes = n.dht_nodes, found = n.found)));
+            if n.blocked > 0 {
+                rows.push(Row::info(t!("overlay.d_blocked"), n.blocked.to_string()));
+            }
+        }
+        if !st.sdks.is_empty() {
+            rows.push(Row::header(t!("overlay.through")));
+            rows.push(Row::info(st.sdks.iter().map(|s| sdk_label(s)).collect::<Vec<_>>().join(", "), "").icon(Icon::Link, Tone::Plain));
+        }
+        rows.push(Row::note(t!("overlay.no_addresses")));
+        rows
+    }
+
+    /// One player's page: who and where they are, how they're connected, and only what
+    /// can be done with them (no Invite or Join once they're with you, no Invite for a
+    /// server or where the game can't).
+    fn profile_rows(&self, id: &str) -> Vec<Row> {
+        let st = &self.state;
+        let Some((i, p)) = st.peers.iter().enumerate().find(|(_, p)| p.id == id) else {
+            return vec![Row::info(t!("overlay.left"), "")];
+        };
+        let mut rows = vec![Row::info(p.name.clone(), self.peer_detail(p))];
+        let mut conn = p.connection();
+        if let Some(ping) = self.ping_of(p) {
+            conn.push_str(&format!("  \u{b7}  {ping}"));
+        }
+        if let Some(ip) = self.ip_to_type(p) {
+            conn.push_str(&t!("overlay.d_ip_to_type", ip = ip));
+        }
+        rows.push(Row::info(t!("overlay.connection"), conn));
+        if st.voice_in_use && !p.server {
+            rows.push(Row::toggle(t!("overlay.mute_them"), t!("overlay.mute_them_detail"), p.muted, Action::ToggleMute(i)).icon(Icon::Mic, Tone::Plain));
+        }
+        if !p.with_me && !p.server && st.can_invite {
+            rows.push(Row::action(t!("overlay.invite_to_yours"), "", Action::Invite(i), t!("overlay.invite")).icon(Icon::People, Tone::Plain));
+        }
+        if !p.with_me {
+            rows.push(Row::action(t!("overlay.join_theirs"), "", Action::Join(i), t!("overlay.join")).icon(Icon::Play, Tone::Plain));
+        }
+        if p.public() {
+            let armed = self.block_armed.as_ref().is_some_and(|(a, at)| a == &p.id && at.elapsed() < BLOCK_ARMED);
+            let row = if armed {
+                Row::action(t!("overlay.block_sure", name = p.name), t!("overlay.block_detail"), Action::Block(i), t!("overlay.block_again"))
+            } else {
+                Row::action(t!("overlay.block"), t!("overlay.block_detail"), Action::Block(i), t!("overlay.block_button"))
+            };
+            rows.push(Row { id: "block".into(), ..row.icon(Icon::Shield, Tone::Warn) });
+        }
+        rows
+    }
+
+    fn rows(&self) -> Vec<Row> {
         match &self.page {
-            Page::Home => {
-                let mut rows = self.problems();
-                rows.extend(self.invites());
-                let room = st.lobby.as_ref().is_some_and(|l| l.kind == "photon.room");
-                rows.push(self.invite_all(if room { t!("overlay.invite_code_detail") } else { t!("overlay.invite_all_detail") }));
-                if st.codes {
-                    rows.push(self.paste_row());
-                }
-                // Players and dedicated servers are counted apart: a server isn't a player.
-                let list = |server: bool| -> Vec<&str> { st.peers.iter().filter(|p| p.server == server).map(|p| p.name.as_str()).collect() };
-                let shown = |names: &[&str]| {
-                    let shown = names.iter().take(4).copied().collect::<Vec<_>>().join(", ");
-                    let more = if names.len() > 4 { t!("overlay.and_more", n = names.len() - 4) } else { String::new() };
-                    format!("{shown}{more}")
-                };
-                let names = list(false);
-                let servers = list(true);
-                let who = if !names.is_empty() {
-                    Row::action(t!("overlay.players_here", n = names.len()), shown(&names), Action::Open(PageRef::Players), t!("overlay.open"))
-                } else if servers.is_empty() {
-                    Row::action(t!("overlay.nobody_yet"), t!("overlay.nobody_yet_detail"), Action::Open(PageRef::Players), t!("overlay.open"))
-                } else {
-                    Row::info(t!("overlay.nobody_yet"), t!("overlay.nobody_yet_detail"))
-                };
-                rows.push(who.icon(Icon::People, if names.is_empty() { Tone::Plain } else { Tone::Good }));
-                if !servers.is_empty() {
-                    let row = Row::action(t!("overlay.servers_here", n = servers.len()), shown(&servers), Action::Open(PageRef::Players), t!("overlay.open"));
-                    rows.push(Row { id: "servers here".into(), ..row.icon(Icon::Home, Tone::Good) });
-                }
-                let lobby = match &st.lobby {
-                    Some(l) if l.kind == "photon.room" => {
-                        let members: Vec<String> = l.members.iter().map(|(_, n, owner)| if *owner { t!("overlay.host_name", name = n) } else { n.clone() }).collect();
-                        let title = if l.max > 0 {
-                            t!("overlay.in_room_max", code = l.id, n = l.members.len(), max = l.max)
-                        } else {
-                            t!("overlay.in_room", code = l.id, n = l.members.len())
-                        };
-                        Row::action(title, members.join(", "), Action::CopyCode, t!("overlay.copy_code"))
-                    }
-                    Some(l) => {
-                        let members: Vec<String> = l.members.iter().map(|(_, n, owner)| if *owner { t!("overlay.host_name", name = n) } else { n.clone() }).collect();
-                        let mut detail = members.join(", ");
-                        if let Some(kind) = lobby_kind(&l.kind) {
-                            detail.push_str(&format!("  \u{b7}  {kind}"));
-                        }
-                        Row::info(t!("overlay.in_lobby", n = l.members.len(), max = l.max.max(l.members.len() as u32)), detail)
-                    }
-                    None => Row::info(t!("overlay.no_lobby"), t!("overlay.no_lobby_detail")),
-                };
-                rows.push(lobby.icon(Icon::Gamepad, Tone::Plain));
-                rows.push(self.online_line());
-                if !st.sdks.is_empty() {
-                    rows.push(Row::info(t!("overlay.through"), st.sdks.iter().map(|s| sdk_label(s)).collect::<Vec<_>>().join(", ")).icon(Icon::Link, Tone::Plain));
-                }
-                rows.push(Row::action(t!("overlay.back_to_game"), "", Action::Close, t!("overlay.close")));
-                rows
-            }
-            Page::Players => {
-                let mut rows = Vec::new();
-                if self.invite_mode {
-                    rows.push(self.invite_all(t!("overlay.invite_asked")));
-                }
-                rows.extend(self.invites());
-                if st.codes {
-                    rows.push(self.paste_row());
-                }
-                if let Some((_, name, _)) = self.blocked.as_ref().filter(|b| b.2.elapsed() < BLOCK_UNDO) {
-                    rows.push(Row::action(t!("overlay.blocked_now", name = name), t!("overlay.blocked_now_detail"), Action::Unblock, t!("overlay.undo")).icon(Icon::Shield, Tone::Warn));
-                }
-                if st.voice_in_use {
-                    rows.push(Row::toggle(t!("overlay.mic"), t!("overlay.mic_detail"), st.mic_on, Action::ToggleMic).icon(Icon::Mic, Tone::Plain));
-                }
-                if !self.invite_mode {
-                    rows.extend(self.seat_rows());
-                }
-                if st.peers.is_empty() {
-                    rows.push(Row::info(t!("overlay.no_players"), t!("overlay.no_players_detail")));
-                }
-                for (i, p) in st.peers.iter().enumerate() {
-                    // A server can't be invited anywhere.
-                    if p.server && self.invite_mode {
-                        continue;
-                    }
-                    let mut detail = if p.server {
-                        t!("overlay.dedicated_server").to_string()
-                    } else if p.with_me {
-                        t!("overlay.in_your_lobby").to_string()
-                    } else if p.status.is_empty() {
-                        t!("overlay.playing").to_string()
-                    } else {
-                        p.status.clone()
-                    };
-                    if p.public() {
-                        detail.push_str(&format!("  \u{b7}  {}", t!("overlay.public_player")));
-                    } else if p.via == "room" {
-                        detail.push_str(&format!("  \u{b7}  {}", t!("overlay.your_room")));
-                    } else if let Some(ip) = p.shown_ip() {
-                        detail.push_str(&format!("  \u{b7}  {ip}"));
-                    }
-                    if !p.same_build && !p.server {
-                        detail.push_str(&format!("  \u{b7}  {}", t!("overlay.other_version")));
-                    }
-                    let icon = if p.public() { Icon::Globe } else if p.via == "room" { Icon::People } else { Icon::Home };
-                    // A joins them (X invites them here); opened from the game's own
-                    // invite button, A invites; someone already in your lobby, A shows
-                    // their details.
-                    let r = if p.server && p.public() {
-                        Row::action(p.name.clone(), detail, Action::Join(i), t!("overlay.join")).second(Action::Profile(i), t!("overlay.details"))
-                    } else if p.server {
-                        // Join asks the game to join the server (the hook's steamgs.rs).
-                        Row::action(p.name.clone(), detail, Action::Join(i), t!("overlay.join"))
-                    } else if p.with_me {
-                        Row::action(p.name.clone(), detail, Action::Profile(i), t!("overlay.details"))
-                    } else if self.invite_mode {
-                        Row::action(p.name.clone(), detail, Action::Invite(i), t!("overlay.invite"))
-                    } else if p.public() {
-                        // Strangers: their details (and Block) are one button away.
-                        Row::action(p.name.clone(), detail, Action::Join(i), t!("overlay.join")).second(Action::Profile(i), t!("overlay.details"))
-                    } else {
-                        Row::action(p.name.clone(), detail, Action::Join(i), t!("overlay.join")).second(Action::Invite(i), t!("overlay.invite"))
-                    };
-                    rows.push(Row { id: format!("peer {}", p.id), ..r.icon(icon, if p.with_me { Tone::Good } else { Tone::Plain }) });
-                }
-                rows
-            }
-            Page::Network => {
-                let mut rows = Vec::new();
-                let problems = self.problems();
-                if !problems.is_empty() || st.lan_unreachable.is_some() {
-                    rows.push(Row::header(t!("overlay.net_pc")));
-                }
-                if problems.is_empty() && st.lan_unreachable.is_some() {
-                    rows.push(Row::info(t!("overlay.net_fw_ok"), t!("overlay.net_fw_ok_detail")).icon(Icon::Shield, Tone::Good));
-                }
-                rows.extend(problems);
-                rows.push(Row::header(t!("overlay.net_home")));
-                let near = st.peers.iter().filter(|p| p.via.is_empty() || p.via == "lan").count();
-                rows.push(Row::info(t!("overlay.net_near", n = near), t!("overlay.net_near_detail")).icon(Icon::Home, if near > 0 { Tone::Good } else { Tone::Plain }));
-                rows.push(Row::header(t!("overlay.net_internet")));
-                // The switch has no left / right value, so those still switch pages from it.
-                if !st.internet_configured {
-                    rows.push(Row::info(t!("overlay.net_unset"), t!("overlay.net_unset_detail")).icon(Icon::Globe, Tone::Plain));
-                } else {
-                    rows.push(
-                        Row::toggle(t!("overlay.net_switch"), if st.internet_on { t!("overlay.net_switch_on") } else { t!("overlay.net_switch_off") }, st.internet_on, Action::ToggleInternet)
-                            .icon(Icon::Globe, if st.internet_on { Tone::Good } else { Tone::Plain }),
-                    );
-                }
-                if st.internet_on {
-                    for n in &st.internet {
-                        let title = if n.mode == "public" { t!("overlay.net_public", n = n.peers.len()) } else { t!("overlay.net_room", n = n.peers.len()) };
-                        let detail = if n.online { t!("overlay.net_online", nat = if n.nat.is_empty() { t!("overlay.unknown").to_string() } else { n.nat.clone() }) } else { t!("overlay.net_looking").to_string() };
-                        rows.push(Row::info(title, detail).icon(if n.mode == "public" { Icon::Globe } else { Icon::People }, if n.online { Tone::Good } else { Tone::Plain }));
-                    }
-                    if !st.internet.is_empty() {
-                        rows.push(Row::action(t!("overlay.details_title"), t!("overlay.details_sub"), Action::Open(PageRef::Details), t!("overlay.open")).icon(Icon::Info, Tone::Plain));
-                    }
-                }
-                rows.push(Row::action(t!("overlay.back_to_game"), t!("overlay.no_addresses"), Action::Close, t!("overlay.close")));
-                rows
-            }
-            Page::Details => {
-                let mut rows = Vec::new();
-                for n in &st.internet {
-                    rows.push(Row::header(if n.mode == "public" { t!("overlay.via_public") } else { t!("overlay.via_room") }));
-                    rows.push(Row::info(t!("overlay.d_router"), if n.nat.is_empty() { t!("overlay.unknown").to_string() } else { n.nat.clone() }));
-                    rows.push(Row::info(t!("overlay.d_ports"), if n.port_map.is_empty() { t!("overlay.d_ports_none").to_string() } else { n.port_map.clone() }));
-                    rows.push(Row::info(t!("overlay.d_dht"), t!("overlay.d_dht_detail", nodes = n.dht_nodes, found = n.found)));
-                    if n.blocked > 0 {
-                        rows.push(Row::info(t!("overlay.d_blocked"), n.blocked.to_string()));
-                    }
-                    for (name, rtt, resent, address, v6) in &n.peers {
-                        let ping = rtt.map_or(t!("overlay.d_no_ping").to_string(), |r| t!("overlay.d_ping", ms = r));
-                        let ping = if *v6 { t!("overlay.d_ipv6", ping = ping) } else { ping };
-                        let lost = if *resent > 0 { t!("overlay.d_resent", n = resent) } else { String::new() };
-                        let ip = if address.is_empty() || address == "hidden" { String::new() } else { t!("overlay.d_ip_to_type", ip = address) };
-                        rows.push(Row::info(format!("    {name}"), format!("{ping}{lost}{ip}")));
-                    }
-                }
-                rows.push(Row::action(t!("common.back"), t!("overlay.no_addresses"), Action::Open(PageRef::Network), t!("common.back")));
-                rows
-            }
-            Page::Settings => {
-                // The keys that open it in this game: one a store overlay loaded here
-                // opens on too is left to that overlay (host's `usable_hotkeys`).
-                let usable = usable_keys(prefs, &st.foreign);
-                let keys: Vec<&str> = KEY_NAMES.iter().zip(usable).filter(|k| k.1).map(|k| *k.0).collect();
-                let mut open_with = keys.join(", ");
-                if super::guide_opens(prefs) {
-                    if !open_with.is_empty() {
-                        open_with.push_str(", ");
-                    }
-                    open_with.push_str(t!("overlay.home_button"));
-                }
-                vec![
-                    // The top row has no left / right value, so those still switch pages
-                    // from the top of the list.
-                    Row::toggle(t!("settings.toasts"), t!("overlay.s_toasts_detail"), prefs.toasts, Action::ToggleToasts),
-                    Row::toggle(t!("together.auto_accept"), t!("overlay.s_auto_accept_detail"), prefs.auto_accept, Action::ToggleAutoAccept),
-                    Row::header(t!("settings.look")),
-                    Row::setting(t!("settings.size"), "", format!("{:.0}%", prefs.overlay_scale * 100.0), Action::Scale(1), (Action::Scale(-1), Action::Scale(1))),
-                    Row::setting(
-                        t!("settings.glyphs"),
-                        "",
-                        crate::ui::shared::glyph_label(&prefs.glyphs),
-                        Action::Glyphs(1),
-                        (Action::Glyphs(-1), Action::Glyphs(1)),
-                    ),
-                    Row::action(t!("settings.open_with"), if open_with.is_empty() { t!("overlay.none").to_string() } else { open_with }, Action::Open(PageRef::Hotkeys), t!("overlay.open")).icon(Icon::Keyboard, Tone::Plain),
-                    Row::info(t!("overlay.your_name", name = st.me), t!("overlay.your_name_detail")).icon(Icon::Person, Tone::Plain),
-                ]
-            }
-            Page::Hotkeys => {
-                let hk = &prefs.hotkeys;
-                let usable = usable_keys(prefs, &st.foreign);
-                let on = [hk.shift_tab, hk.shift_f3, hk.shift_f1, hk.shift_f2];
-                let detail = |i: usize, own: &'static str| -> String {
-                    // On, but this game's store overlay has it.
-                    if on[i] && !usable[i] { t!("toast.key_left", key = KEY_NAMES[i], store = super::HOTKEY_OWNERS[i].1) } else { own.to_string() }
-                };
-                vec![
-                    Row::toggle("Shift+Tab", detail(0, t!("settings.key_steam")), hk.shift_tab, Action::Hotkey(0)),
-                    Row::toggle("Shift+F3", detail(1, t!("settings.key_epic")), hk.shift_f3, Action::Hotkey(1)),
-                    Row::toggle("Shift+F1", detail(2, t!("settings.key_ea")), hk.shift_f1, Action::Hotkey(2)),
-                    Row::toggle("Shift+F2", detail(3, t!("settings.key_ubisoft")), hk.shift_f2, Action::Hotkey(3)),
-                    Row::toggle(t!("settings.key_guide"), t!("settings.key_guide_sub"), hk.guide, Action::Hotkey(4)),
-                    Row {
-                        value: if hk.chord.count_ones() >= 2 { super::pad::names(hk.chord) } else { t!("overlay.none").into() },
-                        main: Action::RecordChord,
-                        main_label: t!("overlay.chord_set"),
-                        second: Action::ClearChord,
-                        second_label: t!("overlay.none"),
-                        selectable: true,
-                        ..Row::info(t!("settings.chord"), t!("overlay.chord_detail"))
-                    },
-                ]
-            }
-            Page::Profile(id) => {
-                let Some((i, p)) = st.peers.iter().enumerate().find(|(_, p)| &p.id == id) else {
-                    return vec![Row::info(t!("overlay.left"), "")];
-                };
-                let mut rows = vec![Row::info(p.name.clone(), if p.with_me { t!("overlay.in_your_lobby") } else { p.reach() }), Row::info(t!("overlay.connection"), p.connection())];
-                if !p.status.is_empty() {
-                    rows.push(Row::info(t!("overlay.status"), p.status.clone()));
-                }
-                if st.voice_in_use && !p.server {
-                    rows.push(Row::toggle(t!("overlay.mute_them"), t!("overlay.mute_them_detail"), p.muted, Action::ToggleMute(i)).icon(Icon::Mic, Tone::Plain));
-                }
-                rows.push(Row::action(t!("overlay.invite_to_yours"), "", Action::Invite(i), t!("overlay.invite")));
-                rows.push(Row::action(t!("overlay.join_theirs"), "", Action::Join(i), t!("overlay.join")));
-                if p.public() {
-                    let armed = self.block_armed.as_ref().is_some_and(|(a, at)| a == &p.id && at.elapsed() < BLOCK_ARMED);
-                    let row = if armed {
-                        Row::action(t!("overlay.block_sure", name = p.name), t!("overlay.block_detail"), Action::Block(i), t!("overlay.block_again"))
-                    } else {
-                        Row::action(t!("overlay.block"), t!("overlay.block_detail"), Action::Block(i), t!("overlay.block_button"))
-                    };
-                    rows.push(Row { id: "block".into(), ..row.icon(Icon::Shield, Tone::Warn) });
-                }
-                rows
-            }
+            Page::SplitScreen => self.split_rows(),
+            Page::Players => self.player_rows(),
+            Page::Network => self.network_rows(),
+            Page::Details => self.details_rows(),
+            Page::Profile(id) => self.profile_rows(id),
         }
     }
 
@@ -1236,20 +1242,10 @@ impl Overlay {
             }
             Action::Open(to) => {
                 let page = match to {
-                    PageRef::Players => Page::Players,
                     PageRef::Network => Page::Network,
                     PageRef::Details => Page::Details,
-                    PageRef::Hotkeys => Page::Hotkeys,
                 };
                 self.open(page, false);
-            }
-            Action::ToggleAutoAccept => {
-                prefs.auto_accept = !prefs.auto_accept;
-                out.push(Cmd::Prefs);
-            }
-            Action::ToggleToasts => {
-                prefs.toasts = !prefs.toasts;
-                out.push(Cmd::Prefs);
             }
             Action::ToggleInternet => {
                 // Flips what the game reports (an environment value may differ from the
@@ -1260,39 +1256,11 @@ impl Overlay {
                 out.push(msg(HostMsg::Set { key: "internet".into(), value: if on { "on" } else { "off" }.into() }));
                 self.state.internet_on = on;
             }
-            Action::Scale(d) => {
-                prefs.overlay_scale = crate::ui::shared::step_overlay_scale(prefs.overlay_scale, d);
-                out.push(Cmd::Prefs);
-            }
-            Action::Glyphs(d) => {
-                let opts = crate::ui::shared::GLYPH_VALUES;
-                let i = opts.iter().position(|o| *o == prefs.glyphs).unwrap_or(0) as i32;
-                prefs.glyphs = opts[(i + d).rem_euclid(opts.len() as i32) as usize].to_string();
-                out.push(Cmd::Prefs);
-            }
-            Action::Hotkey(i) => {
-                let hk = &mut prefs.hotkeys;
-                let b = match i {
-                    0 => &mut hk.shift_tab,
-                    1 => &mut hk.shift_f3,
-                    2 => &mut hk.shift_f1,
-                    3 => &mut hk.shift_f2,
-                    _ => &mut hk.guide,
-                };
-                *b = !*b;
-                out.push(Cmd::Prefs);
-            }
-            Action::RecordChord => out.push(Cmd::RecordChord),
             Action::SwapSeat(k) => out.push(Cmd::SwapSeat(k)),
             Action::FreeSeat(k) => out.push(Cmd::FreeSeat(k)),
             Action::KeyboardStep(d) => out.push(Cmd::KeyboardStep(d)),
             Action::ArrangePanes => out.push(Cmd::OpenLayoutStudio),
             Action::FixFirewall(public) => out.push(Cmd::FixFirewall(public)),
-            Action::ClearChord => {
-                prefs.hotkeys.chord = 0;
-                out.push(Cmd::Prefs);
-            }
-            Action::Close => out.push(Cmd::Close),
             Action::None => {}
         }
     }
@@ -1311,7 +1279,6 @@ impl Overlay {
         match self.page {
             Page::Profile(_) => Some(Page::Players),
             Page::Details => Some(Page::Network),
-            Page::Hotkeys => Some(Page::Settings),
             _ => None,
         }
     }
@@ -1327,13 +1294,18 @@ impl Overlay {
         if replay {
             nav = Nav::default();
         }
+        // Split screen's tab goes with the session's second player.
+        if self.page == Page::SplitScreen && !self.split() {
+            self.open(Page::Players, self.invite_mode);
+        }
         // The rows are built once a frame, and again only when something this frame
         // changed them (another page opened, a row's action done).
-        let mut rows = self.rows(prefs);
+        let mut rows = self.rows();
         self.follow(&rows);
         if self.sel_moved.is_some_and(|t| t.elapsed() < MOVED_HOLD) {
             nav.select = false;
             nav.second = false;
+            nav.third = false;
         }
         // Left / right change the selected row's value when it has one, and switch pages
         // otherwise.
@@ -1348,15 +1320,16 @@ impl Overlay {
         }
         // Page switching and closing.
         let (page_before, invite_before) = (self.page.clone(), self.invite_mode);
-        let tab_i = TABS.iter().position(|p| *p == self.page.tab()).unwrap_or(0);
+        let tabs = self.tabs();
+        let tab_i = tabs.iter().position(|p| *p == self.page.tab()).unwrap_or(0);
         if nav.next_tab || nav.prev_tab {
-            let n = TABS.len() as i32;
+            let n = tabs.len() as i32;
             let i = (tab_i as i32 + if nav.next_tab { 1 } else { -1 }).rem_euclid(n) as usize;
-            self.open(TABS[i].clone(), false);
+            self.open(tabs[i].clone(), false);
         }
         // The tab to highlight is the one switched to just now (frames are only drawn
         // on input, so a stale one would stay until the next button press).
-        let tab_i = TABS.iter().position(|p| *p == self.page.tab()).unwrap_or(0);
+        let tab_i = tabs.iter().position(|p| *p == self.page.tab()).unwrap_or(0);
         if nav.close {
             out.push(Cmd::Close);
         }
@@ -1367,7 +1340,7 @@ impl Overlay {
             }
         }
         if self.page != page_before || self.invite_mode != invite_before {
-            rows = self.rows(prefs);
+            rows = self.rows();
         }
         let selectable: Vec<usize> = rows.iter().enumerate().filter(|(_, r)| r.selectable).map(|(i, _)| i).collect();
         if !selectable.contains(&self.sel) {
@@ -1390,6 +1363,8 @@ impl Overlay {
                 nav_action = r.main;
             } else if nav.second {
                 nav_action = r.second;
+            } else if nav.third {
+                nav_action = r.third;
             } else if nav.left {
                 nav_action = r.change.map(|c| c.0).unwrap_or(Action::None);
             } else if nav.right {
@@ -1398,7 +1373,7 @@ impl Overlay {
         }
         let rows = if nav_action != Action::None {
             self.act(nav_action, prefs, out);
-            let rows = self.rows(prefs);
+            let rows = self.rows();
             let selectable: Vec<usize> = rows.iter().enumerate().filter(|(_, r)| r.selectable).map(|(i, _)| i).collect();
             if !selectable.contains(&self.sel) {
                 self.sel = selectable.first().copied().unwrap_or(0);
@@ -1439,13 +1414,11 @@ impl Overlay {
         let mut x = inner.left();
         icons::glyph(&painter, Pos2::new(x + 13.0, tabs_y + 16.0), Glyph::Lb, style);
         x += 34.0;
-        for (i, page) in TABS.iter().enumerate() {
+        for (i, page) in tabs.iter().enumerate() {
             let name = tab_name(page);
             let badge = match page {
                 Page::Players if !self.state.pending.is_empty() => Some((self.state.pending.len().to_string(), GOOD)),
-                Page::Network if self.firewall.is_some() || self.state.lan_unreachable.is_some_and(|n| n > 0) || self.state.other_version > 0 => {
-                    Some(("!".to_string(), theme::WARN))
-                }
+                Page::Network if !self.problems().is_empty() => Some(("!".to_string(), theme::WARN)),
                 _ => None,
             };
             let tw = painter.layout_no_wrap(name.to_string(), theme::strong(14.0), TEXT).size().x;
@@ -1474,139 +1447,161 @@ impl Overlay {
             x += w + 6.0;
         }
         icons::glyph(&painter, Pos2::new(x + 13.0, tabs_y + 16.0), Glyph::Rb, style);
-        // A sub-page says where it is.
+        // A sub-page says where it is, and a click there goes back; Players says which
+        // lobby the game is in.
         let mut top = tabs_y + 46.0;
         let crumb = match &self.page {
             Page::Profile(_) => Some(t!("overlay.crumb_player")),
             Page::Details => Some(t!("overlay.details_title")),
-            Page::Hotkeys => Some(t!("settings.open_with")),
             _ => None,
         };
         if let Some(c) = crumb {
             Icon::Back.paint(&painter, Pos2::new(inner.left() + 8.0, top + 9.0), 12.0, DIM);
-            painter.text(Pos2::new(inner.left() + 22.0, top + 9.0), Align2::LEFT_CENTER, c, theme::strong(13.0), TEXT2);
+            let t = painter.text(Pos2::new(inner.left() + 22.0, top + 9.0), Align2::LEFT_CENTER, c, theme::strong(13.0), TEXT2);
+            let hit = Rect::from_min_max(Pos2::new(inner.left(), top - 2.0), Pos2::new(t.right() + 8.0, top + 20.0));
+            if ui.interact(hit, ui.scope_id().with("crumb"), egui::Sense::click()).clicked() && !replay {
+                if let Some(parent) = self.parent() {
+                    self.open(parent, false);
+                    ui.ctx().request_discard("the overlay went back");
+                }
+            }
+            top += 24.0;
+        } else if let Some(c) = self.caption() {
+            Icon::Gamepad.paint(&painter, Pos2::new(inner.left() + 8.0, top + 9.0), 12.0, DIM);
+            painter.text(Pos2::new(inner.left() + 22.0, top + 9.0), Align2::LEFT_CENTER, c, theme::font(13.0), DIM);
             top += 24.0;
         }
 
-        // Rows.
-        let list = Rect::from_min_max(Pos2::new(inner.left(), top), Pos2::new(inner.right(), inner.bottom() - 36.0));
+        // Rows. The scroll area reaches into the panel's margin, with that room inside
+        // it, so the selected row's glow isn't cut off at its edges.
+        let list = Rect::from_min_max(Pos2::new(inner.left() - LIST_ROOM, top), Pos2::new(inner.right() + LIST_ROOM, inner.bottom() - 36.0));
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(list));
         let scroll_to = std::mem::take(&mut self.scroll_to_sel);
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(&mut child, |ui| {
-            for (i, row) in rows.iter().enumerate() {
-                if row.header {
-                    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), egui::Sense::hover());
-                    ui.painter().text(Pos2::new(rect.left() + 4.0, rect.bottom() - 8.0), Align2::LEFT_BOTTOM, row.title.to_uppercase(), theme::strong(11.5), theme::TEXT3);
-                    continue;
-                }
-                // The detail wraps (up to three lines) in the room left of the buttons or
-                // value on the right; a longer one makes the row taller.
-                let width = ui.available_width();
-                let text_x = if row.icon.is_some() { 57.0 } else { 16.0 };
-                let right_w = if !row.value.is_empty() { 150.0 } else if row.selectable { 220.0 } else { 0.0 };
-                let tw = (width - text_x - right_w - 8.0).max(80.0);
-                let detail = (!row.detail.is_empty()).then(|| {
-                    let mut job = egui::text::LayoutJob::simple(row.detail.clone(), theme::font(12.5), DIM, tw);
-                    job.wrap.max_rows = 3;
-                    ui.painter().layout_job(job)
-                });
-                let line = 17.0;
-                let h = match &detail {
-                    None => 44.0,
-                    Some(d) => 58.0 + (d.size().y - line).max(0.0),
-                };
-                let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), h), if row.selectable { egui::Sense::click() } else { egui::Sense::hover() });
-                let selected = row.selectable && i == self.sel;
-                if row.selectable && resp.hovered() && resp.ctx.input(|inp| inp.pointer.delta() != Vec2::ZERO) {
-                    self.sel = i;
-                }
-                let p = ui.painter();
-                let body = rect.shrink2(Vec2::new(0.0, 2.5));
-                let tone = match row.tone {
-                    Tone::Warn => theme::WARN,
-                    Tone::Good => GOOD,
-                    Tone::Plain => ACCENT_HI,
-                };
-                if selected {
-                    fx::glow(p, body, 11.0, ACCENT.gamma_multiply(0.30), 12.0);
-                    fx::gradient(p, body, 11.0, false, &[(0.0, ROW_SEL), (1.0, theme::mix(ROW, ROW_SEL, 0.45))]);
-                    fx::gradient(p, body, 11.0, true, &[(0.0, Color32::from_white_alpha(22)), (0.5, Color32::TRANSPARENT)]);
-                    let bar = Rect::from_min_size(Pos2::new(body.left() + 1.0, body.center().y - 12.0), Vec2::new(3.0, 24.0));
-                    fx::glow(p, bar, 1.5, ACCENT_HI.gamma_multiply(0.8), 8.0);
-                    p.rect_filled(bar, 1.5, Color32::WHITE);
-                } else if row.selectable {
-                    p.rect_filled(body, 11.0, ROW);
-                } else if row.tone == Tone::Warn {
-                    p.rect_filled(body, 11.0, theme::WARN.gamma_multiply(0.07));
-                }
-                if row.tone == Tone::Warn {
-                    p.rect_stroke(body, 11.0, Stroke::new(1.0, theme::WARN.gamma_multiply(0.45)), egui::StrokeKind::Inside);
-                }
-                let mut tx = rect.left() + 16.0;
-                if let Some(icon) = row.icon {
-                    let tile = Rect::from_center_size(Pos2::new(rect.left() + 30.0, rect.center().y), Vec2::splat(30.0));
-                    let c = if row.tone == Tone::Plain && !selected { DIM } else { tone };
-                    p.rect_filled(tile, 9.0, c.gamma_multiply(if selected { 0.32 } else { 0.16 }));
-                    icon.paint(p, tile.center(), 15.0, theme::mix(c, Color32::WHITE, 0.3));
-                    tx = tile.right() + 12.0;
-                }
-                // The text stops short of the buttons or value on the right.
-                let title_y = if row.detail.is_empty() { rect.center().y } else { rect.top() + 21.0 };
-                let tg = p.layout_no_wrap(row.title.clone(), theme::strong(15.5), if row.selectable || row.tone != Tone::Plain { TEXT } else { TEXT2 });
-                p.with_clip_rect(Rect::from_min_size(Pos2::new(tx, rect.top()), Vec2::new(tw, rect.height()))).galley(Pos2::new(tx, title_y - tg.size().y / 2.0), tg, TEXT);
-                if let Some(dg) = detail {
-                    p.galley(Pos2::new(tx, rect.top() + 31.0), dg, DIM);
-                }
-                let mut rx = rect.right() - 14.0;
-                if !row.value.is_empty() {
-                    if row.change.is_some() {
-                        // Room for the right arrow.
-                        rx -= 10.0;
+            egui::Frame::new().inner_margin(egui::Margin { left: LIST_ROOM as i8, right: LIST_ROOM as i8, top: 6, bottom: 8 }).show(ui, |ui| {
+                for (i, row) in rows.iter().enumerate() {
+                    if row.header {
+                        let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), egui::Sense::hover());
+                        ui.painter().text(Pos2::new(rect.left() + 4.0, rect.bottom() - 8.0), Align2::LEFT_BOTTOM, row.title.to_uppercase(), theme::strong(11.5), theme::TEXT3);
+                        continue;
                     }
-                    if row.is_on() || row.value == t!("common.off") {
-                        // A switch, drawn as one (shared with launcher/src/ui/widgets.rs).
-                        let on = row.is_on();
-                        let sw = Rect::from_min_size(Pos2::new(rx - 40.0, rect.center().y - 11.0), Vec2::new(40.0, 22.0));
-                        crate::ui::shared::paint_switch(p, sw, if on { 1.0 } else { 0.0 }, selected);
-                    } else {
-                        let g = p.text(Pos2::new(rx, rect.center().y), Align2::RIGHT_CENTER, &row.value, theme::strong(14.5), TEXT);
-                        if selected && row.change.is_some() {
-                            arrow(p, Pos2::new(g.left() - 10.0, rect.center().y), -1.0);
-                            arrow(p, Pos2::new(g.right() + 10.0, rect.center().y), 1.0);
-                        }
+                    if row.note {
+                        let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), egui::Sense::hover());
+                        ui.painter().text(Pos2::new(rect.left() + 4.0, rect.center().y + 2.0), Align2::LEFT_CENTER, &row.title, theme::font(12.0), theme::TEXT3);
+                        continue;
                     }
-                } else if row.selectable {
-                    // Buttons on the right: clickable, with their controller glyph.
-                    for (action, label, g) in [(row.second, row.second_label, Glyph::West), (row.main, row.main_label, Glyph::South)] {
-                        if action == Action::None || label.is_empty() {
-                            continue;
+                    // The detail wraps (up to three lines) in the room left of the buttons or
+                    // value on the right; a longer one makes the row taller.
+                    let width = ui.available_width();
+                    let text_x = if row.icon.is_some() { 57.0 } else { 16.0 };
+                    let right_w = if !row.value.is_empty() { 150.0 } else if row.selectable { 220.0 } else { 0.0 };
+                    let tw = (width - text_x - right_w - 8.0).max(80.0);
+                    let detail = (!row.detail.is_empty()).then(|| {
+                        let mut job = egui::text::LayoutJob::simple(row.detail.clone(), theme::font(12.5), DIM, tw);
+                        job.wrap.max_rows = 3;
+                        ui.painter().layout_job(job)
+                    });
+                    let line = 17.0;
+                    let h = match &detail {
+                        None => 44.0,
+                        Some(d) => 58.0 + (d.size().y - line).max(0.0),
+                    };
+                    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), h), if row.selectable { egui::Sense::click() } else { egui::Sense::hover() });
+                    let selected = row.selectable && i == self.sel;
+                    if row.selectable && resp.hovered() && resp.ctx.input(|inp| inp.pointer.delta() != Vec2::ZERO) {
+                        self.sel = i;
+                    }
+                    let p = ui.painter();
+                    let body = rect.shrink2(Vec2::new(0.0, 2.5));
+                    let tone = match row.tone {
+                        Tone::Warn => theme::WARN,
+                        Tone::Good => GOOD,
+                        Tone::Plain => ACCENT_HI,
+                    };
+                    if selected {
+                        fx::glow(p, body, 11.0, ACCENT.gamma_multiply(0.30), 12.0);
+                        fx::gradient(p, body, 11.0, false, &[(0.0, ROW_SEL), (1.0, theme::mix(ROW, ROW_SEL, 0.45))]);
+                        fx::gradient(p, body, 11.0, true, &[(0.0, Color32::from_white_alpha(22)), (0.5, Color32::TRANSPARENT)]);
+                        let bar = Rect::from_min_size(Pos2::new(body.left() + 1.0, body.center().y - 12.0), Vec2::new(3.0, 24.0));
+                        fx::glow(p, bar, 1.5, ACCENT_HI.gamma_multiply(0.8), 8.0);
+                        p.rect_filled(bar, 1.5, Color32::WHITE);
+                    } else if row.selectable {
+                        p.rect_filled(body, 11.0, ROW);
+                    } else if row.tone == Tone::Warn {
+                        p.rect_filled(body, 11.0, theme::WARN.gamma_multiply(0.07));
+                    }
+                    if row.tone == Tone::Warn {
+                        p.rect_stroke(body, 11.0, Stroke::new(1.0, theme::WARN.gamma_multiply(0.45)), egui::StrokeKind::Inside);
+                    }
+                    let mut tx = rect.left() + 16.0;
+                    if let Some(icon) = row.icon {
+                        let tile = Rect::from_center_size(Pos2::new(rect.left() + 30.0, rect.center().y), Vec2::splat(30.0));
+                        let c = if row.tone == Tone::Plain && !selected { DIM } else { tone };
+                        p.rect_filled(tile, 9.0, c.gamma_multiply(if selected { 0.32 } else { 0.16 }));
+                        icon.paint(p, tile.center(), 15.0, theme::mix(c, Color32::WHITE, 0.3));
+                        tx = tile.right() + 12.0;
+                    }
+                    // The text stops short of the buttons or value on the right.
+                    let title_y = if row.detail.is_empty() { rect.center().y } else { rect.top() + 21.0 };
+                    let tg = p.layout_no_wrap(row.title.clone(), theme::strong(15.5), if row.selectable || row.tone != Tone::Plain { TEXT } else { TEXT2 });
+                    p.with_clip_rect(Rect::from_min_size(Pos2::new(tx, rect.top()), Vec2::new(tw, rect.height()))).galley(Pos2::new(tx, title_y - tg.size().y / 2.0), tg, TEXT);
+                    if let Some(dg) = detail {
+                        p.galley(Pos2::new(tx, rect.top() + 31.0), dg, DIM);
+                    }
+                    let mut rx = rect.right() - 14.0;
+                    if !row.value.is_empty() {
+                        if row.change.is_some() {
+                            // Room for the right arrow.
+                            rx -= 10.0;
                         }
-                        let w = 42.0 + ui.painter().layout_no_wrap(label.to_string(), theme::strong(13.0), TEXT).size().x;
-                        let br = Rect::from_min_size(Pos2::new(rx - w, rect.center().y - 15.0), Vec2::new(w, 30.0));
-                        let bresp = ui.interact(br, ui.scope_id().with(("btn", i, label)), egui::Sense::click());
-                        let p = ui.painter();
-                        let fill = if bresp.hovered() { Color32::from_rgb(76, 116, 200) } else if selected { Color32::from_white_alpha(30) } else { Color32::from_white_alpha(14) };
-                        p.rect_filled(br, 15.0, fill);
-                        if selected {
-                            icons::glyph(p, Pos2::new(br.left() + 16.0, br.center().y), g, style);
+                        if row.is_on() || row.value == t!("common.off") {
+                            // A switch, drawn as one (shared with launcher/src/ui/widgets.rs).
+                            let on = row.is_on();
+                            let sw = Rect::from_min_size(Pos2::new(rx - 40.0, rect.center().y - 11.0), Vec2::new(40.0, 22.0));
+                            crate::ui::shared::paint_switch(p, sw, if on { 1.0 } else { 0.0 }, selected);
                         } else {
-                            p.circle_stroke(Pos2::new(br.left() + 16.0, br.center().y), 6.0, Stroke::new(1.2, Color32::from_white_alpha(50)));
+                            let g = p.text(Pos2::new(rx, rect.center().y), Align2::RIGHT_CENTER, &row.value, theme::strong(14.5), TEXT);
+                            if selected && row.change.is_some() {
+                                arrow(p, Pos2::new(g.left() - 10.0, rect.center().y), -1.0);
+                                arrow(p, Pos2::new(g.right() + 10.0, rect.center().y), 1.0);
+                            }
                         }
-                        p.text(Pos2::new(br.left() + 30.0, br.center().y), Align2::LEFT_CENTER, label, theme::strong(13.0), TEXT);
-                        if bresp.clicked() && !replay {
-                            pending_action = action;
+                    } else if row.selectable {
+                        // Buttons on the right, A's leftmost: clickable, with their controller
+                        // glyph on the selected row only (elsewhere a glyph-sized gap reads as
+                        // an empty radio button).
+                        for (action, label, g) in [(row.third, row.third_label, Glyph::North), (row.second, row.second_label, Glyph::West), (row.main, row.main_label, Glyph::South)] {
+                            if action == Action::None || label.is_empty() {
+                                continue;
+                            }
+                            let text_w = ui.painter().layout_no_wrap(label.to_string(), theme::strong(13.0), TEXT).size().x;
+                            let w = text_w + if selected { 42.0 } else { 26.0 };
+                            let br = Rect::from_min_size(Pos2::new(rx - w, rect.center().y - 15.0), Vec2::new(w, 30.0));
+                            let bresp = ui.interact(br, ui.scope_id().with(("btn", i, label)), egui::Sense::click());
+                            let p = ui.painter();
+                            let fill = if bresp.hovered() { Color32::from_rgb(76, 116, 200) } else if selected { Color32::from_white_alpha(30) } else { Color32::from_white_alpha(14) };
+                            p.rect_filled(br, 15.0, fill);
+                            if selected {
+                                icons::glyph(p, Pos2::new(br.left() + 16.0, br.center().y), g, style);
+                                p.text(Pos2::new(br.left() + 30.0, br.center().y), Align2::LEFT_CENTER, label, theme::strong(13.0), TEXT);
+                            } else {
+                                p.text(br.center(), Align2::CENTER_CENTER, label, theme::strong(13.0), TEXT2);
+                            }
+                            if bresp.clicked() && !replay {
+                                pending_action = action;
+                            }
+                            rx = br.left() - 8.0;
                         }
-                        rx = br.left() - 8.0;
+                    }
+                    if resp.clicked() && !replay && row.selectable && pending_action == Action::None {
+                        self.sel = i;
+                        pending_action = row.main;
+                    }
+                    if selected && scroll_to {
+                        ui.scroll_to_rect(rect, None);
                     }
                 }
-                if resp.clicked() && !replay && row.selectable && pending_action == Action::None {
-                    self.sel = i;
-                    pending_action = row.main;
-                }
-                if selected && scroll_to {
-                    ui.scroll_to_rect(rect, None);
-                }
-            }
+            });
         });
 
         // Footer: what the buttons do on the selected row (only the ones that do
@@ -1621,6 +1616,9 @@ impl Overlay {
             }
             if r.second != Action::None && !r.second_label.is_empty() {
                 hints.push((Glyph::West, r.second_label));
+            }
+            if r.third != Action::None && !r.third_label.is_empty() {
+                hints.push((Glyph::North, r.third_label));
             }
         }
         hints.push((Glyph::East, if self.parent().is_some() { t!("hint.back") } else { t!("overlay.close") }));
@@ -1799,14 +1797,13 @@ mod tests {
             ],
             "can_invite": true,
             "internet": [{"mode": "public", "online": true, "nat": "symmetric 192.0.2.9",
-                "port_map": "UPnP: external port 5000 at 203.0.113.7:5000", "peers": [{"name": "1.1.1.1", "rtt_ms": 5, "address": "198.18.7.9"}, {"name": "Zed", "rtt_ms": 6, "address": "203.0.113.8"}]}]
+                "port_map": "UPnP: external port 5000 at 203.0.113.7:5000", "peers": [{"name": "Pat", "rtt_ms": 5, "address": "198.18.7.9"}, {"name": "1.1.1.1", "rtt_ms": 6, "address": "203.0.113.8"}]}]
         }));
-        let prefs = Prefs::default();
         let mut text = String::new();
         let pages = [Page::Network, Page::Details, Page::Players, Page::Profile("bb".into()), Page::Profile("cc".into()), Page::Profile("dd".into()), Page::Profile("ee".into())];
         for page in pages {
             o.open(page, false);
-            for r in o.rows(&prefs) {
+            for r in o.rows() {
                 text.push_str(&format!("{} | {} | {}\n", r.title, r.detail, r.value));
             }
         }
@@ -1828,7 +1825,7 @@ mod tests {
         assert!(out.is_empty(), "one press blocked");
         o.act(Action::Block(1), &mut prefs, &mut out);
         assert!(matches!(&out[..], [Cmd::Hook(HostMsg::Block { peer })] if peer == "cc"));
-        let undo = o.rows(&prefs).into_iter().find(|r| r.main == Action::Unblock).expect("no Undo row");
+        let undo = o.rows().into_iter().find(|r| r.main == Action::Unblock).expect("no Undo row");
         assert!(undo.title.contains(&o.state.peers[1].name), "{}", undo.title);
         out.clear();
         o.act(Action::Unblock, &mut prefs, &mut out);
@@ -1846,24 +1843,24 @@ mod tests {
             "peers": [
                 {"id": "bb", "name": "My World", "server": true, "ip": "192.168.1.20", "via": "lan", "same_build": false},
                 {"id": "cc", "name": "Sam", "ip": "192.168.1.31", "via": "lan", "same_build": false}
-            ]
+            ],
+            "can_invite": true
         }));
         o.open(Page::Players, false);
-        let rows = o.rows(&Prefs::default());
+        let rows = o.rows();
         let server = rows.iter().find(|r| r.title == "My World").expect("the server is listed");
         assert_eq!(server.detail, "Dedicated server  \u{b7}  192.168.1.20");
-        assert!(server.main == Action::Join(0) && server.second_label.is_empty());
+        assert!(server.main == Action::Join(0) && server.second_label.is_empty() && server.third_label.is_empty());
         let sam = rows.iter().find(|r| r.title == "Sam").unwrap();
         assert!(sam.detail.contains("a different version of the game"), "a player still gets the warning");
         assert!(!sam.second_label.is_empty(), "a player can still be invited");
         o.open(Page::Players, true);
-        let rows = o.rows(&Prefs::default());
+        let rows = o.rows();
         assert!(!rows.iter().any(|r| r.title == "My World"), "nothing to invite a server to");
-        // Home counts the player and the server apart.
-        o.open(Page::Home, false);
-        let rows = o.rows(&Prefs::default());
-        assert!(rows.iter().any(|r| r.title == "1 other player" && r.detail == "Sam"));
-        assert!(rows.iter().any(|r| r.title == "1 dedicated server" && r.detail == "My World"));
+        // Players and servers are listed apart, each under its heading.
+        o.open(Page::Players, false);
+        let headers: Vec<String> = o.rows().iter().filter(|r| r.header).map(|r| r.title.clone()).collect();
+        assert_eq!(headers, [t!("overlay.net_home"), t!("overlay.sec_servers")]);
     }
 
     /// A new player is "playing too", a new server "is running", and the player's
@@ -1892,40 +1889,24 @@ mod tests {
     fn voice_switches_show_while_voice_is_on() {
         let mut o = Overlay::new("Game".into());
         o.state = sample_state();
-        let prefs = Prefs::default();
         o.open(Page::Players, false);
-        assert!(!o.rows(&prefs).iter().any(|r| r.main == Action::ToggleMic), "no voice, no switch");
+        assert!(!o.rows().iter().any(|r| r.main == Action::ToggleMic), "no voice, no switch");
         o.state.voice_in_use = true;
         o.state.mic_on = true;
-        assert!(o.rows(&prefs).iter().any(|r| r.main == Action::ToggleMic));
+        assert!(o.rows().iter().any(|r| r.main == Action::ToggleMic));
+        // Someone in your lobby: A mutes them right from their row.
+        let sam = o.rows().into_iter().find(|r| r.title == "Sam").unwrap();
+        assert_eq!((sam.main, sam.main_label, sam.third), (Action::ToggleMute(0), t!("overlay.mute"), Action::Profile(0)));
         let mut out = Vec::new();
         let mut p = Prefs::default();
         o.act(Action::ToggleMic, &mut p, &mut out);
         assert!(matches!(&out[..], [Cmd::Hook(HostMsg::Mic { on: false })]));
         let id = o.state.peers[0].id.clone();
         o.open(Page::Profile(id.clone()), false);
-        assert!(o.rows(&prefs).iter().any(|r| r.main == Action::ToggleMute(0)));
+        assert!(o.rows().iter().any(|r| r.main == Action::ToggleMute(0)));
         out.clear();
         o.act(Action::ToggleMute(0), &mut p, &mut out);
         assert!(matches!(&out[..], [Cmd::Hook(HostMsg::Mute { peer, on: true })] if *peer == id));
-    }
-
-    /// With Steam's overlay loaded in the game, Shift+Tab is left to it: Settings lists
-    /// what does open the overlay, and the key's row says where Shift+Tab goes.
-    #[test]
-    fn a_key_left_to_a_store_overlay_isnt_listed_as_opening_it() {
-        let mut o = Overlay::new("Game".into());
-        o.state = sample_state();
-        o.state.foreign = vec!["steam".into()];
-        let mut prefs = Prefs::default();
-        prefs.hotkeys.shift_tab = true;
-        prefs.hotkeys.shift_f3 = true;
-        o.open(Page::Settings, false);
-        let row = o.rows(&prefs).into_iter().find(|r| r.main == Action::Open(PageRef::Hotkeys)).unwrap();
-        assert!(row.detail.contains("Shift+F3") && !row.detail.contains("Shift+Tab"), "{}", row.detail);
-        o.open(Page::Hotkeys, false);
-        let tab = o.rows(&prefs).into_iter().find(|r| r.title == "Shift+Tab").unwrap();
-        assert!(tab.detail.contains("Steam"), "{}", tab.detail);
     }
 
     #[test]
@@ -1934,7 +1915,7 @@ mod tests {
         o.state = sample_state();
         assert!(o.state.internet_on && o.state.internet_configured, "an older hook's state reads as on and set up");
         o.open(Page::Network, false);
-        let rows = o.rows(&Prefs::default());
+        let rows = o.rows();
         let top = rows.iter().find(|r| r.selectable).unwrap();
         assert_eq!((top.title.as_str(), top.value.as_str()), ("Internet play", "On"));
         assert!(top.change.is_none(), "left / right stay free for switching pages");
@@ -1946,7 +1927,7 @@ mod tests {
         o.act(Action::ToggleInternet, &mut prefs, &mut out);
         assert!(!prefs.internet);
         assert!(matches!(&out[..], [Cmd::Prefs, Cmd::Hook(HostMsg::Set { key, value })] if key == "internet" && value == "off"));
-        let rows = o.rows(&prefs);
+        let rows = o.rows();
         assert_eq!(rows.iter().find(|r| r.selectable).unwrap().value, "Off");
         assert!(!rows.iter().any(|r| r.title.starts_with("Your room")), "no status while off");
 
@@ -1962,12 +1943,12 @@ mod tests {
         assert!(matches!(&out[..], [Cmd::Prefs, Cmd::Hook(HostMsg::Set { value, .. })] if value == "on"));
 
         o.state = GameState::from_json(&serde_json::json!({"t": "state", "internet_on": true, "internet_configured": false, "internet": []}));
-        let rows = o.rows(&Prefs::default());
+        let rows = o.rows();
         assert!(rows.iter().all(|r| r.main != Action::ToggleInternet));
         assert!(rows.iter().any(|r| r.title == "Internet play isn't set up"));
     }
 
-    /// A firewall problem is the Network page's first row (and Home's): Fix asks the host to fix it
+    /// A firewall problem is the Network page's first row (and Players'): Fix asks the host to fix it
     /// (public networks too from the second button), and players we can't reach get a
     /// row saying where to fix it. Without either (an older hook), nothing extra shows.
     #[test]
@@ -1976,14 +1957,14 @@ mod tests {
         o.state = sample_state();
         assert_eq!(o.state.lan_unreachable, None, "an older hook doesn't say");
         o.open(Page::Network, false);
-        let rows = o.rows(&Prefs::default());
+        let rows = o.rows();
         assert!(!rows.iter().any(|r| matches!(r.main, Action::FixFirewall(_)) || r.title.contains("can't be reached")));
 
         let mut v = serde_json::json!({"t": "state", "internet": [], "lan_unreachable": 2});
         o.state = GameState::from_json(&v);
         assert_eq!(o.state.lan_unreachable, Some(2));
         o.firewall = Some(Firewall { title: "Windows Firewall blocks game.exe".into(), detail: "Other players can't connect to you".into() });
-        let rows = o.rows(&Prefs::default());
+        let rows = o.rows();
         let top = rows.iter().find(|r| r.selectable).unwrap();
         assert_eq!(top.title, "Windows Firewall blocks game.exe");
         assert!(top.main == Action::FixFirewall(false) && top.second == Action::FixFirewall(true));
@@ -1997,14 +1978,18 @@ mod tests {
         o.act(Action::FixFirewall(true), &mut prefs, &mut out);
         assert!(matches!(&out[..], [Cmd::FixFirewall(false), Cmd::FixFirewall(true)]));
 
-        o.open(Page::Home, false);
-        let home = o.rows(&Prefs::default());
-        assert_eq!(home.iter().find(|r| r.selectable).unwrap().title, "Windows Firewall blocks game.exe", "Home leads with it too");
+        o.open(Page::Players, false);
+        let players = o.rows();
+        let top = players.iter().find(|r| r.selectable).unwrap();
+        assert_eq!(top.title, "Windows Firewall blocks game.exe", "Players leads with it too");
+        // Two problems: the first, Fix and all, with a way to the other on Network.
+        assert!(top.main == Action::FixFirewall(false) && top.third == Action::Open(PageRef::Network));
+        assert!(!players.iter().any(|r| r.title.contains("can't be reached")), "the rest are on Network");
         o.open(Page::Network, false);
         v["lan_unreachable"] = 0.into();
         o.state = GameState::from_json(&v);
         o.firewall = None;
-        let rows = o.rows(&Prefs::default());
+        let rows = o.rows();
         assert!(!rows.iter().any(|r| matches!(r.main, Action::FixFirewall(_)) || r.title.contains("can't be reached")));
     }
 
@@ -2015,18 +2000,18 @@ mod tests {
         let mut o = Overlay::new("Game".into());
         o.state = GameState::from_json(&serde_json::json!({"t": "state", "internet": [], "lan_unreachable": 0, "lan_other_version": 2, "lan_newer_version": true}));
         o.open(Page::Network, false);
-        let rows = o.rows(&Prefs::default());
+        let rows = o.rows();
         let row = rows.iter().find(|r| r.title == "2 players of this game run a different version of PeerParty").expect("the row");
         assert!(row.detail.starts_with("Theirs is newer: update PeerParty on this PC"), "{}", row.detail);
         o.state = GameState::from_json(&serde_json::json!({"t": "state", "internet": [], "lan_other_version": 1, "lan_newer_version": false}));
-        let rows = o.rows(&Prefs::default());
+        let rows = o.rows();
         let row = rows.iter().find(|r| r.title == "A player of this game runs a different version of PeerParty").expect("the row");
         assert!(row.detail.starts_with("Theirs is older: they need to update"), "{}", row.detail);
         o.state = GameState::from_json(&serde_json::json!({"t": "state", "internet": []}));
-        assert!(!o.rows(&Prefs::default()).iter().any(|r| r.title.contains("PeerParty")));
+        assert!(!o.rows().iter().any(|r| r.title.contains("PeerParty")));
     }
 
-    /// Left on the Network page's switch row goes to Players, right to Settings.
+    /// Left or right on the Network page's switch row goes to Players (the other tab).
     #[test]
     fn internet_switch_leaves_left_right_to_pages() {
         let ctx = egui::Context::default();
@@ -2038,7 +2023,7 @@ mod tests {
         o.open(Page::Network, false);
         draw(&ctx, &mut tex, &mut o, &mut prefs, Nav::default());
         draw(&ctx, &mut tex, &mut o, &mut prefs, Nav { right: true, ..Nav::default() });
-        assert_eq!(o.page, Page::Settings);
+        assert_eq!(o.page, Page::Players);
         assert!(prefs.internet, "switching pages doesn't flip it");
         o.open(Page::Network, false);
         draw(&ctx, &mut tex, &mut o, &mut prefs, Nav::default());
@@ -2059,12 +2044,15 @@ mod tests {
         o.state = sample_state();
         let (w, h) = (1600usize, 900usize);
         let dir = std::env::var_os("PEERPARTY_PREVIEW_DIR");
-        for (i, page) in [Page::Home, Page::Players, Page::Network, Page::Settings, Page::Details].into_iter().enumerate() {
+        let pages = [Page::Players, Page::SplitScreen, Page::Network, Page::Details, Page::Profile("cc".into())];
+        for (i, page) in pages.into_iter().enumerate() {
+            // The second, a split-screen session's own tab (and three tabs).
+            o.seats = (i == 1).then(two_seats);
             o.open(page, false);
             o.style = [Style::Xbox, Style::PlayStation, Style::Nintendo, Style::Xbox, Style::PlayStation][i];
-            // The settings page with a message and a tip under the panel.
+            // A page with a message and a tip under the panel.
             if i == 3 {
-                o.notice = Some(("Hold two or more controller buttons together for a second".into(), std::time::Instant::now() + std::time::Duration::from_secs(5)));
+                o.notice = Some(("Invite sent: to Sam".into(), std::time::Instant::now() + std::time::Duration::from_secs(5)));
                 o.tip = Some("Tip: if Game Bar opens too, turn off Settings > Gaming > Game Bar".into());
             }
             let mut canvas = Canvas::new(w, h);
@@ -2101,7 +2089,7 @@ mod tests {
         }
     }
 
-    /// A game hosting a session that takes no invites (a Photon room): Home says how the
+    /// A game hosting a session that takes no invites (a Photon room): Players says how the
     /// others join it, in the overlay's language, and offers no Invite button.
     #[test]
     fn a_game_without_invites_says_how_to_join() {
@@ -2110,8 +2098,8 @@ mod tests {
         o.state = sample_state();
         o.state.can_invite = false;
         o.state.invite_block = Some(InviteBlock::PhotonRoom("EUCSH".into()));
-        o.open(Page::Home, false);
-        let rows = o.rows(&Prefs::default());
+        o.open(Page::Players, false);
+        let rows = o.rows();
         let row = rows.iter().find(|r| r.title == t!("overlay.invite_all")).unwrap();
         assert!(!row.selectable, "nothing to press");
         assert!(row.detail.contains("game's own menu") && row.detail.ends_with("(room EUCSH)"), "{}", row.detail);
@@ -2132,8 +2120,8 @@ mod tests {
         }
     }
 
-    /// A game whose Steam layer the player turned off: Home says so at the top, with what
-    /// that costs and where it's turned back on, and the invite row names the layer
+    /// A game whose Steam layer the player turned off: Network says so, with what that
+    /// costs and where it's turned back on, and Players' invite row names the layer
     /// instead of asking to host first. The hook's other invite notes are translated too.
     #[test]
     fn a_turned_off_layer_is_named_with_what_it_costs() {
@@ -2146,14 +2134,16 @@ mod tests {
         o.state.layers_off = st.layers_off;
         // The hook's invite.rs LAYERS_OFF note.
         o.state.invite_block = Some(InviteBlock::LayersOff(vec!["steam".into()]));
-        o.open(Page::Home, false);
-        let rows = o.rows(&Prefs::default());
+        o.open(Page::Network, false);
+        let rows = o.rows();
         let steam = rows.iter().find(|r| r.title == t!("overlay.layer_off", name = t!("layer.steam"))).expect("a row for the Steam layer");
         assert!(steam.detail.starts_with(t!("off.steam")) && steam.detail.ends_with(t!("overlay.layer_off_where")), "{}", steam.detail);
         assert!(rows.iter().any(|r| r.title == t!("overlay.layer_off", name = t!("layer.padblock"))));
         // A layer the game page doesn't list: named as written, turned back on where it was turned off.
         let calls = rows.iter().find(|r| r.title == t!("overlay.layer_off", name = "calls")).unwrap();
         assert_eq!(calls.detail, t!("overlay.layer_off_env"));
+        o.open(Page::Players, false);
+        let rows = o.rows();
         let invite = rows.iter().find(|r| r.title == t!("overlay.invite_all")).unwrap();
         assert_eq!(invite.detail, t!("hook.layers_off", names = t!("layer.steam")));
         assert!(invite.detail.contains("Steam lobbies") && !invite.detail.contains("Host or join"), "{}", invite.detail);
@@ -2214,7 +2204,7 @@ mod tests {
         assert_eq!(o.notice.as_ref().map(|(s, _)| s.as_str()), Some("Saved: Your game was saved"));
     }
 
-    /// A Photon room: Home says which room we're in and who is there (not "no lobby"),
+    /// A Photon room: Players says which room we're in and who is there,
     /// Invite sends the code, a received code is typed in from a row, and pasting closes
     /// the overlay.
     #[test]
@@ -2225,10 +2215,10 @@ mod tests {
         o.state.codes = true;
         o.state.can_invite = true;
         o.state.lobby = Some(LobbyInfo { id: "EOXBY".into(), kind: "photon.room".into(), max: 0, members: vec![("a".into(), "Timber".into(), true), ("b".into(), "Lola".into(), false)] });
-        o.state.pending = vec![PendingInvite { id: 7, name: "Lola".into(), kind: "sent you a room code".into(), code: "QWERT".into() }];
-        o.open(Page::Home, false);
-        let rows = o.rows(&Prefs::default());
-        assert!(rows.iter().all(|r| r.title != t!("overlay.no_lobby")));
+        o.state.pending = vec![PendingInvite { id: 7, from: String::new(), name: "Lola".into(), kind: "sent you a room code".into(), code: "QWERT".into() }];
+        o.open(Page::Players, false);
+        let rows = o.rows();
+        assert_eq!(o.caption(), None, "the room has its row, not the lobby line");
         let room = rows.iter().find(|r| r.title.contains("EOXBY")).expect("room row");
         assert!(room.title.contains('2') && room.detail.contains("Lola"), "{} / {}", room.title, room.detail);
         assert_eq!(room.main, Action::CopyCode);
@@ -2279,9 +2269,9 @@ mod tests {
         let (mut tex, mut prefs) = (Textures::default(), Prefs::default());
         let mut o = Overlay::new("Game".into());
         o.state = invites_state(&[(3, "Alex"), (4, "Pat")], 0);
-        o.open(Page::Home, false);
+        o.open(Page::Players, false);
         press(&ctx, &mut tex, &mut o, &mut prefs, Nav::default());
-        let on_pat = |o: &Overlay| o.rows(&Prefs::default())[o.sel].title.contains("Pat");
+        let on_pat = |o: &Overlay| o.rows()[o.sel].title.contains("Pat");
         for _ in 0..6 {
             if on_pat(&o) {
                 break;
@@ -2292,7 +2282,7 @@ mod tests {
         // A problem row appears on top.
         o.state = invites_state(&[(3, "Alex"), (4, "Pat")], 1);
         press(&ctx, &mut tex, &mut o, &mut prefs, Nav::default());
-        assert!(on_pat(&o), "a row above moved the selection to {:?}", o.rows(&prefs)[o.sel].title);
+        assert!(on_pat(&o), "a row above moved the selection to {:?}", o.rows()[o.sel].title);
         // Alex's invite is answered elsewhere, just before A is pressed on Pat's.
         o.state = invites_state(&[(4, "Pat")], 1);
         let cmds = press(&ctx, &mut tex, &mut o, &mut prefs, Nav { select: true, ..Nav::default() });
@@ -2310,16 +2300,16 @@ mod tests {
         let (mut tex, mut prefs) = (Textures::default(), Prefs::default());
         let mut o = Overlay::new("Game".into());
         o.state = invites_state(&[(3, "Alex"), (4, "Pat")], 0);
-        o.open(Page::Home, false);
+        o.open(Page::Players, false);
         press(&ctx, &mut tex, &mut o, &mut prefs, Nav::default());
-        while !o.rows(&prefs)[o.sel].title.contains("Pat") {
+        while !o.rows()[o.sel].title.contains("Pat") {
             press(&ctx, &mut tex, &mut o, &mut prefs, Nav { down: true, ..Nav::default() });
         }
         o.state = invites_state(&[(3, "Alex")], 0);
         let cmds = press(&ctx, &mut tex, &mut o, &mut prefs, Nav { select: true, ..Nav::default() });
-        assert!(cmds.is_empty(), "Select acted at once on {:?}", o.rows(&prefs)[o.sel].title);
+        assert!(cmds.is_empty(), "Select acted at once on {:?}", o.rows()[o.sel].title);
         std::thread::sleep(MOVED_HOLD + Duration::from_millis(50));
-        while !o.rows(&prefs)[o.sel].title.contains("Alex") {
+        while !o.rows()[o.sel].title.contains("Alex") {
             press(&ctx, &mut tex, &mut o, &mut prefs, Nav { up: true, ..Nav::default() });
         }
         let cmds = press(&ctx, &mut tex, &mut o, &mut prefs, Nav { select: true, ..Nav::default() });
@@ -2366,7 +2356,7 @@ mod tests {
         for y in (150..760).step_by(12) {
             let mut o = Overlay::new("Game".into());
             o.state = invites_state(&[(3, "Alex")], 0);
-            o.open(Page::Home, false);
+            o.open(Page::Players, false);
             press(&ctx, &mut tex, &mut o, &mut prefs, Nav::default());
             let at = Pos2::new(o.panel.unwrap().center().x, y as f32);
             let cmds = click(&ctx, &mut tex, &mut o, &mut prefs, at);
@@ -2391,18 +2381,19 @@ mod tests {
         canvas
     }
 
-    /// Left / right on Settings' top row switch pages, and the switched-to tab is the one
-    /// highlighted in that same frame (the next frame may be a while away).
+    /// Left / right on Players' top row switch pages, and the switched-to tab is the one
+    /// highlighted in that same frame (the next frame may be a while away). A row with a
+    /// value (who has the keyboard, on Split screen) takes them instead.
     #[test]
-    fn settings_top_row_leaves_left_right_to_pages() {
+    fn top_row_leaves_left_right_to_pages() {
         let ctx = egui::Context::default();
         theme::install_fonts(&ctx);
         let mut tex = Textures::default();
         let mut prefs = Prefs::default();
         let mut o = Overlay::new("Game".into());
         o.state = sample_state();
-        o.open(Page::Settings, false);
-        let rows = o.rows(&prefs);
+        o.open(Page::Players, false);
+        let rows = o.rows();
         assert!(rows.iter().find(|r| r.selectable).is_some_and(|r| r.change.is_none()), "top row takes left / right");
         draw(&ctx, &mut tex, &mut o, &mut prefs, Nav::default());
         let before = draw(&ctx, &mut tex, &mut o, &mut prefs, Nav::default());
@@ -2411,19 +2402,103 @@ mod tests {
         let again = draw(&ctx, &mut tex, &mut o, &mut prefs, Nav::default());
         assert_ne!(before.px, switched.px);
         assert_eq!(switched.px, again.px, "the switch frame already shows the new tab");
-        // A multi-value row (the size, past a heading) still takes left / right.
-        o.open(Page::Settings, false);
+        o.seats = Some(two_seats());
+        o.open(Page::SplitScreen, false);
         draw(&ctx, &mut tex, &mut o, &mut prefs, Nav::default());
-        for _ in 0..2 {
+        while o.rows()[o.sel].change.is_none() {
             draw(&ctx, &mut tex, &mut o, &mut prefs, Nav { down: true, ..Nav::default() });
         }
-        let scale = prefs.overlay_scale;
-        let c = draw(&ctx, &mut tex, &mut o, &mut prefs, Nav { right: true, ..Nav::default() });
-        assert_eq!(o.page, Page::Settings);
-        assert!(prefs.overlay_scale > scale);
-        if let Some(d) = std::env::var_os("PEERPARTY_PREVIEW_DIR") {
-            let rgba: Vec<u8> = c.px.iter().flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, *p as u8, 255]).collect();
-            image::RgbaImage::from_raw(c.w as u32, c.h as u32, rgba).unwrap().save(std::path::Path::new(&d).join("overlay-settings.png")).unwrap();
-        }
+        let cmds = press(&ctx, &mut tex, &mut o, &mut prefs, Nav { right: true, ..Nav::default() });
+        assert_eq!(o.page, Page::SplitScreen);
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::KeyboardStep(1))));
+    }
+
+    fn two_seats() -> Seats {
+        let seat = |d: &str| PlayerSeat { detail: d.into(), can_swap: true, can_free: true };
+        Seats { players: vec![seat("Xbox controller"), seat("Xbox controller")], me: 0, keyboard: Some(0) }
+    }
+
+    /// A split-screen session opens on its own tab, first of three; an invite waiting
+    /// opens Players instead. Alone (or once the second player is gone) there's no such
+    /// tab.
+    #[test]
+    fn split_screen_has_its_own_tab() {
+        let mut o = Overlay::new("Game".into());
+        o.state = invites_state(&[], 0);
+        assert_eq!((o.landing(), o.tabs()), (Page::Players, vec![Page::Players, Page::Network]));
+        o.seats = Some(two_seats());
+        assert_eq!((o.landing(), o.tabs()), (Page::SplitScreen, vec![Page::SplitScreen, Page::Players, Page::Network]));
+        o.state = invites_state(&[(3, "Alex")], 0);
+        assert_eq!(o.landing(), Page::Players);
+        o.open(Page::SplitScreen, false);
+        let rows = o.rows();
+        assert!(rows.iter().any(|r| r.main == Action::ArrangePanes));
+        assert!(rows.iter().any(|r| r.main == Action::SwapSeat(1) && r.second == Action::FreeSeat(1)));
+        assert!(rows.iter().any(|r| r.change == Some((Action::KeyboardStep(-1), Action::KeyboardStep(1)))));
+        // Its players aren't listed on Players too.
+        o.open(Page::Players, false);
+        assert!(!o.rows().iter().any(|r| matches!(r.main, Action::SwapSeat(_) | Action::FreeSeat(_) | Action::ArrangePanes)));
+        // The session down to one player: back to Players.
+        o.seats = None;
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let (mut tex, mut prefs) = (Textures::default(), Prefs::default());
+        o.page = Page::SplitScreen;
+        press(&ctx, &mut tex, &mut o, &mut prefs, Nav::default());
+        assert_eq!(o.page, Page::Players);
+    }
+
+    /// Everyone is listed once: who sent an invite is on the invite's row (Accept,
+    /// Decline, Details), not again under their network; the rest in groups, with the
+    /// same buttons: Join, Invite (where the game can), Details.
+    #[test]
+    fn each_player_is_listed_once_with_the_same_buttons() {
+        crate::i18n::set("en");
+        let mut o = Overlay::new("Game".into());
+        o.state = sample_state();
+        o.open(Page::Players, false);
+        let rows = o.rows();
+        let alex: Vec<&Row> = rows.iter().filter(|r| r.title.contains("Alex")).collect();
+        assert_eq!(alex.len(), 1, "{:?}", rows.iter().map(|r| &r.title).collect::<Vec<_>>());
+        assert_eq!((alex[0].main, alex[0].second, alex[0].third), (Action::Accept(0), Action::Decline(0), Action::Profile(1)));
+        assert!(alex[0].detail.contains("In the menus"), "{}", alex[0].detail);
+        assert!(rows.iter().any(|r| r.header && r.title == t!("overlay.sec_invites")));
+        // The lobby's line, under the tabs.
+        assert!(o.caption().is_some_and(|c| c.contains("2 of 4") && c.contains("Epic Online Services")), "{:?}", o.caption());
+        // Without the invite: Join, Invite, Details.
+        o.state.pending.clear();
+        let alex = o.rows().into_iter().find(|r| r.title == "Alex").unwrap();
+        assert_eq!((alex.main, alex.second, alex.third), (Action::Join(1), Action::Invite(1), Action::Profile(1)));
+        // Somewhere the game can't invite to: no Invite.
+        o.state.can_invite = false;
+        let alex = o.rows().into_iter().find(|r| r.title == "Alex").unwrap();
+        assert_eq!((alex.main, alex.second, alex.third), (Action::Join(1), Action::None, Action::Profile(1)));
+        // Nothing to say about inviting when the game just isn't hosting yet.
+        o.state.invite_block = Some(InviteBlock::HostFirst);
+        assert!(!o.rows().iter().any(|r| r.title == t!("overlay.invite_all")));
+        // Someone in a room: their ping on their row.
+        o.state.peers[1].via = "room".into();
+        o.state.internet[0].peers[0].0 = "Alex".into();
+        let alex = o.rows().into_iter().find(|r| r.title == "Alex").unwrap();
+        assert!(alex.detail.contains("23 ms over IPv6"), "{}", alex.detail);
+    }
+
+    /// A player's page offers only what can be done: no Invite or Join for someone in
+    /// your lobby, no Invite for a server or where the game can't invite.
+    #[test]
+    fn a_players_page_offers_only_what_can_be_done() {
+        let mut o = Overlay::new("Game".into());
+        o.state = sample_state();
+        let actions = |o: &mut Overlay, id: &str| -> Vec<Action> {
+            o.open(Page::Profile(id.into()), false);
+            o.rows().iter().filter(|r| r.selectable).map(|r| r.main).collect()
+        };
+        assert!(actions(&mut o, "bb").is_empty(), "Sam is in your lobby");
+        assert_eq!(actions(&mut o, "cc"), [Action::Invite(1), Action::Join(1)]);
+        o.state.can_invite = false;
+        assert_eq!(actions(&mut o, "cc"), [Action::Join(1)]);
+        o.state.can_invite = true;
+        o.state.peers[1].server = true;
+        assert_eq!(actions(&mut o, "cc"), [Action::Join(1)]);
     }
 }

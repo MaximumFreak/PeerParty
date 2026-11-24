@@ -28,11 +28,6 @@ pub fn glyph_label(value: &str) -> &'static str {
 /// Overlay scale presets (75% to 150% in 12.5% steps).
 pub const OVERLAY_SCALES: [f32; 7] = [0.75, 0.875, 1.0, 1.125, 1.25, 1.375, 1.5];
 
-/// Steps an overlay scale by `delta` 12.5% increments, clamped to `OVERLAY_SCALES`.
-pub fn step_overlay_scale(cur: f32, delta: i32) -> f32 {
-    (cur + delta as f32 * 0.125).clamp(OVERLAY_SCALES[0], OVERLAY_SCALES[OVERLAY_SCALES.len() - 1])
-}
-
 /// Opening hotkeys in `Prefs.hotkeys` order: `(display_label, i18n_sub_key)`.
 pub const HOTKEY_LABELS: [(&str, &str); 4] = [
     ("Shift+Tab", "settings.key_steam"),
@@ -133,12 +128,5 @@ mod tests {
         assert_eq!(r.step(2, t0 + Duration::from_millis(700)), 0);
         r.reset();
         assert_eq!(r.step(0, t0 + Duration::from_millis(800)), 0);
-    }
-
-    #[test]
-    fn scale_steps_within_bounds() {
-        assert_eq!(step_overlay_scale(1.0, 1), 1.125);
-        assert_eq!(step_overlay_scale(1.5, 1), 1.5);
-        assert_eq!(step_overlay_scale(0.75, -1), 0.75);
     }
 }
