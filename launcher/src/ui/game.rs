@@ -97,8 +97,13 @@ impl App {
                                 if n == 1 {
                                     o.split_screen = false;
                                     o.split_layout.clear();
-                                } else if was <= 1 || n >= 3 {
-                                    o.split_screen = true;
+                                } else {
+                                    if was <= 1 || n >= 3 {
+                                        o.split_screen = true;
+                                    }
+                                    if n != 3 && matches!(o.split_layout.as_str(), "top2" | "bottom2") {
+                                        o.split_layout.clear();
+                                    }
                                 }
                             }
                         });
@@ -122,11 +127,23 @@ impl App {
                             ui.add_space(4.0);
                             ui.label(egui::RichText::new(t!("game.split_layout")).size(13.5).color(TEXT));
                             let mut layout = o.effective_split_layout();
-                            let layout_opts = [
-                                ("horizontal", t!("game.layout_horizontal")),
-                                ("vertical", t!("game.layout_vertical")),
-                                ("grid", t!("game.layout_grid")),
-                            ];
+                            let mut layout_opts: Vec<(&str, &str)> = if o.players == 3 {
+                                vec![
+                                    ("top2", t!("game.layout_top2")),
+                                    ("bottom2", t!("game.layout_bottom2")),
+                                    ("horizontal", t!("game.layout_horizontal")),
+                                    ("grid", t!("game.layout_grid")),
+                                ]
+                            } else {
+                                vec![
+                                    ("horizontal", t!("game.layout_horizontal")),
+                                    ("vertical", t!("game.layout_vertical")),
+                                    ("grid", t!("game.layout_grid")),
+                                ]
+                            };
+                            if o.has_custom_layout() {
+                                layout_opts.push(("custom", t!("game.layout_custom")));
+                            }
                             ui.push_id("split-layout", |ui| {
                                 if widgets::segmented(ui, &mut layout, &layout_opts) {
                                     o.split_layout = layout.to_string();
@@ -172,6 +189,15 @@ impl App {
                                 });
                             }
                             ui.add(egui::Label::new(egui::RichText::new(t!("game.inputs_note")).size(12.0).color(TEXT3)).wrap());
+                            let kbm_forced = o.has_kbm_player();
+                            let mut kbm_on = !o.split_no_kbm || kbm_forced;
+                            ui.add_enabled_ui(!kbm_forced, |ui| {
+                                stacked(ui, t!("game.split_kbm"), t!("game.split_kbm_sub"), |ui| {
+                                    if widgets::switch(ui, &mut kbm_on).changed() {
+                                        o.split_no_kbm = !kbm_on;
+                                    }
+                                });
+                            });
                             ui.add_space(2.0);
                             ui.add(egui::Label::new(egui::RichText::new(t!("game.split_screen_note")).size(12.0).color(TEXT3)).wrap());
                         } else {
@@ -517,6 +543,36 @@ impl App {
 /// (`PEERPARTY_COMPOSITOR`), and Direct3D 9 drawn through DXVK (`PEERPARTY_DXVK`).
 fn advanced_split(ui: &mut egui::Ui, o: &mut GameOptions) {
     widgets::section(ui, t!("game.adv_split"));
+    let mut sync = !o.split_no_sync;
+    let sync_changed = ui
+        .horizontal(|ui| {
+            let c = widgets::switch(ui, &mut sync).changed();
+            ui.add(egui::Label::new(egui::RichText::new(t!("game.adv_sync")).size(13.0).color(TEXT2)).wrap());
+            c
+        })
+        .inner;
+    if sync_changed {
+        o.split_no_sync = !sync;
+    }
+    ui.add(egui::Label::new(egui::RichText::new(t!("game.adv_sync_sub")).size(12.0).color(TEXT3)).wrap());
+    ui.add_space(6.0);
+    ui.label(egui::RichText::new(t!("game.adv_stagger")).size(13.0).color(TEXT2));
+    let stagger_vals = ["", "0", "5", "10", "15", "20", "30"];
+    let stagger_labels: Vec<String> = vec![
+        t!("game.adv_stagger_smart").to_string(),
+        t!("game.adv_stagger_none").to_string(),
+        t!("common.seconds", n = 5),
+        t!("common.seconds", n = 10),
+        t!("common.seconds", n = 15),
+        t!("common.seconds", n = 20),
+        t!("common.seconds", n = 30),
+    ];
+    let mut si = stagger_vals.iter().position(|v| *v == o.split_stagger).unwrap_or(0);
+    if widgets::stepper(ui, "split-stagger", &stagger_labels, &mut si, ui.available_width()).changed() {
+        o.split_stagger = stagger_vals[si].to_string();
+    }
+    ui.add(egui::Label::new(egui::RichText::new(t!("game.adv_stagger_sub")).size(12.0).color(TEXT3)).wrap());
+    ui.add_space(6.0);
     ui.label(egui::RichText::new(t!("game.adv_compositor")).size(13.0).color(TEXT2));
     let mut how = match o.compositor.as_str() {
         "dwm" => "dwm",
@@ -550,7 +606,7 @@ fn advanced_split(ui: &mut egui::Ui, o: &mut GameOptions) {
 
 /// Anything under a game's Advanced that differs from the recommended.
 fn advanced_changed(o: &GameOptions) -> bool {
-    !o.modes.is_empty() || !o.skip.is_empty() || !o.game_key.is_empty() || o.exe.is_some() || !o.args.trim().is_empty() || !o.compositor.is_empty() || !o.dxvk.is_empty()
+    !o.modes.is_empty() || !o.skip.is_empty() || !o.game_key.is_empty() || o.exe.is_some() || !o.args.trim().is_empty() || !o.compositor.is_empty() || !o.dxvk.is_empty() || !o.split_stagger.is_empty() || o.split_no_sync
 }
 
 /// This PC's monitors, as `--monitor` numbers them, looked at every few seconds (one

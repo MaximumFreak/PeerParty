@@ -228,31 +228,8 @@ both.
   as a single-instance check (Unity's, or one whose name says "instance" or holds the
   game's program name; stores' and Windows' own are left alone) is made per copy, and
   FindWindow doesn't find the other copy's windows.
-- `--split-screen` (`--instances 2..4`, `--layout horizontal|vertical|grid`,
-  `--inputs auto|kbm|pad,...`, `--names A,B,...`): start two to four copies on this PC in one shared
-  split-screen window. Each pane gets its own controller (assigned when a controller is
-  first used, and kept across unplugging), its own in-game overlay when that player
-  presses the overlay button, and its own audio and rumble; `Ctrl+Alt+L` cycles the
-  layout, `Ctrl+Alt+Z` zooms the focused pane onto the whole window (its game is told
-  the window's size, as a layout change does, and goes back to its pane after), and
-  `Ctrl+Alt+1`–`4` (number row or number pad) hands the keyboard and mouse to that
-  player's pane, which says so. `--inputs` says what each player plays with, in player order:
-  `kbm` the keyboard and mouse and never a controller (the session starts with that
-  pane focused), `pad` a controller, `auto` (the default) a controller, passing over a
-  player who has already been playing with the keyboard and mouse while another player
-  has none. One controller read twice (a remapper's virtual pad beside the real one)
-  takes one seat. The overlay's Players page lists this PC's players: swap two players'
-  controllers, free one for the next controller pressed, or hand the keyboard and mouse
-  to another player. `--names` gives players names of their own, in player order (a
-  blank one keeps the usual: player 1 `PEERPARTY_NAME`, player 2 `PEERPARTY_OTHER_NAME`,
-  then "name (3)"). A game with a starter program (one that starts the real game and
-  ends) stays in its pane: each copy is all the programs it started from the game's
-  folder. Players 2 to 4 have saves of their own from the game's first look at them
-  (**Players' saves**, below). Voice chat uses the PC's microphone
-  and speakers once, through player 1's copy: the other copies send and play no voice.
-  Closing the session's window (or Close all) asks every copy to close and save; what
-  still runs 6 seconds later is ended, at once if asked again. PeerParty's exit code is
-  player 1's, or another player's when theirs crashed.
+- `--split-screen`: start two to four copies on this PC in one shared split-screen
+  window. Its options, keys and Layout Studio are under **Split screen**, below.
 - **Players' saves.** Player 1 plays with the game's saves where the game keeps them,
   as it does alone. Players 2 to 4 each have their own, in PeerParty's folder
   (`%LOCALAPPDATA%\peerparty\saves\<game>\player-N`): files the game keeps in
@@ -662,6 +639,119 @@ When a player drops out of a match, the game's logs say whose side gave up:
 - `steam-web ...`: what PeerParty answered on Steam's Web API host, what it passed on to
   Steam and how long Steam took, and `steam-web: the game looks up api.steampowered.com,
   which goes to Steam as it is` when it isn't answered here.
+
+### Split screen
+
+Two to four copies of a game on this PC share one window, one pane per player. Start
+them from a game's panel (Players 2–4 with **Split screen** on, a layout and a monitor)
+or from a prompt:
+
+```
+peerparty --split-screen [--instances 1..4] [--layout L] [--monitor N] [--inputs auto|kbm|pad,...] [--no-kbm] [--stagger smart|0..60] [--no-sync] [--names A,B,...] <game.exe> [args...]
+```
+
+- `--instances N`: how many copies (default 2).
+- `--layout horizontal|vertical|top2|bottom2|grid|slots:...`: side by side, top and
+  bottom, two on top and one wide below (`top2`, the default at 3 players), one on top
+  and two below (`bottom2`), a 2×2 grid (the default at 4). `slots:x,y,w,h,fit,ratio,z;...`
+  is a layout of your own, one pane per player, in ten-thousandths of the window
+  (`slots:0,0,5000,10000,fit,match,0;5000,0,5000,10000,fit,match,0` is side by side):
+  Layout Studio writes one when you keep a layout, and the game's panel then shows it
+  as Custom.
+- `--monitor N`: the monitor the window opens on (1 the main one, 2.. the others, left
+  to right).
+- `--inputs auto|kbm|pad,...`: what each player plays with, in player order. `kbm` the
+  keyboard and mouse and never a controller (the session starts with that pane
+  focused), `pad` a controller, `auto` (the default) a controller, passing over a player
+  who has already been playing with the keyboard and mouse while another player has
+  none.
+- `--no-kbm`: controllers only (the panel's "Keyboard and mouse in games" off). The
+  keyboard and mouse never reach the games; the overlay and the keys below still work.
+- `--stagger smart|0..60`: how the copies after player 1 start. `smart` (the default,
+  the panel's Advanced > Launch order "Smart (wait until ready)") starts each one once
+  the one before has opened its window or drawn its first frame, 8 s at most, so heavy
+  games don't fight over the CPU and disk at startup; a number waits that many seconds
+  between copies, `0` starts them all at once.
+- `--no-sync`: turns off **Sync games to screen** (the panel's Advanced > Split screen),
+  which is on by default and keeps each copy from drawing frames faster than the
+  session's window shows them.
+- `--names A,B,...`: names of their own, in player order (a blank one keeps the usual:
+  player 1 `PEERPARTY_NAME`, player 2 `PEERPARTY_OTHER_NAME`, then "name (3)").
+- `--player N` is for one copy: it plays alone as player N (1–4), with that player's
+  saves and name (**Players' saves**, above). It can't be given with `--split-screen`,
+  which gives each copy its player.
+
+Each pane gets its own controller (assigned when a controller is first used, and kept
+across unplugging), its own in-game overlay when that player presses the overlay
+button, and its own audio and rumble. One controller read twice (a remapper's virtual
+pad beside the real one) takes one seat. A game sees only its own player's controller,
+whichever way it reads controllers, and keeps acting as the window in front while
+another pane has the keyboard and mouse. While the focused pane's game holds its
+cursor (an aiming game), the mouse stays inside that pane and its pointer hides; the
+pointer also hides once the mouse has sat still for a moment while players are on
+controllers. The overlay's Players page lists this PC's players: swap two players'
+controllers, free one for the next controller pressed, or hand the keyboard and mouse
+to another player.
+
+Keys, with the session's window or a copy in front:
+
+- `Ctrl+Alt+E`: opens or closes Layout Studio.
+- `Ctrl+Alt+L`: the next layout.
+- `Ctrl+Alt+Z`: the focused pane on the whole window, and back. Its game is told the
+  window's size, as a layout change does, and goes back to its pane after.
+- `Ctrl+Alt+1`–`4` (number row or number pad): the keyboard and mouse to that player's
+  pane, which says so.
+
+**Layout Studio** arranges the panes over the running games (`Ctrl+Alt+E`, or the
+overlay's Players page > **Arrange panes**). Every change shows at once:
+
+- Drag a divider between panes to resize every pane along it; edges snap to halves,
+  thirds, quarters and the other panes (**Snap** turns it off, `Alt` held drags freely).
+  Drag a pane's corner or edge to resize it alone, for a picture in a picture.
+- Drag a pane onto another to swap the two players. The pane you pick up comes to the
+  front, so in a picture-in-picture layout a small pane can sit over a large one.
+- Each pane: **Scale** `Fit` (the whole picture, with black bars), `Crop` (fills the
+  pane, cutting the edges) or `Stretch`; **Ratio** `Auto` (the pane's own shape),
+  `16:9`, `16:10`, `4:3` or `21:9`, the shape the game is told to render at, for a HUD
+  that crowds in a narrow pane; **Sound** / **Muted** for that copy's audio; **Full Screen**.
+- The bar: the layouts for this many players and **PiP** (player 1 on the whole window,
+  the others in corners), **KBM** (which player has the keyboard and mouse, or Off),
+  **Sync: On / Off** (turns **Sync games to screen** on or off live), **Snap**, **Reset**
+  (back to the layout and sync state Layout Studio opened with) and **Done** (or Esc),
+  which keeps them for this game's next sessions.
+- With a controller: live button prompts match your controller (Xbox, PlayStation or
+  Nintendo). The left stick or d-pad selects a pane, LB / RB switch layout preset, Y
+  changes Scale, X changes Ratio, LT mutes, RT toggles Full Screen, View / Share toggles
+  Sync, and A enters Resize / Swap mode for the selected pane (left stick / d-pad resizes
+  with LT for fine steps, right stick moves, X swaps slots, Y toggles Snap, A or B
+  returns). B or Start is Done.
+
+A game with a starter program (one that starts the real game and ends) stays in its
+pane: each copy is all the programs it started from the game's folder. Players 2 to 4
+have saves of their own from the game's first look at them (**Players' saves**,
+above). Voice chat uses the PC's microphone and speakers once, through player 1's copy:
+the other copies send and play no voice. Closing the session's window (or Close all)
+asks every copy to close and save; what still runs 6 seconds later is ended, at once if
+asked again. PeerParty's exit code is player 1's, or another player's when theirs
+crashed.
+
+How the window shows the copies (the game panel's Advanced > Split screen):
+
+- `PEERPARTY_COMPOSITOR`: unset (**Frames**, recommended) draws each copy's frames on
+  the graphics card, from textures the copy shares with the window, and shows a copy's
+  own window in its pane where its frames can't be shared (another graphics card, or a
+  graphics API that can't share them). `dwm` (**Game windows**) always shows the copies'
+  own windows, for a game whose pane stays black. `pixels` (**Pixels**) copies the
+  frames through memory instead: slower, for trying that path.
+- `PEERPARTY_DXVK=<folder>` (**Direct3D 9 through DXVK**): the folder of a DXVK release
+  you downloaded (`1`: `%LOCALAPPDATA%\peerparty\dxvk`). A Direct3D 9 game's
+  split-screen copies load its `d3d9.dll` and draw through Vulkan, so their frames reach
+  the window as other games' do; for an older Direct3D 9 game whose panes stay black.
+  Nothing in the game's folder is changed.
+
+What split screen does for now: it runs on Windows; one keyboard and mouse is shared
+between the players, plus a controller each, for up to four players. Racing wheels and
+a keyboard and mouse per player are planned.
 
 ### Internet play
 

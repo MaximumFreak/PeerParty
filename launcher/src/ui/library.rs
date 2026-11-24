@@ -12,6 +12,9 @@ use crate::t;
 const CARD_W: f32 = 164.0;
 const CARD_H: f32 = 246.0;
 const GAP: f32 = 18.0;
+/// Room inside the scroll area so the first row's and first column's expanded hover /
+/// focus ring isn't clipped by the scroll viewport.
+const CARD_PAD: f32 = 4.0;
 const ROW_H: f32 = 56.0;
 /// The top bar's buttons (list / grid, rescan, Add) with their gaps: with Add's label,
 /// and with its icon alone.
@@ -147,7 +150,7 @@ impl App {
             self.empty_state(ui);
             return;
         }
-        let width = ui.available_width();
+        let width = (ui.available_width() - 2.0 * CARD_PAD).max(CARD_W);
         let cols = (((width + GAP) / (CARD_W + GAP)).floor() as usize).max(1);
         self.lib.grid_cols = cols;
         let rows = visible.len().div_ceil(cols);
@@ -164,14 +167,17 @@ impl App {
         let spare = (width - cols as f32 * CARD_W - (cols - 1) as f32 * GAP).max(0.0);
         let gap = GAP + if cols > 1 { spare / (cols - 1) as f32 } else { 0.0 };
         area.show_rows(ui, CARD_H + GAP, rows, |ui, range| {
+            ui.spacing_mut().item_spacing.y = 0.0;
             for row in range {
+                ui.add_space(CARD_PAD);
                 ui.horizontal(|ui| {
+                    ui.add_space(CARD_PAD);
                     ui.spacing_mut().item_spacing.x = gap.min(GAP + 24.0);
                     for &i in visible.iter().skip(row * cols).take(cols) {
                         self.card(ui, i, &mut actions, &mut need);
                     }
                 });
-                ui.add_space(GAP - ui.spacing().item_spacing.y);
+                ui.add_space(GAP - CARD_PAD);
             }
         });
         self.request_icons(need);

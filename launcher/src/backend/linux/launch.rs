@@ -288,8 +288,16 @@ mod run {
 
         launch::remember(&t.listed);
         let _control = control::listen(|| false, host::close_session);
-        let look = host::SessionLook { layout: split.layout.clone(), bounds, pixels: host::pixel_frames(compositor.as_deref()) };
-        host::run_session(launches, look, &t.exe, prefs, false);
+        let look = host::SessionLook {
+            layout: split.layout.clone(),
+            bounds,
+            pixels: host::pixel_frames(compositor.as_deref()),
+            no_kbm: split.no_kbm,
+            stagger: launch::StaggerMode::Fixed(0),
+            sync: !split.no_sync,
+            total_count: launches.len(),
+        };
+        host::run_session(launches, look, None, &t.exe, prefs, false);
 
         // The first player's exit, unless another player's game ended with an error.
         let mut exits = Vec::with_capacity(waiters.len());

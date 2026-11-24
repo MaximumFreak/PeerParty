@@ -234,18 +234,20 @@ fn own<'a>(g: &Gl, all: &'a mut Vec<Ctx>, dc: usize, hwnd: usize) -> Option<&'a 
 }
 
 /// At each swap of `dc`: the viewport reported, then, in PeerParty's context made current
-/// once, the overlay drawn and the frame copied for the session's window.
-fn on_swap(dc: usize) {
+/// once, the overlay drawn and the frame copied for the session's window. Returns false
+/// when a lower translation layer (Zink/Vulkan) handles the swap instead.
+fn on_swap(dc: usize) -> bool {
     let size = client_size(dc);
     let hwnd = size.map_or(0, |s| s.2);
     if let Some((w, h, hwnd)) = size {
         super::report_viewport(w, h, hwnd, "opengl");
     }
     if super::lower_layer_presents(|| hwnd) {
-        return;
+        return false;
     }
     super::presented();
     swap_turn(dc, size, frame(), super::capture::enabled());
+    true
 }
 
 /// In PeerParty's context on `dc` (its window's client area `size`): the overlay `f` drawn,
@@ -379,12 +381,13 @@ thread_local! {
 
 fn swapping(dc: usize, real: impl FnOnce() -> i32) -> i32 {
     let outer = !IN_SWAP.with(|s| s.replace(true));
-    if outer {
-        let _ = std::panic::catch_unwind(|| on_swap(dc));
-    }
+    let handled = outer && std::panic::catch_unwind(|| on_swap(dc)).unwrap_or(false);
     let r = real();
     if outer {
         IN_SWAP.with(|s| s.set(false));
+        if handled {
+            super::capture::pace();
+        }
     }
     r
 }

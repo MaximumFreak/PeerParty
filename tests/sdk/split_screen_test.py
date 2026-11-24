@@ -21,7 +21,13 @@ CopyFile2 (.NET's File.Copy), and write the same HKCU/Software key; player 2 als
 a file in the game's folder. Neither may meet the other: player 1's are the real ones,
 player 2's are in its own folder (PEERPARTY_DATA_DIR/saves/.../player-2) and key. Then
 `peerparty --player 2` alone (role P) reads player 2's save, and a second
-`--player 2` meanwhile is turned away."""
+`--player 2` meanwhile is turned away.
+
+Input: each copy is told an input of its own (neither everything), and its game, left
+idle, polls XInput and the keyboard as a game does: no copy sees a controller past its
+own (XInput users 1-3 never connect, whatever is plugged in), the keyboard reaches one
+copy at most, and each copy's log says its hook answered XInput from the session's
+input block rather than passing it through. Needs no controller attached."""
 import ctypes, glob, json, os, subprocess, sys, time, winreg
 
 DIR = os.environ["PPTEST_DIR"]
@@ -81,6 +87,31 @@ def save_calls(slot):
         out["reads"] = fh.read()
     return out
 
+def input_calls(slot):
+    """What an idle game reads of the controllers and keyboard, for 3 seconds: the
+    return codes of XInputGetState for users 0-3, and the keys seen down."""
+    u = ctypes.WinDLL("user32")
+    u.GetAsyncKeyState.restype = ctypes.c_short
+    u.GetAsyncKeyState.argtypes = [ctypes.c_int]
+    try:
+        xi = ctypes.WinDLL("xinput1_4")
+    except OSError:
+        xi = ctypes.WinDLL("xinput9_1_0")
+    xi.XInputGetState.restype = ctypes.c_uint32
+    xi.XInputGetState.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+    codes = {i: set() for i in range(4)}
+    keys = set()
+    state = ctypes.create_string_buffer(16)
+    end = time.time() + 3
+    while time.time() < end:
+        for i in range(4):
+            codes[i].add(xi.XInputGetState(i, state))
+        for vk in range(1, 255):
+            if u.GetAsyncKeyState(vk) & 0x8000:
+                keys.add(vk)
+        time.sleep(0.05)
+    return {"slot": slot, "xinput": {str(i): sorted(c) for i, c in codes.items()}, "keys": sorted(keys)}
+
 if ROLE == "G":
     spec = json.loads(os.environ.get("PEERPARTY_INSTANCE") or "{}")
     with open(os.path.join(DIR, f"game-{spec.get('slot', -1)}.txt"), "w") as fh:
@@ -90,6 +121,12 @@ if ROLE == "G":
     except Exception as e:  # said in the result, checked by the driver
         result = {"error": repr(e)}
     with open(os.path.join(DIR, f"save-{spec.get('slot', -1)}.json"), "w") as fh:
+        json.dump(result, fh)
+    try:
+        result = input_calls(spec.get("slot", -1))
+    except Exception as e:
+        result = {"error": repr(e)}
+    with open(os.path.join(DIR, f"input-{spec.get('slot', -1)}.json"), "w") as fh:
         json.dump(result, fh)
     # Until the session ends it (or the driver's deadline has long passed).
     time.sleep(120)
@@ -227,13 +264,17 @@ log("session pid", session.pid)
 started = wait_for(lambda: all(read_pair(f"game-{s}.txt") for s in (0, 1)), time.time() + 60)
 check("both players' games started", started, sorted(os.listdir(DIR)))
 games = {}
+specs = {}
 for s in (0, 1):
     got = read_pair(f"game-{s}.txt")
     if got:
         games[s] = int(got[0])
-        spec = json.loads(got[1])
+        spec = specs[s] = json.loads(got[1])
         pane = spec.get("pane") or {}
         check(f"player {s + 1}'s game has its pane", pane.get("width", 0) > 0 and spec.get("compositor_capture") is not None, got[1])
+        check(f"player {s + 1}'s game is told the focus is its own", spec.get("focus_spoof") is True, got[1])
+inputs = [specs.get(s, {}).get("input_assignment") or {} for s in (0, 1)]
+check("each player is told an input of its own", inputs[0] != inputs[1] and all(a.get("kind") not in (None, "all", "none") for a in inputs), inputs)
 starters = {}
 for s in (0, 1):
     got = read_pair(f"starter-{s}.txt")
@@ -274,6 +315,24 @@ check("player 2's registry key is its own", 1 in theirs, theirs)
 check("the game's folder is never written", not os.path.exists(GAME_FILE), GAME_FILE)
 check("player 2's write there is in its own folder", bool(glob.glob(os.path.join(data, "saves", "*", "player-2", "fs", "GameDir", f"PeerPartyTest{TAG}", "SteamData", "stats.ini"))))
 
+# Input: what each idle game read (its log is checked once the session has ended).
+done = wait_for(lambda: all(os.path.exists(os.path.join(DIR, f"input-{s}.json")) for s in (0, 1)), time.time() + 20)
+check("both games polled their input", done)
+polled = {}
+for s in (0, 1):
+    try:
+        with open(os.path.join(DIR, f"input-{s}.json")) as fh:
+            polled[s] = json.load(fh)
+    except (OSError, ValueError):
+        polled[s] = {}
+NOT_CONNECTED = 1167
+for s in (0, 1):
+    r = polled.get(s, {})
+    xi = r.get("xinput") or {}
+    check(f"player {s + 1}'s game sees no controller past its own", len(xi) == 4 and all(xi.get(str(i)) == [NOT_CONNECTED] for i in (1, 2, 3)), r)
+    check(f"player {s + 1}'s controller is there or not, nothing else", set(xi.get("0") or [-1]) <= {0, NOT_CONNECTED}, r)
+check("the keyboard reaches one copy at most", not (polled.get(0, {}).get("keys") and polled.get(1, {}).get("keys")), polled)
+
 # Close all, as the launcher's window does it.
 ev = k32.OpenEventW(0x0002, False, f"Local\\peerparty-close-{session.pid}")  # EVENT_MODIFY_STATE
 check("the session listens for Close all", bool(ev))
@@ -297,6 +356,11 @@ check("and ended each game it had asked to close", "player 1's game is ended" in
 notes = "".join(open(f, encoding="utf-8", errors="replace").read() for f in glob.glob(os.path.join(logs, "*.log")))
 check("each copy's log says the session closed it", notes.count("session: closing") >= 2)
 check("player 2's log says its saves are its own", "saves: player 2's saves are its own" in notes)
+for s, pid in games.items():
+    own = "".join(open(f, encoding="utf-8", errors="replace").read() for f in glob.glob(os.path.join(logs, f"*-{pid}.log")))
+    check(f"player {s + 1}'s hook reads the session's input block", "input: mapped virtual input block" in own, pid)
+    check(f"player {s + 1}'s hook answers XInput from it, not the real controllers",
+          "input: XInput controller 0 polled before a controller took this copy's seat" in own or "input: the game reads XInput (hook slot" in own, pid)
 if session.poll() is None:
     session.kill()
 

@@ -162,6 +162,25 @@ impl App {
             widgets::setting(ui, t!("together.name"), t!("together.name_sub"), |ui| {
                 widgets::text_field(ui, &mut p.name, &user, 240.0, 32);
             });
+            widgets::divider(ui);
+            let main = match p.name.trim() {
+                "" => user,
+                n => n.to_string(),
+            };
+            ui.label(RichText::new(t!("together.local_players")).size(14.0).color(TEXT));
+            ui.add_space(-2.0);
+            ui.add(egui::Label::new(RichText::new(t!("together.local_players_sub")).size(12.0).color(TEXT3)).wrap());
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                for (n, field) in [(2u8, &mut p.other_name), (3, &mut p.third_name), (4, &mut p.fourth_name)] {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(t!("game.input_player", n = n)).size(12.0).color(TEXT2));
+                        ui.push_id(("local-player", n), |ui| {
+                            widgets::text_field(ui, field, &format!("{main} ({n})"), 180.0, 32);
+                        });
+                    });
+                }
+            });
         });
     }
 

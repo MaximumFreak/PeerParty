@@ -44,6 +44,10 @@ pub struct RingBlock {
     pub name: String,
     view: *mut u8,
     keep: Keep,
+    /// Auto-reset event signalled right after the compositor's `Present(1, 0)` so the
+    /// copy can pace its frames to the display refresh (`HostMsg::Capture`'s `pace`).
+    #[cfg(windows)]
+    pace: Option<(String, windows_sys::Win32::Foundation::HANDLE)>,
 }
 
 unsafe impl Send for RingBlock {}
@@ -52,6 +56,22 @@ unsafe impl Sync for RingBlock {}
 #[cfg(windows)]
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
+}
+
+#[cfg(windows)]
+fn create_pace_event(pid: u32) -> Option<(String, windows_sys::Win32::Foundation::HANDLE)> {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
+    use windows_sys::Win32::System::Threading::CreateEventW;
+    let name = format!(r"Local\peerparty-pace-{pid}-{}", token());
+    let h = unsafe { CreateEventW(std::ptr::null(), 0, 0, wide(&name).as_ptr()) };
+    if h.is_null() {
+        return None;
+    }
+    if unsafe { GetLastError() } == 183 {
+        unsafe { CloseHandle(h) };
+        return None;
+    }
+    Some((name, h))
 }
 
 impl RingBlock {
@@ -75,7 +95,7 @@ impl RingBlock {
             unsafe { CloseHandle(map) };
             return None;
         }
-        let b = RingBlock { name, view, keep: Keep::Mapping(map) };
+        let b = RingBlock { name, view, keep: Keep::Mapping(map), pace: create_pace_event(pid) };
         b.header().init();
         Some(Arc::new(b))
     }
@@ -111,13 +131,35 @@ impl RingBlock {
             };
             (m.as_ptr(), Keep::File(Some(file), m))
         };
-        let b = RingBlock { name, view, keep };
+        let b = RingBlock {
+            name,
+            view,
+            keep,
+            #[cfg(windows)]
+            pace: create_pace_event(pid),
+        };
         b.header().init();
         Some(Arc::new(b))
     }
 
     pub fn header(&self) -> &RingHeader {
         unsafe { RingHeader::from_raw(self.view, BLOCK_SIZE) }.expect("a page-aligned view")
+    }
+
+    /// The per-copy pace event's name, if one was created (`HostMsg::Capture`'s `pace`).
+    pub fn pace_event_name(&self) -> Option<&str> {
+        #[cfg(windows)]
+        return self.pace.as_ref().map(|(n, _)| n.as_str());
+        #[cfg(not(windows))]
+        None
+    }
+
+    /// Wakes the copy if it is waiting on the compositor's refresh boundary.
+    pub fn signal_pace(&self) {
+        #[cfg(windows)]
+        if let Some((_, h)) = &self.pace {
+            unsafe { windows_sys::Win32::System::Threading::SetEvent(*h) };
+        }
     }
 
     /// Whether it's a file (the frames come as pixels).
@@ -128,10 +170,15 @@ impl RingBlock {
 
 impl Drop for RingBlock {
     fn drop(&mut self) {
+        self.header().set_flag(peerparty_protocol::frame_ring::FLAG_COMPOSITOR_LIVE, false);
+        self.signal_pace();
         #[cfg(windows)]
         {
             use windows_sys::Win32::Foundation::CloseHandle;
             use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+            if let Some((_, h)) = self.pace.take() {
+                unsafe { CloseHandle(h) };
+            }
             unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: self.view.cast() }) };
             match &mut self.keep {
                 Keep::Mapping(map) => unsafe {

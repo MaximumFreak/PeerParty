@@ -417,8 +417,8 @@ fn command(cmd: HostMsg) {
         HostMsg::InputShm { name } => {
             crate::input::attach_shm(&name);
         }
-        HostMsg::Capture { enabled, ring, event, pixels } => {
-            crate::video::set_capture(enabled, ring.as_deref(), event.as_deref(), pixels);
+        HostMsg::Capture { enabled, ring, event, pace, pixels } => {
+            crate::video::set_capture(enabled, ring.as_deref(), event.as_deref(), pace.as_deref(), pixels);
         }
         HostMsg::DevicesChanged => {
             // What the hook knows of devices first, so the game's own look finds it fresh.

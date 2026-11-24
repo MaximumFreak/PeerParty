@@ -12,7 +12,7 @@ use crate::launch::{self, Launch, LaunchError, SplitScreen};
 use crate::{backend, firewall, host};
 use peerparty_protocol::session::LayoutPreset;
 
-pub const USAGE: &str = "usage: peerparty [--room CODE] [--public] [--set key=value] [--log-dir DIR] [--multi-instance] [--copy-saves] [--player N] [--split-screen [--instances N] [--layout horizontal|vertical|grid] [--inputs auto|kbm|pad,...] [--names A,B,...] [--monitor N]] <game.exe> [args...]\n         plays the game through peerparty: the local network, plus the internet with --room or --public\n         a simple .bat or .cmd that starts the game works too: peerparty starts the program it runs\n         --set changes one setting for this run: name=Alex, voice=off, internet=off, overlay=off, auto_accept=on, ... (docs/usage.md)\n         --player N plays alone as player N (1-4): that player's saves, name and identity\n       peerparty --saves <game.exe>   (each player's saves for the game, and their backups)\n       peerparty --copy-save FROM TO <game.exe> | --swap-saves A B <game.exe> | --reset-save N <game.exe> | --restore-save N BACKUP <game.exe>   (players 1-4; the one replaced is backed up first)\n       peerparty --invite   (invites every other player to the game in front)\n       peerparty --new-room   (makes a room code for internet play)\n       peerparty --net-test   (checks this PC's internet path: STUN, NAT type, the DHT)\n       peerparty --pads   (lists the controllers the overlay reads, and their buttons)\n       peerparty --firewall <game.exe>   (whether Windows Firewall lets other players connect to it)\n       peerparty --fix-firewall <game.exe> [--public]   (as administrator: lets them, on private and domain networks, and public ones with --public)\n       peerparty --remove-firewall   (as administrator: removes every firewall rule peerparty added)\n       peerparty --blocked | --block FINGERPRINT | --unblock FINGERPRINT|all   (public players you blocked)\n       peerparty --friends | --friend FINGERPRINT | --unfriend FINGERPRINT|all   (friends for PEERPARTY_PUBLIC_FRIENDS_ONLY=1)";
+pub const USAGE: &str = "usage: peerparty [--room CODE] [--public] [--set key=value] [--log-dir DIR] [--multi-instance] [--copy-saves] [--player N] [--split-screen [--instances N] [--layout horizontal|vertical|top2|bottom2|grid|slots:...] [--inputs auto|kbm|pad,...] [--no-kbm] [--stagger smart|0..60] [--no-sync] [--names A,B,...] [--monitor N]] <game.exe> [args...]\n         plays the game through peerparty: the local network, plus the internet with --room or --public\n         a simple .bat or .cmd that starts the game works too: peerparty starts the program it runs\n         --set changes one setting for this run: name=Alex, voice=off, internet=off, overlay=off, auto_accept=on, ... (docs/usage.md)\n         --player N plays alone as player N (1-4): that player's saves, name and identity\n       peerparty --saves <game.exe>   (each player's saves for the game, and their backups)\n       peerparty --copy-save FROM TO <game.exe> | --swap-saves A B <game.exe> | --reset-save N <game.exe> | --restore-save N BACKUP <game.exe>   (players 1-4; the one replaced is backed up first)\n       peerparty --invite   (invites every other player to the game in front)\n       peerparty --new-room   (makes a room code for internet play)\n       peerparty --net-test   (checks this PC's internet path: STUN, NAT type, the DHT)\n       peerparty --pads   (lists the controllers the overlay reads, and their buttons)\n       peerparty --firewall <game.exe>   (whether Windows Firewall lets other players connect to it)\n       peerparty --fix-firewall <game.exe> [--public]   (as administrator: lets them, on private and domain networks, and public ones with --public)\n       peerparty --remove-firewall   (as administrator: removes every firewall rule peerparty added)\n       peerparty --blocked | --block FINGERPRINT | --unblock FINGERPRINT|all   (public players you blocked)\n       peerparty --friends | --friend FINGERPRINT | --unfriend FINGERPRINT|all   (friends for PEERPARTY_PUBLIC_FRIENDS_ONLY=1)";
 
 /// A parsed command-line invocation.
 pub enum Command {
@@ -109,7 +109,7 @@ pub fn parse(raw: impl IntoIterator<Item = OsString>) -> Result<Command, String>
             Some("--layout") => {
                 args.next();
                 let name = args.next().ok_or(USAGE)?.to_string_lossy().into_owned();
-                let layout = SplitScreen::layout_named(&name).ok_or_else(|| format!("unknown layout {name:?} (expected horizontal, vertical, or grid)"))?;
+                let layout = SplitScreen::layout_named(&name).ok_or_else(|| format!("unknown layout {name:?} (expected horizontal, vertical, top2, bottom2, or grid)"))?;
                 launch.split.get_or_insert_with(SplitScreen::default).layout = layout;
                 layout_given = true;
             }
@@ -124,6 +124,20 @@ pub fn parse(raw: impl IntoIterator<Item = OsString>) -> Result<Command, String>
                 let list = args.next().ok_or(USAGE)?.to_string_lossy().into_owned();
                 let inputs = SplitScreen::inputs_named(&list).ok_or_else(|| format!("bad --inputs {list:?} (expected up to {} of auto, kbm or pad, comma-separated)", SplitScreen::MAX_INSTANCES))?;
                 launch.split.get_or_insert_with(SplitScreen::default).inputs = inputs;
+            }
+            Some("--no-kbm") => {
+                args.next();
+                launch.split.get_or_insert_with(SplitScreen::default).no_kbm = true;
+            }
+            Some("--stagger") => {
+                args.next();
+                let raw = args.next().ok_or(USAGE)?.to_string_lossy().into_owned();
+                let mode = launch::StaggerMode::parse(&raw).ok_or_else(|| format!("bad --stagger {raw:?} (expected smart, or 0..=60 seconds)"))?;
+                launch.split.get_or_insert_with(SplitScreen::default).stagger = mode;
+            }
+            Some("--no-sync") => {
+                args.next();
+                launch.split.get_or_insert_with(SplitScreen::default).no_sync = true;
             }
             Some("--names") => {
                 args.next();
@@ -180,10 +194,10 @@ pub fn parse(raw: impl IntoIterator<Item = OsString>) -> Result<Command, String>
             _ => break,
         }
     }
-    // Three or four players get a grid unless a layout was asked for, as the launcher's
-    // game page gives them: side by side, a pane is too thin to play in.
+    // Three players get 2 + 1 (two on top, one wide below) and four get a 2x2 grid unless
+    // a layout was asked for, matching the launcher's game page.
     if let Some(split) = launch.split.as_mut().filter(|s| !layout_given && s.instances >= 3) {
-        split.layout = LayoutPreset::Grid2x2;
+        split.layout = if split.instances == 3 { LayoutPreset::TopTwo } else { LayoutPreset::Grid2x2 };
     }
     if launch.player.is_some() && launch.split.is_some() {
         return Err("--player is for one copy; a split-screen session gives each copy its player".into());
@@ -441,7 +455,7 @@ mod tests {
         assert!(why_lines);
         assert_eq!(launch.first, PathBuf::from("game.exe"));
         assert_eq!(launch.args, args(&["-windowed"]));
-        assert_eq!(launch.split, Some(SplitScreen { instances: 4, layout: LayoutPreset::Grid2x2, inputs: vec![SlotInput::KeyboardMouse, SlotInput::Auto], names: vec!["".into(), "Sam".into(), "Robin".into()], monitor: None }));
+        assert_eq!(launch.split, Some(SplitScreen { instances: 4, layout: LayoutPreset::Grid2x2, inputs: vec![SlotInput::KeyboardMouse, SlotInput::Auto], no_kbm: false, names: vec!["".into(), "Sam".into(), "Robin".into()], monitor: None, stagger: launch::StaggerMode::Smart, no_sync: false }));
         let split = launch.split.as_ref().unwrap();
         assert_eq!((split.name(0), split.name(1), split.name(3)), (None, Some("Sam".into()), None));
         assert_eq!(
@@ -450,7 +464,7 @@ mod tests {
         );
     }
 
-    /// Three or four players get a grid unless a layout is given; two stay side by side.
+    /// Three players default to 2 + 1 and four to a grid unless a layout is given; two stay side by side.
     #[test]
     fn three_or_four_players_default_to_a_grid() {
         let split = |v: &[&str]| match parse(args(v)) {
@@ -458,9 +472,18 @@ mod tests {
             _ => panic!("expected a split-screen launch"),
         };
         assert_eq!(split(&["--split-screen", "game.exe"]).layout, LayoutPreset::Horizontal);
-        assert_eq!(split(&["--split-screen", "--instances", "3", "game.exe"]).layout, LayoutPreset::Grid2x2);
+        assert_eq!(split(&["--split-screen", "--instances", "3", "game.exe"]).layout, LayoutPreset::TopTwo);
         assert_eq!(split(&["--instances", "4", "--split-screen", "game.exe"]).layout, LayoutPreset::Grid2x2);
+        assert_eq!(split(&["--layout", "bottom2", "--instances", "3", "game.exe"]).layout, LayoutPreset::BottomTwo, "asked for");
         assert_eq!(split(&["--layout", "vertical", "--instances", "4", "game.exe"]).layout, LayoutPreset::Vertical, "asked for");
+        assert!(split(&["--split-screen", "--no-kbm", "game.exe"]).no_kbm);
+        assert!(split(&["--split-screen", "--no-sync", "game.exe"]).no_sync);
+        assert!(!split(&["--split-screen", "game.exe"]).no_sync);
+        assert_eq!(split(&["--split-screen", "--stagger", "0", "game.exe"]).stagger, launch::StaggerMode::Fixed(0));
+        assert_eq!(split(&["--split-screen", "--stagger", "10", "game.exe"]).stagger, launch::StaggerMode::Fixed(10));
+        assert_eq!(split(&["--split-screen", "--stagger", "smart", "game.exe"]).stagger, launch::StaggerMode::Smart);
+        let slots_arg = LayoutPreset::format_slots(&LayoutPreset::pip_slots(2));
+        assert_eq!(split(&["--split-screen", "--layout", &slots_arg, "game.exe"]).layout, LayoutPreset::Slots(LayoutPreset::pip_slots(2)));
         let s = split(&["--split-screen", "--monitor", "2", "game.exe"]);
         assert_eq!(s.monitor, Some(2));
     }
@@ -470,6 +493,8 @@ mod tests {
         assert!(parse(args(&["--instances", "0", "game.exe"])).is_err());
         assert!(parse(args(&["--instances", "5", "game.exe"])).is_err());
         assert!(parse(args(&["--layout", "spiral", "game.exe"])).is_err());
+        assert!(parse(args(&["--stagger", "99", "game.exe"])).is_err());
+        assert!(parse(args(&["--stagger", "later", "game.exe"])).is_err());
         assert!(parse(args(&["--inputs", "kbm,joystick", "game.exe"])).is_err());
         assert!(parse(args(&["--names", "a,b,c,d,e", "game.exe"])).is_err());
         assert!(parse(args(&["--monitor", "0", "game.exe"])).is_err());

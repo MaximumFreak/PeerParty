@@ -35,12 +35,21 @@ pub struct GameOptions {
     pub players: u8,
     /// Run all copies in one split-screen window (when `players >= 2`).
     pub split_screen: bool,
-    /// Split-screen layout preset: "" (auto: side by side for 2, grid for 3–4),
-    /// "horizontal", "vertical", or "grid".
+    /// Split-screen layout preset: "" (auto: side by side for 2, 2+1 for 3, grid for 4),
+    /// "horizontal", "vertical", "top2", "bottom2", "grid", or "custom".
     pub split_layout: String,
+    /// Saved normalized custom layout from Layout Studio (`slots:x,y,w,h,fit,aspect,z;...`).
+    pub split_custom_layout: String,
+    /// Split-screen launch staggering (`""` = smart ready-gate, `"0"` = at once, or seconds).
+    pub split_stagger: String,
+    /// Turn off compositor-locked frame pacing (`--no-sync`; false = sync ON by default).
+    pub split_no_sync: bool,
     /// What each split-screen player plays with, by player: "auto", "kbm" or "pad"
     /// (`launch::SlotInput`); missing ones are "auto".
     pub split_inputs: Vec<String>,
+    /// Keep the PC's keyboard and mouse from reaching games in split screen (`--no-kbm`,
+    /// controllers only), unless a player explicitly chose keyboard and mouse.
+    pub split_no_kbm: bool,
     /// The monitor the split-screen window opens on (`--monitor`, from 1:
     /// `MonitorBounds::all`'s numbers); 0 or 1 is the main one.
     pub split_monitor: u8,
@@ -86,15 +95,40 @@ impl GameOptions {
         self.players >= 2 && self.split_screen
     }
 
-    /// The layout preset name passed to `--layout` (`"horizontal"`, `"vertical"`, or `"grid"`).
+    /// Whether a saved Layout Studio custom layout exists for the current player count.
+    pub fn has_custom_layout(&self) -> bool {
+        let want = usize::from(self.players.clamp(2, 4));
+        peerparty_protocol::session::LayoutPreset::parse_slots(&self.split_custom_layout).is_some_and(|s| s.len() == want)
+    }
+
+    /// The layout preset name selected on the game page.
     pub fn effective_split_layout(&self) -> &'static str {
         match self.split_layout.as_str() {
+            "custom" if self.has_custom_layout() => "custom",
             "horizontal" => "horizontal",
             "vertical" => "vertical",
+            "top2" => "top2",
+            "bottom2" => "bottom2",
             "grid" => "grid",
-            _ if self.players >= 3 => "grid",
+            _ if self.players == 3 => "top2",
+            _ if self.players >= 4 => "grid",
             _ => "horizontal",
         }
+    }
+
+    /// The value passed to `--layout` (resolving `"custom"` to its saved `slots:...` string).
+    pub fn split_layout_arg(&self) -> String {
+        if self.effective_split_layout() == "custom" {
+            self.split_custom_layout.clone()
+        } else {
+            self.effective_split_layout().to_string()
+        }
+    }
+
+    /// Whether any active split-screen player is explicitly assigned keyboard and mouse.
+    pub fn has_kbm_player(&self) -> bool {
+        let n = usize::from(self.players.clamp(2, 4));
+        (0..n).any(|k| self.split_input(k) == "kbm")
     }
 
     /// Split-screen player `k`'s input: "auto", "kbm" or "pad".
@@ -134,7 +168,11 @@ impl Default for GameOptions {
             players: 1,
             split_screen: false,
             split_layout: String::new(),
+            split_custom_layout: String::new(),
+            split_stagger: String::new(),
+            split_no_sync: false,
             split_inputs: Vec::new(),
+            split_no_kbm: false,
             split_monitor: 0,
             compositor: String::new(),
             dxvk: String::new(),

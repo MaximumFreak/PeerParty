@@ -617,7 +617,7 @@ mod tests {
 
         // Asked for pixels: read back, a frame later, into the pixel file, top row first.
         let (ring, dir) = capture::tests::session_ring_file();
-        capture::configure_as(true, Some(&ring), None, true);
+        capture::configure_as(true, Some(&ring), None, None, true);
         let start = std::time::Instant::now();
         let p = loop {
             copy_only(dc);

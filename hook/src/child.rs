@@ -528,7 +528,7 @@ fn hand_over_when_claimed(event: usize, process: usize, pid: u32, image: &str) {
                 // into the same ring once it's told to (the session sends it again).
                 if crate::video::capture::enabled() {
                     log!("child: this starter's frames stop going to the split-screen window");
-                    crate::video::set_capture(false, None, None, false);
+                    crate::video::set_capture(false, None, None, None, false);
                 }
                 crate::ipc::hand_over();
                 if let Some(g) = grant {

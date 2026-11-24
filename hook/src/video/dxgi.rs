@@ -418,18 +418,23 @@ thread_local! {
     static IN_PRESENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-fn presenting(swap: usize, flags: u32, real: impl FnOnce() -> i32) -> i32 {
+fn presenting(swap: usize, flags: u32, real: impl FnOnce(bool) -> i32) -> i32 {
     let outer = !IN_PRESENT.with(|p| p.replace(true));
+    let mut paced = false;
     if outer && flags & 1 == 0 {
         if !super::lower_layer_presents(|| window_of(swap)) {
             super::presented();
+            paced = capture::sync_active();
         }
 
         let _ = std::panic::catch_unwind(|| on_present(swap));
     }
-    let hr = real();
+    let hr = real(paced);
     if outer {
         IN_PRESENT.with(|p| p.set(false));
+        if paced {
+            capture::pace();
+        }
     }
     not_occluded(hr)
 }
@@ -444,11 +449,11 @@ fn not_occluded(hr: i32) -> i32 {
 }
 
 unsafe extern "system" fn present_hook(swap: usize, sync: u32, flags: u32) -> i32 {
-    presenting(swap, flags, || unsafe { PRESENT.get().unwrap().call(swap, sync, flags) })
+    presenting(swap, flags, |paced| unsafe { PRESENT.get().unwrap().call(swap, if paced { 0 } else { sync }, flags) })
 }
 
 unsafe extern "system" fn present1_hook(swap: usize, sync: u32, flags: u32, params: usize) -> i32 {
-    presenting(swap, flags, || unsafe { PRESENT1.get().unwrap().call(swap, sync, flags, params) })
+    presenting(swap, flags, |paced| unsafe { PRESENT1.get().unwrap().call(swap, if paced { 0 } else { sync }, flags, params) })
 }
 
 unsafe extern "system" fn resize_hook(swap: usize, n: u32, w: u32, h: u32, fmt: u32, flags: u32) -> i32 {

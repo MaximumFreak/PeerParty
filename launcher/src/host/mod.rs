@@ -39,6 +39,7 @@
 //! drawn inside its frames only, worked with controllers (evdev), and the keyboard
 //! hooks, the window over the game and Game Bar are stand-ins (unix.rs).
 
+mod audio;
 mod compositor;
 mod desktop;
 mod firewall_watch;
@@ -51,6 +52,7 @@ mod gpu;
 mod input;
 mod input_hub;
 mod instance;
+mod layout_studio;
 mod overlay_render;
 pub(crate) mod pad;
 pub mod pipe;
@@ -73,12 +75,13 @@ mod window;
 #[cfg(unix)]
 use unix::{gamebar, input, window};
 
+use std::collections::VecDeque;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 use peerparty_protocol::ipc::{HookMsg, HostMsg};
-use peerparty_protocol::session::{InputAssignment, InstanceId, InstanceSpec};
+use peerparty_protocol::session::{InputAssignment, InstanceId, InstanceSpec, PaneRect, PaneSlot};
 
 pub use compositor::{CompositorWindow, MonitorBounds};
 pub use ring::pixel_frames;
@@ -87,11 +90,13 @@ use desktop::Rect;
 pub use peerparty_protocol::session::LayoutPreset;
 
 use crate::firewall;
-use crate::launch::SlotInput;
+use crate::launch::{SlotInput, StaggerMode};
 use crate::ui::store::Prefs;
+use audio::AudioMixer;
 use firewall_watch::{FirewallEvent, FirewallWatcher};
 use input_hub::InputHub;
 use instance::{InstanceConn, Surface, Viewport};
+use layout_studio::{LayoutStudio, PlayerInfo, StudioAction, StudioInfo, StudioPad};
 use overlay_render::{FRAME_GAP, OverlayRenderer, scale_for};
 use prefs_sync::PrefsSync;
 use ui::{Cmd, Nav, Overlay, Page};
@@ -114,8 +119,17 @@ const HOTKEY_NAMES: [&str; 4] = ["Shift+Tab", "Shift+F3", "Shift+F1", "Shift+F2"
 const HOTKEY_OWNERS: [(&str, &str); 4] = [("steam", "Steam"), ("epic", "Epic"), ("ea", "EA"), ("ubisoft", "Ubisoft")];
 /// A split-screen session's keys, with Ctrl+Alt held while its window or a copy is in
 /// front: L the next layout, Z the focused copy on the whole window, 1 to 4 (the number
-/// row's, then the number pad's) the focus to that copy.
-const SESSION_KEYS: [i32; 10] = [0x4C, 0x5A, 0x31, 0x32, 0x33, 0x34, 0x61, 0x62, 0x63, 0x64];
+/// row's, then the number pad's) the focus to that copy, E the live Layout Studio.
+const SESSION_KEYS: [i32; 11] = [0x4C, 0x5A, 0x31, 0x32, 0x33, 0x34, 0x61, 0x62, 0x63, 0x64, 0x45];
+
+/// Smart ready-gate launch staggering timings: wait for the previous copy to create its
+/// window (plus a brief settle) or render its first frame, with a safety timeout.
+const SMART_STAGGER_WINDOW_SETTLE: Duration = Duration::from_millis(500);
+const SMART_STAGGER_MAX: Duration = Duration::from_secs(8);
+const SMART_STAGGER_ABORT_WINDOW: Duration = Duration::from_secs(5);
+
+/// Spawns copy `slot` (1..N) when the session host's launch stagger gate fires.
+pub type PendingSpawner = Box<dyn FnMut(u32, Option<PaneRect>, Option<(u32, u32)>) -> Result<SessionLaunch, String>>;
 
 /// Which of the hotkeys that are on (`on`) open the overlay in a game with `foreign`
 /// store overlays loaded. A key a loaded store overlay opens on is left to it (a game
@@ -350,10 +364,28 @@ struct SessionHost {
     panics: u32,
     /// What each player plays with (`SessionLaunch::input`).
     inputs: Vec<SlotInput>,
+    /// Keyboard and mouse are kept from reaching the games (controllers only); overlay
+    /// and session hotkeys still work.
+    kbm_off: bool,
     /// Each player seen playing with the keyboard and mouse before a controller of
     /// theirs was used (`watch_keyboard`): a controller goes to another player first.
     kbm_player: Vec<bool>,
     kbm_seen: KbmSeen,
+    /// Interactive Layout Studio canvas drawn live over the compositor panes.
+    layout_studio: LayoutStudio,
+    /// Per-copy WASAPI audio mute controller.
+    audio: AudioMixer,
+    audio_refresh: Instant,
+    /// Copies waiting to be started by the smart ready-gate stagger queue.
+    pending_spawns: VecDeque<u32>,
+    spawner: Option<PendingSpawner>,
+    stagger: StaggerMode,
+    last_spawned_at: Instant,
+    stagger_ready_at: Option<Instant>,
+    pixels: bool,
+    /// Compositor-locked frame pacing ("Sync games to screen", ON by default).
+    sync_frames: bool,
+    game_title: String,
 }
 
 /// Runs until the game has ended: `process` says so then (on Windows the game's process,
@@ -389,18 +421,23 @@ pub fn initial_session_bounds(monitor: Option<u32>) -> MonitorBounds {
 }
 
 /// How a split-screen session's window looks: its layout, where it opens (the bounds
-/// `initial_session_bounds` gave the copies' panes), and whether the copies' frames come
-/// as pixels (`ring::pixel_frames`).
+/// `initial_session_bounds` gave the copies' panes), whether the copies' frames come
+/// as pixels (`ring::pixel_frames`), KBM lockout, launch staggering, and total copy count.
 pub struct SessionLook {
     pub layout: LayoutPreset,
     pub bounds: MonitorBounds,
     pub pixels: bool,
+    pub no_kbm: bool,
+    pub stagger: StaggerMode,
+    pub sync: bool,
+    pub total_count: usize,
 }
 
 /// Runs a split-screen session until every copy in it has ended: one window shows them
 /// in panes cut by `layout` (each copy told its pane and given a virtual input block),
-/// and each copy has an overlay of its own, as `run` gives one.
-pub fn run_session(instances: Vec<SessionLaunch>, look: SessionLook, exe: &Path, prefs: Prefs, packaged: bool) {
+/// and each copy has an overlay of its own, as `run` gives one. Copies beyond the initial
+/// batch are started lazily via `spawner` according to `look.stagger`.
+pub fn run_session(instances: Vec<SessionLaunch>, look: SessionLook, spawner: Option<PendingSpawner>, exe: &Path, prefs: Prefs, packaged: bool) {
     if instances.is_empty() {
         return;
     }
@@ -414,13 +451,26 @@ pub fn run_session(instances: Vec<SessionLaunch>, look: SessionLook, exe: &Path,
             c
         })
         .collect();
+    let total = look.total_count.max(copies.len());
     CLOSE_ASKED.store(false, std::sync::atomic::Ordering::Release);
     let name = exe.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let title = game_title(exe, &name);
     // The window is made on this thread, which hands it its messages (desktop::wait).
-    let compositor = CompositorWindow::open(look.layout, look.bounds, copies.len(), &title, exe);
+    let compositor = CompositorWindow::open(look.layout, look.bounds, total, &title, exe);
     let mut host = SessionHost::new(copies, Some(compositor), exe, prefs, packaged);
+    host.pixels = look.pixels;
+    host.sync_frames = look.sync;
+    host.stagger = look.stagger;
+    if let Some(sp) = spawner {
+        let start = host.instances.len() as u32;
+        for slot in start..total as u32 {
+            host.pending_spawns.push_back(slot);
+        }
+        host.spawner = Some(sp);
+        host.last_spawned_at = Instant::now();
+    }
     host.set_inputs(inputs);
+    host.set_kbm_off(look.no_kbm);
     let event = host.compositor.as_ref().and_then(|c| c.frame_event());
     let draws = host.compositor.as_ref().is_some_and(|c| c.draws_frames());
     for inst in &mut host.instances {
@@ -430,6 +480,7 @@ pub fn run_session(instances: Vec<SessionLaunch>, look: SessionLook, exe: &Path,
         // ring block.
         if draws {
             inst.make_ring(look.pixels);
+            inst.set_sync(host.sync_frames);
             inst.send_capture(event.as_deref());
         }
     }
@@ -473,8 +524,20 @@ impl SessionHost {
             pads_logged: None,
             panics: 0,
             inputs: Vec::new(),
+            kbm_off: false,
             kbm_player: Vec::new(),
             kbm_seen: KbmSeen::default(),
+            layout_studio: LayoutStudio::new(),
+            audio: AudioMixer::new(),
+            audio_refresh: Instant::now(),
+            pending_spawns: VecDeque::new(),
+            spawner: None,
+            stagger: StaggerMode::Smart,
+            last_spawned_at: Instant::now(),
+            stagger_ready_at: None,
+            pixels: false,
+            sync_frames: true,
+            game_title: title,
         };
         host.inputs = vec![SlotInput::Auto; host.instances.len()];
         host.kbm_player = vec![false; host.instances.len()];
@@ -484,10 +547,15 @@ impl SessionHost {
 
     fn run(mut self) {
         loop {
-            let open = self.any_open();
+            let open = self.any_open() || self.layout_studio.active;
+            let last_frame = if self.layout_studio.active {
+                self.layout_studio.last_frame
+            } else {
+                self.panes[self.focus].render.last_frame
+            };
             let timeout = if open && input::pending() {
                 // Input waits: the next frame as soon as the last one is far enough behind.
-                FRAME_GAP.saturating_sub(self.panes[self.focus].render.last_frame.elapsed()).as_millis() as u32
+                FRAME_GAP.saturating_sub(last_frame.elapsed()).as_millis() as u32
             } else if open || self.panes.iter().any(|p| p.overlay.has_toasts()) {
                 16
             } else if self.in_front() {
@@ -595,10 +663,274 @@ impl SessionHost {
     }
 
     /// The keyboard and mouse are taken from the games while the focused copy's overlay
-    /// is open (and Game Bar isn't over it); another copy's open overlay is worked with
-    /// its player's controller alone.
+    /// or Layout Studio is open (and Game Bar isn't over it); another copy's open overlay
+    /// is worked with its player's controller alone.
     fn update_capture(&self) {
-        input::capture(self.panes[self.focus].visible && !self.under_gamebar);
+        input::capture((self.panes[self.focus].visible || self.layout_studio.active) && !self.under_gamebar);
+    }
+
+    /// Controller button glyph style for Layout Studio (honors the user's glyph setting).
+    fn studio_glyph_style(&mut self) -> pad::Style {
+        match self.prefs.glyphs.as_str() {
+            "xbox" => pad::Style::Xbox,
+            "playstation" => pad::Style::PlayStation,
+            "nintendo" => pad::Style::Nintendo,
+            _ => self.input.pads().style,
+        }
+    }
+
+    /// Snapshot of combined controller buttons, triggers, right stick and style for Layout Studio.
+    fn studio_pad(&mut self) -> StudioPad {
+        let (lt, rt, rx, ry, connected) = self.input.pads().studio_analog();
+        let style = self.studio_glyph_style();
+        StudioPad { buttons: self.pads.all, lt, rt, rx, ry, style, connected }
+    }
+
+    /// Opens the live Layout Studio canvas over the split-screen panes.
+    fn open_layout_studio(&mut self) {
+        if self.layout_studio.active {
+            return;
+        }
+        let Some(bounds) = self.compositor.as_ref().filter(|c| c.hwnd() != 0).map(|c| c.bounds()) else {
+            return;
+        };
+        let slots = self.compositor.as_ref().map(|c| c.slots().to_vec()).unwrap_or_default();
+        if slots.is_empty() {
+            return;
+        }
+        let (w, h) = (i32::try_from(bounds.width).unwrap_or(i32::MAX), i32::try_from(bounds.height).unwrap_or(i32::MAX));
+        let rect = Rect { left: bounds.x, top: bounds.y, right: bounds.x.saturating_add(w), bottom: bounds.y.saturating_add(h) };
+        let pad = self.studio_pad();
+        // Activate Studio before hiding any open overlay so input capture stays on seamlessly
+        // without tearing down and reinstalling the low-level keyboard/mouse hooks.
+        self.layout_studio.open(slots, self.focus, self.sync_frames, rect, self.prefs.overlay_scale, pad);
+        for i in 0..self.panes.len() {
+            if self.panes[i].visible {
+                self.hide(i);
+            }
+        }
+        self.update_capture();
+        self.cur().send(&HostMsg::Note { text: "session: Layout Studio opened (drag dividers/corners to resize, drag panes to move or swap, Esc/B to finish)".into() });
+    }
+
+    /// Closes Layout Studio and restores normal session input.
+    fn close_layout_studio(&mut self) {
+        if !self.layout_studio.active {
+            return;
+        }
+        self.layout_studio.close();
+        self.nav.keys_down = [true; 4];
+        self.update_capture();
+        self.cur().send(&HostMsg::Note { text: "session: Layout Studio closed".into() });
+    }
+
+    /// Saves the chosen split-screen layout for this game in `ui.json` (using a clean
+    /// preset name when it matches a built-in preset, else `"custom"` + `slots:...`).
+    fn save_custom_layout(&self, slots: &[PaneSlot]) {
+        let count = slots.len();
+        let named = [
+            ("horizontal", LayoutPreset::Horizontal, true),
+            ("vertical", LayoutPreset::Vertical, true),
+            ("grid", LayoutPreset::Grid2x2, count >= 3),
+            ("top2", LayoutPreset::TopTwo, count == 3),
+            ("bottom2", LayoutPreset::BottomTwo, count == 3),
+        ]
+        .into_iter()
+        .find(|(_, p, ok)| *ok && p.to_slots(count) == slots)
+        .map(|(name, _, _)| name.to_string());
+        let encoded = LayoutPreset::format_slots(slots);
+        let key = self.key.clone();
+        let what = named.clone().unwrap_or_else(|| "custom".into());
+        crate::ui::store::Settings::update(|s| {
+            let o = s.games.entry(key).or_default();
+            match named {
+                Some(preset) => o.split_layout = preset,
+                None => {
+                    o.split_custom_layout = encoded;
+                    o.split_layout = "custom".into();
+                }
+            }
+        });
+        self.cur().send(&HostMsg::Note { text: format!("session: saved {what} split-screen layout for this game") });
+    }
+
+    /// Runs one tick of Layout Studio while it is open.
+    fn frame_studio(&mut self) {
+        let Some((bounds, zoomed)) = self.compositor.as_ref().filter(|c| c.hwnd() != 0).map(|c| (c.bounds(), c.zoomed().then_some(c.focused()))) else {
+            self.close_layout_studio();
+            return;
+        };
+        let (w, h) = (i32::try_from(bounds.width).unwrap_or(i32::MAX), i32::try_from(bounds.height).unwrap_or(i32::MAX));
+        let rect = Rect { left: bounds.x, top: bounds.y, right: bounds.x.saturating_add(w), bottom: bounds.y.saturating_add(h) };
+        let total = self.layout_studio.slots.len().max(self.instances.len());
+        let players: Vec<PlayerInfo> = (0..total)
+            .map(|i| match self.instances.get(i) {
+                Some(inst) => {
+                    let name = if !inst.state.me.is_empty() {
+                        inst.state.me.clone()
+                    } else {
+                        inst.spec.identity_override.clone().unwrap_or_default()
+                    };
+                    PlayerInfo { name, muted: self.audio.is_muted(inst.pid), starting: false, gone: inst.gone }
+                }
+                None => PlayerInfo { name: String::new(), muted: false, starting: true, gone: false },
+            })
+            .collect();
+        let info = StudioInfo {
+            players,
+            screen: (bounds.width, bounds.height),
+            keyboard: (!self.kbm_off).then_some(self.focus),
+            zoomed,
+            sync: self.sync_frames,
+        };
+        let pad = self.studio_pad();
+        let actions = self.layout_studio.tick(rect, self.prefs.overlay_scale, self.started.elapsed().as_secs_f64(), pad, &info);
+        for action in actions {
+            match action {
+                StudioAction::Preview(slots) => {
+                    if let Some(c) = self.compositor.as_mut() {
+                        c.preview_slots(slots, &self.instances);
+                    }
+                }
+                StudioAction::Commit(slots) => {
+                    if let Some(c) = self.compositor.as_mut() {
+                        c.set_zoomed(false);
+                        c.set_layout(LayoutPreset::Slots(slots));
+                    }
+                    self.panes_stale = true;
+                }
+                StudioAction::Preset(preset) => {
+                    if let Some(c) = self.compositor.as_mut() {
+                        c.set_zoomed(false);
+                        c.set_layout(preset);
+                    }
+                    self.panes_stale = true;
+                }
+                StudioAction::ToggleMute(i) => {
+                    if let Some(inst) = self.instances.get(i) {
+                        let muted = self.audio.toggle(inst.pid);
+                        let msg = if muted {
+                            format!("session: muted player {}'s game audio", i + 1)
+                        } else {
+                            format!("session: unmuted player {}'s game audio", i + 1)
+                        };
+                        inst.send(&HostMsg::Note { text: msg });
+                    }
+                }
+                StudioAction::ToggleZoom(i) => {
+                    if i < self.instances.len() && !self.instances[i].gone {
+                        self.set_focus(i);
+                        if let Some(c) = self.compositor.as_mut() {
+                            let same = c.zoomed() && c.focused() == i;
+                            c.focus_pane(i);
+                            c.set_zoomed(!same);
+                        }
+                        self.panes_stale = true;
+                        self.close_layout_studio();
+                    }
+                }
+                StudioAction::KeyboardStep(d) => self.keyboard_step(d),
+                StudioAction::SetSync(on) => {
+                    self.sync_frames = on;
+                    for inst in &self.instances {
+                        inst.set_sync(on);
+                    }
+                    let msg = if on {
+                        "session: sync games to screen turned on (copies paced to the display refresh)"
+                    } else {
+                        "session: sync games to screen turned off (copies render at their own frame rate)"
+                    };
+                    self.cur().send(&HostMsg::Note { text: msg.into() });
+                }
+                StudioAction::Save(slots) => {
+                    if let Some(c) = self.compositor.as_mut() {
+                        c.set_zoomed(false);
+                        c.set_layout(LayoutPreset::Slots(slots.clone()));
+                    }
+                    self.save_custom_layout(&slots);
+                    self.panes_stale = true;
+                }
+                StudioAction::SaveSync(on) => {
+                    let key = self.key.clone();
+                    crate::ui::store::Settings::update(|s| {
+                        s.games.entry(key).or_default().split_no_sync = !on;
+                    });
+                }
+                StudioAction::Close => self.close_layout_studio(),
+            }
+        }
+    }
+
+    /// Smart ready-gate launch staggering: spawns the next queued split-screen copy once
+    /// the latest running copy is ready (first frame / viewport + short settle floor, or
+    /// fallback timeout), or drops the queue immediately if the session is closing.
+    fn stagger_tick(&mut self) {
+        if self.pending_spawns.is_empty() || self.spawner.is_none() {
+            return;
+        }
+        if self.closing_since.is_some() {
+            self.pending_spawns.clear();
+            return;
+        }
+        // If copy 0 died right after launch, don't pile on copies 2..N.
+        if self.instances.first().is_some_and(|i| i.gone) && self.started.elapsed() < SMART_STAGGER_ABORT_WINDOW {
+            self.pending_spawns.clear();
+            return;
+        }
+        let now = Instant::now();
+        let ready = match self.stagger {
+            StaggerMode::Fixed(0) => true,
+            StaggerMode::Fixed(secs) => self.last_spawned_at.elapsed() >= Duration::from_secs(secs.into()),
+            StaggerMode::Smart => {
+                let Some(last) = self.instances.last() else { return };
+                if last.gone || last.surface.is_some() || self.last_spawned_at.elapsed() >= SMART_STAGGER_MAX {
+                    true
+                } else if last.best_hwnd() != 0 || last.viewport.as_ref().is_some_and(|v| v.width > 0 && v.height > 0) {
+                    let since = *self.stagger_ready_at.get_or_insert(now);
+                    since.elapsed() >= SMART_STAGGER_WINDOW_SETTLE
+                } else {
+                    false
+                }
+            }
+        };
+        if !ready {
+            return;
+        }
+        let Some(slot) = self.pending_spawns.pop_front() else { return };
+        let pane = self.compositor.as_ref().and_then(|c| c.screen_pane(slot as usize));
+        let virt = self.compositor.as_ref().and_then(|c| c.virtual_size(slot as usize));
+        let result = self.spawner.as_mut().expect("checked")(slot, pane, virt);
+        self.last_spawned_at = now;
+        self.stagger_ready_at = None;
+        match result {
+            Ok(launch) => {
+                let input = launch.input;
+                let mut conn = InstanceConn::new(launch.spec, launch.process, launch.pid, launch.pipe);
+                conn.stop = launch.stop;
+                conn.make_input_block();
+                let event = self.compositor.as_ref().and_then(|c| c.frame_event());
+                let draws = self.compositor.as_ref().is_some_and(|c| c.draws_frames());
+                if draws {
+                    conn.make_ring(self.pixels);
+                    conn.set_sync(self.sync_frames);
+                    conn.send_capture(event.as_deref());
+                }
+                self.instances.push(conn);
+                self.panes.push(PaneOverlay::new(self.game_title.clone()));
+                self.inputs.push(input);
+                self.kbm_player.push(false);
+                if input == SlotInput::KeyboardMouse {
+                    self.kbm_off = false;
+                }
+                self.refresh_hints();
+                self.panes_stale = true;
+                self.layout_studio.dirty = true;
+            }
+            Err(e) => {
+                eprintln!("peerparty: session: couldn't start player {}: {e}", slot + 1);
+                self.pending_spawns.clear();
+            }
+        }
     }
 
     /// Which running split-screen copy owns controller `pad_index` (if any).
@@ -610,21 +942,33 @@ impl SessionHost {
     }
 
     /// Keeps the real mouse in the focused pane while its game has locked its cursor (an
-    /// aiming game), the session's window is in front and no overlay is open there; the
-    /// game's locked cursor isn't the real one (its hook answers for it), so without
-    /// this the mouse would wander into another pane and click it.
-    fn confine_cursor(&mut self, front: bool) {
+    /// aiming game), and hides the pointer while locked, while the game hid its cursor
+    /// (`ShowCursor`), or while the mouse sits idle with controllers active (or KBM off).
+    fn update_pointer(&mut self, front: bool) {
         let f = self.focus;
+        let has_pad = self.input.pads().seat_info().iter().any(Option::is_some);
         let Some(c) = self.compositor.as_mut() else { return };
         let ours = front && c.hwnd() != 0 && desktop::in_front(std::process::id());
-        let lock = ours && !self.panes[f].visible && self.instances.get(f).is_some_and(|i| i.cursor_locked && !i.gone);
-        if c.confine_cursor(lock.then_some(f)) {
+        let active = ours && !self.panes[f].visible && !self.layout_studio.active && self.instances.get(f).is_some_and(|i| !i.gone);
+        let lock = active && !self.kbm_off && self.instances[f].cursor_locked;
+        let game_hide = active && !self.kbm_off && self.instances[f].cursor_hidden;
+        let idle_hide = active && (self.kbm_off || has_pad);
+        if c.update_pointer(lock.then_some(f), game_hide, idle_hide) {
             let text = if lock {
                 "session: the game locked its cursor: the mouse stays in its pane, the pointer hidden, while the session is in front".to_string()
             } else {
                 "session: the mouse is free of the pane again (the cursor unlocked, the overlay opened, or the session left the front)".to_string()
             };
             self.instances[f].send(&HostMsg::Note { text });
+        }
+    }
+
+    /// Starts the session with keyboard and mouse kept from the games (controllers only),
+    /// unless a player explicitly chose keyboard and mouse.
+    fn set_kbm_off(&mut self, off: bool) {
+        if off && !self.inputs.contains(&SlotInput::KeyboardMouse) {
+            self.kbm_off = true;
+            self.cur().send(&HostMsg::Note { text: "input: keyboard and mouse to games are off (controllers only; overlay and Ctrl+Alt+1-4 still work)".into() });
         }
     }
 
@@ -695,7 +1039,7 @@ impl SessionHost {
         let new = presses.saturating_sub(self.kbm_seen.last);
         self.kbm_seen.last = presses;
         let f = self.focus;
-        if new == 0 || !front || self.kbm_player.get(f) != Some(&false) || self.inputs.get(f) != Some(&SlotInput::Auto) {
+        if new == 0 || !front || self.kbm_off || self.layout_studio.active || self.any_open() || self.kbm_player.get(f) != Some(&false) || self.inputs.get(f) != Some(&SlotInput::Auto) {
             return;
         }
         if self.kbm_seen.pane != f {
@@ -744,7 +1088,7 @@ impl SessionHost {
                 ui::PlayerSeat { detail, can_swap: takes_pad(k, self) && pad_players > 1, can_free: takes_pad(k, self) && seat.is_some() }
             })
             .collect();
-        Some(ui::Seats { players, me, keyboard: self.focus })
+        Some(ui::Seats { players, me, keyboard: (!self.kbm_off).then_some(self.focus) })
     }
 
     /// Player `k`'s controller trades places with the next player's who plays with one.
@@ -766,14 +1110,23 @@ impl SessionHost {
         self.instances[k].send(&HostMsg::Note { text });
     }
 
-    /// The keyboard and mouse go `d` players on (wrapping), past the ones that ended.
+    /// The keyboard and mouse go `d` steps on (wrapping through active players and Off).
     fn keyboard_step(&mut self, d: i32) {
-        let n = self.instances.len() as i32;
-        let next = (1..n).map(|s| (self.focus as i32 + d * s).rem_euclid(n) as usize).find(|&j| !self.instances[j].gone);
-        if let Some(j) = next {
-            let text = format!("input: the keyboard and mouse go to player {} (from the overlay)", j + 1);
-            self.instances[j].send(&HostMsg::Note { text });
-            self.set_focus(j);
+        let mut opts: Vec<Option<usize>> = (0..self.instances.len()).filter(|&j| !self.instances[j].gone).map(Some).collect();
+        opts.push(None);
+        let cur = if self.kbm_off { None } else { Some(self.focus) };
+        let at = opts.iter().position(|&o| o == cur).unwrap_or(0) as i32;
+        match opts[(at + d).rem_euclid(opts.len() as i32) as usize] {
+            Some(j) => {
+                self.kbm_off = false;
+                let text = format!("input: the keyboard and mouse go to player {} (from the overlay)", j + 1);
+                self.instances[j].send(&HostMsg::Note { text });
+                self.set_focus(j);
+            }
+            None => {
+                self.kbm_off = true;
+                self.cur().send(&HostMsg::Note { text: "input: keyboard and mouse to games turned off (controllers only, from the overlay)".into() });
+            }
         }
     }
 
@@ -901,6 +1254,11 @@ impl SessionHost {
             self.set_focus(i);
         }
         self.session_tick();
+        self.stagger_tick();
+        if self.audio_refresh.elapsed() >= Duration::from_secs(2) {
+            self.audio_refresh = Instant::now();
+            self.audio.refresh();
+        }
         self.firewall_tick();
         let front = self.in_front();
         self.track_focus(front);
@@ -945,14 +1303,23 @@ impl SessionHost {
                 self.frame_open(i);
             }
         }
-        if front && self.prefs.overlay && !gamebar {
+        if self.layout_studio.active {
+            if !front || gamebar {
+                self.close_layout_studio();
+            } else {
+                self.frame_studio();
+            }
+        }
+        if front && self.prefs.overlay && !gamebar && !self.layout_studio.active {
             // The game doesn't get the opening hotkeys (input.rs `watch_hotkeys`).
             let vks: Vec<u32> = self.hotkeys().iter().filter(|(on, _)| *on).map(|(_, vk)| *vk).collect();
             input::watch_hotkeys(&vks);
             self.check_open();
         } else {
             input::watch_hotkeys(&[]);
-            self.why_not_open(front, gamebar);
+            if !self.layout_studio.active {
+                self.why_not_open(front, gamebar);
+            }
             // A Home or hotkey still down when the game comes back to the front (Guide
             // closing Game Bar) isn't a press.
             self.input.pads().hold_home();
@@ -962,14 +1329,13 @@ impl SessionHost {
             self.release_pads(i);
         }
         self.frame_toasts();
-        let open: Vec<bool> = self.panes.iter().map(|p| p.visible).collect();
+        let open: Vec<bool> = self.panes.iter().map(|p| p.visible || self.layout_studio.active).collect();
         // The keyboard and mouse are the focused player's only while the session is in
-        // front: typed into another program, they'd reach that player's game too (raw
-        // input reads them wherever they go), and stay down there after Alt+Tab.
-        let focus = self.compositor.as_ref().map(|_| self.focus).filter(|_| front);
+        // front, Layout Studio is closed, and keyboard/mouse input to games is enabled.
+        let focus = self.compositor.as_ref().map(|_| self.focus).filter(|_| front && !self.kbm_off && !self.layout_studio.active);
         let focus_cursor = self.compositor.as_ref().and_then(|c| c.cursor_screen(self.focus));
         self.input.publish_session(&mut self.instances, &open, focus, focus_cursor);
-        self.confine_cursor(front);
+        self.update_pointer(front);
     }
 
     /// Every copy's messages since the last tick.
@@ -1013,10 +1379,12 @@ impl SessionHost {
             self.ended_all = true;
             c.terminate_instances(&self.instances, &format!("still running {} s after being asked to close", CLOSE_WAIT.as_secs()));
         }
-        let mut focus = c.take_click().and_then(|(x, y)| c.pane_at(x, y));
+        let click = c.take_click();
+        let mut focus = if self.kbm_off || self.layout_studio.active { None } else { click.and_then(|(x, y)| c.pane_at(x, y)) };
         // A focus asked for by Ctrl+Alt+1–4: said in that pane (outside a zoom nothing on
         // screen changes, so the keys seemed to do nothing).
         let mut keyed: Option<usize> = None;
+        let mut toggle_studio = false;
         let ours = c.hwnd() != 0 && desktop::in_front(std::process::id());
         let held = ours || self.instances.iter().any(|i| i.in_front());
         let chord = held && ctrl_alt(down);
@@ -1028,6 +1396,9 @@ impl SessionHost {
                         c.cycle_layout();
                         let text = format!("session: the {} layout", c.layout().as_str());
                         self.instances[self.focus].send(&HostMsg::Note { text });
+                        if self.layout_studio.active {
+                            self.layout_studio.set_slots(c.slots().to_vec());
+                        }
                         self.panes_stale = true;
                     }
                     1 => {
@@ -1039,6 +1410,9 @@ impl SessionHost {
                         };
                         crate::launch::note(self.instances[c.focused()].pid, &text);
                         self.panes_stale = true;
+                    }
+                    10 => {
+                        toggle_studio = true;
                     }
                     n => {
                         let i = (n - 2) % 4;
@@ -1057,6 +1431,9 @@ impl SessionHost {
             }
         }
         if let Some(i) = focus.filter(|&i| i < self.instances.len() && !self.instances[i].gone) {
+            if keyed == Some(i) {
+                self.kbm_off = false;
+            }
             c.focus_pane(i);
             c.activate_pane(i, &self.instances);
             self.panes_stale = true;
@@ -1077,7 +1454,14 @@ impl SessionHost {
             self.redraw_all();
             self.close_hidden_overlays();
         }
-        let overlay_open = self.panes[self.focus].visible;
+        if toggle_studio {
+            if self.layout_studio.active {
+                self.close_layout_studio();
+            } else {
+                self.open_layout_studio();
+            }
+        }
+        let overlay_open = self.panes[self.focus].visible || self.layout_studio.active;
         let clicked_focus = if let Some(c) = self.compositor.as_mut() {
             c.maintain(&self.instances);
             // What changed in the panes, into each copy's log.
@@ -1086,7 +1470,7 @@ impl SessionHost {
                     crate::launch::note(inst.pid, &line);
                 }
             }
-            c.forward_input(self.focus, overlay_open, &self.instances)
+            c.forward_input(self.focus, overlay_open, self.kbm_off, &self.instances)
         } else {
             None
         };
@@ -1187,6 +1571,7 @@ impl SessionHost {
             }
             HookMsg::Log(_) => {}
             HookMsg::CursorLock { on } => self.instances[i].cursor_locked = on,
+            HookMsg::CursorHide { hidden } => self.instances[i].cursor_hidden = hidden,
             HookMsg::Viewport { width, height, hwnd, api } => {
                 let v = Viewport { width, height, hwnd, api };
                 let inst = &mut self.instances[i];
@@ -1228,9 +1613,11 @@ impl SessionHost {
         // A starter program handed over to the game it started (pipe.rs): the overlay
         // follows the process that's talking now.
         let pid = state.get("pid").as_u64().and_then(|p| u32::try_from(p).ok()).unwrap_or(0);
+        let old_pid = self.instances[i].pid;
         let handoff = self.instances[i].follow_pid(pid);
         let connected = self.instances[i].first_state || handoff;
         if handoff {
+            self.audio.follow_pid(old_pid, pid);
             self.send_settings(i);
             if i == self.focus {
                 if let Some(exe) = crate::platform::process_exe(pid) {
@@ -1843,6 +2230,7 @@ impl SessionHost {
                 Cmd::SwapSeat(k) => self.swap_seat(k, i),
                 Cmd::FreeSeat(k) => self.free_seat(k, i),
                 Cmd::KeyboardStep(d) => self.keyboard_step(d),
+                Cmd::OpenLayoutStudio => self.open_layout_studio(),
                 Cmd::RecordChord => {
                     let now = Instant::now();
                     let p = &mut self.panes[i];
@@ -2287,11 +2675,14 @@ mod tests {
         assert_eq!(host.seat_open(), Some(vec![pad::Open::Later, pad::Open::No, pad::Open::Yes, pad::Open::No]));
         assert_eq!(session(1).seat_open(), None, "a copy alone hands seats out as controllers come");
         let seats = host.seats(0).unwrap();
-        assert_eq!((seats.me, seats.keyboard), (0, 1));
+        assert_eq!((seats.me, seats.keyboard), (0, Some(1)));
         assert!(seats.players[0].can_swap && !seats.players[1].can_swap && !seats.players[3].can_swap);
         host.keyboard_step(1);
-        assert_eq!(host.focus, 2);
+        assert_eq!((host.focus, host.kbm_off), (2, false));
         host.keyboard_step(1);
-        assert_eq!(host.focus, 0, "past the one that ended");
+        assert!(host.kbm_off, "Off step in the cycle");
+        assert_eq!(host.seats(0).unwrap().keyboard, None);
+        host.keyboard_step(1);
+        assert_eq!((host.focus, host.kbm_off), (0, false), "wraps past the one that ended");
     }
 }

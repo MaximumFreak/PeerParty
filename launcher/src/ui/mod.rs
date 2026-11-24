@@ -673,10 +673,20 @@ impl App {
             args.push("--instances".into());
             args.push(o.players.clamp(2, 4).to_string());
             args.push("--layout".into());
-            args.push(o.effective_split_layout().into());
+            args.push(o.split_layout_arg());
             if let Some(inputs) = o.split_inputs_arg() {
                 args.push("--inputs".into());
                 args.push(inputs);
+            }
+            if o.split_no_kbm && !o.has_kbm_player() {
+                args.push("--no-kbm".into());
+            }
+            if !o.split_stagger.is_empty() && !o.split_stagger.eq_ignore_ascii_case("smart") {
+                args.push("--stagger".into());
+                args.push(o.split_stagger.clone());
+            }
+            if o.split_no_sync {
+                args.push("--no-sync".into());
             }
             if o.split_monitor >= 2 {
                 args.push("--monitor".into());
@@ -1443,15 +1453,16 @@ struct Plan {
     later: Option<Vec<String>>,
 }
 
-/// Drops leading `--split-screen`, `--instances <n>`, and `--layout <preset>` flags from
-/// a command line so adding one more copy alongside a running session starts a single
-/// `--multi-instance` copy rather than a second split-screen session.
+/// Drops leading `--split-screen`, `--no-kbm`, `--instances <n>`, `--layout <preset>`,
+/// `--inputs <list>`, and `--names <list>` flags from a command line so adding one more
+/// copy alongside a running session starts a single `--multi-instance` copy rather than
+/// a second split-screen session.
 fn strip_split_flags(args: &[String]) -> Vec<String> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--split-screen" => i += 1,
-            "--instances" | "--layout" | "--inputs" | "--names" => i += 2,
+            "--split-screen" | "--no-kbm" | "--no-sync" => i += 1,
+            "--instances" | "--layout" | "--inputs" | "--names" | "--stagger" | "--monitor" => i += 2,
             _ => break,
         }
     }
@@ -1985,7 +1996,7 @@ mod tests {
         assert_eq!(plan(one.clone(), 1, false, true, true), Plan { now: one, later: None }, "an Xbox app game: one copy");
         // Split screen: one peerparty.exe runs all copies. Adding another copy while
         // running strips the split flags and launches one --multi-instance copy.
-        let split = s(&["--split-screen", "--instances", "3", "--layout", "grid", r"C:\g\a.exe"]);
+        let split = s(&["--split-screen", "--instances", "3", "--layout", "top2", "--no-kbm", "--no-sync", r"C:\g\a.exe"]);
         assert_eq!(plan(split.clone(), 3, true, false, false), Plan { now: split.clone(), later: None });
         assert_eq!(plan(split, 3, true, true, false), Plan { now: two, later: None });
         let ctx = egui::Context::default();
@@ -2006,6 +2017,14 @@ mod tests {
         let cmd = app.command(&g, &o_split);
         assert_eq!(&cmd[..5], ["--split-screen", "--instances", "4", "--layout", "vertical"]);
         assert!(!cmd.iter().any(|a| a == "--copy-saves"));
+        // 3 players default to the 2+1 layout; --no-kbm is emitted only when no player
+        // explicitly chose Keyboard and mouse.
+        let o3 = GameOptions { players: 3, split_screen: true, split_no_kbm: true, ..GameOptions::default() };
+        let cmd3 = app.command(&g, &o3);
+        assert_eq!(&cmd3[..6], ["--split-screen", "--instances", "3", "--layout", "top2", "--no-kbm"]);
+        let mut o3_kbm = o3.clone();
+        o3_kbm.set_split_input(0, "kbm");
+        assert!(!app.command(&g, &o3_kbm).iter().any(|a| a == "--no-kbm"));
     }
 
     /// Play with copy 2 waiting starts it now; Cancel drops it; and when the game's last

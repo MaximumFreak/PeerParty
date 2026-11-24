@@ -232,6 +232,28 @@ impl ChildEnv {
     }
 }
 
+/// How split-screen copies 2..N are launched after player 1 (`--stagger`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StaggerMode {
+    /// Wait until the previous copy renders its first frame or opens its viewport (or
+    /// 12 s at most) so shader compilation and disk I/O don't collide at start-up.
+    #[default]
+    Smart,
+    /// Wait a fixed number of seconds between copies (`0` = start all copies at once).
+    Fixed(u32),
+}
+
+impl StaggerMode {
+    pub fn parse(s: &str) -> Option<StaggerMode> {
+        let s = s.trim();
+        if s.is_empty() || s.eq_ignore_ascii_case("smart") || s.eq_ignore_ascii_case("auto") {
+            return Some(StaggerMode::Smart);
+        }
+        let secs: u32 = s.parse().ok()?;
+        (secs <= 60).then_some(StaggerMode::Fixed(secs))
+    }
+}
+
 /// Several copies of the game sharing the screen, each in a pane (`--split-screen`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct SplitScreen {
@@ -239,6 +261,9 @@ pub struct SplitScreen {
     pub layout: LayoutPreset,
     /// What each player plays with (`--inputs`), by player; missing ones are `Auto`.
     pub inputs: Vec<SlotInput>,
+    /// Keep the PC's keyboard and mouse from reaching the games (`--no-kbm`, controllers
+    /// only); overlay and session hotkeys still work.
+    pub no_kbm: bool,
     /// Each player's name (`--names`), by player; blank or missing: the PC's naming
     /// (player 1 the PC's, player 2 the second player's name, players 3 and 4 theirs from
     /// Settings, else "<name> (3)").
@@ -246,6 +271,11 @@ pub struct SplitScreen {
     /// The monitor the session's window opens on (`--monitor`, from 1:
     /// `MonitorBounds::all`'s numbers); None is the main one.
     pub monitor: Option<u32>,
+    /// When copies 2..N are started after copy 1 (`--stagger`).
+    pub stagger: StaggerMode,
+    /// Turn off compositor-locked frame pacing (`--no-sync`; on by default so copies
+    /// don't render faster than the split-screen window displays them).
+    pub no_sync: bool,
 }
 
 /// What a split-screen player plays with (`--inputs auto,kbm,pad`).
@@ -294,11 +324,16 @@ impl SplitScreen {
     /// Copies in one split-screen session.
     pub const MAX_INSTANCES: u32 = 4;
 
-    /// A layout's name on the command line.
+    /// A layout's name on the command line (or `slots:...` for a saved custom layout).
     pub fn layout_named(name: &str) -> Option<LayoutPreset> {
+        if let Some(slots) = LayoutPreset::parse_slots(name) {
+            return Some(LayoutPreset::Slots(slots));
+        }
         Some(match name.to_ascii_lowercase().as_str() {
             "horizontal" => LayoutPreset::Horizontal,
             "vertical" => LayoutPreset::Vertical,
+            "top2" | "2+1" | "two_top" => LayoutPreset::TopTwo,
+            "bottom2" | "1+2" | "two_bottom" => LayoutPreset::BottomTwo,
             "grid" | "grid2x2" => LayoutPreset::Grid2x2,
             _ => return None,
         })
@@ -345,7 +380,7 @@ impl SplitScreen {
 
 impl Default for SplitScreen {
     fn default() -> Self {
-        SplitScreen { instances: 2, layout: LayoutPreset::Horizontal, inputs: Vec::new(), names: Vec::new(), monitor: None }
+        SplitScreen { instances: 2, layout: LayoutPreset::Horizontal, inputs: Vec::new(), no_kbm: false, names: Vec::new(), monitor: None, stagger: StaggerMode::Smart, no_sync: false }
     }
 }
 
@@ -1014,9 +1049,11 @@ mod tests {
     #[test]
     fn split_screen_layouts_by_name() {
         assert_eq!(SplitScreen::layout_named("Vertical"), Some(LayoutPreset::Vertical));
+        assert_eq!(SplitScreen::layout_named("top2"), Some(LayoutPreset::TopTwo));
+        assert_eq!(SplitScreen::layout_named("1+2"), Some(LayoutPreset::BottomTwo));
         assert_eq!(SplitScreen::layout_named("grid"), Some(LayoutPreset::Grid2x2));
         assert_eq!(SplitScreen::layout_named("diagonal"), None);
-        assert_eq!(SplitScreen::default(), SplitScreen { instances: 2, layout: LayoutPreset::Horizontal, inputs: Vec::new(), names: Vec::new(), monitor: None });
+        assert_eq!(SplitScreen::default(), SplitScreen { instances: 2, layout: LayoutPreset::Horizontal, inputs: Vec::new(), no_kbm: false, names: Vec::new(), monitor: None, stagger: StaggerMode::Smart, no_sync: false });
     }
 
     #[test]

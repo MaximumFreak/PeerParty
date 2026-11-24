@@ -144,6 +144,22 @@ pub enum Glyph {
     North,
     Lb,
     Rb,
+    Lt,
+    Rt,
+    Back,
+    Start,
+    Dpad,
+    RStick,
+}
+
+/// Visual width (in points) of `g` when drawn by [`glyph`].
+pub fn glyph_width(g: Glyph) -> f32 {
+    match g {
+        Glyph::Lb | Glyph::Rb | Glyph::Lt | Glyph::Rt => 26.0,
+        Glyph::Back | Glyph::Start => 34.0,
+        Glyph::RStick => 20.0,
+        Glyph::South | Glyph::East | Glyph::West | Glyph::North | Glyph::Dpad => 18.0,
+    }
 }
 
 /// A controller button in the style of the pad in use, centred on `c`.
@@ -152,6 +168,11 @@ pub fn glyph(p: &Painter, c: Pos2, g: Glyph, style: Style) {
     let face = |label: &str, fill: Color32| {
         p.circle_filled(c, r, fill);
         p.text(c, Align2::CENTER_CENTER, label, theme::strong(11.0), Color32::WHITE);
+    };
+    let pill = |label: &str, w: f32| {
+        let rect = Rect::from_center_size(c, Vec2::new(w, 16.0));
+        p.rect_filled(rect, CornerRadius::same(5), Color32::from_rgb(64, 70, 86));
+        p.text(c, Align2::CENTER_CENTER, label, theme::strong(9.5), theme::TEXT);
     };
     match g {
         Glyph::Lb | Glyph::Rb => {
@@ -163,9 +184,49 @@ pub fn glyph(p: &Painter, c: Pos2, g: Glyph, style: Style) {
                 (Glyph::Lb, _) => "LB",
                 _ => "RB",
             };
-            let rect = Rect::from_center_size(c, Vec2::new(26.0, 16.0));
-            p.rect_filled(rect, CornerRadius::same(5), Color32::from_rgb(64, 70, 86));
-            p.text(c, Align2::CENTER_CENTER, label, theme::strong(10.0), theme::TEXT);
+            pill(label, 26.0);
+        }
+        Glyph::Lt | Glyph::Rt => {
+            let label = match (g, style) {
+                (Glyph::Lt, Style::PlayStation) => "L2",
+                (Glyph::Rt, Style::PlayStation) => "R2",
+                (Glyph::Lt, Style::Nintendo) => "ZL",
+                (Glyph::Rt, Style::Nintendo) => "ZR",
+                (Glyph::Lt, _) => "LT",
+                _ => "RT",
+            };
+            pill(label, 26.0);
+        }
+        Glyph::Back => {
+            let label = match style {
+                Style::PlayStation => "Share",
+                Style::Nintendo => "−",
+                Style::Xbox => "View",
+            };
+            pill(label, 34.0);
+        }
+        Glyph::Start => {
+            let label = match style {
+                Style::PlayStation => "Opt",
+                Style::Nintendo => "+",
+                Style::Xbox => "Menu",
+            };
+            pill(label, 34.0);
+        }
+        Glyph::Dpad => {
+            let col = Color32::from_rgb(180, 188, 206);
+            p.rect_filled(Rect::from_center_size(c, Vec2::new(14.0, 5.0)), CornerRadius::same(1), col);
+            p.rect_filled(Rect::from_center_size(c, Vec2::new(5.0, 14.0)), CornerRadius::same(1), col);
+            p.circle_filled(c, 1.6, Color32::from_rgb(36, 40, 50));
+        }
+        Glyph::RStick => {
+            let label = match style {
+                Style::Nintendo => "R",
+                _ => "RS",
+            };
+            p.circle_filled(c, 9.5, Color32::from_rgb(56, 62, 78));
+            p.circle_stroke(c, 9.5, Stroke::new(1.2, Color32::from_rgb(130, 140, 165)));
+            p.text(c, Align2::CENTER_CENTER, label, theme::strong(9.5), theme::TEXT);
         }
         _ => match style {
             Style::Xbox => match g {
@@ -214,7 +275,7 @@ pub fn glyph(p: &Painter, c: Pos2, g: Glyph, style: Style) {
 pub fn hints(p: &Painter, at: Pos2, items: &[(Glyph, &str)], style: Style, color: Color32) -> f32 {
     let mut x = at.x;
     for (g, label) in items {
-        let w = if matches!(g, Glyph::Lb | Glyph::Rb) { 13.0 } else { 9.0 };
+        let w = glyph_width(*g) * 0.5;
         glyph(p, Pos2::new(x + w, at.y), *g, style);
         let t = p.text(Pos2::new(x + w * 2.0 + 7.0, at.y), Align2::LEFT_CENTER, *label, theme::font(13.0), color);
         x = t.right() + 18.0;

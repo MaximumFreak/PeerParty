@@ -570,6 +570,83 @@ connection is drained before the new one delivers, so nothing is lost or reorder
   invite dialog, the Xbox invite screens) open the matching overlay page, and games hear
   it open and close as their store's overlay.
 
+## Split screen (`launcher/src/host/`, `hook/src/video/`, `hook/src/input/`, `hook/src/saves/`)
+
+A split-screen session is one peerparty.exe (the session host, `host/mod.rs`) running two
+to four copies of the game, each a normal PeerParty copy with its own identity, that
+meet over the LAN core as copies on two PCs would. The host owns the session's window,
+the controllers, the keyboard and mouse, and the layout. What follows is the Windows
+session; a Linux one (frames read back as pixels) isn't at the same level yet.
+
+- **One window, drawn on the GPU** (`compositor.rs`, `gpu.rs`). A thread of the host
+  owns a Direct3D 11 device on the copies' graphics card and a flip-model swap chain on
+  the window. Each pane is drawn from its copy's newest finished frame, scaled into the
+  pane with a source crop (`Crop` fills the pane by cutting the frame's edges) and in
+  the panes' Z order, so a picture-in-picture pane draws over the one behind it. Frames
+  keep their colour space: on an HDR monitor the swap chain is scRGB and SDR panes are
+  brought up to Windows' SDR white level, on an SDR one HDR panes are tone-mapped down.
+  A pane whose copy can't share frames (another graphics card, before its first frame)
+  shows the copy's own window through a DWM thumbnail instead; `PEERPARTY_COMPOSITOR=dwm`
+  does that for every pane.
+- **Frames** (`protocol/src/frame_ring.rs`, `hook/src/video/capture.rs`). At each
+  present, after the overlay is drawn, the hook copies the back buffer on the GPU into
+  one of three shared textures and publishes the slot in a small shared-memory ring.
+  Two shared fences do the waiting, both on the GPU: the window waits on the hook's
+  content fence before sampling a slot, and the hook writes only a slot whose release
+  fence the window has passed (it skips that frame's copy otherwise). Neither process
+  ever waits for the other on the CPU. Direct3D 11 and 12 copy on the game's own device;
+  Vulkan and OpenGL go through a Direct3D 11 device of PeerParty's own on the same
+  adapter; Direct3D 9Ex opens a texture shared by that device, and plain Direct3D 9 reads
+  its frames back (or, with `PEERPARTY_DXVK`, is drawn through Vulkan and shares them as
+  a Vulkan game does). `PEERPARTY_COMPOSITOR=pixels` reads every frame back into a file
+  instead, the way a game under Wine has to.
+- **Frame pacing** (`protocol/src/frame_ring.rs`, `host/gpu.rs`, `hook/src/video/capture.rs`).
+  With **Sync games to screen** on (the default; `--no-sync` or Layout Studio turns it off),
+  each copy's ring header carries `FLAG_SYNC_WANTED` and `FLAG_COMPOSITOR_LIVE` alongside a
+  per-copy auto-reset pace event. On DXGI, the hook passes sync interval 0 to the hidden
+  swap chain so it never double-vsyncs against DWM, then after present calls
+  `capture::pace()`. If the compositor's `presents` counter already advanced since the last
+  frame (a copy running below the monitor's refresh rate), it returns at once with no stall;
+  otherwise it waits for the pace event signalled right after the compositor's `Present(1, 0)`,
+  capped at 35 ms. The compositor clears `FLAG_COMPOSITOR_LIVE` and wakes waiting copies
+  whenever a pane is hidden, minimized, occluded or stopping, so a copy never stalls.
+- **The pane is the game's screen** (`hook/src/window.rs`). Each copy is told its pane:
+  its window, display modes and screen size read as the pane's (or the aspect Layout
+  Studio set), so the game renders at the pane's own size. A zoomed pane is told the
+  whole window. The copy keeps reading as the window in front (`GetForegroundWindow`,
+  `GetFocus` and focus-loss messages) while another pane has the keyboard and mouse.
+- **Input** (`protocol/src/input_shm.rs`, `host/input_hub.rs`, `hook/src/input/`). The
+  host reads every controller, the keyboard and the mouse, and writes each copy's share
+  into that copy's 256-byte shared-memory block. The hook answers XInput, DirectInput,
+  HID, Raw Input, Windows.Gaming.Input and GameInput from it, so a pane sees its own
+  player's controller only; where that controller can be reached as it is (its XInput
+  slot, its HID device) the game's reads go to it untouched, and the other players'
+  devices read as unplugged or at rest. Devices are told apart by which one's buttons
+  moved, so two identical controllers stay two seats. The mouse is held inside the
+  focused pane while its game holds its cursor, and the pointer hides then, while the
+  game hid it, and when the mouse sits still while players are on controllers.
+- **Players' saves** (`hook/src/saves/`, `launcher/src/saves.rs`). Player 1's copy uses
+  the game's own saves, untouched and the same ones it has when played alone. In players
+  2–4's copies, the file calls for a save folder (Windows' data folders, Documents,
+  Saved Games, Steam's userdata) go to the player's own folder under
+  `<data>\saves\<game>\player-N`; the game's own folder is read through, and a file the
+  game writes there is copied into the player's folder first, so the game's files are
+  never written. Keys under `HKCU\Software\<vendor>` go to
+  `HKCU\Software\PeerParty\Saves\<game>\p<N>`, and Steam Cloud files to the player's
+  folder.
+- **Sound** (`host/audio.rs`). Muting a pane mutes every WASAPI audio session of that
+  copy's process (`IAudioSessionManager2`), again when a game opens its audio late, and
+  everything muted is unmuted when the host exits.
+- **Starting** (`host/mod.rs`). Copy 1 starts first; with the smart stagger (the
+  default) each next copy starts once the one before has a window or a viewport (plus
+  half a second) or its first frame, 8 s at most, so copies don't compile shaders and
+  load from disk at the same moment. `--stagger N` waits N seconds instead.
+- **Layout Studio** (`host/layout_studio.rs`) edits the panes as slots in ten-thousandths
+  of the window (`protocol/src/session.rs` `PaneSlot`: rectangle, fit, aspect, Z), drawn
+  in egui over the live frames. A drag previews without telling the copies; letting go
+  commits, and each copy is told its new pane. **Done** keeps the slots in ui.json as the
+  game's layout (`slots:...`, the same text `--layout` takes).
+
 ## The launcher (`launcher/src/ui/`)
 
 An egui window shown when peerparty.exe starts with no arguments. It lists Steam, Epic,

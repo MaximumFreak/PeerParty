@@ -26,7 +26,7 @@
 
 use std::path::Path;
 
-use peerparty_protocol::session::{LayoutPreset, PaneRect};
+use peerparty_protocol::session::{LayoutPreset, PaneFit, PaneRect, PaneSlot};
 
 use super::instance::InstanceConn;
 
@@ -127,8 +127,10 @@ fn in_order(mut found: Vec<(bool, MonitorBounds)>) -> Vec<MonitorBounds> {
     found.into_iter().map(|(_, b)| b).collect()
 }
 
-/// The presets `cycle_layout` goes through, in order.
+/// The presets `cycle_layout` goes through, in order (for 3 copies, the 2+1 and 1+2
+/// layouts come first so no quarter sits empty).
 const CYCLE: [LayoutPreset; 3] = [LayoutPreset::Horizontal, LayoutPreset::Vertical, LayoutPreset::Grid2x2];
+const CYCLE_3: [LayoutPreset; 5] = [LayoutPreset::TopTwo, LayoutPreset::BottomTwo, LayoutPreset::Horizontal, LayoutPreset::Vertical, LayoutPreset::Grid2x2];
 
 /// An empty pane: a copy not shown.
 const HIDDEN: PaneRect = PaneRect { x: 0, y: 0, width: 0, height: 0 };
@@ -175,17 +177,61 @@ pub fn effective_source_size(client: (u32, u32), dwm_src: (u32, u32), viewport: 
     dwm_src
 }
 
-/// Maps a point `(cx, cy)` in compositor client coordinates inside fitted thumbnail rect
-/// `dest` to target window client coordinates `(gx, gy)` in `0..src_w` × `0..src_h`.
-pub fn map_point_to_source(cx: i32, cy: i32, dest: PaneRect, src_w: u32, src_h: u32) -> Option<(i32, i32)> {
+/// Computes `(dest_rect, uv_rect)` for drawing a `src_w x src_h` frame inside `pane`
+/// according to `fit`:
+/// - `Fit`: letterboxed/pillarboxed inside `pane` with full UVs `[0, 0, 1, 1]`.
+/// - `Fill`: fills `pane` edge-to-edge with centered crop UVs (zero black bars, zero stretch).
+/// - `Stretch`: fills `pane` edge-to-edge with full UVs.
+pub fn compute_fit(pane: PaneRect, src_w: u32, src_h: u32, fit: PaneFit) -> (PaneRect, [f32; 4]) {
+    const FULL: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+    if pane.width == 0 || pane.height == 0 || src_w == 0 || src_h == 0 {
+        return (pane, FULL);
+    }
+    match fit {
+        PaneFit::Fit => (fit_aspect(pane, src_w, src_h), FULL),
+        PaneFit::Stretch => (pane, FULL),
+        PaneFit::Fill => {
+            let lhs = u64::from(src_w) * u64::from(pane.height);
+            let rhs = u64::from(pane.width) * u64::from(src_h);
+            if lhs.abs_diff(rhs) * 100 <= lhs.max(rhs) {
+                return (pane, FULL);
+            }
+            if lhs > rhs {
+                // Source is wider than pane: crop left and right equally.
+                let keep = (rhs as f64 / lhs as f64).clamp(0.05, 1.0) as f32;
+                let pad = (1.0 - keep) * 0.5;
+                (pane, [pad, 0.0, 1.0 - pad, 1.0])
+            } else {
+                // Source is taller than pane: crop top and bottom equally.
+                let keep = (lhs as f64 / rhs as f64).clamp(0.05, 1.0) as f32;
+                let pad = (1.0 - keep) * 0.5;
+                (pane, [0.0, pad, 1.0, 1.0 - pad])
+            }
+        }
+    }
+}
+
+/// Maps a point `(cx, cy)` in compositor client coordinates inside fitted rect `dest`
+/// (sampling source UV rectangle `uv = [u0, v0, u1, v1]`) to target window client
+/// coordinates `(gx, gy)` in `0..src_w` × `0..src_h`.
+pub fn map_point_to_source_uv(cx: i32, cy: i32, dest: PaneRect, uv: [f32; 4], src_w: u32, src_h: u32) -> Option<(i32, i32)> {
     if dest.width == 0 || dest.height == 0 || src_w == 0 || src_h == 0 {
         return None;
     }
-    let rx = (i64::from(cx) - i64::from(dest.x)).clamp(0, i64::from(dest.width) - 1);
-    let ry = (i64::from(cy) - i64::from(dest.y)).clamp(0, i64::from(dest.height) - 1);
-    let gx = ((rx * i64::from(src_w)) / i64::from(dest.width)).clamp(0, i64::from(src_w) - 1) as i32;
-    let gy = ((ry * i64::from(src_h)) / i64::from(dest.height)).clamp(0, i64::from(src_h) - 1) as i32;
+    let rx = ((f64::from(cx) - f64::from(dest.x)) / f64::from(dest.width)).clamp(0.0, 1.0);
+    let ry = ((f64::from(cy) - f64::from(dest.y)) / f64::from(dest.height)).clamp(0.0, 1.0);
+    let u = f64::from(uv[0]) + rx * f64::from(uv[2] - uv[0]);
+    let v = f64::from(uv[1]) + ry * f64::from(uv[3] - uv[1]);
+    let gx = (u * f64::from(src_w)).floor().clamp(0.0, f64::from(src_w - 1)) as i32;
+    let gy = (v * f64::from(src_h)).floor().clamp(0.0, f64::from(src_h - 1)) as i32;
     Some((gx, gy))
+}
+
+/// Maps a point `(cx, cy)` in compositor client coordinates inside fitted thumbnail rect
+/// `dest` to target window client coordinates `(gx, gy)` in `0..src_w` × `0..src_h`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn map_point_to_source(cx: i32, cy: i32, dest: PaneRect, src_w: u32, src_h: u32) -> Option<(i32, i32)> {
+    map_point_to_source_uv(cx, cy, dest, [0.0, 0.0, 1.0, 1.0], src_w, src_h)
 }
 
 pub struct CompositorWindow {
@@ -199,6 +245,8 @@ pub struct CompositorWindow {
     zoomed: bool,
     /// Each copy's pane, in the client area.
     panes: Vec<PaneRect>,
+    /// Each copy's normalized slot (fit, virtual aspect, Z-order).
+    slots: Vec<PaneSlot>,
     #[cfg(windows)]
     window: Option<win::HostWindow>,
     #[cfg(unix)]
@@ -216,6 +264,7 @@ impl CompositorWindow {
             focus: 0,
             zoomed: false,
             panes: Vec::new(),
+            slots: Vec::new(),
             #[cfg(windows)]
             window: None,
             #[cfg(unix)]
@@ -263,6 +312,21 @@ impl CompositorWindow {
         &self.panes
     }
 
+    /// Each copy's normalized slot (fit, virtual aspect, Z-order).
+    pub fn slots(&self) -> &[PaneSlot] {
+        &self.slots
+    }
+
+    /// The virtual render size `(width, height)` copy `i` is told for its pane.
+    pub fn virtual_size(&self, i: usize) -> Option<(u32, u32)> {
+        let pane = self.told_panes().get(i).copied()?;
+        if self.zoomed && i == self.focus {
+            return Some((pane.width, pane.height));
+        }
+        let slot = self.slots.get(i).copied().unwrap_or_else(|| PaneSlot::new(peerparty_protocol::session::NormRect::FULL));
+        Some(slot.aspect.size_for(pane, slot.fit, self.bounds.width, self.bounds.height))
+    }
+
     /// Pane `i` on screen, as its copy is told it (`told_panes`).
     pub fn screen_pane(&self, i: usize) -> Option<PaneRect> {
         self.told_panes().get(i).map(|p| PaneRect { x: p.x.saturating_add(self.bounds.x), y: p.y.saturating_add(self.bounds.y), ..*p })
@@ -299,15 +363,44 @@ impl CompositorWindow {
         self.zoomed
     }
 
-    /// The pane under a point of the client area.
+    /// The pane under a point of the client area (highest Z-order wins for overlapping
+    /// Picture-in-Picture panes).
     pub fn pane_at(&self, x: i32, y: i32) -> Option<usize> {
         let inside = |p: &PaneRect| x >= p.x && y >= p.y && i64::from(x) < i64::from(p.x) + i64::from(p.width) && i64::from(y) < i64::from(p.y) + i64::from(p.height);
-        self.display_panes().iter().position(inside)
+        let panes = self.display_panes();
+        let mut order: Vec<usize> = (0..panes.len()).collect();
+        order.sort_by_key(|&i| (self.slots.get(i).map_or(0, |s| s.z), i));
+        order.into_iter().rev().find(|&i| inside(&panes[i]))
     }
 
     fn recompute(&mut self) {
         self.panes = self.layout.compute_panes(self.bounds.width, self.bounds.height, self.count);
+        self.slots = self.layout.to_slots(self.count);
         self.focus = self.focus.min(self.panes.len().saturating_sub(1));
+    }
+
+    /// Live preview during interactive drag in Layout Studio: updates the GPU compositor's
+    /// displayed rectangles, crop UVs, and Z-order immediately at 60+ fps without telling
+    /// the game processes to rebuild swap chains mid-drag. Call `sync_instances` to commit.
+    pub fn preview_slots(&mut self, slots: Vec<PaneSlot>, instances: &[InstanceConn]) {
+        self.zoomed = false;
+        self.layout = LayoutPreset::Slots(slots);
+        self.recompute();
+        #[cfg(windows)]
+        if self.window.is_some() {
+            let shown = self.display_panes();
+            let slot_meta: Vec<(PaneFit, u8)> = self.slots.iter().map(|s| (s.fit, s.z)).collect();
+            let w = self.window.as_mut().expect("checked");
+            for (i, inst) in instances.iter().enumerate() {
+                let display_pane = shown.get(i).copied().unwrap_or(HIDDEN);
+                let (fit, z) = slot_meta.get(i).copied().unwrap_or((PaneFit::Fit, 0));
+                let vp = inst.viewport.as_ref().map(|v| (v.width, v.height));
+                w.preview_pane(i, display_pane, fit, z, vp);
+            }
+            w.push_panes();
+        }
+        #[cfg(not(windows))]
+        let _ = instances;
     }
 
     /// Another layout, now.
@@ -316,11 +409,12 @@ impl CompositorWindow {
         self.recompute();
     }
 
-    /// The next preset: side by side, one above the other, quarters, and round again (a
-    /// custom or single layout goes on to side by side).
+    /// The next preset: side by side, one above the other, quarters, and round again (for
+    /// three copies, 2+1 and 1+2 too; a custom or single layout goes on to the first).
     pub fn cycle_layout(&mut self) -> &LayoutPreset {
-        let next = CYCLE.iter().position(|l| *l == self.layout).map_or(0, |i| (i + 1) % CYCLE.len());
-        self.set_layout(CYCLE[next].clone());
+        let list: &[LayoutPreset] = if self.count == 3 { &CYCLE_3 } else { &CYCLE };
+        let next = list.iter().position(|l| *l == self.layout).map_or(0, |i| (i + 1) % list.len());
+        self.set_layout(list[next].clone());
         &self.layout
     }
 
@@ -452,16 +546,18 @@ impl CompositorWindow {
 
     /// Forwards queued keyboard and mouse messages from the compositor window to the
     /// focused pane (or switches focus to the clicked pane first). Returns the newly
-    /// focused pane if a mouse click changed focus.
-    pub fn forward_input(&mut self, focus: usize, overlay_open: bool, instances: &[InstanceConn]) -> Option<usize> {
+    /// focused pane if a mouse click changed focus. While `overlay_open` or `kbm_off`,
+    /// only releases for already-held keys and buttons are delivered.
+    pub fn forward_input(&mut self, focus: usize, overlay_open: bool, kbm_off: bool, instances: &[InstanceConn]) -> Option<usize> {
         #[cfg(windows)]
         if self.window.is_some() {
             let panes = self.display_panes();
+            let zs: Vec<u8> = self.slots.iter().map(|s| s.z).collect();
             let w = self.window.as_mut().expect("checked");
-            return w.forward_input(focus, overlay_open, &panes, instances);
+            return w.forward_input(focus, overlay_open || kbm_off, &panes, &zs, instances);
         }
         #[cfg(not(windows))]
-        let _ = (focus, overlay_open, instances);
+        let _ = (focus, overlay_open, kbm_off, instances);
         None
     }
 
@@ -477,14 +573,16 @@ impl CompositorWindow {
         None
     }
 
-    /// Keeps the real mouse inside pane `i` (and the pointer hidden over it), for a game
-    /// that locked its cursor, or lets it go (None). Whether that changed.
-    pub fn confine_cursor(&mut self, i: Option<usize>) -> bool {
+    /// Keeps the real mouse inside pane `confine` (for a game that locked its cursor),
+    /// and hides the pointer over the window while confined, while the focused game hid
+    /// its cursor (`game_hide`), or while the mouse has sat idle (`idle_hide`). Returns
+    /// whether confinement changed.
+    pub fn update_pointer(&mut self, confine: Option<usize>, game_hide: bool, idle_hide: bool) -> bool {
         #[cfg(windows)]
         if let Some(w) = self.window.as_mut() {
-            return w.confine(i);
+            return w.update_pointer(confine, game_hide, idle_hide);
         }
-        let _ = i;
+        let _ = (confine, game_hide, idle_hide);
         false
     }
 
@@ -552,17 +650,24 @@ impl CompositorWindow {
     /// one; a copy whose spec changed is told. On Windows each copy whose window is
     /// known is shown in its pane. The number of copies told.
     pub fn sync_instances(&mut self, instances: &mut [InstanceConn]) -> usize {
-        if instances.len() != self.count {
+        if instances.len() > self.count {
             self.set_count(instances.len());
         }
-        let many = instances.len() > 1;
+        let many = self.count > 1 || instances.len() > 1;
         let mut told = 0;
+        let mut layout_sizes: Vec<PaneRect> = Vec::with_capacity(instances.len());
         for (i, inst) in instances.iter_mut().enumerate() {
-            let Some(pane) = self.screen_pane(i) else { continue };
+            let Some(pane) = self.screen_pane(i) else {
+                layout_sizes.push(HIDDEN);
+                continue;
+            };
+            let (vw, vh) = self.virtual_size(i).unwrap_or((pane.width, pane.height));
+            let told_pane = PaneRect { x: pane.x, y: pane.y, width: vw, height: vh };
+            layout_sizes.push(PaneRect { x: pane.x.saturating_sub(self.bounds.x), y: pane.y.saturating_sub(self.bounds.y), width: vw, height: vh });
             let mut spec = inst.spec.clone();
-            spec.pane = Some(pane);
-            spec.virtual_width = Some(pane.width);
-            spec.virtual_height = Some(pane.height);
+            spec.pane = Some(told_pane);
+            spec.virtual_width = Some(vw);
+            spec.virtual_height = Some(vh);
             spec.dpi = Some(self.bounds.dpi);
             spec.focus_spoof = many;
             if spec != inst.spec {
@@ -576,15 +681,16 @@ impl CompositorWindow {
         #[cfg(windows)]
         if self.window.is_some() {
             let shown = self.display_panes();
-            let layout_panes = self.told_panes();
+            let slot_meta: Vec<(PaneFit, u8)> = self.slots.iter().map(|s| (s.fit, s.z)).collect();
             let bounds = self.bounds;
             let w = self.window.as_mut().expect("checked");
             for (i, inst) in instances.iter().enumerate() {
                 let source = inst.best_hwnd();
-                let layout_pane = layout_panes.get(i).copied().unwrap_or(HIDDEN);
+                let layout_pane = layout_sizes.get(i).copied().unwrap_or(HIDDEN);
                 let display_pane = shown.get(i).copied().unwrap_or(HIDDEN);
+                let (fit, z) = slot_meta.get(i).copied().unwrap_or((PaneFit::Fit, 0));
                 let vp = inst.viewport.as_ref().map(|v| (v.width, v.height));
-                w.show(i, if inst.gone { 0 } else { source }, layout_pane, display_pane, bounds, vp);
+                w.show(i, if inst.gone { 0 } else { source }, layout_pane, display_pane, fit, z, bounds, vp);
                 if inst.gone {
                     w.set_surface(i, None, None);
                 }
@@ -620,8 +726,8 @@ mod win {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_F4};
     use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-    use super::super::gpu::{Gpu, PaneDraw, RingBlock, SharedSurface};
-    use super::{InstanceConn, MonitorBounds, PaneRect, effective_source_size, fit_aspect, map_point_to_source};
+    use super::super::gpu::{FULL_UV, Gpu, PaneDraw, RingBlock, SharedSurface};
+    use super::{InstanceConn, MonitorBounds, PaneFit, PaneRect, compute_fit, effective_source_size, map_point_to_source_uv};
     use std::sync::Arc;
 
     type Thumbnail = isize;
@@ -758,8 +864,25 @@ mod win {
         out
     }
 
-    /// The pointer is hidden over the session's window (a game locked its cursor).
+    /// The pointer is hidden over the session's window (a game locked/hid its cursor, or
+    /// the mouse sat idle while controllers play).
     static HIDE_POINTER: AtomicBool = AtomicBool::new(false);
+    /// The game itself locked or hid the cursor, so moving the mouse doesn't unhide it.
+    static FORCE_HIDE_POINTER: AtomicBool = AtomicBool::new(false);
+    /// When the mouse last moved or clicked over the session's window (`mono_ms`; 0: never).
+    static LAST_MOUSE_MS: AtomicU64 = AtomicU64::new(0);
+    /// How long the mouse sits still before auto-hiding in controller/idle mode.
+    const IDLE_HIDE_MS: u64 = 1500;
+
+    fn mono_ms() -> u64 {
+        static START: OnceLock<Instant> = OnceLock::new();
+        START.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
+    }
+
+    fn mouse_idle() -> bool {
+        let last = LAST_MOUSE_MS.load(Ordering::Relaxed);
+        last == 0 || mono_ms().saturating_sub(last) >= IDLE_HIDE_MS
+    }
 
     /// A key or mouse button down in a game window, until it's let go.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -833,7 +956,7 @@ mod win {
     }
 
     fn is_session_chord(vk: usize) -> bool {
-        crate::host::ctrl_alt(|k| unsafe { GetKeyState(k) } < 0) && matches!(vk as u32, 0x4C | 0x5A | 0x31..=0x34 | 0x61..=0x64)
+        crate::host::ctrl_alt(|k| unsafe { GetKeyState(k) } < 0) && matches!(vk as u32, 0x45 | 0x4C | 0x5A | 0x31..=0x34 | 0x61..=0x64)
     }
 
     unsafe extern "system" fn proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
@@ -853,6 +976,12 @@ mod win {
             WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_RBUTTONDBLCLK | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_XBUTTONDOWN | WM_XBUTTONUP => {
                 let (x, y) = (i32::from(l as u16 as i16), i32::from((l >> 16) as u16 as i16));
                 let is_button_down = matches!(m, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN);
+                if m == WM_MOUSEMOVE || is_button_down {
+                    LAST_MOUSE_MS.store(mono_ms(), Ordering::Relaxed);
+                    if !FORCE_HIDE_POINTER.load(Ordering::Relaxed) && HIDE_POINTER.swap(false, Ordering::Relaxed) {
+                        unsafe { SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_ARROW)) };
+                    }
+                }
                 if m == WM_LBUTTONDOWN {
                     CLICK.store(pack(x, y), Ordering::Release);
                 }
@@ -1028,6 +1157,9 @@ mod win {
         layout_pane: PaneRect,
         display_pane: PaneRect,
         dest: PaneRect,
+        uv: [f32; 4],
+        fit: PaneFit,
+        z: u8,
         src_size: (u32, u32),
         adopted_at: Instant,
         grace_retried: bool,
@@ -1053,9 +1185,9 @@ mod win {
         cursor_screen: Vec<Option<(i32, i32)>>,
         /// The real cursor is kept inside this copy's pane (`confine`).
         confined: Option<usize>,
-        /// Each copy's display pane, as `show` was last told it (whether or not its
-        /// window is known yet).
-        display: Vec<PaneRect>,
+        /// Each copy's display pane, fit, and z, as `show`/`preview_pane` last saw them
+        /// (whether or not its window is known yet).
+        display: Vec<(PaneRect, PaneFit, u8)>,
         /// Keys and buttons down in a game window, where (and how) they went.
         pressed: Vec<(Held, isize, LPARAM)>,
         /// What changed in each copy's pane, for its log (`take_notes`).
@@ -1086,6 +1218,8 @@ mod win {
             RESIZED.store(false, Ordering::Release);
             CLICK.store(NO_CLICK, Ordering::Release);
             HIDE_POINTER.store(false, Ordering::Relaxed);
+            FORCE_HIDE_POINTER.store(false, Ordering::Relaxed);
+            LAST_MOUSE_MS.store(0, Ordering::Relaxed);
             if let Ok(mut q) = input_queue().lock() {
                 q.clear();
             }
@@ -1148,11 +1282,13 @@ mod win {
             }))
         }
 
-        /// Keeps the real cursor inside copy `i`'s frames (None: lets it go), and hides
-        /// the pointer over the window meanwhile. Whether that changed.
-        pub fn confine(&mut self, i: Option<usize>) -> bool {
-            let dest = i.and_then(|i| self.shown.get(i)?.as_ref()).map(|s| s.dest).filter(|d| d.width > 0 && d.height > 0);
-            let i = i.filter(|_| dest.is_some());
+        /// Keeps the real cursor inside copy `confine`'s frames (None: lets it go), and
+        /// hides the pointer over the window when confined, when the focused game hid its
+        /// cursor (`game_hide`), or when the mouse is idle (`idle_hide`). Returns whether
+        /// confinement changed.
+        pub fn update_pointer(&mut self, confine: Option<usize>, game_hide: bool, idle_hide: bool) -> bool {
+            let dest = confine.and_then(|i| self.shown.get(i)?.as_ref()).map(|s| s.dest).filter(|d| d.width > 0 && d.height > 0);
+            let i = confine.filter(|_| dest.is_some());
             if let Some(d) = dest {
                 let mut tl = POINT { x: d.x, y: d.y };
                 unsafe { ClientToScreen(self.hwnd, &mut tl) };
@@ -1161,22 +1297,26 @@ mod win {
                 // foreground for a moment.
                 unsafe { ClipCursor(&r) };
             }
-            if i == self.confined {
-                return false;
+            let confine_changed = i != self.confined;
+            if confine_changed {
+                if dest.is_none() {
+                    unsafe { ClipCursor(std::ptr::null()) };
+                }
+                self.confined = i;
             }
-            if dest.is_none() {
-                unsafe { ClipCursor(std::ptr::null()) };
+            let force_hide = i.is_some() || game_hide;
+            FORCE_HIDE_POINTER.store(force_hide, Ordering::Relaxed);
+            let want_hide = force_hide || (idle_hide && mouse_idle());
+            if HIDE_POINTER.swap(want_hide, Ordering::Relaxed) != want_hide {
+                // The pointer's look is asked for again when it next moves; this shows the
+                // change at once.
+                let mut pt = POINT { x: 0, y: 0 };
+                unsafe {
+                    GetCursorPos(&mut pt);
+                    SetCursorPos(pt.x, pt.y);
+                }
             }
-            self.confined = i;
-            HIDE_POINTER.store(i.is_some(), Ordering::Relaxed);
-            // The pointer's look is asked for again when it next moves; this shows the
-            // change at once.
-            let mut pt = POINT { x: 0, y: 0 };
-            unsafe {
-                GetCursorPos(&mut pt);
-                SetCursorPos(pt.x, pt.y);
-            }
-            true
+            confine_changed
         }
 
         /// The client area on screen, with the window's monitor's DPI.
@@ -1205,16 +1345,31 @@ mod win {
             CLOSE_REQUESTED.swap(false, Ordering::AcqRel)
         }
 
+        /// Updates pane `i`'s visual destination, fit mode, and Z-order immediately for
+        /// live Layout Studio dragging without touching the game window's Win32 bounds.
+        pub fn preview_pane(&mut self, i: usize, display_pane: PaneRect, fit: PaneFit, z: u8, viewport: Option<(u32, u32)>) {
+            if self.display.len() <= i {
+                self.display.resize(i + 1, (super::HIDDEN, PaneFit::Fit, 0));
+            }
+            self.display[i] = (display_pane, fit, z);
+            if let Some(Some(s)) = self.shown.get_mut(i) {
+                s.fit = fit;
+                s.z = z;
+                self.update(i, display_pane, viewport, false, false);
+            }
+        }
+
         /// Shows window `source` (0: none) in pane `i` of the client area; a display pane
         /// of no size hides its thumbnail.
-        pub fn show(&mut self, i: usize, source: u64, layout_pane: PaneRect, display_pane: PaneRect, bounds: MonitorBounds, viewport: Option<(u32, u32)>) {
+        #[allow(clippy::too_many_arguments)]
+        pub fn show(&mut self, i: usize, source: u64, layout_pane: PaneRect, display_pane: PaneRect, fit: PaneFit, z: u8, bounds: MonitorBounds, viewport: Option<(u32, u32)>) {
             if self.shown.len() <= i {
                 self.shown.resize_with(i + 1, || None);
             }
             if self.display.len() <= i {
-                self.display.resize(i + 1, super::HIDDEN);
+                self.display.resize(i + 1, (super::HIDDEN, PaneFit::Fit, 0));
             }
-            self.display[i] = display_pane;
+            self.display[i] = (display_pane, fit, z);
             if self.shown[i].as_ref().is_some_and(|s| s.source != source) {
                 let old = self.shown[i].take().expect("checked");
                 if old.thumbnail != 0
@@ -1243,20 +1398,34 @@ mod win {
                         self.notes.push((i, format!("session: no DWM thumbnail of the game's window 0x{source:x}: its pane shows only the frames it hands over")));
                     }
                 }
+                // A copy that made a new window (a mode switch, a device reset) may still
+                // be handing over frames this window draws: its new thumbnail starts
+                // hidden, or it would cover them until `push_panes` saw it.
+                let drawn = self.gpu.as_ref().is_some_and(|g| g.live(i));
+                if drawn {
+                    self.notes.push((i, format!("session: the game's window is now 0x{source:x}; its pane keeps drawing the frames it hands over")));
+                }
                 self.shown[i] = Some(Shown {
                     source,
                     thumbnail,
                     layout_pane,
                     display_pane,
                     dest: super::HIDDEN,
+                    uv: FULL_UV,
+                    fit,
+                    z,
                     src_size: (0, 0),
                     adopted_at: Instant::now(),
                     grace_retried: false,
-                    drawn: false,
+                    drawn,
                     style,
                 });
-                self.update(i, display_pane, viewport, true);
+                self.update(i, display_pane, viewport, true, true);
                 return;
+            }
+            if let Some(s) = self.shown[i].as_mut() {
+                s.fit = fit;
+                s.z = z;
             }
             if self.shown[i].as_ref().is_some_and(|s| s.layout_pane != layout_pane) {
                 if let Some(s) = self.shown[i].as_mut() {
@@ -1264,7 +1433,7 @@ mod win {
                 }
                 contain_window(self.hwnd, source as HWND, layout_pane, bounds, minimized);
             }
-            self.update(i, display_pane, viewport, false);
+            self.update(i, display_pane, viewport, false, true);
         }
 
         /// Copy `i`'s textures and ring block (None: it has none, or ended).
@@ -1275,7 +1444,7 @@ mod win {
             self.surfaces[i] = (ring, surface);
             // Fitted to the new frames' size before the drawing thread hears of them.
             if let Some((pane, src)) = self.shown.get(i).and_then(|s| s.as_ref()).map(|s| (s.display_pane, s.src_size)) {
-                self.update(i, pane, Some(src).filter(|s| s.0 > 0), false);
+                self.update(i, pane, Some(src).filter(|s| s.0 > 0), false, true);
             }
             self.push_panes();
         }
@@ -1290,14 +1459,17 @@ mod win {
                     let (ring, surface) = self.surfaces.get(i).cloned().unwrap_or((None, None));
                     // Frames before the copy's window is known go in its pane too, fitted
                     // by their own size.
-                    let dest = match self.shown.get(i).and_then(|s| s.as_ref()) {
-                        Some(s) => s.dest,
+                    let (dest, uv, z) = match self.shown.get(i).and_then(|s| s.as_ref()) {
+                        Some(s) => (s.dest, s.uv, s.z),
                         None => match (surface.as_ref().map(|s| s.size), self.display.get(i)) {
-                            (Some((w, h)), Some(p)) if w > 0 && h > 0 => fit_aspect(*p, w, h),
-                            _ => super::HIDDEN,
+                            (Some((w, h)), Some(&(p, fit, z))) if w > 0 && h > 0 => {
+                                let (d, uv) = compute_fit(p, w, h, fit);
+                                (d, uv, z)
+                            }
+                            _ => (super::HIDDEN, FULL_UV, 0),
                         },
                     };
-                    PaneDraw { dest, ring, surface }
+                    PaneDraw { dest, uv, z, ring, surface }
                 })
                 .collect();
             gpu.set(panes);
@@ -1308,7 +1480,7 @@ mod win {
                 {
                     s.drawn = drawn;
                     let (pane, src) = (s.display_pane, s.src_size);
-                    self.update(i, pane, Some(src).filter(|s| s.0 > 0), true);
+                    self.update(i, pane, Some(src).filter(|s| s.0 > 0), true, true);
                 }
             }
         }
@@ -1359,14 +1531,14 @@ mod win {
                 keep_behind(self.hwnd, src, bounds);
                 let display_pane = s.display_pane;
                 let vp = instances.get(i).and_then(|inst| inst.viewport.as_ref()).map(|v| (v.width, v.height));
-                self.update(i, display_pane, vp, force_thumb);
+                self.update(i, display_pane, vp, force_thumb, true);
             }
             self.push_panes();
         }
 
         /// Drains keyboard/mouse messages received by the compositor window and forwards
         /// them to the focused pane's game window with mapped coordinates.
-        pub fn forward_input(&mut self, mut focus: usize, overlay_open: bool, panes: &[PaneRect], instances: &[InstanceConn]) -> Option<usize> {
+        pub fn forward_input(&mut self, mut focus: usize, overlay_open: bool, panes: &[PaneRect], zs: &[u8], instances: &[InstanceConn]) -> Option<usize> {
             let events: Vec<ForwardedInput> = match input_queue().lock() {
                 Ok(mut q) => std::mem::take(&mut *q),
                 Err(_) => return None,
@@ -1375,8 +1547,12 @@ mod win {
                 return None;
             }
             let mut switched = None;
+            let mut order: Vec<usize> = (0..panes.len()).collect();
+            order.sort_by_key(|&i| (zs.get(i).copied().unwrap_or(0), i));
+            order.reverse();
             let pane_at = |x: i32, y: i32| {
-                panes.iter().position(|p| {
+                order.iter().copied().find(|&i| {
+                    let p = panes[i];
                     x >= p.x && y >= p.y && i64::from(x) < i64::from(p.x) + i64::from(p.width) && i64::from(y) < i64::from(p.y) + i64::from(p.height)
                 })
             };
@@ -1451,9 +1627,10 @@ mod win {
                         return false;
                     }
                     let dest = s.dest;
+                    let uv = s.uv;
                     let Some((gx, gy, sx, sy)) = in_dpi_of(src, || {
                         let (cw, ch) = client_size(src);
-                        let (gx, gy) = map_point_to_source(cx, cy, dest, cw, ch)?;
+                        let (gx, gy) = map_point_to_source_uv(cx, cy, dest, uv, cw, ch)?;
                         let mut screen_pt = POINT { x: gx, y: gy };
                         unsafe { ClientToScreen(src, &mut screen_pt) };
                         Some((gx, gy, screen_pt.x, screen_pt.y))
@@ -1500,7 +1677,7 @@ mod win {
             }
         }
 
-        fn update(&mut self, i: usize, display_pane: PaneRect, viewport: Option<(u32, u32)>, force: bool) {
+        fn update(&mut self, i: usize, display_pane: PaneRect, viewport: Option<(u32, u32)>, force: bool, log: bool) {
             let dwm = dwm();
             // The frames the window draws itself are fitted by their own size: the game
             // may draw at a size its window and viewport don't say.
@@ -1512,11 +1689,11 @@ mod win {
                 _ => (0, 0),
             };
             let src_size = frames.unwrap_or_else(|| effective_source_size(client, dwm_src, viewport));
-            let dest = fit_aspect(display_pane, src_size.0, src_size.1);
-            if !force && s.display_pane == display_pane && s.dest == dest && s.src_size == src_size {
+            let (dest, uv) = compute_fit(display_pane, src_size.0, src_size.1, s.fit);
+            if !force && s.display_pane == display_pane && s.dest == dest && s.uv == uv && s.src_size == src_size {
                 return;
             }
-            if s.dest != dest || s.src_size != src_size {
+            if log && (s.dest != dest || s.uv != uv || s.src_size != src_size) {
                 let from = match (frames, viewport) {
                     (Some(_), _) => "its frames".to_string(),
                     (None, Some(v)) if v == src_size => "the game's viewport".to_string(),
@@ -1534,6 +1711,7 @@ mod win {
             let Some(s) = self.shown[i].as_mut() else { return };
             s.display_pane = display_pane;
             s.dest = dest;
+            s.uv = uv;
             s.src_size = src_size;
             let (w, h) = (i32::try_from(dest.width).unwrap_or(i32::MAX), i32::try_from(dest.height).unwrap_or(i32::MAX));
             let props = ThumbnailProperties {
@@ -1554,8 +1732,9 @@ mod win {
         fn drop(&mut self) {
             if self.confined.is_some() {
                 unsafe { ClipCursor(std::ptr::null()) };
-                HIDE_POINTER.store(false, Ordering::Relaxed);
             }
+            HIDE_POINTER.store(false, Ordering::Relaxed);
+            FORCE_HIDE_POINTER.store(false, Ordering::Relaxed);
             // The drawing thread goes before the window it draws in; one that won't stop
             // keeps the window (hidden), rather than presenting to a destroyed one.
             let stopped = self.gpu.as_mut().is_none_or(|g| g.stop());
@@ -1683,6 +1862,12 @@ mod tests {
         assert_eq!(c.cycle_layout(), &LayoutPreset::Horizontal, "a custom layout goes on to side by side");
         c.set_layout(LayoutPreset::Single);
         assert_eq!(c.panes(), [r(0, 0, 1920, 1080); 2]);
+        c.set_count(3);
+        c.set_layout(LayoutPreset::TopTwo);
+        assert_eq!(c.panes(), [r(0, 0, 960, 540), r(960, 0, 960, 540), r(0, 540, 1920, 540)]);
+        assert_eq!(c.cycle_layout(), &LayoutPreset::BottomTwo);
+        assert_eq!(c.panes(), [r(0, 0, 1920, 540), r(0, 540, 960, 540), r(960, 540, 960, 540)]);
+        assert_eq!(c.cycle_layout(), &LayoutPreset::Horizontal);
         c.set_count(4);
         c.set_layout(LayoutPreset::Grid2x2);
         assert_eq!(c.panes().len(), 4);
@@ -1786,5 +1971,24 @@ mod tests {
         assert_eq!(map_point_to_source(1720, 236, letterboxed, 1280, 720), Some((0, 0)));
         assert_eq!(map_point_to_source(2580, 720, letterboxed, 1280, 720), Some((640, 360)));
         assert_eq!(map_point_to_source(1720, 0, letterboxed, 1280, 720), Some((0, 0)), "clamped from top bar");
+
+        // Fill mode crops evenly without distortion, and inverse UV mapping lands in the visible middle.
+        let (dest, uv) = compute_fit(r(0, 0, 960, 1080), 1920, 1080, PaneFit::Fill);
+        assert_eq!(dest, r(0, 0, 960, 1080));
+        assert!((uv[0] - 0.25).abs() < 0.001 && (uv[2] - 0.75).abs() < 0.001);
+        assert_eq!(uv[1], 0.0);
+        assert_eq!(uv[3], 1.0);
+        assert_eq!(map_point_to_source_uv(0, 0, dest, uv, 1920, 1080), Some((480, 0)));
+        assert_eq!(map_point_to_source_uv(480, 540, dest, uv, 1920, 1080), Some((960, 540)));
+
+        // Z-ordered hit-testing: PiP inset on top of full-screen pane wins hits inside it.
+        let mut pip = CompositorWindow::new(LayoutPreset::Slots(LayoutPreset::pip_slots(2)), HD, 2);
+        assert_eq!(pip.pane_at(100, 100), Some(0));
+        assert_eq!(pip.pane_at(1600, 900), Some(1), "PiP pane on top wins click");
+        // Virtual aspect override changes what virtual size the copy is told.
+        let mut slots = pip.slots().to_vec();
+        slots[0].aspect = peerparty_protocol::session::VirtualAspect::Ratio { num: 4, den: 3 };
+        pip.set_layout(LayoutPreset::Slots(slots));
+        assert_eq!(pip.virtual_size(0), Some((1440, 1080)));
     }
 }

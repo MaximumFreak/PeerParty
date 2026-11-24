@@ -662,7 +662,7 @@ mod tests {
         release_all();
 
         let (ring, dir) = ct::session_ring_file();
-        cap::configure_as(true, Some(&ring), None, true);
+        cap::configure_as(true, Some(&ring), None, None, true);
         let p = until_published(dev);
         assert_eq!(p.ready, 0, "pixels need no fence");
         let row = peerparty_protocol::frame_ring::slot_bytes(64 * 4, 32).unwrap();

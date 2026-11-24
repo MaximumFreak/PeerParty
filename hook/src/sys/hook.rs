@@ -23,7 +23,7 @@ static HOOK_LOCK: Mutex<()> = Mutex::new(());
 /// game's threads exist, so in the hook's own start (`watch::starting`, under the loader
 /// lock) nothing is paused.
 pub fn frozen<R>(at: usize, f: impl FnOnce() -> R) -> R {
-    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     if crate::watch::starting() {
         return f();
     }
@@ -46,33 +46,51 @@ pub fn frozen<R>(at: usize, f: impl FnOnce() -> R) -> R {
         }
         unsafe { CloseHandle(snap) };
     }
-    let mut handles: Vec<windows_sys::Win32::Foundation::HANDLE> = Vec::with_capacity(ids.len());
+    struct Paused(Vec<(HANDLE, bool)>);
+    impl Paused {
+        fn suspend_all(&mut self) {
+            for (h, paused) in &mut self.0 {
+                if !*paused && unsafe { SuspendThread(*h) } != u32::MAX {
+                    *paused = true;
+                }
+            }
+        }
+        fn resume_all(&mut self) {
+            for (h, paused) in &mut self.0 {
+                if *paused {
+                    unsafe { ResumeThread(*h) };
+                    *paused = false;
+                }
+            }
+        }
+    }
+    impl Drop for Paused {
+        fn drop(&mut self) {
+            // Resume every thread before closing handles or freeing the Vec.
+            self.resume_all();
+            for (h, _) in &self.0 {
+                unsafe { CloseHandle(*h) };
+            }
+        }
+    }
+    let mut threads = Paused(Vec::with_capacity(ids.len()));
     for id in &ids {
         let h = unsafe { OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, 0, *id) };
         if !h.is_null() {
-            handles.push(h);
+            threads.0.push((h, false));
         }
     }
     // A thread caught in those bytes runs on for a moment, then all are paused again.
     for _ in 0..100 {
-        for h in &handles {
-            unsafe { SuspendThread(*h) };
-        }
-        if !handles.iter().any(|h| inside(*h, at)) {
+        threads.suspend_all();
+        if !threads.0.iter().any(|(h, paused)| *paused && inside(*h, at)) {
             break;
         }
-        for h in &handles {
-            unsafe { ResumeThread(*h) };
-        }
-        unsafe { windows_sys::Win32::System::Threading::Sleep(1) };
+        threads.resume_all();
+        unsafe { Sleep(1) };
     }
     let r = f();
-    for h in &handles {
-        unsafe {
-            ResumeThread(*h);
-            CloseHandle(*h);
-        }
-    }
+    drop(threads);
     r
 }
 
@@ -82,22 +100,25 @@ fn inside(thread: windows_sys::Win32::Foundation::HANDLE, at: usize) -> bool {
     if at == 0 {
         return false;
     }
-    let mut ctx: CONTEXT = unsafe { std::mem::zeroed() };
+    // GetThreadContext requires 16-byte alignment on x86_64; windows-sys's CONTEXT is 8-aligned.
+    #[repr(C, align(16))]
+    struct Aligned(CONTEXT);
+    let mut ctx: Aligned = unsafe { std::mem::zeroed() };
     #[cfg(target_arch = "x86_64")]
     {
-        ctx.ContextFlags = 0x0010_0001; // CONTEXT_CONTROL (AMD64)
+        ctx.0.ContextFlags = 0x0010_0001; // CONTEXT_CONTROL (AMD64)
     }
     #[cfg(target_arch = "x86")]
     {
-        ctx.ContextFlags = 0x0001_0001; // CONTEXT_CONTROL (x86)
+        ctx.0.ContextFlags = 0x0001_0001; // CONTEXT_CONTROL (x86)
     }
-    if unsafe { GetThreadContext(thread, &mut ctx) } == 0 {
+    if unsafe { GetThreadContext(thread, &mut ctx.0) } == 0 {
         return false;
     }
     #[cfg(target_arch = "x86_64")]
-    let ip = ctx.Rip as usize;
+    let ip = ctx.0.Rip as usize;
     #[cfg(target_arch = "x86")]
-    let ip = ctx.Eip as usize;
+    let ip = ctx.0.Eip as usize;
     (at..at + 32).contains(&ip)
 }
 
@@ -648,5 +669,152 @@ mod tests {
         );
         assert!(text.contains("SteamMatchMaking009"), "{text}");
         assert!(text.contains("user=7"), "{text}");
+    }
+
+    unsafe extern "C" fn ret_22() -> u32 {
+        22
+    }
+
+    /// `RawDetour::enable`/`disable` run inside `frozen` while every other thread is
+    /// paused and may hold the process heap lock; toggling must never touch the heap,
+    /// and must restore distinct protections across a straddled page boundary.
+    #[test]
+    fn enable_does_not_allocate_while_process_heap_is_locked() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use windows_sys::Win32::System::Memory::{
+            GetProcessHeap, HeapLock, HeapUnlock, MEMORY_BASIC_INFORMATION, MEM_COMMIT,
+            MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect, VirtualQuery,
+        };
+
+        let pages = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                0x2000,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            )
+        } as *mut u8;
+        assert!(!pages.is_null());
+
+        // `mov eax, 11 ; ret` (6 bytes, valid on x86 and x86_64) straddling the 4 KiB
+        // boundary between page 0 (RX) and page 1 (RWX).
+        let entry = unsafe { pages.add(0x1000 - 2) };
+        let body: [u8; 6] = [0xB8, 11, 0, 0, 0, 0xC3];
+        unsafe { std::ptr::copy_nonoverlapping(body.as_ptr(), entry, body.len()) };
+
+        let mut old = 0u32;
+        assert_ne!(unsafe { VirtualProtect(pages.cast(), 0x1000, PAGE_EXECUTE_READ, &mut old) }, 0);
+
+        let func: unsafe extern "C" fn() -> u32 = unsafe { std::mem::transmute(entry) };
+        assert_eq!(unsafe { black_box(func)() }, 11);
+
+        let prot = |p: *const u8| -> u32 {
+            let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            assert_ne!(unsafe { VirtualQuery(p.cast(), &mut mbi, size_of::<MEMORY_BASIC_INFORMATION>()) }, 0);
+            mbi.Protect
+        };
+
+        // Hold HOOK_LOCK so no parallel test can hold retour's POOL lock while blocked on the heap.
+        with_lock(|| {
+            let detour = unsafe { RawDetour::new(entry.cast(), ret_22 as *const ()) }.unwrap();
+            let locked = Arc::new(AtomicBool::new(false));
+            let release = Arc::new(AtomicBool::new(false));
+            let (l, r) = (locked.clone(), release.clone());
+            let holder = std::thread::spawn(move || unsafe {
+                let heap = GetProcessHeap();
+                assert_ne!(HeapLock(heap), 0);
+                l.store(true, Ordering::Release);
+                while !r.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                assert_ne!(HeapUnlock(heap), 0);
+            });
+            struct ReleaseGuard(Arc<AtomicBool>);
+            impl Drop for ReleaseGuard {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Release);
+                }
+            }
+            let guard = ReleaseGuard(release);
+            while !locked.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+
+            let e1 = unsafe { detour.enable() };
+            let e2 = unsafe { detour.disable() };
+            let e3 = unsafe { detour.enable() };
+
+            drop(guard);
+            holder.join().unwrap();
+
+            e1.unwrap();
+            e2.unwrap();
+            e3.unwrap();
+            assert_eq!(unsafe { black_box(func)() }, 22);
+            assert_eq!(prot(pages), PAGE_EXECUTE_READ);
+            assert_eq!(prot(unsafe { pages.add(0x1000) }), PAGE_EXECUTE_READWRITE);
+
+            unsafe { detour.disable() }.unwrap();
+            assert_eq!(unsafe { black_box(func)() }, 11);
+            assert_eq!(prot(pages), PAGE_EXECUTE_READ);
+            assert_eq!(prot(unsafe { pages.add(0x1000) }), PAGE_EXECUTE_READWRITE);
+        });
+
+        unsafe { VirtualFree(pages.cast(), 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn frozen_enable_does_not_deadlock_with_allocating_threads() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+            VirtualAlloc, VirtualFree, VirtualProtect,
+        };
+
+        let code = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                0x1000,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            )
+        } as *mut u8;
+        assert!(!code.is_null());
+        let body: [u8; 6] = [0xB8, 11, 0, 0, 0, 0xC3];
+        unsafe { std::ptr::copy_nonoverlapping(body.as_ptr(), code, body.len()) };
+        let mut old = 0u32;
+        assert_ne!(unsafe { VirtualProtect(code.cast(), 0x1000, PAGE_EXECUTE_READ, &mut old) }, 0);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let workers: Vec<_> = (0..4)
+            .map(|i| {
+                let s = stop.clone();
+                std::thread::spawn(move || {
+                    let mut n = 0usize;
+                    while !s.load(Ordering::Relaxed) {
+                        let v = vec![i as u8; 64 + (n & 1023)];
+                        black_box(v);
+                        n = n.wrapping_add(1);
+                    }
+                })
+            })
+            .collect();
+
+        with_lock(|| {
+            let detour = unsafe { RawDetour::new(code.cast(), ret_22 as *const ()) }.unwrap();
+            for _ in 0..64 {
+                frozen(code as usize, || unsafe { detour.enable() }).unwrap();
+                frozen(code as usize, || unsafe { detour.disable() }).unwrap();
+            }
+        });
+
+        stop.store(true, Ordering::Relaxed);
+        for w in workers {
+            w.join().unwrap();
+        }
+        unsafe { VirtualFree(code.cast(), 0, MEM_RELEASE) };
     }
 }

@@ -76,6 +76,9 @@ fn target_of(format: u32, hdr10: bool) -> Target {
 
 const FORMAT_B8G8R8A8_UNORM: u32 = 87;
 
+/// D3D11_1_UAV_SLOT_COUNT.
+const UAV_SLOTS_11_1: usize = 64;
+
 #[repr(C)]
 struct Texture2dDesc {
     width: u32,
@@ -136,6 +139,9 @@ pub struct Renderer {
     srv: usize,
     size: (u32, u32),
     seq: Option<u32>,
+    /// The output-merger slots a UAV can sit in: 8 below feature level 11_1, 64 from it
+    /// (D3D11_1_UAV_SLOT_COUNT); RTVs share the first 8.
+    uav_slots: usize,
 }
 
 // The objects are only used from the game's render thread, under the present lock.
@@ -147,8 +153,12 @@ impl Renderer {
         let mut ctx = 0usize;
         vcall!(device, 40, fn(*mut usize) -> (), &mut ctx);
         let mut r = Renderer {
-            device, ctx, vs: 0, ps: 0, ps_srgb: 0, ps_scrgb: 0, ps_pq: 0, hdr10: false, sampler: 0, blend: 0, raster: 0, depth: 0, tex: 0, srv: 0, size: (0, 0), seq: None,
+            device, ctx, vs: 0, ps: 0, ps_srgb: 0, ps_scrgb: 0, ps_pq: 0, hdr10: false, sampler: 0, blend: 0, raster: 0, depth: 0, tex: 0, srv: 0, size: (0, 0), seq: None, uav_slots: 8,
         };
+        // ID3D11Device::GetFeatureLevel.
+        if vcall!(device, 37, fn() -> u32) >= 0xb100 {
+            r.uav_slots = UAV_SLOTS_11_1;
+        }
         let hlsl = format!("#define SDR_WHITE {SDR_WHITE}\n{HLSL}");
         let vs = compile(&hlsl, c"vs", c"vs_4_0")?;
         let ps = compile(&hlsl, c"ps", c"ps_4_0")?;
@@ -290,10 +300,12 @@ impl Renderer {
             Target::ScRgb => self.ps_scrgb,
             Target::Pq => self.ps_pq,
         };
-        // Save.
+        // Save. With the RTVs the pixel shader's UAVs, which share their slots: setting
+        // the render targets alone would unbind them.
         let mut rtvs = [0usize; 8];
         let mut dsv = 0usize;
-        vcall!(c, 89, fn(u32, *mut usize, *mut usize) -> (), 8, rtvs.as_mut_ptr(), &mut dsv);
+        let mut uavs = [0usize; UAV_SLOTS_11_1];
+        vcall!(c, 90, fn(u32, *mut usize, *mut usize, u32, u32, *mut usize) -> (), 8, rtvs.as_mut_ptr(), &mut dsv, 0, self.uav_slots as u32, uavs.as_mut_ptr());
         let (mut blend, mut factor, mut mask) = (0usize, [0f32; 4], 0u32);
         vcall!(c, 91, fn(*mut usize, *mut f32, *mut u32) -> (), &mut blend, factor.as_mut_ptr(), &mut mask);
         let (mut depth, mut stencil_ref) = (0usize, 0u32);
@@ -337,7 +349,18 @@ impl Renderer {
         vcall!(c, 13, fn(u32, u32) -> (), 3, 0);
 
         // Restore (the Get calls added a reference to each object; Set takes its own).
-        vcall!(c, 33, fn(u32, *const usize, usize) -> (), 8, rtvs.as_ptr(), dsv);
+        match (uavs.iter().position(|&u| u != 0), uavs.iter().rposition(|&u| u != 0)) {
+            (Some(first), Some(last)) => {
+                // No RTV is bound at or past the first UAV's slot (D3D11 refuses the
+                // overlap), so the RTVs below it are all there were. A count of -1 keeps
+                // each append/consume buffer's counter where the game left it.
+                let n = last - first + 1;
+                let counts = [u32::MAX; UAV_SLOTS_11_1];
+                vcall!(c, 34, fn(u32, *const usize, usize, u32, u32, *const usize, *const u32) -> (),
+                    first.min(8) as u32, rtvs.as_ptr(), dsv, first as u32, n as u32, uavs[first..].as_ptr(), counts.as_ptr());
+            }
+            _ => vcall!(c, 33, fn(u32, *const usize, usize) -> (), 8, rtvs.as_ptr(), dsv),
+        }
         vcall!(c, 35, fn(usize, *const f32, u32) -> (), blend, factor.as_ptr(), mask);
         vcall!(c, 36, fn(usize, u32) -> (), depth, stencil_ref);
         vcall!(c, 43, fn(usize) -> (), raster);
@@ -351,7 +374,7 @@ impl Renderer {
         vcall!(c, 64, fn(usize, *const usize, u32) -> (), ds, std::ptr::null(), 0);
         vcall!(c, 8, fn(u32, u32, *const usize) -> (), 0, 1, &srv0);
         vcall!(c, 10, fn(u32, u32, *const usize) -> (), 0, 1, &samp0);
-        for o in rtvs.into_iter().chain([dsv, blend, depth, raster, layout, vs, ps, gs, hs, ds, srv0, samp0]) {
+        for o in rtvs.into_iter().chain(uavs).chain([dsv, blend, depth, raster, layout, vs, ps, gs, hs, ds, srv0, samp0]) {
             release(o);
         }
     }
@@ -446,6 +469,81 @@ mod tests {
         release(target);
         release(ctx);
         release(device);
+    }
+
+    /// A game's pixel-shader UAV, bound beside its render target, must still be bound
+    /// (with its append counter as it was) once the overlay is drawn, and the saved
+    /// references dropped again. Slot 1 at feature level 11_0; slot 9, past the RTVs'
+    /// eight, at 11_1.
+    #[test]
+    fn keeps_the_games_pixel_shader_uavs() {
+        let m = super::super::com::load("d3d11.dll");
+        type Create = unsafe extern "system" fn(usize, u32, usize, u32, *const u32, u32, u32, *mut usize, *mut u32, *mut usize) -> i32;
+        let create: Create = unsafe { std::mem::transmute(super::super::com::proc(m, c"D3D11CreateDevice").unwrap()) };
+        let refs = |o: usize| {
+            vcall!(o, 1, fn() -> u32);
+            vcall!(o, 2, fn() -> u32)
+        };
+        for (level, slot) in [(0xb000u32, 1usize), (0xb100, 9)] {
+            let (mut device, mut ctx, mut fl) = (0usize, 0usize, 0u32);
+            let hr = unsafe { create(0, 5, 0, 0x20, &level, 1, 7, &mut device, &mut fl, &mut ctx) };
+            assert!(hr >= 0, "D3D11CreateDevice {level:#x} {hr:#x}");
+            let (w, h) = (16u32, 16u32);
+            let desc = Texture2dDesc {
+                width: w, height: h, mip_levels: 1, array_size: 1, format: FORMAT_B8G8R8A8_UNORM, sample_count: 1, sample_quality: 0,
+                usage: 0, bind_flags: 0x20, cpu_access: 0, misc: 0,
+            };
+            let mut target = 0usize;
+            assert!(vcall!(device, 5, fn(*const Texture2dDesc, usize, *mut usize) -> i32, &desc, 0, &mut target) >= 0);
+            // An append buffer: structured, 16 uints, its UAV with a counter.
+            let buf_desc: [u32; 6] = [64, 0, 0x80, 0, 0x40, 4];
+            let mut buf = 0usize;
+            assert!(vcall!(device, 3, fn(*const u32, usize, *mut usize) -> i32, buf_desc.as_ptr(), 0, &mut buf) >= 0);
+            let uav_desc: [u32; 5] = [0, 1, 0, 16, 4];
+            let mut uav = 0usize;
+            assert!(vcall!(device, 8, fn(usize, *const u32, *mut usize) -> i32, buf, uav_desc.as_ptr(), &mut uav) >= 0);
+            let mut r = Renderer::new(device).expect("renderer");
+            let rtv = r.rtv_for(target);
+            assert_ne!(rtv, 0);
+            vcall!(ctx, 34, fn(u32, *const usize, usize, u32, u32, *const usize, *const u32) -> (), 1, &rtv, 0, slot as u32, 1, &uav, &5u32);
+            let (rtv_refs, uav_refs) = (refs(rtv), refs(uav));
+            let px = vec![0x8080_8080u32; (w * h) as usize];
+            let f = Frame { seq: 2, w, h, px: px.as_ptr(), header: None };
+            assert!(r.ensure_texture(w, h));
+            r.seq = Some(2);
+            r.draw(rtv, w, h, &f);
+
+            let (mut rtvs, mut dsv, mut uavs) = ([0usize; 8], 0usize, [0usize; UAV_SLOTS_11_1]);
+            vcall!(ctx, 90, fn(u32, *mut usize, *mut usize, u32, u32, *mut usize) -> (), 8, rtvs.as_mut_ptr(), &mut dsv, 0, r.uav_slots as u32, uavs.as_mut_ptr());
+            assert_eq!(rtvs[0], rtv, "feature level {level:#x}");
+            assert_eq!(uavs[slot], uav, "feature level {level:#x}");
+            assert_eq!(uavs.iter().filter(|&&u| u != 0).count(), 1);
+            for o in rtvs.into_iter().chain(uavs).chain([dsv]) {
+                release(o);
+            }
+            assert_eq!((refs(rtv), refs(uav)), (rtv_refs, uav_refs), "references left behind");
+            // The counter is still the 5 it was bound with (an initial count of 0 would
+            // have reset it).
+            let staging_desc: [u32; 6] = [16, 3, 0, 0x20000, 0, 0];
+            let mut staging = 0usize;
+            assert!(vcall!(device, 3, fn(*const u32, usize, *mut usize) -> i32, staging_desc.as_ptr(), 0, &mut staging) >= 0);
+            vcall!(ctx, 49, fn(usize, u32, usize) -> (), staging, 0, uav);
+            let mut mp = Mapped { data: std::ptr::null_mut(), row_pitch: 0, depth_pitch: 0 };
+            assert!(vcall!(ctx, 14, fn(usize, u32, u32, u32, *mut Mapped) -> i32, staging, 0, 1, 0, &mut mp) >= 0);
+            let count = unsafe { *(mp.data as *const u32) };
+            vcall!(ctx, 15, fn(usize, u32) -> (), staging, 0);
+            assert_eq!(count, 5, "feature level {level:#x}");
+
+            vcall!(ctx, 110, fn() -> ());
+            release(staging);
+            release(rtv);
+            drop(r);
+            release(uav);
+            release(buf);
+            release(target);
+            release(ctx);
+            release(device);
+        }
     }
 
     /// An sRGB back buffer encodes what is written: the overlay's grey must land as the

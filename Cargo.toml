@@ -37,8 +37,11 @@ windows-sys = { version = "0.59", features = [
 # instruction, which corrupts `cmp dword [rip+d], imm8` and crashed a game.
 # The vendored copy finds the real displacement offset. It also takes its two locks
 # whether or not a panic once happened while one was held (the disassembler panics on
-# bytes it doesn't know): poisoned, every later hook in the game failed. And a dropped
+# bytes it doesn't know): poisoned, every later hook in the game failed. A dropped
 # detour is disabled in release builds too (upstream's disable sat in a debug_assert!).
+# And on Windows, enabling or disabling calls VirtualProtect directly with stack-only
+# state instead of region::protect_with_handle (which allocates a Vec on the process
+# heap and deadlocks when called with other threads suspended via sys::hook::frozen).
 [patch.crates-io]
 retour = { path = "vendor/retour" }
 

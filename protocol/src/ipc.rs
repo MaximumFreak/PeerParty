@@ -382,11 +382,12 @@ pub enum HostMsg {
     InputShm { name: String },
     /// Share this copy's frames with the compositor (textures reported in a `surface`,
     /// the newest finished one said in the `frame_ring` block `ring`, a mapping name or a
-    /// `ShmBacking` string, and the event named `event` set after each), or stop. With
+    /// `ShmBacking` string, the event named `event` set after each, and an optional
+    /// per-copy `pace` event set by the compositor after each refresh), or stop. With
     /// `pixels`, the frames are read back and written into a file of the hook's own next
     /// to the ring's (`SurfaceMsg::pixels`) instead: what a game under Wine can share with
     /// a native Linux window, which can't open Windows' shared textures.
-    Capture { enabled: bool, ring: Option<String>, event: Option<String>, pixels: bool },
+    Capture { enabled: bool, ring: Option<String>, event: Option<String>, pace: Option<String>, pixels: bool },
     /// This copy's assigned controller arrived, changed, or went away: tell its windows
     /// so engines that only re-check controllers on `WM_DEVICECHANGE` scan again.
     DevicesChanged,
@@ -418,10 +419,13 @@ impl HostMsg {
             HostMsg::Frame { name } => t("frame", vec![("name", Json::str(name.as_str()))]),
             HostMsg::Instance(spec) => t("instance", vec![("spec", spec.to_json())]),
             HostMsg::InputShm { name } => t("input_shm", vec![("name", Json::str(name.as_str()))]),
-            HostMsg::Capture { enabled, ring, event, pixels } => t(
-                "capture",
-                vec![("enabled", Json::Bool(*enabled)), ("ring", opt_str(ring)), ("event", opt_str(event)), ("pixels", Json::Bool(*pixels))],
-            ),
+            HostMsg::Capture { enabled, ring, event, pace, pixels } => {
+                let mut fields = vec![("enabled", Json::Bool(*enabled)), ("ring", opt_str(ring)), ("event", opt_str(event)), ("pixels", Json::Bool(*pixels))];
+                if let Some(p) = pace {
+                    fields.push(("pace", Json::str(p.as_str())));
+                }
+                t("capture", fields)
+            }
             HostMsg::DevicesChanged => t("devices_changed", vec![]),
         }
     }
@@ -447,7 +451,7 @@ impl HostMsg {
             "frame" => HostMsg::Frame { name: s("name")? },
             "instance" => HostMsg::Instance(crate::session::InstanceSpec::from_json(v.get("spec"))?),
             "input_shm" => HostMsg::InputShm { name: s("name")? },
-            "capture" => HostMsg::Capture { enabled: flag(v, "enabled"), ring: s("ring"), event: s("event"), pixels: flag(v, "pixels") },
+            "capture" => HostMsg::Capture { enabled: flag(v, "enabled"), ring: s("ring"), event: s("event"), pace: s("pace"), pixels: flag(v, "pixels") },
             "devices_changed" => HostMsg::DevicesChanged,
             _ => return None,
         })
@@ -544,6 +548,9 @@ pub enum HookMsg {
     /// A split-screen copy's game locked its cursor to its window (`ClipCursor`), or let
     /// it go: the session keeps the real mouse in its pane meanwhile.
     CursorLock { on: bool },
+    /// A split-screen copy's game hid its cursor (`ShowCursor(FALSE)`), or showed it
+    /// again: the session hides the real pointer over the window while its pane has focus.
+    CursorHide { hidden: bool },
     /// A line for the launcher's log.
     Log(String),
     /// The game's frames: their size in pixels, its window (0: none known) and the
@@ -571,6 +578,7 @@ impl HookMsg {
             }
             HookMsg::Close => Json::obj(vec![("t", Json::str("close"))]),
             HookMsg::CursorLock { on } => Json::obj(vec![("t", Json::str("cursor_lock")), ("on", Json::Bool(*on))]),
+            HookMsg::CursorHide { hidden } => Json::obj(vec![("t", Json::str("cursor_hide")), ("hidden", Json::Bool(*hidden))]),
             HookMsg::Log(text) => Json::obj(vec![("t", Json::str("log")), ("text", Json::str(text.as_str()))]),
             HookMsg::Viewport { width, height, hwnd, api } => Json::obj(vec![
                 ("t", Json::str("viewport")),
@@ -606,6 +614,7 @@ impl HookMsg {
             "local_saves" => HookMsg::LocalSaves { service: text(v, "service")?, path: text(v, "path").unwrap_or_default() },
             "close" => HookMsg::Close,
             "cursor_lock" => HookMsg::CursorLock { on: v.get("on").as_bool()? },
+            "cursor_hide" => HookMsg::CursorHide { hidden: v.get("hidden").as_bool()? },
             "log" => HookMsg::Log(text(v, "text")?),
             "viewport" => HookMsg::Viewport {
                 width: u32_of(v, "width")?,
@@ -778,6 +787,7 @@ mod tests {
             HookMsg::LocalSaves { service: "PlayFab".into(), path: r"C:\Users\Alex\AppData\Local\peerparty".into() },
             HookMsg::Close,
             HookMsg::CursorLock { on: true },
+            HookMsg::CursorHide { hidden: true },
             HookMsg::Log("hello".into()),
         ] {
             assert_eq!(HookMsg::from_line(&m.to_line()), Some(m));
@@ -806,10 +816,10 @@ mod tests {
             HostMsg::Instance(spec.clone()),
             HostMsg::Instance(InstanceSpec::solo(InstanceId(0), 0)),
             HostMsg::InputShm { name: r"Local\peerparty-input-1-00".into() },
-            HostMsg::Capture { enabled: true, ring: Some(r"Local\peerparty-ring-1-00".into()), event: Some(r"Local\peerparty-frames-00".into()), pixels: false },
-            HostMsg::Capture { enabled: true, ring: Some("file:/run/user/1000/peerparty/ring-1-00".into()), event: None, pixels: true },
-            HostMsg::Capture { enabled: true, ring: None, event: None, pixels: false },
-            HostMsg::Capture { enabled: false, ring: None, event: None, pixels: false },
+            HostMsg::Capture { enabled: true, ring: Some(r"Local\peerparty-ring-1-00".into()), event: Some(r"Local\peerparty-frames-00".into()), pace: Some(r"Local\peerparty-pace-1-00".into()), pixels: false },
+            HostMsg::Capture { enabled: true, ring: Some("file:/run/user/1000/peerparty/ring-1-00".into()), event: None, pace: None, pixels: true },
+            HostMsg::Capture { enabled: true, ring: None, event: None, pace: None, pixels: false },
+            HostMsg::Capture { enabled: false, ring: None, event: None, pace: None, pixels: false },
             HostMsg::DevicesChanged,
         ] {
             let line = m.to_line();
@@ -817,13 +827,13 @@ mod tests {
             assert_eq!(HostMsg::from_line(&line), Some(m), "{line}");
         }
         assert_eq!(
-            HostMsg::Capture { enabled: false, ring: None, event: None, pixels: false }.to_line(),
+            HostMsg::Capture { enabled: false, ring: None, event: None, pace: None, pixels: false }.to_line(),
             r#"{"t":"capture","enabled":false,"ring":null,"event":null,"pixels":false}"#
         );
         assert_eq!(HostMsg::InputShm { name: "x".into() }.to_line(), r#"{"t":"input_shm","name":"x"}"#);
         // The least a launcher writes, and what lacks what it needs.
         assert_eq!(HostMsg::from_line(r#"{"t":"instance","spec":{"id":2,"slot":1}}"#), Some(HostMsg::Instance(InstanceSpec::solo(InstanceId(2), 1))));
-        assert_eq!(HostMsg::from_line(r#"{"t":"capture"}"#), Some(HostMsg::Capture { enabled: false, ring: None, event: None, pixels: false }));
+        assert_eq!(HostMsg::from_line(r#"{"t":"capture"}"#), Some(HostMsg::Capture { enabled: false, ring: None, event: None, pace: None, pixels: false }));
         for bad in [
             r#"{"t":"instance"}"#,
             r#"{"t":"instance","spec":null}"#,

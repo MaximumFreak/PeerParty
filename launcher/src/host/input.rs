@@ -101,10 +101,10 @@ static WOKEN: AtomicBool = AtomicBool::new(false);
 
 /// Starts the hook thread (idle until `capture(true)`).
 pub fn start() {
+    HOST.store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
     if THREAD.load(Ordering::Relaxed) != 0 {
         return;
     }
-    HOST.store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("peerparty-input".into())
@@ -113,6 +113,11 @@ pub fn start() {
     if let Ok(id) = rx.recv() {
         THREAD.store(id, Ordering::Relaxed);
     }
+}
+
+/// Whether either Alt key is currently held while input capture is active.
+pub fn alt_down() -> bool {
+    ALT.load(Ordering::Relaxed)
 }
 
 /// Starts or stops taking keyboard and mouse input from everything else.
@@ -205,6 +210,9 @@ fn run(tx: std::sync::mpsc::Sender<u32>) {
                 for t in &TAKEN {
                     t.store(false, Ordering::Relaxed);
                 }
+                for b in &BUTTONS_TAKEN {
+                    b.store(false, Ordering::Relaxed);
+                }
                 kb = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard), module, 0) };
                 mouse = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), module, 0) };
             }
@@ -217,6 +225,9 @@ fn run(tx: std::sync::mpsc::Sender<u32>) {
                 // Alt is only followed while the overlay takes keys: a release missed
                 // while it was closed (Alt+Tab away) mustn't leave it held.
                 ALT.store(false, Ordering::Relaxed);
+                for b in &BUTTONS_TAKEN {
+                    b.store(false, Ordering::Relaxed);
+                }
                 mouse = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), module, 0) };
             }
             INSTALL_KEYS if kb.is_null() => {

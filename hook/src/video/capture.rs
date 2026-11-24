@@ -18,7 +18,7 @@
 //! Neither side waits for the other on the CPU: a slot whose release the session's GPU
 //! hasn't passed yet is not written (`RingHeader::pick`), and that frame isn't copied.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use peerparty_protocol::frame_ring::{RingHeader, SLOTS};
@@ -46,17 +46,20 @@ pub fn epoch() -> u64 {
     EPOCH.load(Ordering::Acquire)
 }
 
-/// The session's ring block and frame event, mapped and opened.
+/// The session's ring block, frame event, and optional pace event, mapped and opened.
 struct Link {
     map: HANDLE,
     view: *mut u8,
     event: HANDLE,
+    /// Auto-reset event signalled by the compositor right after `Present(1, 0)`.
+    pace: HANDLE,
     /// A ring in a file (`ShmBacking::FileMmap`): its directory, as the session names it
     /// (where pixel files go).
     dir: Option<String>,
 }
 
 unsafe impl Send for Link {}
+unsafe impl Sync for Link {}
 
 impl Drop for Link {
     fn drop(&mut self) {
@@ -67,11 +70,19 @@ impl Drop for Link {
             if !self.event.is_null() {
                 CloseHandle(self.event);
             }
+            if !self.pace.is_null() {
+                CloseHandle(self.pace);
+            }
         }
     }
 }
 
-static LINK: Mutex<Option<Link>> = Mutex::new(None);
+static LINK: Mutex<Option<Arc<Link>>> = Mutex::new(None);
+/// The compositor's `RingHeader::presents` counter as last seen by `pace()`.
+static LAST_PACED_PRESENT: AtomicU64 = AtomicU64::new(0);
+/// Safety cap (ms) on waiting for the compositor's pace event so a stall or crash can
+/// never deadlock a copy.
+const PACE_TIMEOUT_MS: u32 = 35;
 
 /// Whether the session wants the frames, and has said where they go.
 pub fn enabled() -> bool {
@@ -95,15 +106,16 @@ pub fn pixels() -> bool {
 /// The session's `HostMsg::Capture`, for shared textures.
 #[cfg(test)]
 pub fn configure(on: bool, ring: Option<&str>, event: Option<&str>) {
-    configure_as(on, ring, event, false);
+    configure_as(on, ring, event, None, false);
 }
 
 /// The session's `HostMsg::Capture`.
-pub fn configure_as(on: bool, ring: Option<&str>, event: Option<&str>, pixels: bool) {
+pub fn configure_as(on: bool, ring: Option<&str>, event: Option<&str>, pace: Option<&str>, pixels: bool) {
     PIXELS.store(on && pixels, Ordering::Release);
-    let link = if on { ring.and_then(|r| open_link(r, event)) } else { None };
+    let link = if on { ring.and_then(|r| open_link(r, event, pace)).map(Arc::new) } else { None };
     let ok = link.is_some();
     *crate::sys::lock(&LINK) = link;
+    LAST_PACED_PRESENT.store(0, Ordering::Release);
     // A new setup gets new sets: none of the old ones is drawn or reported again.
     CURRENT.store(0, Ordering::Release);
     crate::sys::lock(&REPORTED).clear();
@@ -164,7 +176,7 @@ fn open_ring(ring: &str) -> Option<(HANDLE, Option<String>)> {
     (!map.is_null()).then_some((map, dir))
 }
 
-fn open_link(ring: &str, event: Option<&str>) -> Option<Link> {
+fn open_link(ring: &str, event: Option<&str>, pace: Option<&str>) -> Option<Link> {
     use windows_sys::Win32::System::Memory::{FILE_MAP_ALL_ACCESS, MapViewOfFile};
     use windows_sys::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW};
     let (map, dir) = open_ring(ring)?;
@@ -174,9 +186,51 @@ fn open_link(ring: &str, event: Option<&str>) -> Option<Link> {
         return None;
     }
     let event = event.map_or(std::ptr::null_mut(), |e| unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, wide(e).as_ptr()) });
-    let link = Link { map, view, event, dir };
+    // SYNCHRONIZE (0x0010_0000) | EVENT_MODIFY_STATE (0x2) so we can wait and drain.
+    let pace = pace.map_or(std::ptr::null_mut(), |e| unsafe { OpenEventW(0x0010_0000 | EVENT_MODIFY_STATE, 0, wide(e).as_ptr()) });
+    let link = Link { map, view, event, pace, dir };
     let ok = unsafe { RingHeader::from_raw(link.view, peerparty_protocol::frame_ring::BLOCK_SIZE) }.is_some_and(|h| h.valid());
     ok.then_some(link)
+}
+
+/// Whether compositor-locked frame pacing is active for this copy right now.
+pub fn sync_active() -> bool {
+    if !enabled() {
+        return false;
+    }
+    let Some(link) = crate::sys::lock(&LINK).clone() else { return false };
+    !link.pace.is_null()
+        && unsafe { RingHeader::from_raw(link.view, peerparty_protocol::frame_ring::BLOCK_SIZE) }.is_some_and(|h| h.sync_active())
+}
+
+/// Paces this copy to the compositor's refresh boundary when "Sync games to screen" is
+/// active: returns immediately (0 ms) if the compositor already presented since our last
+/// paced frame (slow game), otherwise waits for the compositor's next `Present(1, 0)`
+/// with a `PACE_TIMEOUT_MS` safety cap.
+pub fn pace() {
+    if !enabled() {
+        return;
+    }
+    let Some(link) = crate::sys::lock(&LINK).clone() else { return };
+    if link.pace.is_null() {
+        return;
+    }
+    let Some(h) = (unsafe { RingHeader::from_raw(link.view, peerparty_protocol::frame_ring::BLOCK_SIZE) }) else {
+        return;
+    };
+    if !h.sync_active() {
+        return;
+    }
+    let now = h.presents.load(Ordering::Acquire);
+    let prev = LAST_PACED_PRESENT.load(Ordering::Acquire);
+    if now != prev {
+        LAST_PACED_PRESENT.store(now, Ordering::Release);
+        // Drain any stale signal so the next fast frame waits cleanly for a fresh VBlank.
+        unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(link.pace, 0) };
+        return;
+    }
+    unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(link.pace, PACE_TIMEOUT_MS) };
+    LAST_PACED_PRESENT.store(h.presents.load(Ordering::Acquire), Ordering::Release);
 }
 
 /// Where pixel files go: the ring file's directory, as the session names it (None when
@@ -1248,7 +1302,7 @@ pub(crate) mod tests {
     fn d3d11_frames_are_read_back_into_pixels() {
         let _turn = crate::sys::lock(&SERIAL);
         let (ring, dir) = session_ring_file();
-        configure_as(true, Some(&ring), None, true);
+        configure_as(true, Some(&ring), None, None, true);
         assert!(pixels());
         assert!(pixel_dir().is_some_and(|d| !d.is_empty()));
         let (device, ctx) = warp();
@@ -1365,5 +1419,52 @@ pub(crate) mod tests {
         for t in [27, 90, 92, 23, 9] {
             assert_eq!(typeless(typed(t)), t);
         }
+    }
+
+    /// Compositor-locked frame pacing: returns immediately (0 ms) when the compositor
+    /// already advanced `presents` (slow game), wakes right away when the pace event is
+    /// signalled (fast game), and never stalls past `PACE_TIMEOUT_MS` if unsignalled.
+    #[test]
+    fn pace_waits_for_compositor_and_skips_slow_frames() {
+        use peerparty_protocol::frame_ring::{FLAG_COMPOSITOR_LIVE, FLAG_SYNC_WANTED};
+        use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent};
+        let _turn = crate::sys::lock(&SERIAL);
+        let (_map, ring_name) = session_ring();
+        let pace_name = format!(r"Local\peerparty-pace-test-{}", std::process::id());
+        let pace_ev = unsafe { CreateEventW(std::ptr::null(), 0, 0, wide(&pace_name).as_ptr()) };
+        assert!(!pace_ev.is_null());
+        configure_as(true, Some(&ring_name), None, Some(&pace_name), false);
+        assert!(!sync_active(), "flags not set yet");
+        with_ring(|h| {
+            h.set_flag(FLAG_SYNC_WANTED, true);
+            h.set_flag(FLAG_COMPOSITOR_LIVE, true);
+        });
+        assert!(sync_active());
+
+        // Slow game: compositor already presented -> 0 ms wait.
+        with_ring(|h| h.presented());
+        let t0 = std::time::Instant::now();
+        pace();
+        assert!(t0.elapsed().as_millis() < 15, "slow game must not stall");
+
+        // Fast game: compositor signals pace event in 8 ms -> wakes right away.
+        let ev_addr = pace_ev as usize;
+        let signaler = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(8));
+            unsafe { SetEvent(ev_addr as HANDLE) };
+        });
+        let t1 = std::time::Instant::now();
+        pace();
+        signaler.join().unwrap();
+        assert!(t1.elapsed().as_millis() < 100, "woke on pace signal");
+
+        // Unsignalled safety timeout: returns in ~PACE_TIMEOUT_MS, never deadlocks.
+        let t2 = std::time::Instant::now();
+        pace();
+        let ms = t2.elapsed().as_millis();
+        assert!(ms >= 20 && ms < 200, "safety timeout bounded ({ms} ms)");
+
+        configure(false, None, None);
+        unsafe { CloseHandle(pace_ev) };
     }
 }

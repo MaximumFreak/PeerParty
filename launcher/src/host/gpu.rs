@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use peerparty_protocol::frame_ring::SLOTS;
+use peerparty_protocol::frame_ring::{FLAG_COMPOSITOR_LIVE, SLOTS};
 use peerparty_protocol::ipc::SurfaceMsg;
 use peerparty_protocol::session::PaneRect;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND};
@@ -199,10 +199,19 @@ impl Drop for SharedSurface {
     }
 }
 
-/// What a pane shows: where, from which ring, which textures.
+/// Full-texture UV rectangle `[u0, v0, u1, v1]`.
+pub const FULL_UV: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+
+/// What a pane shows: where, its source UV crop, draw Z-order, from which ring, and
+/// which textures.
 #[derive(Clone)]
 pub struct PaneDraw {
     pub dest: PaneRect,
+    /// Source UV sub-rectangle `[u0, v0, u1, v1]` in `0.0..=1.0` (`FULL_UV` for Fit/Stretch,
+    /// centered crop for `PaneFit::Fill`).
+    pub uv: [f32; 4],
+    /// Draw order (higher draws on top, for Picture-in-Picture overlays).
+    pub z: u8,
     pub ring: Option<Arc<RingBlock>>,
     pub surface: Option<Arc<SharedSurface>>,
 }
@@ -219,7 +228,7 @@ impl PartialEq for PaneDraw {
             (None, None) => true,
             _ => false,
         };
-        self.dest == o.dest && same(&self.ring, &o.ring) && same_surface
+        self.dest == o.dest && self.uv == o.uv && self.z == o.z && same(&self.ring, &o.ring) && same_surface
     }
 }
 
@@ -354,6 +363,7 @@ cbuffer Pane : register(b0) {
     uint output;     // the window's: 0 sRGB-encoded (an SDR display), 1 scRGB (an HDR one)
     float sdr_white; // where SDR white goes on an HDR display, in scRGB (1.0 = 80 nits)
     float hdr_white; // the nits of an HDR frame shown as white on an SDR display
+    float4 uv_rect;  // (u0, v0, u1 - u0, v1 - v0) source sub-rectangle
 };
 float3 srgb_decode(float3 e) {
     e = saturate(e);
@@ -389,7 +399,8 @@ float3 finite(float3 c) {
     return clamp(c, -65504.0, 65504.0);
 }
 float4 ps(V i) : SV_Target {
-    float3 c = finite(t.Sample(s, i.uv).rgb);
+    float2 uv = uv_rect.xy + i.uv * uv_rect.zw;
+    float3 c = finite(t.Sample(s, uv).rgb);
     if (input == 0) return float4(output == 1 ? srgb_decode(c) * sdr_white : c, 1);
     float3 nits = input == 2 ? mul(BT2020_TO_709, pq_nits(c)) : c * 80.0;
     if (output == 1) return float4(nits / 80.0, 1);
@@ -397,7 +408,7 @@ float4 ps(V i) : SV_Target {
 }
 "#;
 
-/// A pane's `cbuffer Pane`.
+/// A pane's `cbuffer Pane` (32 bytes, 16-byte aligned for D3D11).
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Debug)]
 struct PaneParams {
@@ -405,6 +416,7 @@ struct PaneParams {
     output: u32,
     sdr_white: f32,
     hdr_white: f32,
+    uv_rect: [f32; 4],
 }
 
 /// The nits an HDR frame's white is shown at on an SDR display (BT.2408's reference white).
@@ -544,9 +556,15 @@ impl Display {
         if self.hdr { (10, peerparty_protocol::frame_ring::COLOR_SPACE_SCRGB) } else { (87, peerparty_protocol::frame_ring::COLOR_SPACE_SRGB) }
     }
 
-    /// `cbuffer Pane` for a pane of frames encoded as `input`.
-    fn params(&self, input: u32) -> PaneParams {
-        PaneParams { input, output: u32::from(self.hdr), sdr_white: self.sdr_white, hdr_white: HDR_WHITE_NITS }
+    /// `cbuffer Pane` for a pane of frames encoded as `input` with source UV `[u0, v0, u1, v1]`.
+    fn params(&self, input: u32, uv: [f32; 4]) -> PaneParams {
+        PaneParams {
+            input,
+            output: u32::from(self.hdr),
+            sdr_white: self.sdr_white,
+            hdr_white: HDR_WHITE_NITS,
+            uv_rect: [uv[0], uv[1], uv[2] - uv[0], uv[3] - uv[1]],
+        }
     }
 }
 
@@ -873,8 +891,11 @@ impl Renderer {
         vcall!(ctx, 9, fn(usize, usize, u32) -> (), self.ps, 0, 0);
         vcall!(ctx, 16, fn(u32, u32, *const usize) -> (), 0, 1, &self.cb); // PSSetConstantBuffers
         vcall!(ctx, 10, fn(u32, u32, *const usize) -> (), 0, 1, &self.sampler);
+        let mut order: Vec<usize> = (0..panes.len()).collect();
+        order.sort_by_key(|&i| (panes[i].draw.z, i));
         let mut drawn = Vec::new();
-        for (i, p) in panes.iter().enumerate() {
+        for i in order {
+            let p = &panes[i];
             let (Some(o), Some(&Some((slot, ready)))) = (p.shown(), take.get(i)) else { continue };
             let d = p.draw.dest;
             if d.width == 0 || d.height == 0 {
@@ -886,7 +907,7 @@ impl Renderer {
             }
             let vp: [f32; 6] = [d.x as f32, d.y as f32, d.width as f32, d.height as f32, 0.0, 1.0];
             vcall!(ctx, 44, fn(u32, *const [f32; 6]) -> (), 1, &vp);
-            let params = self.display.params(o.input);
+            let params = self.display.params(o.input, p.draw.uv);
             if self.params != Some(params) {
                 // ID3D11DeviceContext::UpdateSubresource is slot 48.
                 vcall!(ctx, 48, fn(usize, u32, usize, *const PaneParams, u32, u32) -> (), self.cb, 0, 0, &params, 0, 0);
@@ -986,7 +1007,7 @@ struct Pane {
 impl Default for Pane {
     fn default() -> Pane {
         Pane {
-            draw: PaneDraw { dest: PaneRect { x: 0, y: 0, width: 0, height: 0 }, ring: None, surface: None },
+            draw: PaneDraw { dest: PaneRect { x: 0, y: 0, width: 0, height: 0 }, uv: FULL_UV, z: 0, ring: None, surface: None },
             opened: None,
             previous: None,
             failed: None,
@@ -1161,6 +1182,9 @@ fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE) {
                         if d.surface.is_none()
                             && let Some(r) = &p.draw.ring
                         {
+                            if r.header().set_flag(FLAG_COMPOSITOR_LIVE, false) {
+                                r.signal_pace();
+                            }
                             r.header().stop_reading();
                         }
                     }
@@ -1184,7 +1208,7 @@ fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE) {
             dirty = true;
         }
         let Some(r) = gpu.as_mut() else {
-            set_live(shared, &panes);
+            set_live(shared, &panes, false);
             continue;
         };
         if r.check_display() {
@@ -1212,6 +1236,9 @@ fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE) {
                         dirty = true;
                     }
                     if let Some(ring) = &p.draw.ring {
+                        if ring.header().set_flag(FLAG_COMPOSITOR_LIVE, false) {
+                            ring.signal_pace();
+                        }
                         ring.header().stop_reading();
                     }
                 }
@@ -1226,12 +1253,12 @@ fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE) {
             reset_gpu(&mut panes);
             gpu = None;
             prefer = Some(other);
-            set_live(shared, &panes);
+            set_live(shared, &panes, false);
             continue;
         }
         // Minimized: nothing is shown, so nothing is taken, uploaded or presented.
         if unsafe { windows_sys::Win32::UI::WindowsAndMessaging::IsIconic(hwnd) } != 0 {
-            set_live(shared, &panes);
+            set_live(shared, &panes, false);
             continue;
         }
         // Not seen: as minimized, until a test present (DXGI_PRESENT_TEST, nothing shown)
@@ -1241,7 +1268,7 @@ fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE) {
                 if since.elapsed() >= OCCLUDED_RETRY {
                     occluded = Some(std::time::Instant::now());
                 }
-                set_live(shared, &panes);
+                set_live(shared, &panes, false);
                 continue;
             }
             eprintln!("peerparty: session: the window can be seen again; drawing resumes");
@@ -1249,7 +1276,7 @@ fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE) {
             dirty = true;
         }
         let (fresh, _, _) = take_frames(r, &mut panes, &mut dirty);
-        set_live(shared, &panes);
+        set_live(shared, &panes, true);
         if !fresh && !dirty {
             continue;
         }
@@ -1277,11 +1304,13 @@ fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE) {
         if hr == DXGI_STATUS_OCCLUDED && occluded.is_none() {
             eprintln!("peerparty: session: the window can't be seen (the screen is locked, or a full-screen window covers it); nothing is drawn until it can");
             occluded = Some(std::time::Instant::now());
+            set_live(shared, &panes, false);
         }
         for (i, slot) in drawn {
             let p = &mut panes[i];
             let Some(ring) = p.draw.ring.as_ref() else { continue };
             ring.header().presented();
+            ring.signal_pace();
             // The previous set's frame (drawn while the new one has none), or the last
             // frame of a set the copy has moved on from, isn't released.
             let Some(o) = p.opened.as_mut().filter(|o| !o.pixels && taken[i]) else { continue };
@@ -1303,6 +1332,7 @@ fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE) {
         // DXGI_ERROR_DEVICE_REMOVED / DEVICE_RESET: start over on a new device.
         if hr == 0x887A_0005_u32 as i32 || hr == 0x887A_0007_u32 as i32 {
             eprintln!("peerparty: session: the window's graphics device was lost ({hr:#x}); making a new one");
+            set_live(shared, &panes, false);
             reset_gpu(&mut panes);
             gpu = None;
             failed_luid = None;
@@ -1310,6 +1340,8 @@ fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE) {
     }
     for p in &panes {
         if let Some(r) = &p.draw.ring {
+            r.header().set_flag(FLAG_COMPOSITOR_LIVE, false);
+            r.signal_pace();
             r.header().stop_reading();
         }
     }
@@ -1317,8 +1349,17 @@ fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE) {
     drop(gpu);
 }
 
-fn set_live(shared: &Shared, panes: &[Pane]) {
+fn set_live(shared: &Shared, panes: &[Pane], presenting: bool) {
     let live: Vec<bool> = panes.iter().map(|p| p.shown().is_some_and(|o| o.last.is_some())).collect();
+    for (p, &has_frame) in panes.iter().zip(live.iter()) {
+        if let Some(ring) = &p.draw.ring {
+            let visible = p.draw.dest.width > 0 && p.draw.dest.height > 0;
+            let active = presenting && has_frame && visible;
+            if ring.header().set_flag(FLAG_COMPOSITOR_LIVE, active) && !active {
+                ring.signal_pace();
+            }
+        }
+    }
     let mut l = shared.live.lock().unwrap_or_else(|e| e.into_inner());
     if *l != live {
         *l = live;
@@ -1459,7 +1500,7 @@ mod tests {
         };
         let surface = Arc::new(SharedSurface::duplicate(&m).expect("handles duplicated"));
         let gpu = Gpu::start(hwnd).expect("the drawing thread");
-        gpu.set(vec![PaneDraw { dest: PaneRect { x: 0, y: 0, width: 128, height: 64 }, ring: Some(ring.clone()), surface: Some(surface) }]);
+        gpu.set(vec![PaneDraw { dest: PaneRect { x: 0, y: 0, width: 128, height: 64 }, uv: FULL_UV, z: 0, ring: Some(ring.clone()), surface: Some(surface) }]);
         let start = std::time::Instant::now();
         while !(gpu.live(0) && ring.header().presents.load(Ordering::SeqCst) > 0) {
             assert!(start.elapsed().as_secs() < 10, "drawn within 10 s");
@@ -1493,7 +1534,7 @@ mod tests {
         r.display = Display::SDR;
         let s2 = Arc::new(surface_again(&m));
         let mut pane = Pane::default();
-        pane.draw = PaneDraw { dest: PaneRect { x: 32, y: 16, width: 64, height: 32 }, ring: None, surface: Some(s2.clone()) };
+        pane.draw = PaneDraw { dest: PaneRect { x: 32, y: 16, width: 64, height: 32 }, uv: FULL_UV, z: 0, ring: None, surface: Some(s2.clone()) };
         pane.opened = r.open(&s2);
         assert!(pane.opened.is_some(), "the textures open on the window's device");
         let target_desc = TexDesc { width: 128, height: 64, mips: 1, array: 1, format: 87, samples: 1, quality: 0, usage: 0, bind: 0x20, cpu: 0, misc: 0 };
@@ -1609,7 +1650,7 @@ mod tests {
         r.params = None;
         let s = Arc::new(surface_again(&sets[set].0));
         let mut pane = Pane::default();
-        pane.draw = PaneDraw { dest: PaneRect { x: 0, y: 0, width: 16, height: 16 }, ring: None, surface: Some(s.clone()) };
+        pane.draw = PaneDraw { dest: PaneRect { x: 0, y: 0, width: 16, height: 16 }, uv: FULL_UV, z: 0, ring: None, surface: Some(s.clone()) };
         pane.opened = r.open(&s);
         assert!(pane.opened.is_some(), "set {set} opens");
         let desc = TexDesc { width: 16, height: 16, mips: 1, array: 1, format, samples: 1, quality: 0, usage: 0, bind: 0x20, cpu: 0, misc: 0 };
@@ -1734,7 +1775,7 @@ mod tests {
         let mut r = Renderer::new(hwnd, default_luid().expect("an adapter")).expect("a renderer");
         r.display = Display::SDR;
         let mut pane = Pane::default();
-        pane.draw = PaneDraw { dest: PaneRect { x: 0, y: 0, width: 16, height: 16 }, ring: None, surface: Some(s.clone()) };
+        pane.draw = PaneDraw { dest: PaneRect { x: 0, y: 0, width: 16, height: 16 }, uv: FULL_UV, z: 0, ring: None, surface: Some(s.clone()) };
         pane.opened = r.open(&s);
         let o = pane.opened.as_mut().expect("its texture");
         assert!(o.pixels);

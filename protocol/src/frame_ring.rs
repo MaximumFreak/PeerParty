@@ -21,7 +21,8 @@
 //! | 56 | released: four release-fence values, one per slot |
 //! | 88 | presents: how many frames the compositor has shown |
 //! | 96 | released_gen: four generations, the one each `released` value is of (0: none) |
-//! | 112 | reserved, zero |
+//! | 112 | flags: compositor frame-pacing bits (`FLAG_SYNC_WANTED`, `FLAG_COMPOSITOR_LIVE`) |
+//! | 120 | reserved, zero |
 //!
 //! A generation is one set of textures (`HookMsg::Surface`): the hook makes a new one when
 //! the game's frames change size or format, and a slot only means something within its
@@ -51,6 +52,12 @@ pub const MAGIC: u32 = u32::from_le_bytes(*b"PPFR");
 pub const VERSION: u32 = 2;
 /// `reading` when the compositor samples nothing.
 pub const NONE: u64 = u64::MAX;
+
+/// `RingHeader::flags`: the session wants this copy paced to the compositor's refresh.
+pub const FLAG_SYNC_WANTED: u32 = 1 << 0;
+/// `RingHeader::flags`: the compositor is actively presenting this copy's visible pane
+/// right now (cleared when minimized, occluded, hidden, or stopping so a copy never waits).
+pub const FLAG_COMPOSITOR_LIVE: u32 = 1 << 1;
 
 /// `DXGI_COLOR_SPACE_TYPE`s a frame's values are in (`SurfaceMsg::color_space`).
 /// sRGB-encoded, BT.709 primaries: what every SDR frame is.
@@ -95,7 +102,9 @@ pub struct RingHeader {
     pub released: [AtomicU64; 4],
     pub presents: AtomicU64,
     pub released_gen: [AtomicU32; 4],
-    pub reserved: [AtomicU64; 18],
+    pub flags: AtomicU32,
+    pub _pad: AtomicU32,
+    pub reserved: [AtomicU64; 17],
 }
 
 const _: () = assert!(std::mem::size_of::<RingHeader>() == BLOCK_SIZE);
@@ -105,6 +114,7 @@ const _: () = assert!(std::mem::offset_of!(RingHeader, reading) == 48);
 const _: () = assert!(std::mem::offset_of!(RingHeader, released) == 56);
 const _: () = assert!(std::mem::offset_of!(RingHeader, presents) == 88);
 const _: () = assert!(std::mem::offset_of!(RingHeader, released_gen) == 96);
+const _: () = assert!(std::mem::offset_of!(RingHeader, flags) == 112);
 
 /// A frame the hook published: which generation and slot, its sequence number (24 bits,
 /// wrapping), and the content-fence value it is finished at.
@@ -148,8 +158,27 @@ impl RingHeader {
             self.released_gen[i].store(0, Ordering::SeqCst);
         }
         self.presents.store(0, Ordering::SeqCst);
+        self.flags.store(0, Ordering::SeqCst);
+        self._pad.store(0, Ordering::SeqCst);
         self.version.store(VERSION, Ordering::SeqCst);
         self.magic.store(MAGIC, Ordering::SeqCst);
+    }
+
+    /// Sets or clears one bit in `flags`; returns whether the bit was previously set.
+    pub fn set_flag(&self, bit: u32, on: bool) -> bool {
+        let prev = if on {
+            self.flags.fetch_or(bit, Ordering::AcqRel)
+        } else {
+            self.flags.fetch_and(!bit, Ordering::AcqRel)
+        };
+        prev & bit != 0
+    }
+
+    /// Whether compositor-locked frame pacing is both wanted by the session and live on
+    /// the compositor right now.
+    pub fn sync_active(&self) -> bool {
+        const BOTH: u32 = FLAG_SYNC_WANTED | FLAG_COMPOSITOR_LIVE;
+        self.flags.load(Ordering::Acquire) & BOTH == BOTH
     }
 
     pub fn valid(&self) -> bool {
@@ -248,6 +277,13 @@ mod tests {
         assert_eq!(r.take(1), None);
         assert_eq!(r.reading.load(Ordering::SeqCst), NONE);
         assert_eq!(r.pick(1, |_| true), Some(0));
+        assert!(!r.sync_active());
+        assert!(!r.set_flag(FLAG_SYNC_WANTED, true));
+        assert!(!r.sync_active(), "needs compositor live too");
+        assert!(!r.set_flag(FLAG_COMPOSITOR_LIVE, true));
+        assert!(r.sync_active());
+        assert!(r.set_flag(FLAG_COMPOSITOR_LIVE, false));
+        assert!(!r.sync_active());
     }
 
     /// The hook never writes the slot published last or the one sampled, and moves on to

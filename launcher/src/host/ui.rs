@@ -375,6 +375,8 @@ pub enum Cmd {
     FreeSeat(usize),
     /// The keyboard and mouse go to the next (1) or previous (-1) player.
     KeyboardStep(i32),
+    /// Open the live Layout Studio canvas over the split-screen panes.
+    OpenLayoutStudio,
     /// Let the game through Windows Firewall (on public networks too, when true).
     FixFirewall(bool),
 }
@@ -386,6 +388,7 @@ enum Action {
     SwapSeat(usize),
     FreeSeat(usize),
     KeyboardStep(i32),
+    ArrangePanes,
     /// Copy the room code we're in; type the copied one into the game.
     CopyCode,
     PasteCode,
@@ -574,8 +577,9 @@ pub struct Seats {
     pub players: Vec<PlayerSeat>,
     /// This overlay's player.
     pub me: usize,
-    /// The player the keyboard and mouse go to (the pane with the focus).
-    pub keyboard: usize,
+    /// The player the keyboard and mouse go to (the pane with the focus), or None when
+    /// keyboard and mouse are off for the games (controllers only).
+    pub keyboard: Option<usize>,
 }
 
 /// One player of a split-screen session (`Seats`).
@@ -872,15 +876,23 @@ impl Overlay {
             }
             rows.push(Row { id: format!("seat {k}"), ..row.icon(Icon::Gamepad, Tone::Plain) });
         }
+        let kbm_val = match s.keyboard {
+            Some(k) => t!("overlay.player_n", n = k + 1),
+            None => t!("common.off").to_string(),
+        };
         rows.push(
             Row::setting(
                 t!("overlay.keyboard_to"),
                 t!("overlay.keyboard_to_detail"),
-                t!("overlay.player_n", n = s.keyboard + 1),
+                kbm_val,
                 Action::KeyboardStep(1),
                 (Action::KeyboardStep(-1), Action::KeyboardStep(1)),
             )
             .icon(Icon::Keyboard, Tone::Plain),
+        );
+        rows.push(
+            Row::action(t!("overlay.arrange_panes"), t!("overlay.arrange_panes_detail"), Action::ArrangePanes, t!("overlay.open"))
+                .icon(Icon::Sliders, Tone::Plain),
         );
         rows
     }
@@ -1288,6 +1300,7 @@ impl Overlay {
             Action::SwapSeat(k) => out.push(Cmd::SwapSeat(k)),
             Action::FreeSeat(k) => out.push(Cmd::FreeSeat(k)),
             Action::KeyboardStep(d) => out.push(Cmd::KeyboardStep(d)),
+            Action::ArrangePanes => out.push(Cmd::OpenLayoutStudio),
             Action::FixFirewall(public) => out.push(Cmd::FixFirewall(public)),
             Action::ClearChord => {
                 prefs.hotkeys.chord = 0;

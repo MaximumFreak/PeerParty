@@ -2029,7 +2029,7 @@ fn presenting(real: &dyn Fn(usize, *const PresentInfo) -> i32, queue: usize, inf
         super::drew("Vulkan");
     }
     let copied = std::panic::catch_unwind(|| vkcapture::capture(queue, i, drew)).ok().flatten();
-    match copied.or(drew) {
+    let r = match copied.or(drew) {
         Some(sem) => {
             let changed = PresentInfo {
                 s_type: i.s_type,
@@ -2044,7 +2044,9 @@ fn presenting(real: &dyn Fn(usize, *const PresentInfo) -> i32, queue: usize, inf
             real(queue, &changed)
         }
         None => real(queue, info),
-    }
+    };
+    super::capture::pace();
+    r
 }
 
 #[cfg(test)]

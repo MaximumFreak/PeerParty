@@ -930,7 +930,7 @@ mod tests {
 
         // Asked for pixels: read back into the pixel file instead.
         let (ring, dir) = capture::tests::session_ring_file();
-        capture::configure_as(true, Some(&ring), None, true);
+        capture::configure_as(true, Some(&ring), None, None, true);
         assert!(capture(queue, &info, None).is_some(), "the frame was read back");
         let start = std::time::Instant::now();
         let p = loop {

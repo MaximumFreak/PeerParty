@@ -31,6 +31,7 @@ type GetClipCursorFn = unsafe extern "system" fn(*mut RECT) -> i32;
 type GetMessagePosFn = unsafe extern "system" fn() -> u32;
 type GetPhysicalCursorPosFn = unsafe extern "system" fn(*mut POINT) -> i32;
 type GetCursorInfoFn = unsafe extern "system" fn(*mut CursorInfo) -> i32;
+type ShowCursorFn = unsafe extern "system" fn(i32) -> i32;
 
 static SET_POS: OnceLock<GenericDetour<SetCursorPosFn>> = OnceLock::new();
 static CLIP: OnceLock<GenericDetour<ClipCursorFn>> = OnceLock::new();
@@ -38,6 +39,7 @@ static GET_CLIP: OnceLock<GenericDetour<GetClipCursorFn>> = OnceLock::new();
 static MESSAGE_POS: OnceLock<GenericDetour<GetMessagePosFn>> = OnceLock::new();
 static PHYSICAL_POS: OnceLock<GenericDetour<GetPhysicalCursorPosFn>> = OnceLock::new();
 static CURSOR_INFO: OnceLock<GenericDetour<GetCursorInfoFn>> = OnceLock::new();
+static SHOW_CURSOR: OnceLock<GenericDetour<ShowCursorFn>> = OnceLock::new();
 
 /// Win32 `CURSORINFO`.
 #[repr(C)]
@@ -62,16 +64,20 @@ pub(super) struct Anchor {
     pub at: Instant,
 }
 
-/// The game's own cursor: where it put it, and its clip.
+/// The game's own cursor: where it put it, its clip, and its `ShowCursor` display count
+/// (starts at 0: visible when `>= 0`, hidden when `< 0`).
 #[derive(Clone, Copy, Default)]
 pub(super) struct Own {
     pub anchor: Option<Anchor>,
     pub clip: Option<RECT>,
+    pub show_count: i32,
 }
 
-static OWN: Mutex<Own> = Mutex::new(Own { anchor: None, clip: None });
+static OWN: Mutex<Own> = Mutex::new(Own { anchor: None, clip: None, show_count: 0 });
 /// The session was told the cursor is locked (`HookMsg::CursorLock`).
 static LOCKED: AtomicBool = AtomicBool::new(false);
+/// The session was told the cursor is hidden (`HookMsg::CursorHide`).
+static HIDDEN: AtomicBool = AtomicBool::new(false);
 
 /// Pure helper: the copy's cursor from snapshot `snap` (the copy has the mouse:
 /// `snap.mouse.active`) and its own state, at `now`. Moved by the mouse from where the
@@ -181,6 +187,28 @@ unsafe extern "system" fn get_cursor_info(ci: *mut CursorInfo) -> i32 {
     rc
 }
 
+/// Pure helper: steps a copy's virtual `ShowCursor` display count (`show != 0` adds 1,
+/// else subtracts 1) and returns `(new_count, hidden)`.
+pub(super) fn step_show_count(count: &mut i32, show: bool) -> (i32, bool) {
+    *count = if show { count.saturating_add(1) } else { count.saturating_sub(1) };
+    (*count, *count < 0)
+}
+
+unsafe extern "system" fn show_cursor(show: i32) -> i32 {
+    if !ours() {
+        return SHOW_CURSOR.get().map_or(0, |h| unsafe { h.call(show) });
+    }
+    let (count, hidden) = step_show_count(&mut crate::sys::lock(&OWN).show_count, show != 0);
+    if HIDDEN.swap(hidden, Ordering::Relaxed) != hidden {
+        static TOLD: AtomicBool = AtomicBool::new(false);
+        if !TOLD.swap(true, Ordering::Relaxed) {
+            log!("input: the game hides its cursor (ShowCursor): its own display count stays separate, and the session hides the pointer while its pane has focus");
+        }
+        crate::ipc::send(peerparty_protocol::ipc::HookMsg::CursorHide { hidden });
+    }
+    count
+}
+
 /// The cursor calls, in user32 (`hook_kbm`).
 pub(super) fn hook() -> usize {
     let Some(m) = module("user32.dll") else { return 0 };
@@ -198,6 +226,7 @@ pub(super) fn hook() -> usize {
     one!(MESSAGE_POS, c"GetMessagePos", GetMessagePosFn, get_message_pos);
     one!(PHYSICAL_POS, c"GetPhysicalCursorPos", GetPhysicalCursorPosFn, get_physical_cursor_pos);
     one!(CURSOR_INFO, c"GetCursorInfo", GetCursorInfoFn, get_cursor_info);
+    one!(SHOW_CURSOR, c"ShowCursor", ShowCursorFn, show_cursor);
     n
 }
 
@@ -229,6 +258,16 @@ mod tests {
         assert_eq!(position(&snap((15, 20), (200, 95)), &mut own, later), (699, 360));
         own.anchor = None;
         assert_eq!(position(&snap((15, 20), (0, 0)), &mut own, later), (600, 300), "the session mouse's place, clipped");
+    }
+
+    #[test]
+    fn show_cursor_tracks_display_count() {
+        let mut c = 0;
+        assert_eq!(step_show_count(&mut c, false), (-1, true));
+        assert_eq!(step_show_count(&mut c, false), (-2, true));
+        assert_eq!(step_show_count(&mut c, true), (-1, true));
+        assert_eq!(step_show_count(&mut c, true), (0, false));
+        assert_eq!(step_show_count(&mut c, true), (1, false));
     }
 
     #[test]

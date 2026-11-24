@@ -764,6 +764,39 @@ impl Pads {
         out
     }
 
+    /// Combined triggers (`lt`, `rt`), strongest right-stick deflection `(rx, ry)`, and
+    /// whether any controller is currently connected, across all live pads (for Layout Studio).
+    pub fn studio_analog(&self) -> (bool, bool, f32, f32, bool) {
+        let mut lt = false;
+        let mut rt = false;
+        let mut rx = 0.0f32;
+        let mut ry = 0.0f32;
+        let mut any = false;
+        let mut merge = |s: State| {
+            any = true;
+            lt |= s.lt > 0.5;
+            rt |= s.rt > 0.5;
+            if s.rx.hypot(s.ry) > rx.hypot(ry) {
+                rx = s.rx;
+                ry = s.ry;
+            }
+        };
+        if self.xinput.is_some() {
+            for i in 0..4 {
+                if self.connected[i] {
+                    merge(self.x_state[i]);
+                }
+            }
+        }
+        for h in self.hid.lock().unwrap().iter().filter(|h| h.alive.load(Ordering::Relaxed)) {
+            merge(*h.state.lock().unwrap());
+        }
+        if rx.hypot(ry) < 0.22 {
+            (rx, ry) = (0.0, 0.0);
+        }
+        (lt, rt, rx, ry, any)
+    }
+
     /// Each controller read, with its buttons now (`peerparty --pads`).
     pub fn describe(&mut self) -> Vec<(String, u32)> {
         let mut out = Vec::new();

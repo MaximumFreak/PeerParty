@@ -97,6 +97,8 @@ pub struct InstanceConn {
     pub slot_told: bool,
     /// Its game locked its cursor (`HookMsg::CursorLock`).
     pub cursor_locked: bool,
+    /// Its game hid its cursor (`HookMsg::CursorHide`).
+    pub cursor_hidden: bool,
     /// Invites and players at its last state, so each new one toasts once.
     pub seen_pending: Vec<u64>,
     pub seen_peers: Vec<String>,
@@ -142,6 +144,7 @@ impl InstanceConn {
             hwnd_checked: None,
             slot_told: false,
             cursor_locked: false,
+            cursor_hidden: false,
             seen_pending: Vec::new(),
             seen_peers: Vec::new(),
             first_state: true,
@@ -187,7 +190,19 @@ impl InstanceConn {
         if event.is_none() && !pixels {
             return;
         }
-        self.send(&HostMsg::Capture { enabled: true, ring: Some(ring.name.clone()), event: event.map(str::to_string), pixels });
+        let pace = ring.pace_event_name().map(str::to_string);
+        self.send(&HostMsg::Capture { enabled: true, ring: Some(ring.name.clone()), event: event.map(str::to_string), pace, pixels });
+    }
+
+    /// Turns compositor-locked frame pacing on or off for this copy, waking it at once
+    /// when turned off.
+    pub fn set_sync(&self, on: bool) {
+        if let Some(ring) = &self.ring {
+            let was = ring.header().set_flag(peerparty_protocol::frame_ring::FLAG_SYNC_WANTED, on);
+            if was && !on {
+                ring.signal_pace();
+            }
+        }
     }
 
     /// A block for its frames' ring, if its frames are the session's to draw: a file in

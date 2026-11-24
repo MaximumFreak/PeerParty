@@ -184,9 +184,6 @@ pub fn start_session(t: Target, base_env: ChildEnv, split: &SplitScreen, prefs: 
         format!("{y:04}{mo:02}{d:02}-{h:02}{mi:02}{s:02}")
     };
 
-    let mut copies: Vec<SessionCopy> = Vec::with_capacity(count as usize);
-    let mut launches: Vec<SessionLaunch> = Vec::with_capacity(count as usize);
-
     // Enable DPI awareness before measuring the monitor so every game starts with the
     // exact physical pane dimensions in `PEERPARTY_INSTANCE` before creating its window.
     let bounds = host::initial_session_bounds(split.monitor);
@@ -200,61 +197,42 @@ pub fn start_session(t: Target, base_env: ChildEnv, split: &SplitScreen, prefs: 
         if dwm { "the copies' windows (PEERPARTY_COMPOSITOR=dwm)" } else if pixels { "the copies' frames, read back as pixels (PEERPARTY_COMPOSITOR=pixels)" } else { "the copies' frames, drawn on the GPU" }
     );
     let panes = split.layout.compute_panes(bounds.width, bounds.height, count as usize);
+    let slots = split.layout.to_slots(count as usize);
 
-    for slot in 0..count {
-        let mut env = base_env.clone();
-        if slot == 0 {
-            env.remove(penv::COPY_SAVES);
-        }
-        let pipe = host::pipe::Pipe::for_game(env.get(penv::IPC).as_deref())
-            .ok_or_else(|| LaunchError::Other(format!("couldn't create IPC pipe for player {}", slot + 1)))?;
-        launch::connect(&mut env, &pipe);
-        let mut spec = InstanceSpec::solo(InstanceId(slot), slot);
-        spec.focus_spoof = count > 1;
-        // The session's window draws the copy's frames itself (host/gpu.rs), unless told
-        // to show the copies' windows.
-        spec.compositor_capture = !dwm;
-        spec.input_assignment = split.input(slot).assignment(slot);
-        spec.identity_override = split.name(slot);
-        // Its saves are that player's from the hook's start (hook saves/mod.rs).
-        env.set(penv::PLAYER_SLOT, slot.to_string());
-        if let Some(&pane) = panes.get(slot as usize) {
-            spec.pane = Some(peerparty_protocol::session::PaneRect {
-                x: bounds.x.saturating_add(pane.x),
-                y: bounds.y.saturating_add(pane.y),
-                width: pane.width,
-                height: pane.height,
-            });
-            spec.virtual_width = Some(pane.width);
-            spec.virtual_height = Some(pane.height);
-            spec.dpi = Some(bounds.dpi);
-        }
-        env.set(penv::INSTANCE, spec.to_json().to_string());
+    let ctx = SpawnCtx {
+        exe: exe.clone(),
+        args: t.args,
+        cmdline,
+        cwd: cwd.to_path_buf(),
+        base_env,
+        split: split.clone(),
+        dll,
+        x86,
+        log_dir: log_dir.to_path_buf(),
+        root: root.map(Path::to_path_buf),
+        stamp,
+        bounds,
+        dwm,
+        count,
+    };
 
-        let mut line = cmdline.clone();
-        if let Some(unity_log) = unity_log_for(&exe, &t.args, log_dir, &stamp, slot + 1) {
-            eprintln!("peerparty: player {}'s Unity log is {}", slot + 1, unity_log.display());
-            line.push(" -logFile ");
-            line.push(quote(unity_log.as_os_str()));
-        }
-        // Each copy has a job of its own: a starter (Unreal's bootstrap, a launcher beside
-        // the game) ends once its game runs, and the copy is the game's programs from the
-        // game's folder until the last of them ends, as a game started alone is (tree.rs).
-        let tree = tree::Tree::new(root);
-        match unsafe { start_injected(&exe, &line, cwd, &env, &dll, x86, tree.as_ref()) } {
-            Ok(pi) => {
-                eprintln!(
-                    "peerparty: started player {} ({}, pid {}, {})",
-                    slot + 1,
-                    exe.display(),
-                    pi.dwProcessId,
-                    if x86 { "x86" } else { "x64" }
-                );
-                let closer = tree.as_ref().map_or_else(|| tree::Closer::process(pi.hProcess), |tr| tr.closer(pi.hProcess));
-                let watch = tree.map(|tr| tr.watch(pi.hProcess, pi.dwProcessId, exe.clone()));
-                let done = watch.as_ref().map_or(pi.hProcess, |w| w.0);
-                launches.push(SessionLaunch { process: done, pid: pi.dwProcessId, pipe, spec, input: split.input(slot), stop: Some(Box::new(closer)) });
-                copies.push(SessionCopy { pi, watch });
+    let simultaneous = count <= 1 || split.stagger == launch::StaggerMode::Fixed(0);
+    let initial_count = if simultaneous { count } else { 1 };
+    let copies = std::sync::Arc::new(std::sync::Mutex::new(Vec::<SessionCopy>::with_capacity(count as usize)));
+    let mut launches: Vec<SessionLaunch> = Vec::with_capacity(initial_count as usize);
+
+    for slot in 0..initial_count {
+        let pane = panes.get(slot as usize).map(|p| peerparty_protocol::session::PaneRect {
+            x: bounds.x.saturating_add(p.x),
+            y: bounds.y.saturating_add(p.y),
+            width: p.width,
+            height: p.height,
+        });
+        let virt = pane.and_then(|p| slots.get(slot as usize).map(|s| s.aspect.size_for(p, s.fit, bounds.width, bounds.height)));
+        match ctx.spawn_slot(slot, pane, virt) {
+            Ok((launch, copy)) => {
+                launches.push(launch);
+                copies.lock().unwrap_or_else(|e| e.into_inner()).push(copy);
             }
             Err(e) => {
                 // The copies started already go: every program of each (a starter may
@@ -264,7 +242,8 @@ pub fn start_session(t: Target, base_env: ChildEnv, split: &SplitScreen, prefs: 
                         stop.force();
                     }
                 }
-                for c in copies {
+                let started: Vec<SessionCopy> = std::mem::take(&mut *copies.lock().unwrap_or_else(|e| e.into_inner()));
+                for c in started {
                     unsafe { c.wait(log_dir, &exe) };
                 }
                 return Err(e);
@@ -272,14 +251,31 @@ pub fn start_session(t: Target, base_env: ChildEnv, split: &SplitScreen, prefs: 
         }
     }
 
+    let spawner: Option<host::PendingSpawner> = (!simultaneous).then(|| {
+        let copies = copies.clone();
+        Box::new(move |slot, pane, virt| {
+            let (launch, copy) = ctx.spawn_slot(slot, pane, virt).map_err(|e| e.to_string())?;
+            copies.lock().unwrap_or_else(|e| e.into_inner()).push(copy);
+            Ok(launch)
+        }) as host::PendingSpawner
+    });
+
     launch::remember(&t.listed);
     // Close all in the launcher's window goes through the session, as its own window's
     // Close does: each copy asked, then ended after a while.
     listen_for_close_with(host::close_session);
-    host::run_session(launches, host::SessionLook { layout: split.layout.clone(), bounds, pixels }, &exe, prefs, false);
+    host::run_session(
+        launches,
+        host::SessionLook { layout: split.layout.clone(), bounds, pixels, no_kbm: split.no_kbm, stagger: split.stagger, sync: !split.no_sync, total_count: count as usize },
+        spawner,
+        &exe,
+        prefs,
+        false,
+    );
 
     // PeerParty's exit code is the first player's, unless another player's game crashed:
     // a session is as good as its worst copy.
+    let copies: Vec<SessionCopy> = std::mem::take(&mut *copies.lock().unwrap_or_else(|e| e.into_inner()));
     let mut exits = Vec::with_capacity(copies.len());
     for (i, c) in copies.into_iter().enumerate() {
         let exited = unsafe { c.wait(log_dir, &exe) };
@@ -289,6 +285,84 @@ pub fn start_session(t: Target, base_env: ChildEnv, split: &SplitScreen, prefs: 
         exits.push(exited);
     }
     Ok(session_exit(exits))
+}
+
+/// Owned launch context so split-screen copies 2..N can be started on demand by
+/// `SessionHost`'s smart ready-gate stagger queue.
+struct SpawnCtx {
+    exe: PathBuf,
+    args: Vec<OsString>,
+    cmdline: OsString,
+    cwd: PathBuf,
+    base_env: ChildEnv,
+    split: SplitScreen,
+    dll: PathBuf,
+    x86: bool,
+    log_dir: PathBuf,
+    root: Option<PathBuf>,
+    stamp: String,
+    bounds: host::MonitorBounds,
+    dwm: bool,
+    count: u32,
+}
+
+impl SpawnCtx {
+    fn spawn_slot(
+        &self,
+        slot: u32,
+        pane: Option<peerparty_protocol::session::PaneRect>,
+        virt: Option<(u32, u32)>,
+    ) -> Result<(SessionLaunch, SessionCopy), LaunchError> {
+        let mut env = self.base_env.clone();
+        if slot == 0 {
+            env.remove(penv::COPY_SAVES);
+        }
+        let pipe = host::pipe::Pipe::for_game(env.get(penv::IPC).as_deref())
+            .ok_or_else(|| LaunchError::Other(format!("couldn't create IPC pipe for player {}", slot + 1)))?;
+        launch::connect(&mut env, &pipe);
+        let mut spec = InstanceSpec::solo(InstanceId(slot), slot);
+        spec.focus_spoof = self.count > 1;
+        // The session's window draws the copy's frames itself (host/gpu.rs), unless told
+        // to show the copies' windows.
+        spec.compositor_capture = !self.dwm;
+        spec.input_assignment = self.split.input(slot).assignment(slot);
+        spec.identity_override = self.split.name(slot);
+        // Its saves are that player's from the hook's start (hook saves/mod.rs).
+        env.set(penv::PLAYER_SLOT, slot.to_string());
+        if let Some(pane) = pane {
+            let (vw, vh) = virt.unwrap_or((pane.width, pane.height));
+            spec.pane = Some(peerparty_protocol::session::PaneRect { x: pane.x, y: pane.y, width: vw, height: vh });
+            spec.virtual_width = Some(vw);
+            spec.virtual_height = Some(vh);
+            spec.dpi = Some(self.bounds.dpi);
+        }
+        env.set(penv::INSTANCE, spec.to_json().to_string());
+
+        let mut line = self.cmdline.clone();
+        if let Some(unity_log) = unity_log_for(&self.exe, &self.args, &self.log_dir, &self.stamp, slot + 1) {
+            eprintln!("peerparty: player {}'s Unity log is {}", slot + 1, unity_log.display());
+            line.push(" -logFile ");
+            line.push(quote(unity_log.as_os_str()));
+        }
+        // Each copy has a job of its own: a starter (Unreal's bootstrap, a launcher beside
+        // the game) ends once its game runs, and the copy is the game's programs from the
+        // game's folder until the last of them ends, as a game started alone is (tree.rs).
+        let tree = tree::Tree::new(self.root.as_deref());
+        let pi = unsafe { start_injected(&self.exe, &line, &self.cwd, &env, &self.dll, self.x86, tree.as_ref())? };
+        eprintln!(
+            "peerparty: started player {} ({}, pid {}, {})",
+            slot + 1,
+            self.exe.display(),
+            pi.dwProcessId,
+            if self.x86 { "x86" } else { "x64" }
+        );
+        let closer = tree.as_ref().map_or_else(|| tree::Closer::process(pi.hProcess), |tr| tr.closer(pi.hProcess));
+        let watch = tree.map(|tr| tr.watch(pi.hProcess, pi.dwProcessId, self.exe.clone()));
+        let done = watch.as_ref().map_or(pi.hProcess, |w| w.0);
+        let launch = SessionLaunch { process: done, pid: pi.dwProcessId, pipe, spec, input: self.split.input(slot), stop: Some(Box::new(closer)) };
+        let copy = SessionCopy { pi, watch };
+        Ok((launch, copy))
+    }
 }
 
 /// What a split-screen session ends with: the first player's exit, unless another

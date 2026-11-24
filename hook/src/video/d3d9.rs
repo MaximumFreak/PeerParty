@@ -379,6 +379,9 @@ fn presenting(dev: usize, wnd: usize, real: impl FnOnce() -> i32) -> i32 {
     let hr = real();
     if outer {
         IN_PRESENT.with(|p| p.set(false));
+        if !lower {
+            super::capture::pace();
+        }
     }
     // S_PRESENT_OCCLUDED (9Ex): a split-screen copy's window is behind the session's, and
     // is answered as shown so it keeps drawing.

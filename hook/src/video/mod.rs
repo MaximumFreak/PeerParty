@@ -283,14 +283,14 @@ pub fn attach(name: &str) {
 }
 
 /// The session's window draws this copy's frames, or stops (`HostMsg::Capture`).
-pub fn set_capture(enabled: bool, ring: Option<&str>, event: Option<&str>, pixels: bool) {
+pub fn set_capture(enabled: bool, ring: Option<&str>, event: Option<&str>, pace: Option<&str>, pixels: bool) {
     if skipped() {
         if enabled {
             log!("video: PEERPARTY_SKIP=present (or video) is set: this copy's frames never reach the split-screen window, which shows Windows' own picture of it instead (and nothing while it's hidden)");
         }
         return;
     }
-    capture::configure_as(enabled, ring, event, pixels);
+    capture::configure_as(enabled, ring, event, pace, pixels);
 
     if enabled {
         ensure_hooks();

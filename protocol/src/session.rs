@@ -40,6 +40,270 @@ impl PaneRect {
     }
 }
 
+/// Fixed-point denominator for `NormRect` coordinates (0..=10_000 = 0.00%..=100.00%).
+pub const NORM_SCALE: u16 = 10_000;
+/// Minimum normalized width or height of an interactive pane (10% of the window).
+pub const NORM_MIN: u16 = 1_000;
+
+/// A resolution-independent rectangle in `[0, NORM_SCALE]` of a monitor's client area.
+/// Stored as integer basis points so layouts stay exact (`Eq`/`Hash`), free of NaN,
+/// and scale seamlessly across 1080p, 1440p, 4K, and ultrawide displays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NormRect {
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+}
+
+impl NormRect {
+    pub const FULL: NormRect = NormRect { x: 0, y: 0, w: NORM_SCALE, h: NORM_SCALE };
+
+    /// Clamps `x, y, w, h` inside `[0, NORM_SCALE]` with at least `NORM_MIN` extent.
+    pub fn clamped(x: u16, y: u16, w: u16, h: u16) -> NormRect {
+        let w = w.clamp(NORM_MIN, NORM_SCALE);
+        let h = h.clamp(NORM_MIN, NORM_SCALE);
+        let x = x.min(NORM_SCALE - w);
+        let y = y.min(NORM_SCALE - h);
+        NormRect { x, y, w, h }
+    }
+
+    /// Converts normalized float coordinates (`0.0..=1.0`) to a clamped `NormRect`.
+    pub fn from_f32(x: f32, y: f32, w: f32, h: f32) -> NormRect {
+        let to_u = |v: f32| (v.clamp(0.0, 1.0) * f32::from(NORM_SCALE)).round() as u16;
+        let x0 = to_u(x);
+        let y0 = to_u(y);
+        let x1 = to_u(x + w).max(x0.saturating_add(NORM_MIN)).min(NORM_SCALE);
+        let y1 = to_u(y + h).max(y0.saturating_add(NORM_MIN)).min(NORM_SCALE);
+        Self::clamped(x0, y0, x1 - x0, y1 - y0)
+    }
+
+    pub fn right(self) -> u16 {
+        self.x.saturating_add(self.w).min(NORM_SCALE)
+    }
+
+    pub fn bottom(self) -> u16 {
+        self.y.saturating_add(self.h).min(NORM_SCALE)
+    }
+
+    /// Resolves to physical client pixels using edge rounding so adjacent panes sharing a
+    /// normalized edge share the exact same pixel boundary with zero 1 px seams.
+    pub fn to_pane_rect(self, screen_w: u32, screen_h: u32) -> PaneRect {
+        let px = |v: u16, total: u32| ((u64::from(total) * u64::from(v) + u64::from(NORM_SCALE) / 2) / u64::from(NORM_SCALE)) as u32;
+        let x0 = px(self.x, screen_w);
+        let y0 = px(self.y, screen_h);
+        let x1 = px(self.right(), screen_w);
+        let y1 = px(self.bottom(), screen_h);
+        PaneRect { x: x0 as i32, y: y0 as i32, width: x1.saturating_sub(x0), height: y1.saturating_sub(y0) }
+    }
+
+    pub fn to_json(&self) -> Json {
+        Json::obj(vec![
+            ("x", Json::u64(self.x.into())),
+            ("y", Json::u64(self.y.into())),
+            ("w", Json::u64(self.w.into())),
+            ("h", Json::u64(self.h.into())),
+        ])
+    }
+
+    pub fn from_json(v: &Json) -> Option<NormRect> {
+        let u = |k: &str| v.get(k).as_u64().and_then(|n| u16::try_from(n).ok());
+        Some(Self::clamped(u("x")?, u("y")?, u("w")?, u("h")?))
+    }
+}
+
+/// How a pane's game frames map into its destination rect on the compositor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum PaneFit {
+    /// Preserve aspect ratio with letterbox or pillarbox bars.
+    #[default]
+    Fit,
+    /// Scale to fill the pane completely, cropping overflow evenly (zero black bars).
+    Fill,
+    /// Stretch edge-to-edge across the pane.
+    Stretch,
+}
+
+impl PaneFit {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PaneFit::Fit => "fit",
+            PaneFit::Fill => "fill",
+            PaneFit::Stretch => "stretch",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<PaneFit> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "fit" => PaneFit::Fit,
+            "fill" | "crop" => PaneFit::Fill,
+            "stretch" => PaneFit::Stretch,
+            _ => return None,
+        })
+    }
+
+    pub fn next(self) -> PaneFit {
+        match self {
+            PaneFit::Fit => PaneFit::Fill,
+            PaneFit::Fill => PaneFit::Stretch,
+            PaneFit::Stretch => PaneFit::Fit,
+        }
+    }
+}
+
+/// What aspect ratio the game is told to render at inside its pane.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum VirtualAspect {
+    /// Match the pane's physical pixel dimensions.
+    #[default]
+    MatchPane,
+    /// Lock the game's virtual screen to a fixed aspect ratio inside the pane so games
+    /// with fixed-aspect HUDs stay legible in tall or narrow panes.
+    Ratio { num: u16, den: u16 },
+}
+
+impl VirtualAspect {
+    /// Standard aspect presets cycled in the live layout editor.
+    pub const PRESETS: [VirtualAspect; 5] = [
+        VirtualAspect::MatchPane,
+        VirtualAspect::Ratio { num: 16, den: 9 },
+        VirtualAspect::Ratio { num: 16, den: 10 },
+        VirtualAspect::Ratio { num: 4, den: 3 },
+        VirtualAspect::Ratio { num: 21, den: 9 },
+    ];
+
+    pub fn label(self) -> String {
+        match self {
+            VirtualAspect::MatchPane => "match".into(),
+            VirtualAspect::Ratio { num, den } => format!("{num}:{den}"),
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<VirtualAspect> {
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("match") || s.eq_ignore_ascii_case("auto") || s.is_empty() {
+            return Some(VirtualAspect::MatchPane);
+        }
+        let (a, b) = s.split_once(':')?;
+        let num: u16 = a.parse().ok()?;
+        let den: u16 = b.parse().ok()?;
+        (num >= 1 && den >= 1 && num <= 64 && den <= 64).then_some(VirtualAspect::Ratio { num, den })
+    }
+
+    pub fn next(self) -> VirtualAspect {
+        let i = Self::PRESETS.iter().position(|&a| a == self).map_or(0, |i| (i + 1) % Self::PRESETS.len());
+        Self::PRESETS[i]
+    }
+
+    /// Computes the `(width, height)` the game is told to render at for a physical `pane`
+    /// inside a `screen_w x screen_h` monitor. In `Fill` mode with an explicit ratio,
+    /// scales up to cover the pane (clamped to the monitor) so cropped frames stay sharp.
+    pub fn size_for(self, pane: PaneRect, fit: PaneFit, screen_w: u32, screen_h: u32) -> (u32, u32) {
+        if pane.width == 0 || pane.height == 0 {
+            return (pane.width, pane.height);
+        }
+        let VirtualAspect::Ratio { num, den } = self else {
+            return (pane.width, pane.height);
+        };
+        let (num, den) = (u64::from(num.max(1)), u64::from(den.max(1)));
+        let (pw, ph) = (u64::from(pane.width), u64::from(pane.height));
+        let (mw, mh) = (u64::from(screen_w.max(pane.width)), u64::from(screen_h.max(pane.height)));
+        let lhs = pw * den;
+        let rhs = ph * num;
+        let (mut w, mut h) = if fit == PaneFit::Fill {
+            // Cover the pane at `num:den`, then fit inside monitor bounds so the
+            // contained game window never exceeds the monitor.
+            let (cw, ch) = if lhs >= rhs {
+                (pw, (pw * den + num / 2) / num)
+            } else {
+                ((ph * num + den / 2) / den, ph)
+            };
+            if cw > mw || ch > mh {
+                if mw * den <= mh * num {
+                    (mw, (mw * den + num / 2) / num)
+                } else {
+                    ((mh * num + den / 2) / den, mh)
+                }
+            } else {
+                (cw, ch)
+            }
+        } else if lhs >= rhs {
+            // Pane is wider than target aspect: match pane height.
+            ((ph * num + den / 2) / den, ph)
+        } else {
+            // Pane is taller than target aspect: match pane width.
+            (pw, (pw * den + num / 2) / num)
+        };
+        // Even dimensions avoid chroma/swapchain alignment quirks in D3D/Vulkan engines.
+        w = (w & !1).max(2).min(mw);
+        h = (h & !1).max(2).min(mh);
+        (w as u32, h as u32)
+    }
+}
+
+/// One pane in a resolution-independent custom layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PaneSlot {
+    pub rect: NormRect,
+    pub fit: PaneFit,
+    pub aspect: VirtualAspect,
+    /// Draw & hit-test order for overlapping Picture-in-Picture panes (higher is on top).
+    pub z: u8,
+}
+
+impl PaneSlot {
+    pub fn new(rect: NormRect) -> PaneSlot {
+        PaneSlot { rect, fit: PaneFit::Fit, aspect: VirtualAspect::MatchPane, z: 0 }
+    }
+
+    pub fn to_json(&self) -> Json {
+        Json::obj(vec![
+            ("rect", self.rect.to_json()),
+            ("fit", Json::str(self.fit.as_str())),
+            ("aspect", Json::str(&self.aspect.label())),
+            ("z", Json::u64(self.z.into())),
+        ])
+    }
+
+    pub fn from_json(v: &Json) -> Option<PaneSlot> {
+        Some(PaneSlot {
+            rect: NormRect::from_json(v.get("rect"))?,
+            fit: v.get("fit").as_str().and_then(PaneFit::parse).unwrap_or_default(),
+            aspect: v.get("aspect").as_str().and_then(VirtualAspect::parse).unwrap_or_default(),
+            z: v.get("z").as_u64().and_then(|n| u8::try_from(n).ok()).unwrap_or(0),
+        })
+    }
+
+    /// Compact shell-safe wire encoding (`x,y,w,h,fit,aspect,z`).
+    pub fn encode(&self) -> String {
+        format!("{},{},{},{},{},{},{}", self.rect.x, self.rect.y, self.rect.w, self.rect.h, self.fit.as_str(), self.aspect.label(), self.z)
+    }
+
+    pub fn decode(s: &str) -> Option<PaneSlot> {
+        let parts: Vec<&str> = s.split(',').collect();
+        if parts.len() < 4 || parts.len() > 7 {
+            return None;
+        }
+        let x: u16 = parts[0].parse().ok()?;
+        let y: u16 = parts[1].parse().ok()?;
+        let w: u16 = parts[2].parse().ok()?;
+        let h: u16 = parts[3].parse().ok()?;
+        let fit = match parts.get(4) {
+            Some(s) => PaneFit::parse(s)?,
+            None => PaneFit::default(),
+        };
+        let aspect = match parts.get(5) {
+            Some(s) => VirtualAspect::parse(s)?,
+            None => VirtualAspect::default(),
+        };
+        let z = match parts.get(6) {
+            Some(s) => s.parse::<u8>().ok()?,
+            None => 0,
+        };
+        Some(PaneSlot { rect: NormRect::clamped(x, y, w, h), fit, aspect, z })
+    }
+}
+
 /// How the screen is shared.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LayoutPreset {
@@ -51,7 +315,13 @@ pub enum LayoutPreset {
     Vertical,
     /// Quarters (more than four copies: the smallest grid that holds them).
     Grid2x2,
-    /// The player's own panes, in order.
+    /// Two side by side above, the rest wide underneath (3 copies: 2 + 1).
+    TopTwo,
+    /// One wide above, the rest side by side underneath (3 copies: 1 + 2).
+    BottomTwo,
+    /// Resolution-independent custom pane slots (with fit, virtual aspect, and Z-order).
+    Slots(Vec<PaneSlot>),
+    /// Legacy raw-pixel custom panes, in order.
     Custom(Vec<PaneRect>),
 }
 
@@ -72,7 +342,148 @@ fn grid(w: u32, h: u32, cols: u32, rows: u32, count: usize) -> Vec<PaneRect> {
         .collect()
 }
 
+/// Two horizontal halves: `top_n` copies across the top, the remaining copies across the
+/// bottom (when `count <= top_n`, all on one row at full height).
+fn two_rows(w: u32, h: u32, top_n: u32, count: usize) -> Vec<PaneRect> {
+    let n = count as u32;
+    if n == 0 {
+        return Vec::new();
+    }
+    if n <= top_n {
+        return grid(w, h, n, 1, count);
+    }
+    let (y0, h0) = split(h, 2, 0);
+    let (y1, h1) = split(h, 2, 1);
+    let bot_n = n - top_n;
+    let mut out = Vec::with_capacity(count);
+    for i in 0..top_n {
+        let (x, width) = split(w, top_n, i);
+        out.push(PaneRect { x, y: y0, width, height: h0 });
+    }
+    for j in 0..bot_n {
+        let (x, width) = split(w, bot_n, j);
+        out.push(PaneRect { x, y: y1, width, height: h1 });
+    }
+    out
+}
+
+/// `NORM_SCALE` cut into `n` parts that add up to it exactly.
+fn split_norm(n: u32, i: u32) -> (u16, u16) {
+    let at = |k: u32| (u32::from(NORM_SCALE) * k / n.max(1)) as u16;
+    (at(i), at(i + 1) - at(i))
+}
+
+/// Normalized `cols` by `rows` grid slots.
+fn grid_slots(cols: u32, rows: u32, count: usize) -> Vec<PaneSlot> {
+    (0..count as u32)
+        .map(|i| {
+            let (x, w) = split_norm(cols, i % cols);
+            let (y, h) = split_norm(rows, i / cols);
+            PaneSlot::new(NormRect { x, y, w, h })
+        })
+        .collect()
+}
+
+/// Normalized two-row layout (`top_n` on top, the rest underneath).
+fn two_rows_slots(top_n: u32, count: usize) -> Vec<PaneSlot> {
+    let n = count as u32;
+    if n == 0 {
+        return Vec::new();
+    }
+    if n <= top_n {
+        return grid_slots(n, 1, count);
+    }
+    let (y0, h0) = split_norm(2, 0);
+    let (y1, h1) = split_norm(2, 1);
+    let bot_n = n - top_n;
+    let mut out = Vec::with_capacity(count);
+    for i in 0..top_n {
+        let (x, w) = split_norm(top_n, i);
+        out.push(PaneSlot::new(NormRect { x, y: y0, w, h: h0 }));
+    }
+    for j in 0..bot_n {
+        let (x, w) = split_norm(bot_n, j);
+        out.push(PaneSlot::new(NormRect { x, y: y1, w, h: h1 }));
+    }
+    out
+}
+
 impl LayoutPreset {
+    /// Picture-in-Picture slots: player 1 full screen (`z = 0`), players 2+ stacked in
+    /// neat corner inset windows (`z = 1+`).
+    pub fn pip_slots(count: usize) -> Vec<PaneSlot> {
+        let count = count.min(MAX_PANES);
+        if count == 0 {
+            return Vec::new();
+        }
+        let mut out = vec![PaneSlot::new(NormRect::FULL)];
+        let inset_w: u16 = 3_200;
+        let inset_h: u16 = 3_200;
+        let pad: u16 = 250;
+        for i in 1..count {
+            let col = ((i - 1) / 2) as u16;
+            let row = ((i - 1) % 2) as u16;
+            let x = NORM_SCALE.saturating_sub(pad + inset_w).saturating_sub(col * (inset_w + pad));
+            let y = if row == 0 {
+                NORM_SCALE.saturating_sub(pad + inset_h)
+            } else {
+                pad
+            };
+            out.push(PaneSlot { rect: NormRect::clamped(x, y, inset_w, inset_h), fit: PaneFit::Fit, aspect: VirtualAspect::MatchPane, z: i.min(255) as u8 });
+        }
+        out
+    }
+
+    /// Converts this layout into `count` normalized `PaneSlot`s (for live editing, fit,
+    /// virtual aspect, and Z-order).
+    pub fn to_slots(&self, count: usize) -> Vec<PaneSlot> {
+        let count = count.min(MAX_PANES);
+        let n = count as u32;
+        match self {
+            LayoutPreset::Single => vec![PaneSlot::new(NormRect::FULL); count],
+            LayoutPreset::Horizontal => grid_slots(n, 1, count),
+            LayoutPreset::Vertical => grid_slots(1, n, count),
+            LayoutPreset::Grid2x2 => {
+                let cols = if count <= 4 { 2 } else { (1..).find(|c: &u32| c * c >= n).unwrap_or(1) };
+                let rows = if count <= 4 { 2 } else { n.div_ceil(cols) };
+                grid_slots(cols, rows, count)
+            }
+            LayoutPreset::TopTwo => two_rows_slots(2, count),
+            LayoutPreset::BottomTwo => two_rows_slots(1, count),
+            LayoutPreset::Slots(slots) => (0..count).map(|i| slots.get(i).copied().unwrap_or_else(|| PaneSlot::new(NormRect::FULL))).collect(),
+            LayoutPreset::Custom(_) => vec![PaneSlot::new(NormRect::FULL); count],
+        }
+    }
+
+    /// Compact shell-safe string encoding for `LayoutPreset::Slots`:
+    /// `slots:x,y,w,h,fit,aspect,z;...`
+    pub fn format_slots(slots: &[PaneSlot]) -> String {
+        let mut s = String::from("slots:");
+        for (i, slot) in slots.iter().take(MAX_PANES).enumerate() {
+            if i > 0 {
+                s.push(';');
+            }
+            s.push_str(&slot.encode());
+        }
+        s
+    }
+
+    /// Parses `slots:x,y,w,h,fit,aspect,z;...` into a non-empty `Vec<PaneSlot>`.
+    pub fn parse_slots(text: &str) -> Option<Vec<PaneSlot>> {
+        let rest = text.trim().strip_prefix("slots:")?;
+        if rest.is_empty() {
+            return None;
+        }
+        let mut out = Vec::new();
+        for item in rest.split(';') {
+            if out.len() >= MAX_PANES {
+                return None;
+            }
+            out.push(PaneSlot::decode(item)?);
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
     /// The panes for `count` copies on a `screen_w` by `screen_h` screen, one each (at
     /// most `MAX_PANES`). A custom layout with fewer panes than copies gives the rest
     /// the whole screen.
@@ -89,6 +500,9 @@ impl LayoutPreset {
                 let rows = if count <= 4 { 2 } else { n.div_ceil(cols) };
                 grid(screen_w, screen_h, cols, rows, count)
             }
+            LayoutPreset::TopTwo => two_rows(screen_w, screen_h, 2, count),
+            LayoutPreset::BottomTwo => two_rows(screen_w, screen_h, 1, count),
+            LayoutPreset::Slots(slots) => (0..count).map(|i| slots.get(i).map_or(whole, |s| s.rect.to_pane_rect(screen_w, screen_h))).collect(),
             LayoutPreset::Custom(panes) => (0..count).map(|i| panes.get(i).copied().unwrap_or(whole)).collect(),
         }
     }
@@ -99,14 +513,19 @@ impl LayoutPreset {
             LayoutPreset::Horizontal => "horizontal",
             LayoutPreset::Vertical => "vertical",
             LayoutPreset::Grid2x2 => "grid2x2",
+            LayoutPreset::TopTwo => "top2",
+            LayoutPreset::BottomTwo => "bottom2",
+            LayoutPreset::Slots(_) => "slots",
             LayoutPreset::Custom(_) => "custom",
         }
     }
 
     pub fn to_json(&self) -> Json {
         let mut pairs = vec![("kind", Json::str(self.as_str()))];
-        if let LayoutPreset::Custom(panes) = self {
-            pairs.push(("panes", Json::Arr(panes.iter().map(PaneRect::to_json).collect())));
+        match self {
+            LayoutPreset::Slots(slots) => pairs.push(("slots", Json::Arr(slots.iter().map(PaneSlot::to_json).collect()))),
+            LayoutPreset::Custom(panes) => pairs.push(("panes", Json::Arr(panes.iter().map(PaneRect::to_json).collect()))),
+            _ => {}
         }
         Json::obj(pairs)
     }
@@ -117,6 +536,9 @@ impl LayoutPreset {
             "horizontal" => LayoutPreset::Horizontal,
             "vertical" => LayoutPreset::Vertical,
             "grid2x2" => LayoutPreset::Grid2x2,
+            "top2" => LayoutPreset::TopTwo,
+            "bottom2" => LayoutPreset::BottomTwo,
+            "slots" => LayoutPreset::Slots(v.get("slots").as_arr().iter().take(MAX_PANES).map(PaneSlot::from_json).collect::<Option<_>>()?),
             "custom" => LayoutPreset::Custom(v.get("panes").as_arr().iter().take(MAX_PANES).map(PaneRect::from_json).collect::<Option<_>>()?),
             _ => return None,
         })
@@ -298,6 +720,16 @@ mod tests {
             [r(0, 0, 960, 540), r(960, 0, 960, 540), r(0, 540, 960, 540), r(960, 540, 960, 540)]
         );
         assert_eq!(LayoutPreset::Grid2x2.compute_panes(1920, 1080, 3).len(), 3, "a quarter stays empty");
+        assert_eq!(
+            LayoutPreset::TopTwo.compute_panes(1920, 1080, 3),
+            [r(0, 0, 960, 540), r(960, 0, 960, 540), r(0, 540, 1920, 540)]
+        );
+        assert_eq!(
+            LayoutPreset::BottomTwo.compute_panes(1920, 1080, 3),
+            [r(0, 0, 1920, 540), r(0, 540, 960, 540), r(960, 540, 960, 540)]
+        );
+        assert_eq!(LayoutPreset::TopTwo.compute_panes(1920, 1080, 2), [r(0, 0, 960, 1080), r(960, 0, 960, 1080)]);
+        assert_eq!(LayoutPreset::BottomTwo.compute_panes(1920, 1080, 2), [r(0, 0, 1920, 540), r(0, 540, 1920, 540)]);
         let five = LayoutPreset::Grid2x2.compute_panes(900, 900, 5);
         assert_eq!(five.len(), 5);
         assert_eq!(five[4], r(300, 450, 300, 450), "3x2 cells");
@@ -306,10 +738,35 @@ mod tests {
         assert!(LayoutPreset::Horizontal.compute_panes(1920, 1080, 0).is_empty());
         assert_eq!(LayoutPreset::Horizontal.compute_panes(1920, 1080, 1000).len(), MAX_PANES);
         assert_eq!(LayoutPreset::Vertical.compute_panes(0, 0, 2), [r(0, 0, 0, 0), r(0, 0, 0, 0)]);
-        for l in [LayoutPreset::Single, LayoutPreset::Horizontal, LayoutPreset::Vertical, LayoutPreset::Grid2x2, custom] {
+        for l in [LayoutPreset::Single, LayoutPreset::Horizontal, LayoutPreset::Vertical, LayoutPreset::Grid2x2, LayoutPreset::TopTwo, LayoutPreset::BottomTwo, custom] {
             assert_eq!(LayoutPreset::from_json(&l.to_json()), Some(l));
         }
         assert_eq!(LayoutPreset::from_json(&Json::parse(r#"{"kind":"spiral"}"#).unwrap()), None);
+
+        // Normalized slots: resolution-independent, zero-seam edge rounding, fit/aspect/z.
+        let slots = vec![
+            PaneSlot { rect: NormRect::clamped(0, 0, 6000, 10_000), fit: PaneFit::Fill, aspect: VirtualAspect::Ratio { num: 16, den: 9 }, z: 0 },
+            PaneSlot { rect: NormRect::clamped(6000, 0, 4000, 10_000), fit: PaneFit::Fit, aspect: VirtualAspect::MatchPane, z: 1 },
+        ];
+        let preset = LayoutPreset::Slots(slots.clone());
+        let p = preset.compute_panes(1920, 1080, 2);
+        assert_eq!(p[0].x + p[0].width as i32, p[1].x, "adjacent panes share exact boundary");
+        assert_eq!(p[0].width + p[1].width, 1920);
+        assert_eq!(LayoutPreset::from_json(&preset.to_json()), Some(preset));
+        let wire = LayoutPreset::format_slots(&slots);
+        assert_eq!(LayoutPreset::parse_slots(&wire), Some(slots));
+        assert_eq!(LayoutPreset::parse_slots("slots:"), None);
+        assert_eq!(LayoutPreset::parse_slots("bad"), None);
+        let pip = LayoutPreset::pip_slots(3);
+        assert_eq!(pip.len(), 3);
+        assert_eq!(pip[0].rect, NormRect::FULL);
+        assert!(pip[1].z > pip[0].z && pip[2].z > pip[1].z);
+        // VirtualAspect sizing: 16:9 inside a tall 960x1080 pane fits to 960x540, and
+        // in Fill mode covers up to monitor width (1920x1080).
+        let tall = r(0, 0, 960, 1080);
+        let aspect169 = VirtualAspect::Ratio { num: 16, den: 9 };
+        assert_eq!(aspect169.size_for(tall, PaneFit::Fit, 1920, 1080), (960, 540));
+        assert_eq!(aspect169.size_for(tall, PaneFit::Fill, 1920, 1080), (1920, 1080));
     }
 
     #[test]

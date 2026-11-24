@@ -38,6 +38,10 @@ pub mod input {
     pub fn pending() -> bool {
         false
     }
+
+    pub fn alt_down() -> bool {
+        false
+    }
 }
 
 pub mod window {

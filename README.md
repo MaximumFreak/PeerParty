@@ -48,7 +48,8 @@ itself still runs. PeerParty moves that part onto the players' own PCs:
   overlay), or two in separate windows. Each player gets their own identity and their
   own saves (player 1's stay where the game keeps them; players 2–4's are kept apart in
   PeerParty's folder), and they meet as LAN players do. The launcher copies, swaps and
-  restores saves between any two players, and starts a game alone as any of them.
+  restores saves between any two players, and starts a game alone as any of them. See
+  [Split screen](#split-screen) below.
 - **An overlay in every game**: players, invites and settings, opened with the usual
   store hotkeys or a controller's Home button.
 
@@ -161,6 +162,33 @@ buttons open it too. While it shows, the game gets no keyboard, mouse or control
 input. When Xbox Game Bar opens over the game,
 the overlay stays open underneath and leaves the input to Game Bar until it closes.
 
+## Split screen
+
+A game's panel (Players: 2–4, **Split screen**) or `--split-screen` starts up to four
+copies of the game in one window, one pane per player:
+
+- **One window, drawn on the graphics card.** Each copy's frames go straight to the
+  session's window through shared GPU textures, HDR included; a copy whose frames can't
+  be shared that way shows its own window in its pane.
+- **Layout Studio** (Ctrl+Alt+E, or the overlay's Players page > **Arrange panes**):
+  drag the dividers and corners while the games run, swap two players, pick how each
+  game fills its pane and the aspect ratio it renders at, mute a pane's sound. **Done**
+  keeps the layout for the game. Ctrl+Alt+L switches layout, Ctrl+Alt+Z zooms a pane onto
+  the whole window, Ctrl+Alt+1–4 hands the keyboard and mouse to a pane.
+- **Each player their own saves.** Player 1 plays with the game's own saves, the same
+  ones they have when playing alone; players 2–4 each have their own in PeerParty's
+  folder. The game's files are never changed.
+- **Controllers only**, if you like (`--no-kbm`, or "Keyboard and mouse in games" off):
+  bumping the mouse or keyboard then never reaches the games.
+- **Copies start one after another**: each once the one before has its window or first
+  frame up, so heavy games don't fight over the disk at startup (`--stagger`).
+- **Sync games to screen** (on unless `--no-sync`): no copy draws frames faster than
+  the window shows them.
+
+What it does for now: Windows only; one keyboard and mouse plus controllers, for up to
+four players. Racing wheels and a keyboard and mouse per player are planned.
+[docs/usage.md](docs/usage.md#split-screen) has every option and key.
+
 ## Command line and Steam launch options
 
 `peerparty [options] <game.exe> [game's own arguments]` starts a game through PeerParty.
@@ -183,8 +211,11 @@ included. Options for one run go in front of the game's path (or of `%command%`)
 | `--public` | Turns public sessions on this run. |
 | `--set key=value` | Changes one setting this run, e.g. `name=Alex`, `voice=off`, `internet=off`. |
 | `--multi-instance` | Lets a second copy of the game start on the same PC. |
-| `--split-screen` | Starts 2–4 copies (`--instances N`, default 2) in one shared split-screen window (`--layout horizontal\|vertical\|grid`), each player on a controller or the keyboard and mouse (`--inputs auto\|kbm\|pad,...`), with names of their own (`--names A,B,...`). |
+| `--split-screen` | Starts 2–4 copies (`--instances N`, default 2) in one shared split-screen window (`--layout horizontal\|vertical\|top2\|bottom2\|grid\|slots:...`), each player on a controller or the keyboard and mouse (`--inputs auto\|kbm\|pad,...`), with names of their own (`--names A,B,...`). |
 | `--monitor N` | With `--split-screen`: the monitor the session's window opens on (1 the main one, 2.. the others, left to right). |
+| `--no-kbm` | With `--split-screen`: controllers only; the keyboard and mouse never reach the games. |
+| `--stagger smart\|0..60` | With `--split-screen`: start each copy once the one before is ready (`smart`, the default), or that many seconds apart (`0`: all at once). |
+| `--no-sync` | With `--split-screen`: turns off "Sync games to screen", which keeps each copy from drawing faster than the window shows its frames. |
 | `--player N` | Plays alone as player N (1–4): that player's saves, name and identity. |
 | `--copy-saves` | Later players start from a copy of player 1's saves; what they had is kept as a backup. Only when given. |
 | `--log-dir DIR` | Where the logs go. |
