@@ -667,88 +667,53 @@ pub fn attach_user32(exports: &[Export]) -> usize {
 fn install_loaded_user32() {
     INSTALL.call_once(|| {
         let Some(u32_mod) = module("user32.dll") else { return };
-        let mut n = 0usize;
-        macro_rules! hook_proc {
-            ($cell:expr, $sym:literal, $ty:ty, $detour:ident) => {
-                if let Some(a) = proc_addr(u32_mod, $sym) {
-                    let target: $ty = unsafe { std::mem::transmute(a) };
-                    // user32 is loaded and the game may be running in these: its other
-                    // threads are paused while each prologue is written.
-                    if crate::sys::detour::try_arm(&$cell, target, $detour as $ty, "window", $sym.to_str().unwrap_or(""), true) == crate::sys::detour::Armed::Hooked {
-                        n += 1;
-                    }
-                }
-            };
-        }
-        hook_proc!(GET_METRICS, c"GetSystemMetrics", GetSystemMetricsFn, detour_get_system_metrics);
-        hook_proc!(MONITOR_INFO_W, c"GetMonitorInfoW", GetMonitorInfoWFn, detour_get_monitor_info_w);
-        hook_proc!(MONITOR_INFO_A, c"GetMonitorInfoA", GetMonitorInfoAFn, detour_get_monitor_info_a);
-        hook_proc!(ENUM_DISP_W, c"EnumDisplaySettingsW", EnumDisplaySettingsWFn, detour_enum_display_w);
-        hook_proc!(ENUM_DISP_A, c"EnumDisplaySettingsA", EnumDisplaySettingsAFn, detour_enum_display_a);
-        hook_proc!(GET_FOREGROUND, c"GetForegroundWindow", GetForegroundWindowFn, detour_get_foreground);
-        hook_proc!(GET_ACTIVE, c"GetActiveWindow", GetActiveWindowFn, detour_get_active);
-        hook_proc!(GET_FOCUS, c"GetFocus", GetFocusFn, detour_get_focus);
-        hook_proc!(REGISTER_RAW_INPUT, c"RegisterRawInputDevices", RegisterRawInputDevicesFn, detour_register_raw_input);
-        hook_proc!(CREATE_WINDOW_EX_W, c"CreateWindowExW", CreateWindowExWFn, detour_create_window_ex_w);
-        hook_proc!(CREATE_WINDOW_EX_A, c"CreateWindowExA", CreateWindowExAFn, detour_create_window_ex_a);
-        hook_proc!(SET_WINDOW_POS, c"SetWindowPos", SetWindowPosFn, detour_set_window_pos);
-        hook_proc!(MOVE_WINDOW, c"MoveWindow", MoveWindowFn, detour_move_window);
-        hook_proc!(SET_LONG_W, c"SetWindowLongW", SetWindowLongFn, detour_set_window_long_w);
-        hook_proc!(SET_LONG_A, c"SetWindowLongA", SetWindowLongFn, detour_set_window_long_a);
-        hook_proc!(SET_LONG_PTR_W, c"SetWindowLongPtrW", SetWindowLongPtrFn, detour_set_window_long_ptr_w);
-        hook_proc!(SET_LONG_PTR_A, c"SetWindowLongPtrA", SetWindowLongPtrFn, detour_set_window_long_ptr_a);
-        hook_proc!(SHOW_WINDOW, c"ShowWindow", ShowWindowFn, detour_show_window);
-        hook_proc!(ENUM_DISP_EX_W, c"EnumDisplaySettingsExW", EnumDisplaySettingsExWFn, detour_enum_display_ex_w);
-        hook_proc!(ENUM_DISP_EX_A, c"EnumDisplaySettingsExA", EnumDisplaySettingsExAFn, detour_enum_display_ex_a);
-        hook_proc!(GET_METRICS_DPI, c"GetSystemMetricsForDpi", GetSystemMetricsForDpiFn, detour_get_system_metrics_for_dpi);
-        hook_proc!(ENUM_MONITORS, c"EnumDisplayMonitors", EnumDisplayMonitorsFn, detour_enum_display_monitors);
-        hook_proc!(TRANSLATE, c"TranslateMessage", TranslateMessageFn, detour_translate_message);
-        n += crate::pointer::hook_loaded(|s| proc_addr(u32_mod, s));
-        hook_proc!(TRACK_MOUSE, c"TrackMouseEvent", TrackMouseEventFn, detour_track_mouse);
-        hook_proc!(DISPATCH_W, c"DispatchMessageW", DispatchMessageWFn, detour_dispatch_w);
-        hook_proc!(CHANGE_DISPLAY_EX_W, c"ChangeDisplaySettingsExW", ChangeDisplayExFn, detour_change_display_ex_w);
-        hook_proc!(CHANGE_DISPLAY_EX_A, c"ChangeDisplaySettingsExA", ChangeDisplayExFn, detour_change_display_ex_a);
-        hook_proc!(CHANGE_DISPLAY_W, c"ChangeDisplaySettingsW", ChangeDisplayFn, detour_change_display_w);
-        hook_proc!(CHANGE_DISPLAY_A, c"ChangeDisplaySettingsA", ChangeDisplayFn, detour_change_display_a);
+        let n = arm_user32(&crate::sys::detour::Source::Loaded(&|s| proc_addr(u32_mod, s)));
         log!("window: hooked {n} user32 viewport/focus entry points");
     });
 }
 
 fn hook_exports(exports: &[Export]) -> usize {
+    arm_user32(&crate::sys::detour::Source::Exports(exports))
+}
+
+/// The user32 hooks, from its export list or from the loaded module (once).
+fn arm_user32(src: &crate::sys::detour::Source) -> usize {
     let mut n = 0;
-    let mut one = |name: &str, f: Box<dyn FnOnce(*const ()) -> bool>| {
-        n += crate::sys::detour::hook_one(exports, "window", name, f);
-    };
-    one("GetSystemMetrics", Box::new(|a| crate::sys::detour::arm(&GET_METRICS, unsafe { std::mem::transmute::<*const (), GetSystemMetricsFn>(a) }, detour_get_system_metrics, "window", "GetSystemMetrics")));
-    one("GetMonitorInfoW", Box::new(|a| crate::sys::detour::arm(&MONITOR_INFO_W, unsafe { std::mem::transmute::<*const (), GetMonitorInfoWFn>(a) }, detour_get_monitor_info_w, "window", "GetMonitorInfoW")));
-    one("GetMonitorInfoA", Box::new(|a| crate::sys::detour::arm(&MONITOR_INFO_A, unsafe { std::mem::transmute::<*const (), GetMonitorInfoAFn>(a) }, detour_get_monitor_info_a, "window", "GetMonitorInfoA")));
-    one("EnumDisplaySettingsW", Box::new(|a| crate::sys::detour::arm(&ENUM_DISP_W, unsafe { std::mem::transmute::<*const (), EnumDisplaySettingsWFn>(a) }, detour_enum_display_w, "window", "EnumDisplaySettingsW")));
-    one("EnumDisplaySettingsA", Box::new(|a| crate::sys::detour::arm(&ENUM_DISP_A, unsafe { std::mem::transmute::<*const (), EnumDisplaySettingsAFn>(a) }, detour_enum_display_a, "window", "EnumDisplaySettingsA")));
-    one("GetForegroundWindow", Box::new(|a| crate::sys::detour::arm(&GET_FOREGROUND, unsafe { std::mem::transmute::<*const (), GetForegroundWindowFn>(a) }, detour_get_foreground, "window", "GetForegroundWindow")));
-    one("GetActiveWindow", Box::new(|a| crate::sys::detour::arm(&GET_ACTIVE, unsafe { std::mem::transmute::<*const (), GetActiveWindowFn>(a) }, detour_get_active, "window", "GetActiveWindow")));
-    one("GetFocus", Box::new(|a| crate::sys::detour::arm(&GET_FOCUS, unsafe { std::mem::transmute::<*const (), GetFocusFn>(a) }, detour_get_focus, "window", "GetFocus")));
-    one("RegisterRawInputDevices", Box::new(|a| crate::sys::detour::arm(&REGISTER_RAW_INPUT, unsafe { std::mem::transmute::<*const (), RegisterRawInputDevicesFn>(a) }, detour_register_raw_input, "window", "RegisterRawInputDevices")));
-    one("CreateWindowExW", Box::new(|a| crate::sys::detour::arm(&CREATE_WINDOW_EX_W, unsafe { std::mem::transmute::<*const (), CreateWindowExWFn>(a) }, detour_create_window_ex_w, "window", "CreateWindowExW")));
-    one("CreateWindowExA", Box::new(|a| crate::sys::detour::arm(&CREATE_WINDOW_EX_A, unsafe { std::mem::transmute::<*const (), CreateWindowExAFn>(a) }, detour_create_window_ex_a, "window", "CreateWindowExA")));
-    one("SetWindowPos", Box::new(|a| crate::sys::detour::arm(&SET_WINDOW_POS, unsafe { std::mem::transmute::<*const (), SetWindowPosFn>(a) }, detour_set_window_pos, "window", "SetWindowPos")));
-    one("MoveWindow", Box::new(|a| crate::sys::detour::arm(&MOVE_WINDOW, unsafe { std::mem::transmute::<*const (), MoveWindowFn>(a) }, detour_move_window, "window", "MoveWindow")));
-    one("SetWindowLongW", Box::new(|a| crate::sys::detour::arm(&SET_LONG_W, unsafe { std::mem::transmute::<*const (), SetWindowLongFn>(a) }, detour_set_window_long_w, "window", "SetWindowLongW")));
-    one("SetWindowLongA", Box::new(|a| crate::sys::detour::arm(&SET_LONG_A, unsafe { std::mem::transmute::<*const (), SetWindowLongFn>(a) }, detour_set_window_long_a, "window", "SetWindowLongA")));
-    one("SetWindowLongPtrW", Box::new(|a| crate::sys::detour::arm(&SET_LONG_PTR_W, unsafe { std::mem::transmute::<*const (), SetWindowLongPtrFn>(a) }, detour_set_window_long_ptr_w, "window", "SetWindowLongPtrW")));
-    one("SetWindowLongPtrA", Box::new(|a| crate::sys::detour::arm(&SET_LONG_PTR_A, unsafe { std::mem::transmute::<*const (), SetWindowLongPtrFn>(a) }, detour_set_window_long_ptr_a, "window", "SetWindowLongPtrA")));
-    one("ShowWindow", Box::new(|a| crate::sys::detour::arm(&SHOW_WINDOW, unsafe { std::mem::transmute::<*const (), ShowWindowFn>(a) }, detour_show_window, "window", "ShowWindow")));
-    one("EnumDisplaySettingsExW", Box::new(|a| crate::sys::detour::arm(&ENUM_DISP_EX_W, unsafe { std::mem::transmute::<*const (), EnumDisplaySettingsExWFn>(a) }, detour_enum_display_ex_w, "window", "EnumDisplaySettingsExW")));
-    one("EnumDisplaySettingsExA", Box::new(|a| crate::sys::detour::arm(&ENUM_DISP_EX_A, unsafe { std::mem::transmute::<*const (), EnumDisplaySettingsExAFn>(a) }, detour_enum_display_ex_a, "window", "EnumDisplaySettingsExA")));
-    one("GetSystemMetricsForDpi", Box::new(|a| crate::sys::detour::arm(&GET_METRICS_DPI, unsafe { std::mem::transmute::<*const (), GetSystemMetricsForDpiFn>(a) }, detour_get_system_metrics_for_dpi, "window", "GetSystemMetricsForDpi")));
-    one("EnumDisplayMonitors", Box::new(|a| crate::sys::detour::arm(&ENUM_MONITORS, unsafe { std::mem::transmute::<*const (), EnumDisplayMonitorsFn>(a) }, detour_enum_display_monitors, "window", "EnumDisplayMonitors")));
-    one("TranslateMessage", Box::new(|a| crate::sys::detour::arm(&TRANSLATE, unsafe { std::mem::transmute::<*const (), TranslateMessageFn>(a) }, detour_translate_message, "window", "TranslateMessage")));
-    one("TrackMouseEvent", Box::new(|a| crate::sys::detour::arm(&TRACK_MOUSE, unsafe { std::mem::transmute::<*const (), TrackMouseEventFn>(a) }, detour_track_mouse, "window", "TrackMouseEvent")));
-    one("DispatchMessageW", Box::new(|a| crate::sys::detour::arm(&DISPATCH_W, unsafe { std::mem::transmute::<*const (), DispatchMessageWFn>(a) }, detour_dispatch_w, "window", "DispatchMessageW")));
-    one("ChangeDisplaySettingsExW", Box::new(|a| crate::sys::detour::arm(&CHANGE_DISPLAY_EX_W, unsafe { std::mem::transmute::<*const (), ChangeDisplayExFn>(a) }, detour_change_display_ex_w, "window", "ChangeDisplaySettingsExW")));
-    one("ChangeDisplaySettingsExA", Box::new(|a| crate::sys::detour::arm(&CHANGE_DISPLAY_EX_A, unsafe { std::mem::transmute::<*const (), ChangeDisplayExFn>(a) }, detour_change_display_ex_a, "window", "ChangeDisplaySettingsExA")));
-    one("ChangeDisplaySettingsW", Box::new(|a| crate::sys::detour::arm(&CHANGE_DISPLAY_W, unsafe { std::mem::transmute::<*const (), ChangeDisplayFn>(a) }, detour_change_display_w, "window", "ChangeDisplaySettingsW")));
-    one("ChangeDisplaySettingsA", Box::new(|a| crate::sys::detour::arm(&CHANGE_DISPLAY_A, unsafe { std::mem::transmute::<*const (), ChangeDisplayFn>(a) }, detour_change_display_a, "window", "ChangeDisplaySettingsA")));
-    n + crate::pointer::hook_exports(exports)
+    macro_rules! one {
+        ($cell:expr, $sym:literal, $ty:ty, $detour:ident) => {
+            n += crate::sys::detour::arm_from(src, &$cell, $sym, $detour as $ty, "window");
+        };
+    }
+    one!(GET_METRICS, c"GetSystemMetrics", GetSystemMetricsFn, detour_get_system_metrics);
+    one!(MONITOR_INFO_W, c"GetMonitorInfoW", GetMonitorInfoWFn, detour_get_monitor_info_w);
+    one!(MONITOR_INFO_A, c"GetMonitorInfoA", GetMonitorInfoAFn, detour_get_monitor_info_a);
+    one!(ENUM_DISP_W, c"EnumDisplaySettingsW", EnumDisplaySettingsWFn, detour_enum_display_w);
+    one!(ENUM_DISP_A, c"EnumDisplaySettingsA", EnumDisplaySettingsAFn, detour_enum_display_a);
+    one!(GET_FOREGROUND, c"GetForegroundWindow", GetForegroundWindowFn, detour_get_foreground);
+    one!(GET_ACTIVE, c"GetActiveWindow", GetActiveWindowFn, detour_get_active);
+    one!(GET_FOCUS, c"GetFocus", GetFocusFn, detour_get_focus);
+    one!(REGISTER_RAW_INPUT, c"RegisterRawInputDevices", RegisterRawInputDevicesFn, detour_register_raw_input);
+    one!(CREATE_WINDOW_EX_W, c"CreateWindowExW", CreateWindowExWFn, detour_create_window_ex_w);
+    one!(CREATE_WINDOW_EX_A, c"CreateWindowExA", CreateWindowExAFn, detour_create_window_ex_a);
+    one!(SET_WINDOW_POS, c"SetWindowPos", SetWindowPosFn, detour_set_window_pos);
+    one!(MOVE_WINDOW, c"MoveWindow", MoveWindowFn, detour_move_window);
+    one!(SET_LONG_W, c"SetWindowLongW", SetWindowLongFn, detour_set_window_long_w);
+    one!(SET_LONG_A, c"SetWindowLongA", SetWindowLongFn, detour_set_window_long_a);
+    one!(SET_LONG_PTR_W, c"SetWindowLongPtrW", SetWindowLongPtrFn, detour_set_window_long_ptr_w);
+    one!(SET_LONG_PTR_A, c"SetWindowLongPtrA", SetWindowLongPtrFn, detour_set_window_long_ptr_a);
+    one!(SHOW_WINDOW, c"ShowWindow", ShowWindowFn, detour_show_window);
+    one!(ENUM_DISP_EX_W, c"EnumDisplaySettingsExW", EnumDisplaySettingsExWFn, detour_enum_display_ex_w);
+    one!(ENUM_DISP_EX_A, c"EnumDisplaySettingsExA", EnumDisplaySettingsExAFn, detour_enum_display_ex_a);
+    one!(GET_METRICS_DPI, c"GetSystemMetricsForDpi", GetSystemMetricsForDpiFn, detour_get_system_metrics_for_dpi);
+    one!(ENUM_MONITORS, c"EnumDisplayMonitors", EnumDisplayMonitorsFn, detour_enum_display_monitors);
+    one!(TRANSLATE, c"TranslateMessage", TranslateMessageFn, detour_translate_message);
+    one!(TRACK_MOUSE, c"TrackMouseEvent", TrackMouseEventFn, detour_track_mouse);
+    one!(DISPATCH_W, c"DispatchMessageW", DispatchMessageWFn, detour_dispatch_w);
+    one!(CHANGE_DISPLAY_EX_W, c"ChangeDisplaySettingsExW", ChangeDisplayExFn, detour_change_display_ex_w);
+    one!(CHANGE_DISPLAY_EX_A, c"ChangeDisplaySettingsExA", ChangeDisplayExFn, detour_change_display_ex_a);
+    one!(CHANGE_DISPLAY_W, c"ChangeDisplaySettingsW", ChangeDisplayFn, detour_change_display_w);
+    one!(CHANGE_DISPLAY_A, c"ChangeDisplaySettingsA", ChangeDisplayFn, detour_change_display_a);
+    n + crate::pointer::arm(src)
 }
 
 const WM_KEYDOWN: u32 = 0x0100;

@@ -126,12 +126,11 @@ impl App {
             update::check_in_background(move || c.request_repaint());
         }
         if let Some(url) = notes {
-            ctx.open_url(egui::OpenUrl::new_tab(url));
+            crate::platform::open_url(&url);
         }
         if let Some(r) = download {
             let c = ctx.clone();
-            let open = ctx.clone();
-            update::download(r, move |url| open.open_url(egui::OpenUrl::new_tab(url)), move || c.request_repaint());
+            update::download(r, crate::platform::open_url, move || c.request_repaint());
         }
         if let Some(r) = elsewhere {
             let picked = rfd::FileDialog::new().set_title(t!("update.elsewhere")).add_filter("Programs", &["exe"]).pick_file();

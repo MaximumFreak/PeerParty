@@ -96,30 +96,37 @@ fn load(f: &crate::platform::FontFile) -> Option<egui::FontData> {
     Some(d)
 }
 
-/// The system's interface fonts first (egui's own after them, for what they lack), a
-/// semibold family and the icon font; any other script's font is found the first time
-/// a character needs it. Called again when the language changes (the provider stays).
+/// The system's interface fonts (egui's own aren't built in: they were most of a
+/// megabyte of the exe), a semibold family, a monospace one and the icon font, each
+/// family falling back on the regular face; any other script's font, or a symbol's, is
+/// found the first time a character needs it. A character nothing has shows as a box.
+/// Called again when the language changes (the provider stays).
 pub fn install_fonts(ctx: &egui::Context) {
     let sys = crate::platform::ui_fonts();
-    let mut defs = egui::FontDefinitions::default();
-    let defaults = defs.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
-    let mut proportional = defaults.clone();
+    let mut defs = egui::FontDefinitions::empty();
+    let mut proportional = Vec::new();
     if let Some(d) = sys.regular.as_ref().and_then(load) {
         defs.font_data.insert("ui".into(), Arc::new(d));
-        proportional.insert(0, "ui".into());
+        proportional.push("ui".to_string());
     }
     let mut bold = proportional.clone();
     if let Some(d) = sys.semibold.as_ref().and_then(load) {
         defs.font_data.insert("ui-semibold".into(), Arc::new(d));
         bold.insert(0, "ui-semibold".into());
     }
-    let mut icon_family = defaults.clone();
+    let mut mono = proportional.clone();
+    if let Some(d) = sys.mono.as_ref().and_then(load) {
+        defs.font_data.insert("ui-mono".into(), Arc::new(d));
+        mono.insert(0, "ui-mono".into());
+    }
+    let mut icon_family = proportional.clone();
     if let Some(d) = sys.icons.as_ref().and_then(load) {
         defs.font_data.insert("ui-icons".into(), Arc::new(d));
         icon_family.insert(0, "ui-icons".into());
         ICON_FONT.store(true, Ordering::Relaxed);
     }
     defs.families.insert(FontFamily::Proportional, proportional);
+    defs.families.insert(FontFamily::Monospace, mono);
     defs.families.insert(semibold(), bold);
     defs.families.insert(icons(), icon_family);
     ctx.set_fonts(defs);
@@ -141,7 +148,7 @@ pub fn install_fonts(ctx: &egui::Context) {
             .or_insert_with(|| load(&f))
             .clone()?;
         let name = format!("fallback-{}", f.path.file_name()?.to_string_lossy());
-        let families = [FontFamily::Proportional, semibold()]
+        let families = [FontFamily::Proportional, semibold(), FontFamily::Monospace, icons()]
             .into_iter()
             .map(|family| egui::InsertFontFamily { family, priority: egui::FontPriority::Lowest })
             .collect();

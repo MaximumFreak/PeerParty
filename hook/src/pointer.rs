@@ -18,7 +18,6 @@ use std::sync::{Mutex, OnceLock};
 use retour::GenericDetour;
 
 use crate::log;
-use crate::sys::pe::Export;
 
 /// The pointer's id: the system mouse's own.
 pub const MOUSE_ID: u32 = 1;
@@ -376,33 +375,13 @@ unsafe extern "system" fn get_touch(id: u32, out: *mut u8) -> i32 {
     GET_TOUCH.get().map_or(0, |h| unsafe { h.call(id, out) })
 }
 
-/// The pointer calls, in user32's exports (window.rs, for a split-screen copy).
-pub fn hook_exports(exports: &[Export]) -> usize {
-    use crate::sys::detour::{arm, hook_one};
+/// The pointer calls, from user32's export list or the loaded module
+/// (`window::arm_user32`).
+pub fn arm(src: &crate::sys::detour::Source) -> usize {
     let mut n = 0;
-    n += hook_one(exports, "window", "EnableMouseInPointer", |a| arm(&ENABLE, unsafe { std::mem::transmute::<*const (), Enable>(a) }, enable, "window", "EnableMouseInPointer"));
-    n += hook_one(exports, "window", "IsMouseInPointerEnabled", |a| arm(&IS_ON, unsafe { std::mem::transmute::<*const (), IsOn>(a) }, is_on, "window", "IsMouseInPointerEnabled"));
-    n += hook_one(exports, "window", "GetPointerInfo", |a| arm(&GET_INFO, unsafe { std::mem::transmute::<*const (), GetInfo>(a) }, get_info, "window", "GetPointerInfo"));
-    n += hook_one(exports, "window", "GetPointerType", |a| arm(&GET_TYPE, unsafe { std::mem::transmute::<*const (), GetType>(a) }, get_type, "window", "GetPointerType"));
-    n += hook_one(exports, "window", "GetPointerFrameInfo", |a| arm(&GET_FRAME, unsafe { std::mem::transmute::<*const (), GetMany>(a) }, get_frame, "window", "GetPointerFrameInfo"));
-    n += hook_one(exports, "window", "GetPointerInfoHistory", |a| arm(&GET_HISTORY, unsafe { std::mem::transmute::<*const (), GetMany>(a) }, get_history, "window", "GetPointerInfoHistory"));
-    n += hook_one(exports, "window", "GetPointerCursorId", |a| arm(&GET_CURSOR_ID, unsafe { std::mem::transmute::<*const (), GetCursorId>(a) }, get_cursor_id, "window", "GetPointerCursorId"));
-    n += hook_one(exports, "window", "GetPointerPenInfo", |a| arm(&GET_PEN, unsafe { std::mem::transmute::<*const (), GetOther>(a) }, get_pen, "window", "GetPointerPenInfo"));
-    n += hook_one(exports, "window", "GetPointerTouchInfo", |a| arm(&GET_TOUCH, unsafe { std::mem::transmute::<*const (), GetOther>(a) }, get_touch, "window", "GetPointerTouchInfo"));
-    n
-}
-
-/// The pointer calls, from a loaded user32 (`proc` looks each one up).
-pub fn hook_loaded(proc: impl Fn(&std::ffi::CStr) -> Option<usize>) -> usize {
-    use crate::sys::detour::{Armed, try_arm};
-    let mut n = 0;
-    // The game may be running in these: its other threads are paused while each
-    // prologue is written.
     macro_rules! one {
         ($cell:expr, $sym:literal, $ty:ty, $detour:expr) => {
-            if let Some(a) = proc($sym) {
-                n += usize::from(try_arm(&$cell, unsafe { std::mem::transmute::<usize, $ty>(a) }, $detour as $ty, "window", $sym.to_str().unwrap_or(""), true) == Armed::Hooked);
-            }
+            n += crate::sys::detour::arm_from(src, &$cell, $sym, $detour as $ty, "window");
         };
     }
     one!(ENABLE, c"EnableMouseInPointer", Enable, enable);

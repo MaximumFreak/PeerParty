@@ -22,10 +22,54 @@ static HOOK_LOCK: Mutex<()> = Mutex::new(());
 /// switched on while the game runs (the overlay's); the start-up hooks go in before the
 /// game's threads exist, so in the hook's own start (`watch::starting`, under the loader
 /// lock) nothing is paused.
+#[inline]
 pub fn frozen<R>(at: usize, f: impl FnOnce() -> R) -> R {
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    let paused = freeze(&[at]);
+    let r = f();
+    drop(paused);
+    r
+}
+
+/// The process's other threads, paused until this is dropped (`freeze`).
+pub struct Paused(Vec<(windows_sys::Win32::Foundation::HANDLE, bool)>);
+
+impl Paused {
+    fn suspend_all(&mut self) {
+        for (h, paused) in &mut self.0 {
+            if !*paused && unsafe { windows_sys::Win32::System::Threading::SuspendThread(*h) } != u32::MAX {
+                *paused = true;
+            }
+        }
+    }
+    fn resume_all(&mut self) {
+        for (h, paused) in &mut self.0 {
+            if *paused {
+                unsafe { windows_sys::Win32::System::Threading::ResumeThread(*h) };
+                *paused = false;
+            }
+        }
+    }
+}
+
+impl Drop for Paused {
+    fn drop(&mut self) {
+        // Resume every thread before closing handles or freeing the Vec.
+        self.resume_all();
+        for (h, _) in &self.0 {
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(*h) };
+        }
+    }
+}
+
+/// Pauses every other thread of the process, none of them with its next instruction in
+/// the first bytes of any function in `at` (see `frozen`), until the result is dropped;
+/// None (nothing paused) in the hook's own start. One function, not generic: every
+/// hook armed while the game runs goes through it.
+#[inline(never)]
+pub fn freeze(at: &[usize]) -> Option<Paused> {
+    use windows_sys::Win32::Foundation::CloseHandle;
     if crate::watch::starting() {
-        return f();
+        return None;
     }
     use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
     use windows_sys::Win32::System::Threading::*;
@@ -46,33 +90,6 @@ pub fn frozen<R>(at: usize, f: impl FnOnce() -> R) -> R {
         }
         unsafe { CloseHandle(snap) };
     }
-    struct Paused(Vec<(HANDLE, bool)>);
-    impl Paused {
-        fn suspend_all(&mut self) {
-            for (h, paused) in &mut self.0 {
-                if !*paused && unsafe { SuspendThread(*h) } != u32::MAX {
-                    *paused = true;
-                }
-            }
-        }
-        fn resume_all(&mut self) {
-            for (h, paused) in &mut self.0 {
-                if *paused {
-                    unsafe { ResumeThread(*h) };
-                    *paused = false;
-                }
-            }
-        }
-    }
-    impl Drop for Paused {
-        fn drop(&mut self) {
-            // Resume every thread before closing handles or freeing the Vec.
-            self.resume_all();
-            for (h, _) in &self.0 {
-                unsafe { CloseHandle(*h) };
-            }
-        }
-    }
     let mut threads = Paused(Vec::with_capacity(ids.len()));
     for id in &ids {
         let h = unsafe { OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, 0, *id) };
@@ -83,15 +100,13 @@ pub fn frozen<R>(at: usize, f: impl FnOnce() -> R) -> R {
     // A thread caught in those bytes runs on for a moment, then all are paused again.
     for _ in 0..100 {
         threads.suspend_all();
-        if !threads.0.iter().any(|(h, paused)| *paused && inside(*h, at)) {
+        if !threads.0.iter().any(|(h, paused)| *paused && at.iter().any(|&a| inside(*h, a))) {
             break;
         }
         threads.resume_all();
         unsafe { Sleep(1) };
     }
-    let r = f();
-    drop(threads);
-    r
+    Some(threads)
 }
 
 /// Whether a paused thread's next instruction is in the 32 bytes from `at`.
@@ -159,9 +174,15 @@ pub struct Summary {
     pub samples: Vec<String>,
 }
 
+#[inline]
 pub fn with_lock<R>(f: impl FnOnce() -> R) -> R {
-    let _g = crate::sys::lock(&HOOK_LOCK);
+    let _g = hook_lock();
     f()
+}
+
+/// The process-wide hook lock itself, held until the guard drops (`with_lock`).
+pub fn hook_lock() -> std::sync::MutexGuard<'static, ()> {
+    crate::sys::lock(&HOOK_LOCK)
 }
 
 /// Hooks every code export except `skip` (already typed-hooked) and anti-cheat

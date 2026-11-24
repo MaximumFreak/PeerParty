@@ -66,6 +66,7 @@ pub fn open(dll_dir: PathBuf, exe_name: &str) -> Option<PathBuf> {
     Some(path)
 }
 
+#[inline(never)]
 pub fn line(args: fmt::Arguments) {
     let Some(log) = LOG.get() else { return };
     if log.written.load(std::sync::atomic::Ordering::Relaxed) >= MAX_BYTES {
@@ -99,25 +100,27 @@ impl Drop for ClearBusy {
     }
 }
 
-/// Runs `f` unless this thread is already inside PeerParty code.
-/// The guard clears on panic so a later call on this thread is logged again.
-pub fn guarded<R>(f: impl FnOnce() -> R) -> Option<R> {
-    let entered = BUSY.try_with(|b| !b.replace(true)).unwrap_or(false);
-    if !entered {
-        return None;
-    }
-    let _clear = ClearBusy;
-    Some(f())
-}
-
 /// Logs `body` for the first `first` hits of `key`, then at powers of two.
 /// Skipped when this thread is already inside PeerParty (a log write re-entered a hook).
+/// (Only the call of `body` is generic: hundreds of call sites each had a copy of the
+/// counting too.)
+#[inline]
 pub fn throttled(key: &str, first: u64, body: impl FnOnce(u64)) {
-    guarded(|| {
-        if let Some(n) = throttle(&CALLS, key, first) {
-            body(n);
-        }
-    });
+    let Some((n, _inside)) = due(key, first) else { return };
+    body(n);
+}
+
+/// `throttled`'s count: Some (with this thread marked inside PeerParty until the guard
+/// drops, also on a panic, so a later call on this thread is logged again) when this hit
+/// of `key` is logged, None when the thread is already inside PeerParty code.
+#[inline(never)]
+fn due(key: &str, first: u64) -> Option<(u64, ClearBusy)> {
+    if !BUSY.try_with(|b| !b.replace(true)).unwrap_or(false) {
+        return None;
+    }
+    let inside = ClearBusy;
+    let n = throttle(&CALLS, key, first)?;
+    Some((n, inside))
 }
 
 /// A call PeerParty doesn't answer itself (it reports unsupported, fails, answers with

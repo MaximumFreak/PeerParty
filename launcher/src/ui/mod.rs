@@ -22,7 +22,9 @@ pub mod fx;
 mod game;
 pub mod icons;
 mod library;
+mod covers;
 pub mod mainexe;
+mod pattern;
 mod padgate;
 mod pads;
 pub mod scan;
@@ -76,7 +78,7 @@ pub fn run(after_update: bool, moved: bool) -> eframe::Result {
         "peerparty",
         options,
         Box::new(move |cc| {
-            egui_extras::install_image_loaders(&cc.egui_ctx);
+            covers::install(&cc.egui_ctx);
             theme::install_fonts(&cc.egui_ctx);
             theme::apply(&cc.egui_ctx);
             let mut app = App::new(cc.egui_ctx.clone(), settings);
@@ -2320,7 +2322,7 @@ mod tests {
         let Some(dir) = std::env::var_os("PEERPARTY_PREVIEW_DIR") else { return };
         crate::i18n::set("en");
         let ctx = egui::Context::default();
-        egui_extras::install_image_loaders(&ctx);
+        covers::install(&ctx);
         theme::install_fonts(&ctx);
         theme::apply(&ctx);
         let covers = std::env::temp_dir().join("peerparty-readme-covers");

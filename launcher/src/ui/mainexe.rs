@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-use regex::Regex;
+use super::pattern::Pattern;
 
 pub const MAX_DEPTH: usize = 6;
 const GAMEBOX: &str = ".gamebox.json";
@@ -45,21 +45,39 @@ const REDIST_DIRS: &[&str] = &[
 const RENDERER_TAGS: &[&str] = &[r"(dx|d3d)(9|10|11|12)", r"vulkan", r"vk"];
 const OLD_RENDERER_TAGS: &[&str] = &[r"(dx|d3d)(9|10|11)"];
 
-fn whole(names: &[&[&str]], suffix: &str) -> Regex {
+fn whole(names: &[&[&str]], suffix: &str) -> Pattern {
     let all: Vec<&str> = names.iter().flat_map(|n| n.iter().copied()).collect();
-    Regex::new(&format!("(?i)^({}){suffix}$", all.join("|"))).unwrap()
+    Pattern::new(&format!("(?i)^({}){suffix}$", all.join("|")))
 }
 
 /// A renderer tag at the end of a name or before a separator. (The C# original uses a
-/// lookahead for the separator; here it's captured and put back.)
-fn tag(tags: &[&str]) -> Regex {
-    Regex::new(&format!(r"(?i)[ _.-]?({})(?P<sep>$|[ _.-])", tags.join("|"))).unwrap()
+/// lookahead for the separator; here it's matched and put back, `without_tags`.)
+fn tag(tags: &[&str]) -> Pattern {
+    Pattern::new(&format!(r"(?i)[ _.-]?({})(?P<sep>$|[ _.-])", tags.join("|")))
 }
 
-static MAIN_NOT: LazyLock<Regex> = LazyLock::new(|| whole(&[UTILITY_NAMES, MAIN_NOT_EXTRA], r"\.exe"));
-static NOT_GAME_DIR: LazyLock<Regex> = LazyLock::new(|| whole(&[REDIST_DIRS], ""));
-static RENDERER_TAG: LazyLock<Regex> = LazyLock::new(|| tag(RENDERER_TAGS));
-static OLD_RENDERER_TAG: LazyLock<Regex> = LazyLock::new(|| tag(OLD_RENDERER_TAGS));
+/// `name` with each renderer tag taken out (its separator kept).
+fn without_tags(tags: &Pattern, name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut from = 0;
+    while let Some((start, end)) = tags.find(name, from) {
+        out.push_str(&name[from..start]);
+        // The match ends with the separator after the tag, or at the end of the name
+        // (a tag never ends in a separator character).
+        let last = name.as_bytes()[end - 1];
+        if b" _.-".contains(&last) {
+            out.push(last as char);
+        }
+        from = end;
+    }
+    out.push_str(&name[from..]);
+    out
+}
+
+static MAIN_NOT: LazyLock<Pattern> = LazyLock::new(|| whole(&[UTILITY_NAMES, MAIN_NOT_EXTRA], r"\.exe"));
+static NOT_GAME_DIR: LazyLock<Pattern> = LazyLock::new(|| whole(&[REDIST_DIRS], ""));
+static RENDERER_TAG: LazyLock<Pattern> = LazyLock::new(|| tag(RENDERER_TAGS));
+static OLD_RENDERER_TAG: LazyLock<Pattern> = LazyLock::new(|| tag(OLD_RENDERER_TAGS));
 
 /// The game's main program, or None if the folder has none.
 pub fn find(folder: &Path) -> Option<PathBuf> {
@@ -130,7 +148,7 @@ pub fn choose(folder: &Path, exes: &[PathBuf]) -> Option<PathBuf> {
             depth: parts.len(),
             sort_key: parts.join("/").to_lowercase(),
             unity: dir.join(format!("{stem}_Data")).is_dir(),
-            base: RENDERER_TAG.replace_all(&stem, "${sep}").to_lowercase(),
+            base: without_tags(&RENDERER_TAG, &stem).to_lowercase(),
             old_renderer: OLD_RENDERER_TAG.is_match(&stem),
             dir,
         });
@@ -209,5 +227,25 @@ mod tests {
         fs::write(root.join(GAMEBOX), r#"{"main":"../x.exe"}"#).unwrap();
         assert_eq!(find(&root).unwrap().file_name().unwrap(), "big.exe");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The rules as built, against the regex crate's reading of the same patterns.
+    #[test]
+    fn rules_match_like_regex() {
+        let all: Vec<&str> = [UTILITY_NAMES, MAIN_NOT_EXTRA].iter().flat_map(|n| n.iter().copied()).collect();
+        let main_not = regex::Regex::new(&format!(r"(?i)^({})\.exe$", all.join("|"))).unwrap();
+        let dirs = regex::Regex::new(&format!("(?i)^({})$", REDIST_DIRS.join("|"))).unwrap();
+        let renderer = regex::Regex::new(&format!(r"(?i)[ _.-]?({})(?P<sep>$|[ _.-])", RENDERER_TAGS.join("|"))).unwrap();
+        let names = [
+            "unins000.exe", "UnityCrashHandler64.exe", "game.exe", "Game_dx11.exe", "setup.exe", "my setup tool.exe",
+            "dxwnd.exe", "cdb.exe", "cdbx.exe", "Overlay64.exe", "GameLauncher.exe", "Battle.net-Setup.exe", "redist",
+            "_CommonRedist", "Support", "supporting", "__MACOSX", "game_dx11_vk", "Game-D3D12", "game.vulkan.x", "dx9",
+            "game dx10 ", "game_dx13", "game__dx11", "über_dx11", "日本_dx9", "pbsvc_r.exe", "Touchup.exe", "",
+        ];
+        for n in names {
+            assert_eq!(MAIN_NOT.is_match(n), main_not.is_match(n), "main-not {n:?}");
+            assert_eq!(NOT_GAME_DIR.is_match(n), dirs.is_match(n), "dir {n:?}");
+            assert_eq!(without_tags(&RENDERER_TAG, n), renderer.replace_all(n, "${sep}"), "tags {n:?}");
+        }
     }
 }

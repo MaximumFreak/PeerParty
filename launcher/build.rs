@@ -1,5 +1,5 @@
-//! Builds the hook DLL for x64 and x86 and hands their paths to `include_bytes!`, so
-//! `peerparty.exe` is the only file anyone needs. The nested builds get their own
+//! Builds the hook DLL for x64 and x86 and hands them, compressed, to `include_bytes!`,
+//! so `peerparty.exe` is the only file anyone needs. The nested builds get their own
 //! target directory inside the outer one: cargo locks per target directory, and a
 //! shared one would deadlock.
 //!
@@ -47,11 +47,79 @@ const HOOKS: [(&str, &str); 2] = [
 /// for another OS without it embeds stubs.
 const HOOK_FILES: [&str; 2] = ["peerparty_hook64.dll", "peerparty_hook32.dll"];
 
-/// An empty file for a hook that isn't embedded.
+/// An empty hook for one that isn't embedded.
 fn stub(out: &Path, key: &str) {
     let stub = out.join(format!("{}-stub.dll", key.to_ascii_lowercase()));
     std::fs::write(&stub, []).expect("writing a hook stub");
-    println!("cargo:rustc-env={key}={}", stub.display());
+    embed(out, key, &stub);
+}
+
+/// Hands `include_bytes!` the hook DLL at `dll`, compressed: the two DLLs were most of
+/// the exe's size. The blob starts with a tag ("PPHK64" or "PPHK32" and two NULs, which
+/// the release check looks for), the DLL's length and its FNV-1a hash (the name of the
+/// folder it's written out to, so the launcher never hashes it), then the raw deflate
+/// stream. Compressed once per DLL: a rerun of this script with the DLL unchanged (same
+/// length and time) keeps the last blob.
+fn embed(out: &Path, key: &str, dll: &Path) {
+    let blob = out.join(format!("{}.z", key.to_ascii_lowercase()));
+    let seen = out.join(format!("{}.z.src", key.to_ascii_lowercase()));
+    let meta = std::fs::metadata(dll).unwrap_or_else(|e| panic!("{}: {e}", dll.display()));
+    let stamp = format!("{} {:?} {}", meta.len(), meta.modified().ok(), dll.display());
+    if !(blob.is_file() && std::fs::read_to_string(&seen).is_ok_and(|s| s == stamp)) {
+        let bytes = std::fs::read(dll).unwrap_or_else(|e| panic!("{}: {e}", dll.display()));
+        let tag: &[u8; 8] = if key.ends_with("32") { b"PPHK32\0\0" } else { b"PPHK64\0\0" };
+        let mut z = Vec::with_capacity(bytes.len() / 2 + 64);
+        z.extend_from_slice(tag);
+        z.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        z.extend_from_slice(&fnv1a(&bytes).to_le_bytes());
+        let z = deflate(z, &bytes);
+        std::fs::write(&blob, z).expect("writing a compressed hook");
+        std::fs::write(&seen, stamp).expect("writing a compressed hook's stamp");
+    }
+    println!("cargo:rustc-env={key}={}", blob.display());
+}
+
+/// `bytes` deflated (raw, best compression) onto the end of `into`.
+fn deflate(into: Vec<u8>, bytes: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut enc = flate2::write::DeflateEncoder::new(into, flate2::Compression::best());
+    enc.write_all(bytes).expect("deflating");
+    enc.finish().expect("deflating")
+}
+
+/// The same hash as `hooks::fnv1a` in the launcher.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// Each language file compressed, without its comments and blank lines (together they
+/// were most of a megabyte of the exe): `OUT_DIR/locales/<code>.z`, which `i18n`
+/// inflates for the languages a run uses.
+fn locales(out: &Path) {
+    let src = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("locales");
+    println!("cargo:rerun-if-changed={}", src.display());
+    let dir = out.join("locales");
+    std::fs::create_dir_all(&dir).expect("creating the locales folder");
+    for e in std::fs::read_dir(&src).expect("reading launcher/locales").flatten() {
+        let p = e.path();
+        if p.extension().is_none_or(|x| x != "txt") {
+            continue;
+        }
+        println!("cargo:rerun-if-changed={}", p.display());
+        let text = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+        let mut kept = String::with_capacity(text.len());
+        for line in text.lines() {
+            let line = line.trim_start_matches('\u{feff}');
+            let t = line.trim_start();
+            if t.is_empty() || t.starts_with('#') {
+                continue;
+            }
+            kept.push_str(line);
+            kept.push('\n');
+        }
+        let name = p.file_stem().unwrap().to_string_lossy();
+        std::fs::write(dir.join(format!("{name}.z")), deflate(Vec::new(), kept.as_bytes())).expect("writing a compressed language");
+    }
 }
 
 fn main() {
@@ -99,7 +167,7 @@ fn main() {
             let dll = dir.join(file);
             if dll.is_file() {
                 println!("cargo:rerun-if-changed={}", dll.display());
-                println!("cargo:rustc-env={key}={}", dll.display());
+                embed(&out, key, &dll);
             } else if key == "PEERPARTY_HOOK32" {
                 println!("cargo:warning=no {} in PEERPARTY_HOOK_DIR: 32-bit games won't run with this build", dll.display());
                 stub(&out, key);
@@ -116,6 +184,7 @@ fn main() {
         build_hooks(&root, &out);
     }
 
+    locales(&out);
     version_resource(&root, &out);
     // Where the exe's DLLs come from (see `only_system_dlls` in main.rs for why). The
     // ones it names are looked for in System32 only (0x800, LOAD_LIBRARY_SEARCH_SYSTEM32).
@@ -189,7 +258,7 @@ fn build_hooks(root: &Path, out: &Path) {
         }
         let dll = nested.join(triple).join(&profile_dir).join("peerparty_hook.dll");
         assert!(dll.is_file(), "{} missing", dll.display());
-        println!("cargo:rustc-env={key}={}", dll.display());
+        embed(out, key, &dll);
     }
 }
 
@@ -375,9 +444,11 @@ const MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?
 </assembly>
 "#;
 
-/// An `.ico` with one 32-bit BMP image per size, drawn by `icon_art`.
+/// An `.ico` with one 32-bit image per size, drawn by `icon_art`: BMP for the small
+/// ones, PNG (which an icon may hold since Windows Vista) from 64 pixels up, where an
+/// uncompressed bitmap was most of the exe's resources (the 256-pixel one alone 270 KB).
 fn ico_file(sizes: &[usize]) -> Vec<u8> {
-    let images: Vec<Vec<u8>> = sizes.iter().map(|&s| bmp_image(s)).collect();
+    let images: Vec<Vec<u8>> = sizes.iter().map(|&s| if s >= 64 { png_image(s) } else { bmp_image(s) }).collect();
     let mut f = Vec::new();
     // ICONDIR: reserved, type 1 (icon), count.
     f.extend_from_slice(&0u16.to_le_bytes());
@@ -398,6 +469,19 @@ fn ico_file(sizes: &[usize]) -> Vec<u8> {
         f.extend_from_slice(&img);
     }
     f
+}
+
+/// A PNG of the icon at `size` (RGBA).
+fn png_image(size: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut enc = png::Encoder::new(&mut out, size as u32, size as u32);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    enc.set_compression(png::Compression::High);
+    let mut w = enc.write_header().expect("writing the icon's PNG header");
+    w.write_image_data(&icon_art::icon_rgba(size)).expect("writing the icon's PNG");
+    w.finish().expect("finishing the icon's PNG");
+    out
 }
 
 /// BITMAPINFOHEADER, bottom-up BGRA pixels, then an empty AND mask (the alpha channel

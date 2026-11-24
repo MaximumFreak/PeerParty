@@ -11,15 +11,18 @@ peerparty_core = { path = "../core" }
 # What the launcher and the hook agree on: messages, the frame block, the catalog.
 peerparty_protocol = { path = "../protocol" }
 # The launcher window (src/ui), shown when peerparty.exe starts with no arguments.
-eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "clipboard", "links"] }
-egui_extras = { version = "0.37", features = ["image", "file"] }
+# No built-in fonts (the system's are used, ui/theme.rs), no link opening (platform::
+# open_url) and no image loaders (ui/covers.rs): together they were 1.4 MB of the exe.
+eframe = { version = "0.37", default-features = false, features = ["glow", "clipboard"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 rfd = "0.17"
-regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Checking a downloaded update against its release checksum (src/release.rs).
 sha2 = "0.10"
+# The embedded hook DLLs and language files are deflated by build.rs (hooks.rs, i18n.rs).
+# Already in the build through png; the pure-Rust backend.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 # The Win32 side (backend/windows, platform/windows.rs, host's windows and hooks).
 [target.'cfg(windows)'.dependencies]
@@ -31,7 +34,16 @@ windows-sys = { workspace = true, features = ["Win32_Graphics_Gdi", "Win32_UI_Sh
 libc = "0.2"
 eframe = { version = "0.37", default-features = false, features = ["x11", "wayland"] }
 
+[build-dependencies]
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# The exe icon's larger images (build.rs); already in the build through image.
+png = "0.18"
+
 # The version number in peerparty.exe's file properties (build.rs), when built on
 # Windows (build.rs runs on the building system, so this is the host's, not the target's).
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
+
+# Tests only: the name matchers (ui/pattern.rs, ui/mainexe.rs) are checked against it.
+[dev-dependencies]
+regex = "1"

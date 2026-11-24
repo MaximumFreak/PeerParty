@@ -511,7 +511,7 @@ mod tests {
     /// what turning it off costs; the services' modes include every one the hook reads.
     #[test]
     fn layers_and_modes_come_from_the_catalog() {
-        let en = crate::i18n::parse(crate::i18n::LANGS[0].2);
+        let en = crate::i18n::parse(crate::i18n::text(0));
         let ids: Vec<&str> = layers().iter().map(|(id, _)| *id).collect();
         assert_eq!(
             ids,

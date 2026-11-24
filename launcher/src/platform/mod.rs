@@ -33,11 +33,14 @@ pub struct FontFile {
     pub index: u32,
 }
 
-/// The interface fonts the system has (any may be missing; egui's own fonts fill in).
+/// The interface fonts the system has (any may be missing: the regular face, or a
+/// fallback font, fills in).
 #[derive(Clone, Debug, Default)]
 pub struct UiFonts {
     pub regular: Option<FontFile>,
     pub semibold: Option<FontFile>,
+    /// For room codes and paths.
+    pub mono: Option<FontFile>,
     /// An icon font with the code points `ui::icons` names.
     pub icons: Option<FontFile>,
 }

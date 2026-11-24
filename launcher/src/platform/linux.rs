@@ -58,11 +58,12 @@ fn first_font(names: &[(&str, u32)]) -> Option<FontFile> {
 }
 
 /// The interface fonts: Noto Sans (SteamOS's and most systems'), else the common others.
-/// No icon font: egui's own symbols fill in.
+/// No icon font: `ui::icons` draws its shapes.
 pub fn ui_fonts() -> UiFonts {
     UiFonts {
         regular: first_font(&[("NotoSans-Regular.ttf", 0), ("Cantarell-Regular.otf", 0), ("DejaVuSans.ttf", 0), ("LiberationSans-Regular.ttf", 0)]),
         semibold: first_font(&[("NotoSans-SemiBold.ttf", 0), ("NotoSans-Bold.ttf", 0), ("Cantarell-Bold.otf", 0), ("DejaVuSans-Bold.ttf", 0)]),
+        mono: first_font(&[("NotoSansMono-Regular.ttf", 0), ("DejaVuSansMono.ttf", 0), ("LiberationMono-Regular.ttf", 0)]),
         icons: None,
     }
 }
@@ -117,6 +118,13 @@ pub fn exe_icon(_exe: &Path, _size: i32) -> Option<Rgba> {
 pub fn reveal(path: &Path) {
     let dir = if path.is_file() { path.parent().unwrap_or(path) } else { path };
     let _ = std::process::Command::new("xdg-open").arg(dir).stdin(std::process::Stdio::null()).spawn();
+}
+
+/// Opens a web page (an https link only) in the desktop's browser.
+pub fn open_url(url: &str) {
+    if url.starts_with("https://") {
+        let _ = std::process::Command::new("xdg-open").arg(url).stdin(std::process::Stdio::null()).spawn();
+    }
 }
 
 /// Starts a helper as it is: there's no console window to keep away.

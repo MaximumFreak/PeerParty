@@ -36,9 +36,19 @@ pub struct Package {
     pub game: PathBuf,
 }
 
+/// The value of attribute `name` in an XML start tag: `name="..."`, not the end of
+/// another name (`xName="..."`).
 fn attr(tag: &str, name: &str) -> Option<String> {
-    let re = regex::Regex::new(&format!(r#"\b{name}="([^"]*)""#)).ok()?;
-    re.captures(tag).map(|c| c[1].to_string())
+    let key = format!("{name}=\"");
+    let mut from = 0;
+    while let Some(i) = tag[from..].find(&key).map(|i| i + from) {
+        if !tag[..i].chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_') {
+            let rest = &tag[i + key.len()..];
+            return rest.find('"').map(|end| rest[..end].to_string());
+        }
+        from = i + key.len();
+    }
+    None
 }
 
 fn tag<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
@@ -255,6 +265,16 @@ mod tests {
         // One with a resource id (Identity has ResourceId="Base").
         let (full, _) = names("Fabrikam.578840CD64788", "CN=Fabrikam", "1.124.4948.0", "x64", "Base").unwrap();
         assert_eq!(full, "Fabrikam.578840CD64788_1.124.4948.0_x64_Base_rf71fm6tkk4qe");
+    }
+
+    #[test]
+    fn attributes_are_read_by_whole_name() {
+        let t = r#"<Identity xName="no" Name="Contoso.Game" Publisher="CN=Contoso" Version="1.0.0.0" Broken="x"#;
+        assert_eq!(attr(t, "Name").as_deref(), Some("Contoso.Game"));
+        assert_eq!(attr(t, "Publisher").as_deref(), Some("CN=Contoso"));
+        assert_eq!(attr(t, "Missing"), None);
+        assert_eq!(attr(t, "Broken"), None);
+        assert_eq!(attr(r#"<Application Id="App""#, "Id").as_deref(), Some("App"));
     }
 
     #[test]

@@ -180,6 +180,17 @@ pub fn reveal(path: &Path) {
     let _ = cmd.spawn();
 }
 
+/// Opens a web page (an https link only) in the default browser.
+pub fn open_url(url: &str) {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    if !url.starts_with("https://") {
+        return;
+    }
+    let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+    let (verb, file) = (wide("open"), wide(url));
+    unsafe { ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), 1) };
+}
+
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const NORMAL_PRIORITY_CLASS: u32 = 0x0000_0020;
 
@@ -318,11 +329,13 @@ fn first_font(names: &[(&str, u32)]) -> Option<FontFile> {
     names.iter().map(|(n, i)| (dir.join(n), *i)).find(|(p, _)| p.is_file()).map(|(path, index)| FontFile { path, index })
 }
 
-/// The interface fonts: Segoe UI, its semibold, and the Fluent (or MDL2) icon font.
+/// The interface fonts: Segoe UI, its semibold, Consolas, and the Fluent (or MDL2) icon
+/// font. Fonts Wine and Proton prefixes have come after them (no font is built in).
 pub fn ui_fonts() -> UiFonts {
     UiFonts {
-        regular: first_font(&[("segoeui.ttf", 0)]),
-        semibold: first_font(&[("seguisb.ttf", 0), ("segoeuib.ttf", 0)]),
+        regular: first_font(&[("segoeui.ttf", 0), ("tahoma.ttf", 0), ("arial.ttf", 0), ("verdana.ttf", 0), ("micross.ttf", 0)]),
+        semibold: first_font(&[("seguisb.ttf", 0), ("segoeuib.ttf", 0), ("tahomabd.ttf", 0), ("arialbd.ttf", 0)]),
+        mono: first_font(&[("consola.ttf", 0), ("CascadiaMono.ttf", 0), ("lucon.ttf", 0), ("cour.ttf", 0)]),
         icons: first_font(&[("SegoeIcons.ttf", 0), ("segmdl2.ttf", 0)]),
     }
 }
