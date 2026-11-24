@@ -269,8 +269,13 @@ unsafe extern "system" fn chained_get_proc<const N: usize>(module: usize, name: 
 }
 
 /// GetProcAddress as the game sees it: PeerParty's swaps, else `next` (another
-/// module's redirect this slot held before; 0 for none), else the real one.
+/// module's redirect this slot held before; 0 for none), else the real one. A copy in a
+/// pane also gets Unity's scripting registration call wrapped (screen_prefs.rs).
 unsafe fn get_proc(module: usize, name: *const u8, next: usize) -> usize {
+    crate::screen_prefs::swap_lookup(name, unsafe { lookup(module, name, next) })
+}
+
+unsafe fn lookup(module: usize, name: *const u8, next: usize) -> usize {
     crate::watch::looked_up(module);
     crate::voice::vivox::looked_up(module);
     if crate::vr::refused(name) {
@@ -324,7 +329,7 @@ unsafe extern "system" fn detour_get_proc_for_caller(
     let Some(hook) = GET_PROC_FOR_CALLER.get() else {
         return 0;
     };
-    unsafe { hook.call(module, name, caller) }
+    crate::screen_prefs::swap_lookup(name, unsafe { hook.call(module, name, caller) })
 }
 
 /// How many modules have had their imports of the SDK at `base` pointed here. (Vivox
