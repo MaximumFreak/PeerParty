@@ -114,6 +114,8 @@ pub use super::ring::RingBlock;
 /// window uploads itself.
 pub struct SharedSurface {
     pub generation: u32,
+    /// The copy's process (its log takes the pane's frame counts).
+    pub pid: u32,
     textures: [HANDLE; SLOTS],
     content: HANDLE,
     release: HANDLE,
@@ -136,6 +138,7 @@ impl SharedSurface {
             let p = super::ring::PixelFrames::open(m)?;
             return Some(SharedSurface {
                 generation: m.generation,
+                pid: m.pid,
                 textures: [std::ptr::null_mut(); SLOTS],
                 content: std::ptr::null_mut(),
                 release: std::ptr::null_mut(),
@@ -156,6 +159,7 @@ impl SharedSurface {
         };
         let mut s = SharedSurface {
             generation: m.generation,
+            pid: m.pid,
             textures: [std::ptr::null_mut(); SLOTS],
             content: std::ptr::null_mut(),
             release: std::ptr::null_mut(),
@@ -975,11 +979,78 @@ struct Pane {
     failed: Option<Arc<SharedSurface>>,
     /// The adapter that surface's textures are on, when it isn't the device's.
     failed_on: Option<Luid>,
+    /// How its frames were shown lately (`Shown`).
+    shown: Shown,
 }
 
 impl Default for Pane {
     fn default() -> Pane {
-        Pane { draw: PaneDraw { dest: PaneRect { x: 0, y: 0, width: 0, height: 0 }, ring: None, surface: None }, opened: None, previous: None, failed: None, failed_on: None }
+        Pane {
+            draw: PaneDraw { dest: PaneRect { x: 0, y: 0, width: 0, height: 0 }, ring: None, surface: None },
+            opened: None,
+            previous: None,
+            failed: None,
+            failed_on: None,
+            shown: Shown::default(),
+        }
+    }
+}
+
+/// How a pane's frames were shown since `since`, said in its copy's log every
+/// `SHOWN_EVERY`: an even pane shows each of its frames once; one shown twice and the
+/// next never shown is a stutter.
+#[derive(Default)]
+struct Shown {
+    since: Option<std::time::Instant>,
+    /// The sequence number last drawn.
+    last: Option<u32>,
+    new: u32,
+    again: u32,
+    missed: u32,
+    presents: u32,
+}
+
+const SHOWN_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl Shown {
+    /// The window presented with frame `seq` of this pane drawn (None: a frame of an older
+    /// set, not counted).
+    fn presented(&mut self, seq: Option<u32>) {
+        self.presents += 1;
+        let Some(seq) = seq else { return };
+        match self.last {
+            Some(l) if l == seq => self.again += 1,
+            Some(l) => {
+                self.new += 1;
+                // Sequence numbers are 24 bits (`frame_ring::pack`); a jump of more than
+                // a few seconds' frames is a ring set up again, not frames missed.
+                let gap = seq.wrapping_sub(l) & 0xff_ffff;
+                if gap <= 1000 {
+                    self.missed += gap - 1;
+                }
+            }
+            None => self.new += 1,
+        }
+        self.last = Some(seq);
+    }
+
+    /// The line for the last `SHOWN_EVERY`, once it's over (and the counts start again).
+    fn report(&mut self, now: std::time::Instant) -> Option<String> {
+        let since = *self.since.get_or_insert(now);
+        let secs = now.duration_since(since).as_secs_f32();
+        if secs < SHOWN_EVERY.as_secs_f32() {
+            return None;
+        }
+        let line = format!(
+            "{} new frames shown ({:.0} a second), {} shown again while it had none newer, {} it made never shown; the window drew {:.0} a second",
+            self.new,
+            self.new as f32 / secs,
+            self.again,
+            self.missed,
+            self.presents as f32 / secs
+        );
+        *self = Shown { since: Some(now), last: self.last, ..Shown::default() };
+        Some(line)
     }
 }
 
@@ -1001,6 +1072,50 @@ impl Pane {
     fn shown(&self) -> Option<&Opened> {
         self.opened.as_ref().filter(|o| o.last.is_some()).or(self.previous.as_ref()).or(self.opened.as_ref())
     }
+}
+
+/// Each pane's newest frame (`RingHeader::take`), its pixels uploaded: whether any is new,
+/// what each pane draws (slot and content-fence value), and whether that's its current
+/// set's frame taken now (only those are released: an old set's fence means nothing to
+/// the copy now).
+fn take_frames(r: &mut Renderer, panes: &mut [Pane], dirty: &mut bool) -> (bool, Vec<Option<(usize, u64)>>, Vec<bool>) {
+    let mut fresh = false;
+    let mut take: Vec<Option<(usize, u64)>> = Vec::with_capacity(panes.len());
+    let mut taken: Vec<bool> = Vec::with_capacity(panes.len());
+    for p in panes.iter_mut() {
+        let mut t = None;
+        let mut now = false;
+        let visible = p.draw.dest.width > 0 && p.draw.dest.height > 0;
+        if let (Some(o), Some(ring), true) = (p.opened.as_mut(), p.draw.ring.as_ref(), visible) {
+            match ring.header().take(o.surface.generation) {
+                Some(f) => {
+                    if o.last != Some((f.slot, f.seq)) {
+                        fresh = true;
+                    }
+                    o.last = Some((f.slot, f.seq));
+                    t = Some((f.slot, f.ready));
+                    now = true;
+                    // Pixels are copied out now: the hook may write the slot once
+                    // it's no longer the one taken.
+                    r.upload(o, f.slot, f.seq);
+                }
+                // A newer generation's surface hasn't come yet: the last frame again.
+                None => t = o.last.map(|(slot, _)| (slot, 0)),
+            }
+            if o.last.is_some() && p.previous.take().is_some() {
+                *dirty = true;
+            }
+        }
+        if t.is_none()
+            && let Some(prev) = p.previous.as_ref()
+        {
+            // Neither waited on nor released: that set is done with.
+            t = prev.last.map(|(slot, _)| (slot, 0));
+        }
+        take.push(t);
+        taken.push(now);
+    }
+    (fresh, take, taken)
 }
 
 fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE) {
@@ -1133,44 +1248,7 @@ fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE) {
             occluded = None;
             dirty = true;
         }
-        // The newest frames; `taken`: the pane's frame is its current set's, taken now
-        // (only those are released: an old set's fence means nothing to the copy now).
-        let mut fresh = false;
-        let mut take: Vec<Option<(usize, u64)>> = Vec::with_capacity(panes.len());
-        let mut taken: Vec<bool> = Vec::with_capacity(panes.len());
-        for p in &mut panes {
-            let mut t = None;
-            let mut now = false;
-            let visible = p.draw.dest.width > 0 && p.draw.dest.height > 0;
-            if let (Some(o), Some(ring), true) = (p.opened.as_mut(), p.draw.ring.as_ref(), visible) {
-                match ring.header().take(o.surface.generation) {
-                    Some(f) => {
-                        if o.last != Some((f.slot, f.seq)) {
-                            fresh = true;
-                        }
-                        o.last = Some((f.slot, f.seq));
-                        t = Some((f.slot, f.ready));
-                        now = true;
-                        // Pixels are copied out now: the hook may write the slot once
-                        // it's no longer the one taken.
-                        r.upload(o, f.slot, f.seq);
-                    }
-                    // A newer generation's surface hasn't come yet: the last frame again.
-                    None => t = o.last.map(|(slot, _)| (slot, 0)),
-                }
-                if o.last.is_some() && p.previous.take().is_some() {
-                    dirty = true;
-                }
-            }
-            if t.is_none()
-                && let Some(prev) = p.previous.as_ref()
-            {
-                // Neither waited on nor released: that set is done with.
-                t = prev.last.map(|(slot, _)| (slot, 0));
-            }
-            take.push(t);
-            taken.push(now);
-        }
+        let (fresh, _, _) = take_frames(r, &mut panes, &mut dirty);
         set_live(shared, &panes);
         if !fresh && !dirty {
             continue;
@@ -1178,6 +1256,11 @@ fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE) {
         if !r.waitable.is_null() {
             unsafe { WaitForSingleObjectEx(r.waitable, 100, 1) };
         }
+        // Taken again once there's room: the frame event woke this for one copy's frame,
+        // and another copy's of this same refresh, published while waiting, is drawn now.
+        // Taken only before the wait, the copy that published second each refresh had its
+        // frame drawn a refresh late, shown twice and skipped as the games' timing drifted.
+        let (_, take, taken) = take_frames(r, &mut panes, &mut dirty);
         let Some(rtv) = r.target() else {
             lost += 1;
             if lost <= 5 {
@@ -1208,6 +1291,15 @@ fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE) {
         }
         vcall!(r.ctx, 111, fn() -> ());
         dirty = false;
+        // Each pane's frames as shown, in its copy's log now and then.
+        let now = std::time::Instant::now();
+        for (i, p) in panes.iter_mut().enumerate() {
+            let Some(o) = p.opened.as_ref() else { continue };
+            p.shown.presented(o.last.map(|(_, seq)| seq));
+            if let Some(line) = p.shown.report(now) {
+                crate::launch::note(o.surface.pid, &format!("session: player {}'s pane over the last {} s: {line}", i + 1, SHOWN_EVERY.as_secs()));
+            }
+        }
         // DXGI_ERROR_DEVICE_REMOVED / DEVICE_RESET: start over on a new device.
         if hr == 0x887A_0005_u32 as i32 || hr == 0x887A_0007_u32 as i32 {
             eprintln!("peerparty: session: the window's graphics device was lost ({hr:#x}); making a new one");
@@ -1236,6 +1328,32 @@ fn set_live(shared: &Shared, panes: &[Pane]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pane's frames as shown: new ones, one shown twice, one never shown, and the
+    /// line once the time is up (the counts start again after it).
+    #[test]
+    fn a_panes_frames_are_counted_as_shown() {
+        let t0 = std::time::Instant::now();
+        let mut s = Shown::default();
+        assert!(s.report(t0).is_none(), "starts the clock");
+        for seq in [1, 2, 2, 4, 5] {
+            s.presented(Some(seq));
+        }
+        s.presented(None);
+        assert_eq!((s.new, s.again, s.missed, s.presents), (4, 1, 1, 6));
+        assert!(s.report(t0 + std::time::Duration::from_secs(5)).is_none());
+        let line = s.report(t0 + SHOWN_EVERY).unwrap();
+        assert!(line.starts_with("4 new frames shown"), "{line}");
+        assert!(line.contains("1 shown again") && line.contains("1 it made never shown"), "{line}");
+        assert_eq!((s.new, s.again, s.missed, s.presents, s.last), (0, 0, 0, 0, Some(5)));
+        s.presented(Some(2));
+        assert_eq!(s.missed, 0, "back to 2 after 5: a ring set up again, nothing missed");
+        s.last = Some(0xff_ffff);
+        s.presented(Some(0));
+        assert_eq!(s.missed, 0, "0 follows 0xffffff");
+        s.presented(Some(3));
+        assert_eq!(s.missed, 2);
+    }
 
     /// D3D11_TEXTURE2D_DESC.
     #[repr(C)]
