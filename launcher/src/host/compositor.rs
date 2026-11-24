@@ -20,8 +20,9 @@
 //!
 //! Panes are in physical pixels of the window's client area, which follows its monitor:
 //! a 4K screen at 200% has 3840 x 2160 of them, and `MonitorBounds::scale` says how many
-//! per point. Zooming shows the focused copy on the whole window without telling the
-//! games anything: their panes (and so their resolutions) stay.
+//! per point. Zooming shows the focused copy on the whole window and tells it so: its
+//! pane (and so its resolution) is the whole window until the zoom ends, as a layout
+//! change would; the others keep theirs, hidden.
 
 use std::path::Path;
 
@@ -262,9 +263,22 @@ impl CompositorWindow {
         &self.panes
     }
 
-    /// Pane `i` on screen.
+    /// Pane `i` on screen, as its copy is told it (`told_panes`).
     pub fn screen_pane(&self, i: usize) -> Option<PaneRect> {
-        self.panes.get(i).map(|p| PaneRect { x: p.x.saturating_add(self.bounds.x), y: p.y.saturating_add(self.bounds.y), ..*p })
+        self.told_panes().get(i).map(|p| PaneRect { x: p.x.saturating_add(self.bounds.x), y: p.y.saturating_add(self.bounds.y), ..*p })
+    }
+
+    /// The pane each copy is told (its window and resolution follow it): its layout pane,
+    /// or zoomed, the whole window for the focused one. Zoom used to leave the zoomed
+    /// game at its pane's resolution, drawn with bars on the whole window.
+    pub fn told_panes(&self) -> Vec<PaneRect> {
+        let mut panes = self.panes.clone();
+        if self.zoomed
+            && let Some(p) = panes.get_mut(self.focus)
+        {
+            *p = PaneRect { x: 0, y: 0, width: self.bounds.width, height: self.bounds.height };
+        }
+        panes
     }
 
     /// Where each copy is shown in the client area: its pane, or zoomed, the focused one
@@ -562,7 +576,7 @@ impl CompositorWindow {
         #[cfg(windows)]
         if self.window.is_some() {
             let shown = self.display_panes();
-            let layout_panes = self.panes.clone();
+            let layout_panes = self.told_panes();
             let bounds = self.bounds;
             let w = self.window.as_mut().expect("checked");
             for (i, inst) in instances.iter().enumerate() {
@@ -819,7 +833,7 @@ mod win {
     }
 
     fn is_session_chord(vk: usize) -> bool {
-        crate::host::ctrl_alt(|k| unsafe { GetKeyState(k) } < 0) && matches!(vk as u32, 0x4C | 0x5A | 0x31..=0x34)
+        crate::host::ctrl_alt(|k| unsafe { GetKeyState(k) } < 0) && matches!(vk as u32, 0x4C | 0x5A | 0x31..=0x34 | 0x61..=0x64)
     }
 
     unsafe extern "system" fn proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
@@ -1675,8 +1689,8 @@ mod tests {
         assert_eq!(c.panes()[3], r(960, 540, 960, 540));
     }
 
-    /// The focused pane: chosen, kept within the panes, zoomed onto the whole window
-    /// without changing the panes the games are told.
+    /// The focused pane: chosen, kept within the panes, zoomed onto the whole window, and
+    /// told the whole window while zoomed (the others keep their panes).
     #[test]
     fn focus_and_zoom() {
         let mut c = CompositorWindow::new(LayoutPreset::Grid2x2, HD, 4);
@@ -1690,10 +1704,13 @@ mod tests {
         c.set_zoomed(true);
         assert!(c.zoomed());
         assert_eq!(c.display_panes(), [HIDDEN, HIDDEN, HIDDEN, r(0, 0, 1920, 1080)]);
-        assert_eq!(c.panes()[3], r(960, 540, 960, 540), "the game's pane stays");
+        assert_eq!(c.panes()[3], r(960, 540, 960, 540), "the layout stays");
+        assert_eq!(c.told_panes()[3], r(0, 0, 1920, 1080), "the zoomed game is told the whole window");
+        assert_eq!(c.told_panes()[0], c.panes()[0], "the others keep theirs");
         assert_eq!(c.pane_at(10, 10), Some(3), "zoomed, the whole window is its");
         c.set_zoomed(false);
         assert_eq!(c.display_panes(), c.panes());
+        assert_eq!(c.told_panes(), c.panes());
         c.set_count(2);
         assert_eq!(c.focused(), 1, "the focus stays on a pane there is");
     }

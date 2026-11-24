@@ -233,8 +233,10 @@ both.
   split-screen window. Each pane gets its own controller (assigned when a controller is
   first used, and kept across unplugging), its own in-game overlay when that player
   presses the overlay button, and its own audio and rumble; `Ctrl+Alt+L` cycles the
-  layout, `Ctrl+Alt+Z` zooms the focused pane, and `Ctrl+Alt+1`–`4` focuses a pane for
-  the keyboard and mouse. `--inputs` says what each player plays with, in player order:
+  layout, `Ctrl+Alt+Z` zooms the focused pane onto the whole window (its game is told
+  the window's size, as a layout change does, and goes back to its pane after), and
+  `Ctrl+Alt+1`–`4` (number row or number pad) hands the keyboard and mouse to that
+  player's pane, which says so. `--inputs` says what each player plays with, in player order:
   `kbm` the keyboard and mouse and never a controller (the session starts with that
   pane focused), `pad` a controller, `auto` (the default) a controller, passing over a
   player who has already been playing with the keyboard and mouse while another player

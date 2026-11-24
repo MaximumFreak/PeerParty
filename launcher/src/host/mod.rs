@@ -113,9 +113,9 @@ const HOTKEY_NAMES: [&str; 4] = ["Shift+Tab", "Shift+F3", "Shift+F1", "Shift+F2"
 /// `foreign` names), and its name for a player.
 const HOTKEY_OWNERS: [(&str, &str); 4] = [("steam", "Steam"), ("epic", "Epic"), ("ea", "EA"), ("ubisoft", "Ubisoft")];
 /// A split-screen session's keys, with Ctrl+Alt held while its window or a copy is in
-/// front: L the next layout, Z the focused copy on the whole window, 1 to 4 the focus
-/// to that copy.
-const SESSION_KEYS: [i32; 6] = [0x4C, 0x5A, 0x31, 0x32, 0x33, 0x34];
+/// front: L the next layout, Z the focused copy on the whole window, 1 to 4 (the number
+/// row's, then the number pad's) the focus to that copy.
+const SESSION_KEYS: [i32; 10] = [0x4C, 0x5A, 0x31, 0x32, 0x33, 0x34, 0x61, 0x62, 0x63, 0x64];
 
 /// Which of the hotkeys that are on (`on`) open the overlay in a game with `foreign`
 /// store overlays loaded. A key a loaded store overlay opens on is left to it (a game
@@ -254,14 +254,14 @@ struct NavState {
     /// Some controller's Home / Guide was down at the last tick, the same for Home.
     diag_home: bool,
     /// A split-screen session's keys held at the last tick (`SESSION_KEYS`).
-    session_keys: [bool; 6],
+    session_keys: [bool; SESSION_KEYS.len()],
     /// When Home last went down on a controller a copy was given (`real_homes`).
     given_home_at: Option<Instant>,
 }
 
 impl NavState {
     fn new() -> NavState {
-        NavState { keys_down: [false; 4], shift: false, diag_keys: [false; 4], diag_home: true, session_keys: [true; 6], given_home_at: None }
+        NavState { keys_down: [false; 4], shift: false, diag_keys: [false; 4], diag_home: true, session_keys: [true; SESSION_KEYS.len()], given_home_at: None }
     }
 }
 
@@ -1014,6 +1014,9 @@ impl SessionHost {
             c.terminate_instances(&self.instances, &format!("still running {} s after being asked to close", CLOSE_WAIT.as_secs()));
         }
         let mut focus = c.take_click().and_then(|(x, y)| c.pane_at(x, y));
+        // A focus asked for by Ctrl+Alt+1–4: said in that pane (outside a zoom nothing on
+        // screen changes, so the keys seemed to do nothing).
+        let mut keyed: Option<usize> = None;
         let ours = c.hwnd() != 0 && desktop::in_front(std::process::id());
         let held = ours || self.instances.iter().any(|i| i.in_front());
         let chord = held && ctrl_alt(down);
@@ -1029,18 +1032,38 @@ impl SessionHost {
                     }
                     1 => {
                         c.set_zoomed(!c.zoomed());
+                        let text = if c.zoomed() {
+                            format!("session: player {}'s pane zoomed onto the whole window: its game is told the window's size", c.focused() + 1)
+                        } else {
+                            format!("session: back to the {} layout from the zoom", c.layout().as_str())
+                        };
+                        crate::launch::note(self.instances[c.focused()].pid, &text);
                         self.panes_stale = true;
                     }
-                    n => focus = Some(n - 2),
+                    n => {
+                        let i = (n - 2) % 4;
+                        focus = Some(i);
+                        keyed = Some(i);
+                    }
                 }
             }
             self.nav.session_keys[k] = d;
+        }
+        if let Some(i) = keyed {
+            let pid = self.instances.get(self.focus).map_or(0, |inst| inst.pid);
+            match self.instances.get(i) {
+                Some(inst) if !inst.gone => crate::launch::note(inst.pid, &format!("session: Ctrl+Alt+{}: player {}'s pane has the keyboard and mouse", i + 1, i + 1)),
+                _ => crate::launch::note(pid, &format!("session: Ctrl+Alt+{}: there's no player {} in this session", i + 1, i + 1)),
+            }
         }
         if let Some(i) = focus.filter(|&i| i < self.instances.len() && !self.instances[i].gone) {
             c.focus_pane(i);
             c.activate_pane(i, &self.instances);
             self.panes_stale = true;
             self.set_focus(i);
+            if keyed == Some(i) && self.prefs.toasts {
+                self.panes[i].overlay.toast(crate::t!("toast.kbm_here", n = i + 1), crate::t!("toast.kbm_here_detail"));
+            }
         }
         for inst in &mut self.instances {
             if inst.refresh_window() {
