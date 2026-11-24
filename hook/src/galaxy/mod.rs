@@ -600,6 +600,10 @@ fn s(p: *const c_char) -> String {
 /// A C string that stays valid.
 fn c_str(text: &str) -> *const c_char {
     let mut m = crate::sys::lock(&STRINGS);
+    // Most are asked for again and again: no new key then.
+    if let Some(c) = m.get(text) {
+        return c.as_ptr();
+    }
     m.entry(text.to_string())
         .or_insert_with(|| CString::new(text.replace('\0', "")).unwrap_or_default())
         .as_ptr()

@@ -677,18 +677,19 @@ fn receive(out: *mut *mut Message, max: i32, pick: impl Fn(&State, u32) -> bool)
             }
         }
     }
-    while n < max {
-        let sockets: HashMap<String, u32> = {
-            let s = crate::sys::lock(&S);
-            s.conns
-                .iter()
-                .filter(|(h, c)| c.peer.is_some() && pick(&s, **h))
-                .map(|(h, c)| (c.socket.clone(), *h))
-                .collect()
-        };
-        if sockets.is_empty() {
-            break;
-        }
+    // The connections' sockets, once a call (not once a message): one closed meanwhile
+    // is passed over below, one opened meanwhile is read by the next call.
+    let sockets: HashMap<String, u32> = if n < max {
+        let s = crate::sys::lock(&S);
+        s.conns
+            .iter()
+            .filter(|(h, c)| c.peer.is_some() && pick(&s, **h))
+            .map(|(h, c)| (c.socket.clone(), *h))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+    while n < max && !sockets.is_empty() {
         let Some(mut p) = lan.receive_where(Some(DATA), |sock| sockets.contains_key(sock)) else {
             break;
         };

@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use peerparty_core::fwd::{self, Forwarder};
@@ -132,7 +132,7 @@ unsafe fn ov_event(ov: *mut u8) -> usize {
 /// their event that have finished (OVERLAPPED.Internal no longer STATUS_PENDING) get
 /// their sender fixed, before the game reads it.
 fn completed_by_events(handles: &[usize]) {
-    if handles.is_empty() || !ANY_PENDING.load(Ordering::Relaxed) {
+    if handles.is_empty() || EVENT_PENDING.load(Ordering::Relaxed) == 0 {
         return;
     }
     let done: Vec<(usize, bool)> = {
@@ -171,18 +171,25 @@ const WSAID_WSARECVMSG: [u8; 16] = [0xc8, 0xd7, 0x89, 0xf6, 0x1f, 0x6f, 0x6b, 0x
 const WSAID_WSASENDMSG: [u8; 16] = [0x12, 0xe7, 0x41, 0xa4, 0x4f, 0x75, 0xca, 0x43, 0x84, 0xa7, 0x0d, 0xee, 0x44, 0xcf, 0x60, 0x6d];
 
 /// The handles a wait that returned `r` found signalled: all of them for a wait-all, the
-/// one it names otherwise (WAIT_OBJECT_0 + i).
-fn signalled(r: u32, n: u32, handles: *const usize, all: bool) -> Vec<usize> {
+/// one it names otherwise (WAIT_OBJECT_0 + i). Read in place: no copy.
+unsafe fn signalled<'a>(r: u32, n: u32, handles: *const usize, all: bool) -> &'a [usize] {
     if handles.is_null() || r >= n || n > 64 {
-        return Vec::new();
+        return &[];
     }
     let hs = unsafe { std::slice::from_raw_parts(handles, n as usize) };
-    if all { hs.to_vec() } else { vec![hs[r as usize]] }
+    if all { hs } else { &hs[r as usize..r as usize + 1] }
+}
+
+/// Whether a wait could have finished a receive we track: one noted with an event is
+/// pending. Every wait in the game goes through these hooks (render, audio and pool
+/// threads, thousands a second), and nearly always there's none: one atomic load.
+fn waits_matter() -> bool {
+    EVENT_PENDING.load(Ordering::Relaxed) != 0
 }
 
 /// After a wait: fixes what finished, keeping the thread's last error.
-fn after_wait(handles: Vec<usize>) {
-    if handles.is_empty() || !ANY_PENDING.load(Ordering::Relaxed) {
+fn after_wait(handles: &[usize]) {
+    if handles.is_empty() || !waits_matter() {
         return;
     }
     let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
@@ -192,40 +199,40 @@ fn after_wait(handles: Vec<usize>) {
 
 unsafe extern "system" fn detour_wait_one(h: usize, ms: u32) -> u32 {
     let r = unsafe { WAIT_ONE.get().unwrap().call(h, ms) };
-    if r == 0 {
-        after_wait(vec![h]);
+    if r == 0 && waits_matter() {
+        after_wait(&[h]);
     }
     r
 }
 
 unsafe extern "system" fn detour_wait_one_ex(h: usize, ms: u32, alertable: i32) -> u32 {
     let r = unsafe { WAIT_ONE_EX.get().unwrap().call(h, ms, alertable) };
-    if r == 0 {
-        after_wait(vec![h]);
+    if r == 0 && waits_matter() {
+        after_wait(&[h]);
     }
     r
 }
 
 unsafe extern "system" fn detour_wait_many(n: u32, handles: *const usize, all: i32, ms: u32) -> u32 {
     let r = unsafe { WAIT_MANY.get().unwrap().call(n, handles, all, ms) };
-    if ANY_PENDING.load(Ordering::Relaxed) {
-        after_wait(signalled(r, n, handles, all != 0));
+    if waits_matter() {
+        after_wait(unsafe { signalled(r, n, handles, all != 0) });
     }
     r
 }
 
 unsafe extern "system" fn detour_wait_many_ex(n: u32, handles: *const usize, all: i32, ms: u32, alertable: i32) -> u32 {
     let r = unsafe { WAIT_MANY_EX.get().unwrap().call(n, handles, all, ms, alertable) };
-    if ANY_PENDING.load(Ordering::Relaxed) {
-        after_wait(signalled(r, n, handles, all != 0));
+    if waits_matter() {
+        after_wait(unsafe { signalled(r, n, handles, all != 0) });
     }
     r
 }
 
 unsafe extern "system" fn detour_wsa_wait(n: u32, events: *const usize, all: i32, ms: u32, alertable: i32) -> u32 {
     let r = unsafe { WSA_WAIT.get().unwrap().call(n, events, all, ms, alertable) };
-    if ANY_PENDING.load(Ordering::Relaxed) {
-        after_wait(signalled(r, n, events, all != 0));
+    if waits_matter() {
+        after_wait(unsafe { signalled(r, n, events, all != 0) });
     }
     r
 }
@@ -296,6 +303,25 @@ unsafe extern "system" fn detour_sendmsg(s: usize, msg: *const u8, flags: u32, s
 /// lock when there are none.
 static PENDING: LazyLock<Mutex<HashMap<usize, Pending>>> = LazyLock::new(Mutex::default);
 static ANY_PENDING: AtomicBool = AtomicBool::new(false);
+/// How many of those name an event (`Pending::event`): only then can a wait finish one.
+static EVENT_PENDING: AtomicUsize = AtomicUsize::new(0);
+
+/// PENDING changed (`m` is it, locked): the counts the hooks read without the lock.
+fn counted(m: &HashMap<usize, Pending>) {
+    EVENT_PENDING.store(m.values().filter(|p| p.event != 0).count(), Ordering::Relaxed);
+    ANY_PENDING.store(!m.is_empty(), Ordering::Relaxed);
+}
+
+/// One entry in or out (`event`: its event), counted without a pass over the table.
+fn count_event(event: usize, added: bool) {
+    if event != 0 {
+        if added {
+            EVENT_PENDING.fetch_add(1, Ordering::Relaxed);
+        } else {
+            EVENT_PENDING.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
 /// More than this many in flight: the game collects them some way that isn't hooked,
 /// so the table is cleared rather than grown.
 const MAX_PENDING: usize = 4096;
@@ -786,8 +812,12 @@ fn note_pending(ov: usize, p: Pending) {
         log!("ipfwd: {MAX_PENDING} overlapped receives never collected through a hooked call; forgetting them");
         // Not the ones with a completion routine: ours has to find the game's to call.
         m.retain(|_, p| p.routine.is_some());
+        counted(&m);
     }
-    m.insert(ov, p);
+    if let Some(old) = m.insert(ov, p) {
+        count_event(old.event, false);
+    }
+    count_event(p.event, true);
     ANY_PENDING.store(true, Ordering::Relaxed);
 }
 
@@ -797,6 +827,9 @@ fn take_pending(ov: usize) -> Option<Pending> {
     }
     let mut m = crate::sys::lock(&PENDING);
     let p = m.remove(&ov);
+    if let Some(p) = &p {
+        count_event(p.event, false);
+    }
     if m.is_empty() {
         ANY_PENDING.store(false, Ordering::Relaxed);
     }
@@ -808,8 +841,10 @@ fn take_pending(ov: usize) -> Option<Pending> {
 fn overlapped_reused(ov: usize) {
     if ov != 0 && ANY_PENDING.load(Ordering::Relaxed) {
         let mut m = crate::sys::lock(&PENDING);
-        if m.get(&ov).is_some_and(|p| p.routine.is_none()) {
-            m.remove(&ov);
+        if m.get(&ov).is_some_and(|p| p.routine.is_none())
+            && let Some(p) = m.remove(&ov)
+        {
+            count_event(p.event, false);
         }
         if m.is_empty() {
             ANY_PENDING.store(false, Ordering::Relaxed);
@@ -1071,7 +1106,10 @@ mod tests {
         assert!(take_pending(100).is_none());
         assert!(take_pending(9).is_some());
         assert!(take_pending(100 + MAX_PENDING - 1).is_some());
-        crate::sys::lock(&PENDING).clear();
+        let mut m = crate::sys::lock(&PENDING);
+        m.clear();
+        counted(&m);
+        drop(m);
 
         // Left behind (collected unseen), then the OVERLAPPED reused: forgotten, unless
         // a routine of ours still has to run.
@@ -1088,7 +1126,10 @@ mod tests {
         // A sender buffer no longer there isn't read (address 0x1000 is never mapped).
         note_pending(8, plain);
         assert!(completed(8, true).is_some());
-        crate::sys::lock(&PENDING).clear();
+        let mut m = crate::sys::lock(&PENDING);
+        m.clear();
+        counted(&m);
+        drop(m);
     }
 
     /// A receive the game collects by waiting on its OVERLAPPED's event is taken once the
@@ -1103,6 +1144,7 @@ mod tests {
         assert_eq!(unsafe { ov_event(at as *mut u8) }, 0x1234);
         let from = [0u8; 16];
         note_pending(at, Pending { socket: 5, from: from.as_ptr() as usize, cap: 16, routine: None, event: 0x1234 });
+        assert_eq!(EVENT_PENDING.load(Ordering::Relaxed), 1);
         completed_by_events(&[0x1234]);
         assert!(crate::sys::lock(&PENDING).contains_key(&at), "still running");
         ov[0] = 0;
@@ -1111,9 +1153,10 @@ mod tests {
         completed_by_events(&[0x1234]);
         assert!(!crate::sys::lock(&PENDING).contains_key(&at), "finished and waited for");
         let hs = [7usize, 8, 9];
-        assert_eq!(signalled(1, 3, hs.as_ptr(), false), vec![8]);
-        assert_eq!(signalled(0, 3, hs.as_ptr(), true), vec![7, 8, 9]);
-        assert!(signalled(258, 3, hs.as_ptr(), false).is_empty(), "WAIT_TIMEOUT");
+        assert_eq!(unsafe { signalled(1, 3, hs.as_ptr(), false) }, [8]);
+        assert_eq!(unsafe { signalled(0, 3, hs.as_ptr(), true) }, [7, 8, 9]);
+        assert!(unsafe { signalled(258, 3, hs.as_ptr(), false) }.is_empty(), "WAIT_TIMEOUT");
+        assert_eq!(EVENT_PENDING.load(Ordering::Relaxed), 0, "counted out again");
     }
 
     #[test]

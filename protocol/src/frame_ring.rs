@@ -271,6 +271,12 @@ impl RingHeader {
     /// Takes the newest frame of `generation` for sampling (marks it `reading`), or keeps
     /// sampling the slot it already had when the newest is of another generation. None:
     /// no frame of that generation yet.
+    /// The frame `take` would give now, as (slot, seq), without taking it: nothing is
+    /// marked as read, so the hook may still publish a newer one over it.
+    pub fn peek(&self, generation: u32) -> Option<(usize, u32)> {
+        unpack(self.published.load(Ordering::SeqCst)).filter(|p| p.0 == generation).map(|(_, seq, slot)| (slot, seq))
+    }
+
     pub fn take(&self, generation: u32) -> Option<Published> {
         loop {
             let raw = self.published.load(Ordering::SeqCst);

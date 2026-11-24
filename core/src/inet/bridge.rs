@@ -237,6 +237,9 @@ pub(super) fn attach(sh: &Arc<Shared>, addr: SocketAddr, epoch: u64, tcp: TcpStr
                     let Some(s) = ss.get_mut(&addr).filter(|s| s.epoch == epoch) else { return };
                     if s.stream.backlog() < stream::MAX_QUEUED {
                         s.stream.write(&out);
+                        // Sent now, not at the next tick (up to a timer tick, 15.6 ms on
+                        // Windows, on every message's way).
+                        s.flush(&sh.cx(), Instant::now());
                         break;
                     }
                     ss = sh.drained.wait_timeout(ss, Duration::from_millis(50)).unwrap().0;

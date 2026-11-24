@@ -133,11 +133,12 @@ struct Room {
 }
 
 /// A room's Opus state: the encoder for what we send (for one format at a time) and a
-/// decoder for each speaker's format.
+/// decoder for each speaker's format, while they're in the room. Boxed: each is large,
+/// and the table moves its entries as it grows.
 #[derive(Default)]
 pub(crate) struct Opus {
-    enc: Option<((u32, u32), rusty_opus::OpusEncoder)>,
-    dec: HashMap<PeerId, ((u32, u32), rusty_opus::OpusDecoder)>,
+    enc: Option<((u32, u32), Box<rusty_opus::OpusEncoder>)>,
+    dec: HashMap<PeerId, ((u32, u32), Box<rusty_opus::OpusDecoder>)>,
 }
 
 /// Opus's rates, and a frame's length (samples per channel) when it's one Opus takes:
@@ -167,6 +168,12 @@ fn opus_bitrate(rate: u32, channels: u32) -> i32 {
 }
 
 impl Opus {
+    /// A speaker left the room: their decoder goes (kept, the room's 64 would fill with
+    /// players long gone, and no one new would be heard).
+    fn forget(&mut self, peer: &PeerId) {
+        self.dec.remove(peer);
+    }
+
     /// A frame as an OPUS message, when Opus takes it.
     fn encode(&mut self, f: &Frame) -> Option<Vec<u8>> {
         let n = opus_takes(f)?;
@@ -174,7 +181,7 @@ impl Opus {
         if self.enc.as_ref().is_none_or(|(s, _)| *s != shape) {
             let mut e = rusty_opus::OpusEncoder::new(f.rate as i32, f.channels as usize, rusty_opus::Application::Voip).ok()?;
             e.bitrate_bps = opus_bitrate(f.rate, f.channels);
-            self.enc = Some((shape, e));
+            self.enc = Some((shape, Box::new(e)));
         }
         let (_, e) = self.enc.as_mut()?;
         let mut out = vec![0u8; 8 + 1275 * 3];
@@ -212,10 +219,13 @@ impl Opus {
         let shape = (rate, channels);
         if self.dec.get(&from).is_none_or(|(s, _)| *s != shape) {
             if self.dec.len() >= 64 && !self.dec.contains_key(&from) {
+                crate::log::throttled("voice: decoders full", 1, |n| {
+                    crate::log!("voice: a room already decodes 64 speakers: another one isn't heard ({n} packet(s) so far)");
+                });
                 return None;
             }
             let d = rusty_opus::OpusDecoder::new(rate as i32, channels as usize).ok()?;
-            self.dec.insert(from, (shape, d));
+            self.dec.insert(from, (shape, Box::new(d)));
         }
         let (_, d) = self.dec.get_mut(&from)?;
         let mut pcm = vec![0f32; n * channels as usize];
@@ -669,6 +679,7 @@ pub fn on_event(lan: &Lan, ev: &Event) {
             let mut s = crate::sys::lock(&S);
             for r in s.rooms.values_mut() {
                 r.greeted.remove(peer);
+                r.opus.forget(peer);
                 if r.members.remove(peer) {
                     r.events.push_back(RoomEvent::Left(*peer));
                 }
@@ -706,6 +717,7 @@ fn sweep(lan: &Lan) {
             for (p, known) in &strangers {
                 if !known {
                     r.greeted.remove(p);
+                    r.opus.forget(p);
                     if r.members.remove(p) {
                         r.events.push_back(RoomEvent::Left(*p));
                     }
@@ -746,6 +758,7 @@ pub fn pump(lan: &Lan) {
                     reply = kind == JOIN;
                 }
                 LEAVE => {
+                    r.opus.forget(&p.peer);
                     if r.members.remove(&p.peer) {
                         r.events.push_back(RoomEvent::Left(p.peer));
                     }
@@ -1340,6 +1353,8 @@ mod tests {
             let _ = o.decode(p, &b);
         }
         assert!(o.dec.len() <= 1);
+        o.forget(&p);
+        assert!(o.dec.is_empty(), "a speaker who left keeps no decoder");
     }
 
     #[test]

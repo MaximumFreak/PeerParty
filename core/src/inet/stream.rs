@@ -86,6 +86,12 @@ impl Stream {
         self.queued.len() + self.in_flight.len() * MAX_SEG
     }
 
+    /// Whether `poll` has segments to send now (written data the window may take, or a
+    /// resend the acknowledgements asked for), not just an acknowledgement.
+    pub fn wants_send(&self) -> bool {
+        !self.queued.is_empty() || self.in_flight.values().any(|s| s.fast)
+    }
+
     pub fn idle(&self) -> bool {
         self.queued.is_empty() && self.in_flight.is_empty()
     }

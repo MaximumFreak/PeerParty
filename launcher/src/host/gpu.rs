@@ -1163,6 +1163,21 @@ impl Pane {
 /// what each pane draws (slot and content-fence value), and whether that's its current
 /// set's frame taken now (only those are released: an old set's fence means nothing to
 /// the copy now).
+/// Whether `take_frames` would find something new to draw: a pane's copy has published
+/// a frame not drawn yet, or a pane has moved on from its previous set. Takes and uploads
+/// nothing (that's done once, after the wait for room in the swap chain).
+fn any_fresh(panes: &[Pane]) -> bool {
+    panes.iter().any(|p| {
+        let visible = p.draw.dest.width > 0 && p.draw.dest.height > 0;
+        match (p.opened.as_ref(), p.draw.ring.as_ref(), visible) {
+            (Some(o), Some(ring), true) => {
+                ring.header().peek(o.surface.generation).is_some_and(|f| o.last != Some(f)) || (o.last.is_some() && p.previous.is_some())
+            }
+            _ => false,
+        }
+    })
+}
+
 fn take_frames(r: &mut Renderer, panes: &mut [Pane], dirty: &mut bool) -> (bool, Vec<Option<(usize, u64)>>, Vec<bool>) {
     let mut fresh = false;
     let mut take: Vec<Option<(usize, u64)>> = Vec::with_capacity(panes.len());
@@ -1339,7 +1354,7 @@ fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE, pause_on_occl
             occluded = None;
             dirty = true;
         }
-        let (fresh, _, _) = take_frames(r, &mut panes, &mut dirty);
+        let fresh = any_fresh(&panes);
         set_live(shared, &panes, true);
         if !fresh && !dirty {
             continue;
@@ -1348,10 +1363,11 @@ fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE, pause_on_occl
         if !r.waitable.is_null() {
             unsafe { WaitForSingleObjectEx(r.waitable, 100 * sync_interval, 1) };
         }
-        // Taken again once there's room: the frame event woke this for one copy's frame,
-        // and another copy's of this same refresh, published while waiting, is drawn now.
-        // Taken only before the wait, the copy that published second each refresh had its
-        // frame drawn a refresh late, shown twice and skipped as the games' timing drifted.
+        // Taken once there's room (only looked at before the wait): the frame event woke
+        // this for one copy's frame, and another copy's of this same refresh, published
+        // while waiting, is drawn now. Taken only before the wait, the copy that published
+        // second each refresh had its frame drawn a refresh late, shown twice and skipped
+        // as the games' timing drifted; taken both times, each frame was copied twice.
         let (_, take, taken) = take_frames(r, &mut panes, &mut dirty);
         let Some(rtv) = r.target() else {
             lost += 1;

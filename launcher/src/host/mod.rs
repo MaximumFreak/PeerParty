@@ -562,39 +562,74 @@ impl SessionHost {
     }
 
     fn run(mut self) {
+        // When the next whole tick is due. The raw input of a moving mouse wakes the wait
+        // up to a thousand times a second: before then, with no overlay open and no key
+        // or button changed, only the keyboards and mice are published (`kbm_tick`).
+        let mut due = Instant::now();
+        let mut others = self.input.kbm_others();
         loop {
             let open = self.any_open() || self.layout_studio.active;
-            let last_frame = if self.layout_studio.active {
-                self.layout_studio.last_frame
-            } else {
-                self.panes[self.focus].render.last_frame
-            };
-            let timeout = if open && input::pending() {
-                // Input waits: the next frame as soon as the last one is far enough behind.
-                FRAME_GAP.saturating_sub(last_frame.elapsed()).as_millis() as u32
-            } else if open || self.panes.iter().any(|p| p.overlay.has_toasts()) {
-                16
-            } else if self.in_front() {
-                33
-            } else {
-                // Often enough to see a Home / Guide press that can't open the overlay
-                // (`why_not_open`).
-                50
-            };
-            if self.wait(timeout) {
+            let now = Instant::now();
+            if open || now >= due {
+                due = now + Duration::from_millis(self.tick_wait(open).into());
+            }
+            if self.wait(due.saturating_duration_since(now).as_millis() as u32) {
                 break;
             }
-            if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.tick())) {
-                self.panics += 1;
-                if self.panics <= 3 {
-                    let what = e.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| e.downcast_ref::<String>().cloned()).unwrap_or_default();
-                    self.cur().send(&HostMsg::Note { text: format!("overlay: the overlay's host failed a tick ({what}); it carries on") });
+            let o = self.input.kbm_others();
+            if !open && o == others && Instant::now() < due {
+                if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.kbm_tick())) {
+                    self.tick_failed(e);
                 }
+                continue;
+            }
+            others = o;
+            // The next wait starts over from its full length, as after any tick.
+            due = Instant::now();
+            if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.tick())) {
+                self.tick_failed(e);
             }
         }
         input::capture(false);
         input::watch_hotkeys(&[]);
         self.saver.finish();
+    }
+
+    /// A tick panicked: said (the first few times) in the focused copy's log.
+    fn tick_failed(&mut self, e: Box<dyn std::any::Any + Send>) {
+        self.panics += 1;
+        if self.panics <= 3 {
+            let what = e.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| e.downcast_ref::<String>().cloned()).unwrap_or_default();
+            self.cur().send(&HostMsg::Note { text: format!("overlay: the overlay's host failed a tick ({what}); it carries on") });
+        }
+    }
+
+    /// Between ticks: the keyboards and mice as they are now, to the copies they go to
+    /// (`InputHub::publish_kbm`).
+    fn kbm_tick(&mut self) {
+        let focus_cursor = self.input.kbm_focus().and_then(|f| self.compositor.as_ref().and_then(|c| c.cursor_screen(f)));
+        self.input.publish_kbm(&mut self.instances, focus_cursor);
+    }
+
+    /// How long the loop waits before its next tick (ms).
+    fn tick_wait(&self, open: bool) -> u32 {
+        let last_frame = if self.layout_studio.active {
+            self.layout_studio.last_frame
+        } else {
+            self.panes[self.focus].render.last_frame
+        };
+        if open && input::pending() {
+            // Input waits: the next frame as soon as the last one is far enough behind.
+            FRAME_GAP.saturating_sub(last_frame.elapsed()).as_millis() as u32
+        } else if open || self.panes.iter().any(|p| p.overlay.has_toasts()) {
+            16
+        } else if self.in_front() {
+            33
+        } else {
+            // Often enough to see a Home / Guide press that can't open the overlay
+            // (`why_not_open`).
+            50
+        }
     }
 
     /// Waits up to `ms` on the first copy still running, handing the host's windows

@@ -99,8 +99,13 @@ pub(super) static USED_WGI_OTHER: AtomicBool = AtomicBool::new(false);
 
 /// Into the log the first time a split-screen copy's game reads controllers `what` way.
 pub(super) fn first_use(flag: &AtomicBool, what: &str) {
+    first_use_with(flag, || what.to_string());
+}
+
+/// `first_use` with the words made only that first time (not on every call).
+pub(super) fn first_use_with(flag: &AtomicBool, what: impl FnOnce() -> String) {
     if !flag.load(Ordering::Relaxed) && !flag.swap(true, Ordering::Relaxed) {
-        log!("input: the game reads {what}");
+        log!("input: the game reads {}", what());
     }
 }
 
@@ -771,7 +776,7 @@ fn get_state(i: usize, pad: u32, out: *mut u8) -> u32 {
                     rc
                 }
                 Route::Virtual => {
-                    first_use(&USED_XINPUT, &format!("XInput (hook slot {i}): its controller 0 is the virtual pad, the others aren't there"));
+                    first_use_with(&USED_XINPUT, || format!("XInput (hook slot {i}): its controller 0 is the virtual pad, the others aren't there"));
                     if !out.is_null() {
                         let mut buf = [0u8; 16];
                         pack_xinput_state(&snap.pad, &mut buf);
@@ -1358,7 +1363,7 @@ unsafe extern "system" fn raw_input_buffer(data: *mut u8, size: *mut u32, header
     if data.is_null() || n == 0 || n == u32::MAX || matches!(policy(), Policy::PassThrough) {
         return n;
     }
-    first_use(&USED_RAW_BUFFER, &format!("Raw Input in batches (GetRawInputBuffer, {}-byte headers)", batch_layout().0));
+    first_use_with(&USED_RAW_BUFFER, || format!("Raw Input in batches (GetRawInputBuffer, {}-byte headers)", batch_layout().0));
     // `size`: the buffer's size in bytes (the reports are inside it).
     let room = unsafe { size.as_ref() }.map_or(0, |s| *s as usize);
     let kept = unsafe { filter_batch(data, room, n, batch_layout(), keep_raw) };

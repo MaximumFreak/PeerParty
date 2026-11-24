@@ -599,6 +599,10 @@ fn appid_in(text: &str) -> Option<u32> {
 /// A C string that stays valid (Steam's own strings stay valid until the next call).
 pub fn c_str(s: &str) -> *const c_char {
     let mut m = crate::sys::lock(&STRINGS);
+    // Most are asked for again and again: no new key then.
+    if let Some(c) = m.get(s) {
+        return c.as_ptr();
+    }
     m.entry(s.to_string())
         .or_insert_with(|| CString::new(s.replace('\0', "")).unwrap())
         .as_ptr()

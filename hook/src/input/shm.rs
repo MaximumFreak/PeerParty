@@ -25,6 +25,12 @@ static ATTACHED: AtomicBool = AtomicBool::new(false);
 /// Last complete snapshot read, returned if the writer is mid-publish when a reader polls.
 static LAST: Mutex<Option<InputSnapshot>> = Mutex::new(None);
 
+thread_local! {
+    /// This thread's last whole read: the block (its address: views are never unmapped,
+    /// so a new block has another), its sequence and the snapshot.
+    static SEEN: std::cell::Cell<Option<(usize, u32, InputSnapshot)>> = const { std::cell::Cell::new(None) };
+}
+
 /// Fast lock-free check: whether an input SHM block is mapped.
 pub fn attached() -> bool {
     ATTACHED.load(Ordering::Acquire)
@@ -94,8 +100,21 @@ pub(super) fn read_from(header: &InputHeader) -> Option<InputSnapshot> {
         InputMode::PassThrough => Some(InputSnapshot { mode: InputMode::PassThrough, ..Default::default() }),
         InputMode::BlockAll => Some(InputSnapshot { mode: InputMode::BlockAll, ..Default::default() }),
         InputMode::Virtual => {
+            // The session publishes at most a few hundred times a second; the game asks
+            // far more often (every key, every API, every thread). The same sequence as
+            // this thread's last whole read is that snapshot: one atomic load, no lock.
+            let at = header as *const InputHeader as usize;
+            let seq = header.seq.load(Ordering::Acquire);
+            if seq & 1 == 0
+                && let Some((h, s, snap)) = SEEN.try_with(std::cell::Cell::get).ok().flatten()
+                && h == at
+                && s == seq
+            {
+                return Some(snap);
+            }
             for i in 0..TRIES {
                 if let Some(snap) = header.read_stable() {
+                    let _ = SEEN.try_with(|c| c.set(Some((at, snap.seq, snap))));
                     *crate::sys::lock(&LAST) = Some(snap);
                     return Some(snap);
                 }

@@ -204,31 +204,36 @@ impl Devices {
     /// Combined state of every connected keyboard and mouse, for the focused pane of a
     /// split-screen session when it isn't bound to one specific device.
     pub fn combined_kbm(&self, cursor: Option<(i32, i32)>) -> (VirtualKeyboard, VirtualMouse) {
-        let mut kb = VirtualKeyboard { active: true, ..Default::default() };
-        for k in self.keyboards.values() {
-            for (dst, src) in kb.keys.iter_mut().zip(&k.keys) {
-                *dst |= *src;
-            }
-        }
-        let mut ms = VirtualMouse { active: true, ..Default::default() };
-        let mut any_cursor = false;
-        for m in self.mice.values() {
-            ms.buttons |= m.buttons;
-            ms.delta_x = ms.delta_x.wrapping_add(m.delta_x);
-            ms.delta_y = ms.delta_y.wrapping_add(m.delta_y);
-            ms.wheel_delta = ms.wheel_delta.wrapping_add(m.wheel_delta);
-            if !any_cursor {
-                ms.cursor_x = m.cursor_x;
-                ms.cursor_y = m.cursor_y;
-                any_cursor = true;
-            }
-        }
-        if let Some((cx, cy)) = cursor {
-            ms.cursor_x = cx;
-            ms.cursor_y = cy;
-        }
-        (kb, ms)
+        combined(&self.keyboards, &self.mice, cursor)
     }
+}
+
+/// Every keyboard and mouse as one (`Devices::combined_kbm`), from the tables as they are.
+fn combined(keyboards: &HashMap<u64, VirtualKeyboard>, mice: &HashMap<u64, VirtualMouse>, cursor: Option<(i32, i32)>) -> (VirtualKeyboard, VirtualMouse) {
+    let mut kb = VirtualKeyboard { active: true, ..Default::default() };
+    for k in keyboards.values() {
+        for (dst, src) in kb.keys.iter_mut().zip(&k.keys) {
+            *dst |= *src;
+        }
+    }
+    let mut ms = VirtualMouse { active: true, ..Default::default() };
+    let mut any_cursor = false;
+    for m in mice.values() {
+        ms.buttons |= m.buttons;
+        ms.delta_x = ms.delta_x.wrapping_add(m.delta_x);
+        ms.delta_y = ms.delta_y.wrapping_add(m.delta_y);
+        ms.wheel_delta = ms.wheel_delta.wrapping_add(m.wheel_delta);
+        if !any_cursor {
+            ms.cursor_x = m.cursor_x;
+            ms.cursor_y = m.cursor_y;
+            any_cursor = true;
+        }
+    }
+    if let Some((cx, cy)) = cursor {
+        ms.cursor_x = cx;
+        ms.cursor_y = cy;
+    }
+    (kb, ms)
 }
 
 /// What a copy with `assignment` sees now (`overlay_open`: the overlay has the input).
@@ -343,6 +348,9 @@ pub struct Kbm {
     /// Keys and mouse buttons gone down so far (a held key's repeats and the modifiers
     /// not counted): a session sees from it which player plays with the keyboard.
     pub presses: u64,
+    /// Key and mouse button events of any kind so far (ups too): while this stays the
+    /// same, only the mice moved or turned their wheels (`InputHub::publish_kbm`).
+    pub others: u64,
 }
 
 /// Shift, Ctrl, Alt and the Windows keys, either side: held for a hotkey (Ctrl+Alt+1
@@ -368,6 +376,7 @@ impl Kbm {
     pub fn apply(&mut self, e: RawEvent) {
         match e {
             RawEvent::Key { device, vk, down } => {
+                self.others += 1;
                 let k = self.keyboards.entry(device).or_default();
                 if down && !k.is_down(vk) && !modifier(vk) {
                     self.presses += 1;
@@ -391,6 +400,7 @@ impl Kbm {
                 m.cursor_y = m.cursor_y.saturating_add(dy).clamp(0, max(h));
             }
             RawEvent::Buttons { device, down, up } => {
+                self.others += 1;
                 let m = self.mice.entry(device).or_default();
                 if down & !m.buttons != 0 {
                     self.presses += 1;
@@ -428,6 +438,8 @@ pub struct InputHub {
     /// Off Windows (and in tests) the keyboards and mice come in through `apply_raw`.
     #[cfg(not(windows))]
     kbm: Kbm,
+    /// The pane the last `publish_session` gave the combined keyboard and mouse.
+    kbm_focus: Option<usize>,
 }
 
 impl InputHub {
@@ -441,6 +453,7 @@ impl InputHub {
             raw: None,
             #[cfg(not(windows))]
             kbm: Kbm::default(),
+            kbm_focus: None,
         }
     }
 
@@ -493,6 +506,45 @@ impl InputHub {
     /// Keys and mouse buttons pressed so far (`Kbm::presses`).
     pub fn kbm_presses(&mut self) -> u64 {
         self.with_kbm(|k| k.presses)
+    }
+
+    /// Key and button events so far (`Kbm::others`).
+    pub fn kbm_others(&mut self) -> u64 {
+        self.with_kbm(|k| k.others)
+    }
+
+    /// The pane the last whole publish gave the combined keyboard and mouse, if any.
+    pub fn kbm_focus(&self) -> Option<usize> {
+        self.kbm_focus
+    }
+
+    /// Between whole publishes, when only the mice moved (raw input comes up to a
+    /// thousand times a second): each copy's last snapshot with its keyboard and mouse
+    /// as they are now, the rest (controllers, overlay, focus) as last published. No
+    /// controller is read and no device table copied. `focus_cursor` is the focused
+    /// pane's cursor (`publish_session`).
+    pub fn publish_kbm(&mut self, instances: &mut [InstanceConn], focus_cursor: Option<(i32, i32)>) {
+        let focus = self.kbm_focus;
+        let pairs = std::mem::take(&mut self.pairs);
+        self.with_kbm(|k| {
+            for (idx, inst) in instances.iter_mut().enumerate() {
+                let assignment = inst.spec.input_assignment;
+                let Some(block) = inst.input.as_mut() else { continue };
+                // An open overlay's copy (BlockAll) and a pass-through one are left as
+                // they are.
+                let Some(mut s) = block.last.filter(|s| s.mode == InputMode::Virtual) else { continue };
+                if let InputAssignment::KeyboardMouse { device_id } = assignment {
+                    let mouse = pairs.get(&device_id).copied().unwrap_or(device_id);
+                    s.keyboard = k.keyboards.get(&device_id).map(|kb| VirtualKeyboard { active: true, ..*kb }).unwrap_or_default();
+                    s.mouse = k.mice.get(&mouse).map(|m| VirtualMouse { active: true, ..*m }).unwrap_or_default();
+                }
+                if focus == Some(idx) && matches!(assignment, InputAssignment::Controller { .. } | InputAssignment::KeyboardMouse { device_id: ANY_KEYBOARD }) {
+                    (s.keyboard, s.mouse) = combined(&k.keyboards, &k.mice, focus_cursor);
+                }
+                block.publish(&s);
+            }
+        });
+        self.pairs = pairs;
     }
 
     /// The devices now: the controllers as the last poll read them (a packet number
@@ -554,7 +606,8 @@ impl InputHub {
         }
         let devices = self.devices();
         let is_open = |i: usize| open.get(i).copied().unwrap_or(false);
-        let focused_kbm = focus.filter(|&f| !is_open(f)).map(|_| devices.combined_kbm(focus_cursor));
+        self.kbm_focus = focus.filter(|&f| !is_open(f));
+        let focused_kbm = self.kbm_focus.map(|_| devices.combined_kbm(focus_cursor));
         for (idx, inst) in instances.iter_mut().enumerate() {
             let mut snapshot = route(&inst.spec.input_assignment, is_open(idx), &devices);
             if let Some((kb, ms)) = focused_kbm
@@ -826,9 +879,13 @@ mod tests {
         k.apply(RawEvent::Key { device: 1, vk: 0x57, down: false });
         assert!(!k.keyboards[&1].is_down(0x57));
         k.set_bounds(5, 100, 50);
+        // Motion and the wheel aren't "other" events: only they may skip a host tick.
+        let others = k.others;
         for _ in 0..3 {
             k.apply(RawEvent::Motion { device: 5, dx: 40, dy: -10 });
         }
+        k.apply(RawEvent::Wheel { device: 5, delta: 0 });
+        assert_eq!(k.others, others);
         let m = k.mice[&5];
         assert_eq!((m.delta_x, m.delta_y), (120, -30), "the motion, whole");
         assert_eq!((m.cursor_x, m.cursor_y), (99, 0), "the cursor, inside");
@@ -837,6 +894,7 @@ mod tests {
         k.apply(RawEvent::Buttons { device: 5, down: MOUSE_LEFT | MOUSE_RIGHT, up: 0 });
         k.apply(RawEvent::Buttons { device: 5, down: 0, up: MOUSE_LEFT });
         assert_eq!(k.mice[&5].buttons, MOUSE_RIGHT);
+        assert_eq!(k.others, others + 2, "button downs and ups");
         k.apply(RawEvent::Wheel { device: 5, delta: -120 });
         k.apply(RawEvent::Wheel { device: 5, delta: 240 });
         assert_eq!(k.mice[&5].wheel_delta, 120);

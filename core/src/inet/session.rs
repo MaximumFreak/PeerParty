@@ -734,7 +734,14 @@ pub(super) fn on_packet(sh: &Arc<Shared>, ss: &mut HashMap<SocketAddr, Session>,
                 s.probe_until = None;
                 acts.push(Act::Log(format!("{}: direct over IPv6 now ({})", redact::addr(key), tag())));
             }
-            if let Err(e) = frames(s, &cx, &plain, now) {
+            let r = frames(s, &cx, &plain, now);
+            // Acknowledgements may have opened the window for data waiting, or asked for a
+            // resend: sent now, not at the next tick. (An acknowledgement alone waits for
+            // the tick, as a delayed one.)
+            if r.is_ok() && s.stream.wants_send() {
+                s.flush(&cx, now);
+            }
+            if let Err(e) = r {
                 let old = ss.remove(&key).unwrap();
                 let leaving = e == LEAVING;
                 if !e.is_empty() && !leaving {

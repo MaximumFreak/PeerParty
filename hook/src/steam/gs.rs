@@ -545,8 +545,8 @@ pub fn tick() {
     let Some(lan) = lan() else { return };
     let (want, server, advert) = {
         let mut st = crate::sys::lock(&S);
-        let Some(server) = st.server.clone() else { return };
-        let want = listed(&server);
+        let Some(server) = st.server.as_ref() else { return };
+        let want = listed(server);
         let due = st.last_advert.is_none_or(|t| t.elapsed() >= ADVERT_EVERY);
         if want && st.advert.is_some() && !(st.dirty && due) {
             return;
@@ -554,6 +554,8 @@ pub fn tick() {
         if !want && st.advert.is_none() {
             return;
         }
+        // Copied only when the advert changes (this runs on every dispatch).
+        let server = server.clone();
         st.dirty = false;
         st.last_advert = Some(std::time::Instant::now());
         (want, server, st.advert.clone())
