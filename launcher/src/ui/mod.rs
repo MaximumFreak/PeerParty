@@ -824,6 +824,12 @@ impl App {
 
     /// Picks up settings a running game's overlay changed (they live in the same file).
     fn reload_prefs(&mut self) {
+        // Looked at twice a second, not every frame (a file's time is a system call).
+        thread_local!(static CHECKED: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) });
+        if CHECKED.get().is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(500)) {
+            return;
+        }
+        CHECKED.set(Some(std::time::Instant::now()));
         let m = store::Settings::modified();
         if m.is_some() && m != self.settings_seen {
             let loaded = Settings::load();

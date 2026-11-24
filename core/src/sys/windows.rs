@@ -222,6 +222,15 @@ pub fn keepalive(stream: &TcpStream, idle: Duration, every: Duration) -> io::Res
 }
 
 /// A UDP socket on `ip:port` that every copy on this machine can share (SO_REUSEADDR),
+/// Asks for receive and send buffers of `bytes` on `sock` (best effort: the system may
+/// give less). Windows' default is 64 KB, which a burst from several peers overruns.
+pub fn udp_buffers(sock: &UdpSocket, bytes: i32) {
+    use windows_sys::Win32::Networking::WinSock::{SO_RCVBUF, SO_SNDBUF, SOL_SOCKET, setsockopt};
+    for opt in [SO_RCVBUF, SO_SNDBUF] {
+        unsafe { setsockopt(sock.as_raw_socket() as usize, SOL_SOCKET, opt, (&bytes as *const i32).cast(), 4) };
+    }
+}
+
 /// with broadcast on. std can't set SO_REUSEADDR before bind, so this builds the socket
 /// with winsock.
 pub fn shared_udp_socket(ip: Ipv4Addr, port: u16) -> io::Result<UdpSocket> {

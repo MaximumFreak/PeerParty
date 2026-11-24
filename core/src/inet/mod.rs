@@ -616,11 +616,17 @@ pub struct Inet {
     sh: Arc<Shared>,
 }
 
+/// The internet sockets' receive and send buffers (asked for; 64 KB by default on
+/// Windows, a few dozen full packets).
+const UDP_BUFFERS: i32 = 1 << 20;
+
 impl Inet {
     pub fn start(cfg: Config, host: Arc<dyn Host>) -> io::Result<Inet> {
         let bind = if crate::loopback_only() { Ipv4Addr::LOCALHOST } else { Ipv4Addr::UNSPECIFIED };
         let sock = UdpSocket::bind((bind, cfg.port))?;
         sock.set_read_timeout(Some(Duration::from_millis(200)))?;
+        // Every session's packets, the DHT's and STUN's share this socket.
+        crate::sys::udp_buffers(&sock, UDP_BUFFERS);
         let local_port = sock.local_addr()?.port();
         let sock6 = if cfg.ipv6 {
             let b6 = if crate::loopback_only() { Ipv6Addr::LOCALHOST } else { Ipv6Addr::UNSPECIFIED };
@@ -628,6 +634,7 @@ impl Inet {
                 .or_else(|_| UdpSocket::bind((b6, 0)))
                 .ok()
                 .filter(|s| s.set_read_timeout(Some(Duration::from_millis(200))).is_ok())
+                .inspect(|s| crate::sys::udp_buffers(s, UDP_BUFFERS))
         } else {
             None
         };

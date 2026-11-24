@@ -157,6 +157,14 @@ pub fn sockets_of(pid: u32, tcp: bool) -> Option<Vec<SocketAddr>> {
     Some(rows.filter(|(_, inode)| ours.contains(inode)).map(|(addr, _)| addr).collect())
 }
 
+/// Asks for receive and send buffers of `bytes` on `sock` (best effort: the system may
+/// give less, or cap it).
+pub fn udp_buffers(sock: &UdpSocket, bytes: i32) {
+    for opt in [libc::SO_RCVBUF, libc::SO_SNDBUF] {
+        let _ = set_int(sock.as_raw_fd(), libc::SOL_SOCKET, opt, bytes);
+    }
+}
+
 fn set_int(fd: RawFd, level: libc::c_int, opt: libc::c_int, v: libc::c_int) -> io::Result<()> {
     let r = unsafe {
         libc::setsockopt(fd, level, opt, (&v as *const libc::c_int).cast(), size_of::<libc::c_int>() as libc::socklen_t)
