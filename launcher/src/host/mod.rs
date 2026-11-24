@@ -815,6 +815,7 @@ impl SessionHost {
                             format!("session: unmuted player {}'s game audio", i + 1)
                         };
                         inst.send(&HostMsg::Note { text: msg });
+                        self.layout_studio.dirty = true;
                     }
                 }
                 StudioAction::ToggleZoom(i) => {
@@ -829,7 +830,10 @@ impl SessionHost {
                         self.close_layout_studio();
                     }
                 }
-                StudioAction::KeyboardStep(d) => self.keyboard_step(d),
+                StudioAction::KeyboardStep(d) => {
+                    self.keyboard_step(d);
+                    self.layout_studio.dirty = true;
+                }
                 StudioAction::SetSync(on) => {
                     self.sync_frames = on;
                     for inst in &self.instances {
@@ -841,6 +845,7 @@ impl SessionHost {
                         "session: sync games to screen turned off (copies render at their own frame rate)"
                     };
                     self.cur().send(&HostMsg::Note { text: msg.into() });
+                    self.layout_studio.dirty = true;
                 }
                 StudioAction::Save(slots) => {
                     if let Some(c) = self.compositor.as_mut() {

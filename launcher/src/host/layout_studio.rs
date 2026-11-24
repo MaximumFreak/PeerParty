@@ -47,7 +47,7 @@ const PAD_STEP_COARSE: i32 = 500;
 const PAD_STEP_FINE: i32 = 100;
 
 /// Per-player metadata shown in Layout Studio.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlayerInfo {
     pub name: String,
     pub muted: bool,
@@ -56,7 +56,7 @@ pub struct PlayerInfo {
 }
 
 /// Snapshot of session state passed into Layout Studio each frame.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StudioInfo {
     pub players: Vec<PlayerInfo>,
     pub screen: (u32, u32),
@@ -197,6 +197,7 @@ pub struct LayoutStudio {
     window: Option<window::Layered>,
     fonts: bool,
     ppp: f32,
+    last_info: Option<StudioInfo>,
     pub last_frame: Instant,
     pub dirty: bool,
 }
@@ -231,6 +232,7 @@ impl LayoutStudio {
             window: None,
             fonts: false,
             ppp: 1.0,
+            last_info: None,
             last_frame: now,
             dirty: true,
         }
@@ -257,6 +259,7 @@ impl LayoutStudio {
         self.pad_connected = pad.connected;
         self.pad_moving = false;
         self.last_move_tick = Instant::now();
+        self.last_info = None;
         self.repeat.reset();
         let w = (bounds.right - bounds.left).max(1) as usize;
         let h = (bounds.bottom - bounds.top).max(1) as usize;
@@ -434,6 +437,10 @@ impl LayoutStudio {
             return actions;
         }
 
+        if self.last_info.as_ref() != Some(info) {
+            self.dirty = true;
+        }
+
         let want_pointer = !self.using_pad;
         let pointer_changed = moved || want_pointer != self.render.pointer_shown();
         if !self.dirty && !pointer_changed {
@@ -446,6 +453,7 @@ impl LayoutStudio {
 
         if self.dirty {
             self.dirty = false;
+            self.last_info = Some(info.clone());
             let raw = egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, screen)),
                 time: Some(time),
@@ -734,7 +742,7 @@ impl LayoutStudio {
                             let layout_changed = self.slots != self.initial;
                             let sync_changed = info.sync != self.initial_sync;
                             if (layout_changed || sync_changed)
-                                && pill_button(ui, t!("studio.reset"), false, false, None, style, Some(t!("studio.tip_reset")))
+                                && pill_button(ui, t!("studio.reset"), false, false, pad_browse.then_some(Glyph::RStick), style, Some(t!("studio.tip_reset")))
                             {
                                 if layout_changed {
                                     self.slots = self.initial.clone();
@@ -848,6 +856,7 @@ impl LayoutStudio {
                                 }
                                 let mute_txt = if muted { t!("studio.muted") } else { t!("studio.sound") };
                                 if pill_button(ui, mute_txt, muted, false, show_pad.then_some(Glyph::Lt), style, Some(t!("studio.tip_mute"))) {
+                                    self.selected = i;
                                     actions.push(StudioAction::ToggleMute(i));
                                     self.dirty = true;
                                 }
@@ -919,7 +928,7 @@ impl LayoutStudio {
                 }
                 Some(DragMode::Move { pane, start_rect, anchor, .. }) => {
                     let next_rect = apply_move_drag(&self.slots, pane, start_rect, self.cursor - anchor, screen, snap_on);
-                    let swap_target = find_swap_target(&self.slots, pane, self.cursor, screen);
+                    let swap_target = find_swap_target(&self.slots, pane, start_rect, self.cursor, screen);
                     if let Some(DragMode::Move { swap_target: st, .. }) = self.drag.as_mut() {
                         *st = swap_target;
                     }
@@ -1676,10 +1685,16 @@ fn apply_move_drag(slots: &[PaneSlot], pane: usize, start: NormRect, delta: Vec2
     NormRect::clamped(x, y, start.w, start.h)
 }
 
-fn find_swap_target(slots: &[PaneSlot], dragging: usize, pt: Pos2, screen: Vec2) -> Option<usize> {
+fn find_swap_target(slots: &[PaneSlot], dragging: usize, start_rect: NormRect, pt: Pos2, screen: Vec2) -> Option<usize> {
+    let drag_area = rect_area(start_rect);
     let mut order: Vec<usize> = (0..slots.len()).filter(|&i| i != dragging).collect();
     order.sort_by_key(|&i| (slots[i].z, i));
     order.into_iter().rev().find(|&i| {
+        // A floating PiP pane dragged over the larger background pane it already sat on top
+        // of should move freely rather than snapping into a swap with the background.
+        if rects_overlap(start_rect, slots[i].rect) && drag_area < rect_area(slots[i].rect) {
+            return false;
+        }
         let r = norm_to_egui(slots[i].rect, screen);
         // Center 65% of the other pane acts as a clear swap drop zone.
         let inner = Rect::from_center_size(r.center(), r.size() * 0.65);
@@ -1687,7 +1702,9 @@ fn find_swap_target(slots: &[PaneSlot], dragging: usize, pt: Pos2, screen: Vec2)
     })
 }
 
-/// Raises `pane` above every other pane in Z-order (compactly re-indexed 0..N).
+/// Raises `pane` above every other pane in Z-order (compactly re-indexed 0..N), while
+/// keeping smaller floating PiP panes that sit completely inside `pane` above it so
+/// clicking the background pane never hides PiP windows behind it.
 fn bring_to_front(slots: &mut [PaneSlot], pane: usize) {
     if slots.len() <= 1 || pane >= slots.len() {
         return;
@@ -1699,16 +1716,25 @@ fn bring_to_front(slots: &mut [PaneSlot], pane: usize) {
     if !overlaps {
         return;
     }
-    let max_z = slots.iter().map(|s| s.z).max().unwrap_or(0);
-    if slots[pane].z <= max_z {
-        slots[pane].z = max_z.saturating_add(1);
-    }
-    // Re-normalize Z to 0..slots.len() so u8 never saturates.
+    let pane_rect = slots[pane].rect;
+    let pane_area = rect_area(pane_rect);
     let mut ord: Vec<usize> = (0..slots.len()).collect();
-    ord.sort_by_key(|&i| (slots[i].z, i == pane));
+    ord.sort_by_key(|&i| {
+        let enclosed_pip = i != pane && rect_contains(pane_rect, slots[i].rect) && rect_area(slots[i].rect) < pane_area;
+        let bucket = if enclosed_pip { 2u8 } else if i == pane { 1 } else { 0 };
+        (bucket, slots[i].z, i)
+    });
     for (rank, i) in ord.into_iter().enumerate() {
         slots[i].z = rank as u8;
     }
+}
+
+fn rect_area(r: NormRect) -> u32 {
+    u32::from(r.w) * u32::from(r.h)
+}
+
+fn rect_contains(outer: NormRect, inner: NormRect) -> bool {
+    outer.x <= inner.x && outer.y <= inner.y && outer.right() >= inner.right() && outer.bottom() >= inner.bottom()
 }
 
 fn rects_overlap(a: NormRect, b: NormRect) -> bool {
@@ -1823,6 +1849,42 @@ mod tests {
 
         // B in Browse mode closes Studio.
         assert!(s.handle_pad(StudioPad { buttons: pad::EAST, ..idle }, &info, &mut actions));
+    }
+
+    #[test]
+    fn pip_drag_moves_freely_without_swapping_into_background() {
+        let mut slots = LayoutPreset::pip_slots(3);
+        let screen = vec2(1920.0, 1080.0);
+        // Dragging PiP pane 1 across the middle of fullscreen pane 0 does NOT swap with pane 0.
+        assert_eq!(find_swap_target(&slots, 1, slots[1].rect, pos2(960.0, 540.0), screen), None);
+        // Dragging PiP pane 1 directly onto PiP pane 2 DOES swap them.
+        let p2_center = norm_to_egui(slots[2].rect, screen).center();
+        assert_eq!(find_swap_target(&slots, 1, slots[1].rect, p2_center, screen), Some(2));
+        // Dragging fullscreen pane 0 onto PiP pane 1 DOES swap them, and clicking pane 0
+        // never buries the enclosed PiP panes behind it.
+        bring_to_front(&mut slots, 0);
+        assert!(slots[1].z > slots[0].z && slots[2].z > slots[0].z, "PiP panes stay above fullscreen background");
+        let p1_center = norm_to_egui(slots[1].rect, screen).center();
+        assert_eq!(find_swap_target(&slots, 0, slots[0].rect, p1_center, screen), Some(1));
+    }
+
+    #[test]
+    fn external_info_change_marks_studio_dirty_immediately() {
+        crate::i18n::set("en");
+        let mut s = LayoutStudio::new();
+        let bounds = ScreenRect { left: 0, top: 0, right: 1280, bottom: 720 };
+        let idle = StudioPad { connected: true, style: pad::Style::Xbox, ..Default::default() };
+        s.open(LayoutPreset::Horizontal.to_slots(2), 0, true, bounds, 1.0, idle);
+        let mut info = test_info(2);
+        s.last_info = Some(info.clone());
+        s.dirty = false;
+
+        // Simulating Sync or Mute toggled by host after tick() returned: next tick sees new info.
+        info.sync = false;
+        assert_ne!(s.last_info.as_ref(), Some(&info));
+        s.last_info = Some(info.clone());
+        info.players[0].muted = true;
+        assert_ne!(s.last_info.as_ref(), Some(&info));
     }
 
     #[test]

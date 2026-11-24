@@ -260,6 +260,15 @@ impl Gpu {
     /// The thread for window `hwnd`. Nothing is made on the GPU until a copy's textures
     /// come.
     pub fn start(hwnd: HWND) -> Option<Gpu> {
+        Gpu::start_inner(hwnd, true)
+    }
+
+    #[cfg(test)]
+    fn start_for_test(hwnd: HWND) -> Option<Gpu> {
+        Gpu::start_inner(hwnd, false)
+    }
+
+    fn start_inner(hwnd: HWND, pause_on_occluded: bool) -> Option<Gpu> {
         let event_name = format!(r"Local\peerparty-frames-{}-{}", std::process::id(), token());
         // Auto-reset: one wake per burst of frames.
         let frames = unsafe { CreateEventW(std::ptr::null(), 0, 0, wide(&event_name).as_ptr()) };
@@ -275,7 +284,7 @@ impl Gpu {
         let shared = Arc::new(Shared { want: Mutex::new((0, Vec::new())), live: Mutex::new(Vec::new()), quit: AtomicBool::new(false) });
         let (frames, wake) = (Arc::new(Handle(frames)), Arc::new(Handle(wake)));
         let (s, f, w, h) = (shared.clone(), frames.clone(), wake.clone(), hwnd as usize);
-        let thread = std::thread::Builder::new().name("peerparty-compositor".into()).spawn(move || run(h, &s, f.0, w.0)).ok()?;
+        let thread = std::thread::Builder::new().name("peerparty-compositor".into()).spawn(move || run(h, &s, f.0, w.0, pause_on_occluded)).ok()?;
         Some(Gpu { shared, wake, frames, event_name, thread: Some(thread), left_running: false })
     }
 
@@ -1139,7 +1148,7 @@ fn take_frames(r: &mut Renderer, panes: &mut [Pane], dirty: &mut bool) -> (bool,
     (fresh, take, taken)
 }
 
-fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE) {
+fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE, pause_on_occluded: bool) {
     let hwnd = hwnd as HWND;
     let mut panes: Vec<Pane> = Vec::new();
     let mut seen = u64::MAX;
@@ -1301,7 +1310,7 @@ fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE) {
         let drawn = r.draw(rtv, &panes, &take);
         // IDXGISwapChain::Present (8): vsync.
         let hr = vcall!(r.swap, 8, fn(u32, u32) -> i32, 1, 0);
-        if hr == DXGI_STATUS_OCCLUDED && occluded.is_none() {
+        if pause_on_occluded && hr == DXGI_STATUS_OCCLUDED && occluded.is_none() {
             eprintln!("peerparty: session: the window can't be seen (the screen is locked, or a full-screen window covers it); nothing is drawn until it can");
             occluded = Some(std::time::Instant::now());
             set_live(shared, &panes, false);
@@ -1499,7 +1508,9 @@ mod tests {
             stride: 0,
         };
         let surface = Arc::new(SharedSurface::duplicate(&m).expect("handles duplicated"));
-        let gpu = Gpu::start(hwnd).expect("the drawing thread");
+        // Test window isn't shown on an interactive desktop (and may run on an isolated
+        // non-input desktop where Present returns DXGI_STATUS_OCCLUDED).
+        let gpu = Gpu::start_for_test(hwnd).expect("the drawing thread");
         gpu.set(vec![PaneDraw { dest: PaneRect { x: 0, y: 0, width: 128, height: 64 }, uv: FULL_UV, z: 0, ring: Some(ring.clone()), surface: Some(surface) }]);
         let start = std::time::Instant::now();
         while !(gpu.live(0) && ring.header().presents.load(Ordering::SeqCst) > 0) {
