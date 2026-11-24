@@ -476,6 +476,13 @@ impl Settings {
         Some(s)
     }
 
+    /// These settings (ours, edited since `base` was read) with what another process
+    /// saved since (`disk`, the file as it is now): ours where we changed something,
+    /// the file's everywhere else. The same merge `save_over` writes.
+    pub fn merged_with(&self, base: &Settings, disk: &Settings) -> Settings {
+        merge3_into(base, self, disk).unwrap_or_else(|| self.clone())
+    }
+
     /// Saves what changed here since `base` (what this window last read or wrote) over
     /// the file as it is now, under the lock: a change another writer made meanwhile
     /// stays. Returns the settings as saved, the next save's `base`.
@@ -682,6 +689,20 @@ mod tests {
         assert_eq!(new.ui_version, UI_VERSION);
         assert!(!new.onboarded);
         assert!(Settings::default().prefs.effects && Settings::default().prefs.language.is_empty());
+    }
+
+    /// A game's options another process saved (a session's Layout Studio) come into the
+    /// window's settings, and the window's own unsaved edits stay.
+    #[test]
+    fn options_saved_elsewhere_are_taken_in() {
+        let base = Settings::default();
+        let mut ours = base.clone();
+        ours.second_delay = 30;
+        let mut disk = base.clone();
+        disk.games.insert("game.exe".into(), GameOptions { split_screen: true, split_fps: crate::launch::FpsCap::Divisor(2), ..GameOptions::default() });
+        let merged = ours.merged_with(&base, &disk);
+        assert_eq!(merged.second_delay, 30, "our edit");
+        assert_eq!(merged.games.get("game.exe").map(|g| g.split_fps), Some(crate::launch::FpsCap::Divisor(2)), "the session's save");
     }
 
     /// Settings that don't read are set aside, not lost to the next save.

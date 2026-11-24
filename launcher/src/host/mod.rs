@@ -936,6 +936,13 @@ impl SessionHost {
                     self.panes_stale = true;
                 }
                 StudioAction::SaveSync(mode) => {
+                    let what = match mode {
+                        StudioSync::Full => "full display refresh",
+                        StudioSync::Half => "1/2 display refresh",
+                        StudioSync::Third => "1/3 display refresh",
+                        StudioSync::Off => "off",
+                    };
+                    self.cur().send(&HostMsg::Note { text: format!("session: VSync saved as this game's setting ({what}); the next start uses it") });
                     let key = self.key.clone();
                     crate::ui::store::Settings::update(|s| {
                         let g = s.games.entry(key).or_default();

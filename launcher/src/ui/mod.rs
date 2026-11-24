@@ -837,8 +837,16 @@ impl App {
                 return;
             }
             self.settings_seen = m;
-            self.settings.prefs = loaded.prefs.clone();
-            self.settings_base.prefs = loaded.prefs;
+            // All of it, not just the preferences: a split-screen session's Layout
+            // Studio saves a game's layout and VSync, and the next start from this
+            // window built its command line from the options as they were before.
+            let merged = self.settings.merged_with(&self.settings_base, &loaded);
+            let games_changed = merged.games != self.settings.games;
+            self.settings = merged;
+            self.settings_base = loaded;
+            if games_changed {
+                eprintln!("peerparty: settings: game options changed in ui.json by another PeerParty (a session's Layout Studio, say): taken in");
+            }
         }
     }
 
