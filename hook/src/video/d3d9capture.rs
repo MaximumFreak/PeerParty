@@ -16,8 +16,10 @@
 //! Both copy into BGRA (A8R8G8B8): `StretchRect` converts the back buffer's format and
 //! resolves a multisampled one.
 //!
-//! Plain Direct3D 9 can also be drawn through DXVK instead (`redirect`, opt-in with
-//! `PEERPARTY_DXVK`): its frames then come through Vulkan, with no copy on the CPU.
+//! In a split-screen copy the game's Direct3DCreate9(Ex) are hooked when d3d9.dll loads
+//! (`redirect`), so the Direct3D 9 hooks are in before its device is made. Plain
+//! Direct3D 9 can also be drawn through DXVK instead (opt-in with `PEERPARTY_DXVK`): its
+//! frames then come through Vulkan, with no copy on the CPU.
 
 use std::sync::OnceLock;
 
@@ -409,24 +411,33 @@ fn dxvk_dll(setting: &str, peerparty_dir: Option<&std::path::Path>) -> Vec<std::
 /// Where DXVK's d3d9.dll is, and the game's own d3d9.dll (set by `redirect`).
 static DXVK_PATH: OnceLock<(std::path::PathBuf, usize)> = OnceLock::new();
 
-/// The game's d3d9.dll (`system`) loaded in a split-screen copy, with `PEERPARTY_DXVK`
-/// set: its `Direct3DCreate9` and `Direct3DCreate9Ex` will make DXVK's devices, so the
-/// game draws through Vulkan and its frames reach the session as Vulkan ones do. Not under
-/// Wine, where d3d9.dll is already DXVK's or Wine's own.
+/// The game's d3d9.dll (`system`) loaded in a split-screen copy: its `Direct3DCreate9`
+/// and `Direct3DCreate9Ex` are hooked, so the Direct3D 9 hooks go in at the game's first
+/// call (`early_hooks`), before it makes its device. Otherwise a game that makes its
+/// device fullscreen in its first second, before the session asked for its frames, got a
+/// real fullscreen one: Direct3D put its window at the monitor's corner, on top of the
+/// session's window. With `PEERPARTY_DXVK` set (not under Wine, where d3d9.dll is already
+/// DXVK's or Wine's own), they make DXVK's devices instead, so the game draws through
+/// Vulkan and its frames reach the session as Vulkan ones do.
 ///
 /// This runs in the load notification, under the loader lock: only the two entry points
 /// are hooked here. DXVK itself is loaded at the game's first call (`dxvk`).
 pub fn redirect(system: windows_sys::Win32::Foundation::HMODULE) {
-    if crate::sys::wine::is_wine() || !crate::window::compositor_capture() || DXVK_PATH.get().is_some() {
+    if !crate::window::compositor_capture() || CREATE9.get().is_some() || CREATE9EX.get().is_some() {
         return;
     }
-    let Ok(setting) = std::env::var(peerparty_protocol::env::DXVK) else { return };
-    let local = crate::util::local_store::peerparty_dir();
-    let Some(path) = dxvk_dll(&setting, local.as_deref()).into_iter().find(|p| p.is_file()) else {
-        log!("video: PEERPARTY_DXVK is set, but no DXVK d3d9.dll for this game's architecture is there; Direct3D 9 is drawn as it is");
-        return;
-    };
-    let _ = DXVK_PATH.set((path.clone(), system as usize));
+    if !crate::sys::wine::is_wine()
+        && let Ok(setting) = std::env::var(peerparty_protocol::env::DXVK)
+    {
+        let local = crate::util::local_store::peerparty_dir();
+        match dxvk_dll(&setting, local.as_deref()).into_iter().find(|p| p.is_file()) {
+            Some(path) => {
+                log!("video: Direct3D 9 is to be drawn through DXVK ({}): it loads at the game's first Direct3DCreate9", path.display());
+                let _ = DXVK_PATH.set((path, system as usize));
+            }
+            None => log!("video: PEERPARTY_DXVK is set, but no DXVK d3d9.dll for this game's architecture is there; Direct3D 9 is drawn as it is"),
+        }
+    }
     let mut n = 0;
     crate::sys::hook::with_lock(|| {
         if let Some(a) = com::proc(system, c"Direct3DCreate9") {
@@ -444,7 +455,28 @@ pub fn redirect(system: windows_sys::Win32::Foundation::HMODULE) {
             }
         }
     });
-    log!("video: Direct3D 9 is to be drawn through DXVK ({}): {n} of 2 entry points hooked; it loads at the game's first Direct3DCreate9", path.display());
+    log!("video: d3d9.dll loaded in a split-screen copy: {n} of 2 entry points hooked; the Direct3D 9 hooks go in at the game's first Direct3DCreate9");
+}
+
+thread_local! {
+    /// Inside `early_hooks`: its own Direct3DCreate9 (the hooks are found through a
+    /// throwaway device) goes straight through.
+    static EARLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The game made its first Direct3D 9 object: the present, reset and device-creation
+/// hooks go in now, on its thread (outside the loader lock), so the device it makes next
+/// is made windowed in its pane and its frames are seen from the first.
+fn early_hooks() {
+    if EARLY.with(|e| e.replace(true)) {
+        return;
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        log!("video: the game makes its first Direct3D 9 object: its hooks go in before it makes a device");
+        super::super::ensure_viewport_hooks();
+    });
+    EARLY.with(|e| e.set(false));
 }
 
 /// DXVK's two entry points, loaded the first time the game makes a Direct3D 9 object
@@ -471,22 +503,34 @@ fn dxvk() -> Option<(usize, usize)> {
 static DXVK: OnceLock<Option<(usize, usize)>> = OnceLock::new();
 
 unsafe extern "system" fn create9(version: u32) -> usize {
+    if EARLY.with(|e| e.get()) {
+        return unsafe { CREATE9.get().unwrap().call(version) };
+    }
     match dxvk() {
         Some((c9, _)) => {
             let f: Create9 = unsafe { std::mem::transmute(c9) };
             unsafe { f(version) }
         }
-        None => unsafe { CREATE9.get().unwrap().call(version) },
+        None => {
+            early_hooks();
+            unsafe { CREATE9.get().unwrap().call(version) }
+        }
     }
 }
 
 unsafe extern "system" fn create9ex(version: u32, out: *mut usize) -> i32 {
+    if EARLY.with(|e| e.get()) {
+        return unsafe { CREATE9EX.get().unwrap().call(version, out) };
+    }
     match dxvk() {
         Some((_, c9ex)) => {
             let f: Create9Ex = unsafe { std::mem::transmute(c9ex) };
             unsafe { f(version, out) }
         }
-        None => unsafe { CREATE9EX.get().unwrap().call(version, out) },
+        None => {
+            early_hooks();
+            unsafe { CREATE9EX.get().unwrap().call(version, out) }
+        }
     }
 }
 
