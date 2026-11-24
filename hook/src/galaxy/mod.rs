@@ -215,14 +215,15 @@ fn sections(base: usize) -> Vec<(usize, usize, u32)> {
     }
 }
 
-fn find_all(hay: &[u8], needle: &[u8]) -> Vec<usize> {
-    hay.windows(needle.len()).enumerate().filter(|(_, w)| *w == needle).map(|(i, _)| i).collect()
+/// Where `needle` first is in `hay` (the scan stops there).
+fn find_first(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 /// The DLL's file version (1.152.6 for Galaxy 1.152.6.0), from its VS_FIXEDFILEINFO.
 fn file_version(base: usize) -> Option<(u32, u32, u32)> {
     let img = image(base);
-    let at = find_all(img, &0xFEEF_04BDu32.to_le_bytes()).into_iter().next()?;
+    let at = find_first(img, &0xFEEF_04BDu32.to_le_bytes())?;
     let ms = u32::from_le_bytes(img.get(at + 8..at + 12)?.try_into().ok()?);
     let ls = u32::from_le_bytes(img.get(at + 12..at + 16)?.try_into().ok()?);
     Some((ms >> 16, ms & 0xffff, ls >> 16))
@@ -272,7 +273,7 @@ fn rtti_slots(base: usize, class: &str) -> Option<usize> {
     let img = image(base);
     let ptr = size_of::<usize>();
     let name = format!(".?AV{class}@api@galaxy@@\0");
-    let at = find_all(img, name.as_bytes()).into_iter().next()?;
+    let at = find_first(img, name.as_bytes())?;
     let td = at - 2 * ptr;
     let secs = sections(base);
     let data: Vec<(usize, usize)> = secs.iter().filter(|s| s.2 & 0x4000_0000 != 0 && s.2 & 0x2000_0000 == 0).map(|s| (s.0, s.1)).collect();

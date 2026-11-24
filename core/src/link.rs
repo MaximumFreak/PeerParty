@@ -40,6 +40,9 @@ const RESEND_EVERY: Duration = Duration::from_secs(1);
 fn size(m: &Msg) -> usize {
     match m {
         Msg::ChanData { socket, data, .. } => socket.len() + data.len() + 16,
+        // Its stream, two ids and the data's length: what `encode` writes, near enough
+        // for a budget (the same both ways).
+        Msg::Relay { data, .. } => data.len() + 48,
         _ => m.encode().len(),
     }
 }

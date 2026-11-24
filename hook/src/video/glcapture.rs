@@ -104,6 +104,10 @@ fn fns() -> Option<Fns> {
         luid: ext(c"glGetUnsignedBytevEXT").map(|p| unsafe { std::mem::transmute(p) }),
     })
 }
+/// How many frames a new multisampled resolve is checked for GL errors: it works from the
+/// first or not at all, and each check (glGetError) waits for the GL pipeline.
+const RESOLVE_CHECKS: u32 = 3;
+
 
 /// One device context's capture, inside PeerParty's own context on it.
 pub struct GlCapture {
@@ -120,6 +124,8 @@ pub struct GlCapture {
     /// A multisampled back buffer's resolve: the texture (of its format) and its
     /// framebuffer.
     resolve: Option<(u32, u32)>,
+    /// Frames the resolve has been checked for errors in (`RESOLVE_CHECKS`).
+    resolve_checks: u32,
     /// Its context is gone or can't be made current: no GL call is made when it's dropped.
     gl_gone: bool,
 }
@@ -148,7 +154,7 @@ impl GlCapture {
         }
         let mut fbo = 0u32;
         unsafe { (fns.gen_framebuffers)(1, &mut fbo) };
-        Some(GlCapture { fns, private, interop, ring: None, shared: None, fbo, made_for: (0, 0, 0), resolve: None, gl_gone: false })
+        Some(GlCapture { fns, private, interop, ring: None, shared: None, fbo, made_for: (0, 0, 0), resolve: None, resolve_checks: 0, gl_gone: false })
     }
 
     /// Lets go of it without a GL call (its context is gone, or isn't current and can't
@@ -230,6 +236,7 @@ impl GlCapture {
                 (f.bind_framebuffer)(DRAW_FRAMEBUFFER, 0);
             }
             self.resolve = Some((tex, fbo));
+            self.resolve_checks = 0;
             log!("video: the OpenGL back buffer is multisampled: resolved (format {format:#x}) before it's copied");
         }
         let Some(ring) = D3d11Ring::new(self.private.0, w, h, 87, 0x08 | 0x20) else { return false };
@@ -277,10 +284,18 @@ impl GlCapture {
             (f.bind_framebuffer)(READ_FRAMEBUFFER, 0);
             (f.read_buffer)(BACK);
             if let Some((_, resolve)) = self.resolve {
-                while (f.get_error)() != 0 {}
+                let check = self.resolve_checks < RESOLVE_CHECKS;
+                if check {
+                    while (f.get_error)() != 0 {}
+                }
                 (f.bind_framebuffer)(DRAW_FRAMEBUFFER, resolve);
                 (f.blit)(0, 0, wi, hi, 0, 0, wi, hi, COLOR_BUFFER_BIT, NEAREST);
-                let e = (f.get_error)();
+                let e = if check {
+                    self.resolve_checks += 1;
+                    (f.get_error)()
+                } else {
+                    0
+                };
                 if e != 0 {
                     (f.bind_framebuffer)(DRAW_FRAMEBUFFER, 0);
                     (f.unlock)(self.interop, 1, &obj);
@@ -425,8 +440,9 @@ impl GlReadback {
     /// Hands over the reads the GPU finished, oldest first.
     fn collect(&mut self) {
         let f = &self.fns;
-        let mut order: Vec<usize> = (0..2).filter(|&i| self.buffers[i].1 != 0).collect();
-        order.sort_by_key(|&i| self.buffers[i].2);
+        let order = if self.buffers[1].2 < self.buffers[0].2 { [1, 0] } else { [0, 1] };
+        let busy = order.map(|i| self.buffers[i].1 != 0);
+        let order = order.into_iter().zip(busy).filter_map(|(i, b)| b.then_some(i));
         let (w, h) = self.size;
         let row = w as usize * 4;
         for i in order {

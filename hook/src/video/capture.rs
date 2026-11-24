@@ -781,9 +781,9 @@ impl D3d11Readback {
     fn capture(&mut self, backbuffer: usize) {
         // Hand over what's done, oldest first: D3D11_MAP_READ with DO_NOT_WAIT answers
         // DXGI_ERROR_WAS_STILL_DRAWING until then.
-        let mut order: Vec<usize> = (0..2).filter(|&i| self.staging[i].1 != 0).collect();
-        order.sort_by_key(|&i| self.staging[i].1);
-        for i in order {
+        let order = if self.staging[1].1 < self.staging[0].1 { [1, 0] } else { [0, 1] };
+        let busy = order.map(|i| self.staging[i].1 != 0);
+        for i in order.into_iter().zip(busy).filter_map(|(i, b)| b.then_some(i)) {
             #[repr(C)]
             struct Mapped {
                 data: *const u8,

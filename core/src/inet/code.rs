@@ -181,8 +181,13 @@ impl RoomCode {
     }
 
     pub fn is_public(&self) -> bool {
-        let h = Sha256::digest(b"peerparty public sessions v1");
-        self.secret[..] == h[..SECRET_LEN]
+        // Worked out once: it's asked every few hundred milliseconds.
+        static PUBLIC: std::sync::OnceLock<[u8; SECRET_LEN]> = std::sync::OnceLock::new();
+        let public = PUBLIC.get_or_init(|| {
+            let h = Sha256::digest(b"peerparty public sessions v1");
+            h[..SECRET_LEN].try_into().unwrap()
+        });
+        self.secret == *public
     }
 
     /// The DHT info-hash a room's copies of `game` meet on in hour `slot`. Only someone

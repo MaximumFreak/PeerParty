@@ -13,14 +13,17 @@ test-util = []
 [dependencies]
 # Internet play (src/inet): pure-Rust crypto, built for x64 and the 32-bit hook alike.
 chacha20poly1305 = "0.10"
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+# No precomputed base-point tables (dalek's default): about 50 KB in each of the launcher
+# and the two hooks, for key exchanges and signatures made once a connection or advert,
+# never per packet.
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
 sha2 = "0.10"
 sha1 = "0.10"
 hkdf = "0.12"
 hmac = "0.12"
 getrandom = "0.2"
-# Public sessions: each player's long-term signing key.
-ed25519-dalek = "2"
+# Public sessions: each player's long-term signing key (no precomputed tables either).
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"] }
 # Wipes key material we hold in plain arrays (the dalek and chacha types wipe their own).
 zeroize = "1"
 
