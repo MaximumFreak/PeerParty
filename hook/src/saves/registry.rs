@@ -246,6 +246,87 @@ pub fn subkey_w(key: isize, sub: *const u16) -> Option<(isize, Vec<u16>)> {
     if sub.is_null() { None } else { own_w(key, sub, false) }
 }
 
+/// A later player's game keys start with the engine's record of the build's screen
+/// defaults that player 1's hold (Unity's `Screenmanager … Default_h…`). Unity compares it
+/// with the build's at start: with none, it takes any saved screen size as stale and
+/// starts at the build's, never asking for the saved one, which a copy in a pane answers
+/// with its pane's (screen_prefs.rs). The values are the build's, the same for every
+/// player: none of player 1's settings or progress come with them.
+pub fn seed_build_defaults() {
+    let Some(st) = vfs::state().filter(|s| s.slot != 0) else { return };
+    BUSY.with(|b| b.set(true));
+    let r = std::panic::catch_unwind(|| {
+        for k in vfs::noted_registry().iter().take(16) {
+            let Some(rest) = layout::game_registry_key(k) else { continue };
+            let mine = format!("{}\\{}", layout::registry_key(&st.game, st.slot), rest);
+            seed_key(k, &mine, st.slot);
+        }
+    });
+    BUSY.with(|b| b.set(false));
+    if r.is_err() {
+        log!("saves: copying the engine's screen defaults to player {}'s keys failed", st.slot + 1);
+    }
+}
+
+/// `seed_build_defaults` for one key: player 1's `real`, the player's own `mine`.
+fn seed_key(real: &str, mine: &str, slot: u32) {
+    use crate::screen_prefs::{Screen, screen_value};
+    use windows_sys::Win32::System::Registry::{HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_DWORD, REG_OPTION_NON_VOLATILE, RegCloseKey, RegCreateKeyExW, RegEnumValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW};
+    let w = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+    let mut h: HKEY = std::ptr::null_mut();
+    if unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, w(real).as_ptr(), 0, KEY_READ, &mut h) } != 0 {
+        return;
+    }
+    let (mut defaults, mut screen) = (Vec::new(), false);
+    for i in 0..4096 {
+        let mut name = [0u16; 256];
+        let (mut name_len, mut kind, mut v, mut len) = (name.len() as u32, 0u32, 0u32, 4u32);
+        let rc = unsafe { RegEnumValueW(h, i, name.as_mut_ptr(), &mut name_len, std::ptr::null(), &mut kind, (&mut v as *mut u32).cast(), &mut len) };
+        const ERROR_MORE_DATA: u32 = 234;
+        if rc == ERROR_MORE_DATA {
+            continue;
+        }
+        if rc != 0 {
+            break;
+        }
+        let n = String::from_utf16_lossy(&name[..name_len as usize]);
+        match screen_value(&n) {
+            Some(Screen::Default) if kind == REG_DWORD && len == 4 => defaults.push((n, v)),
+            Some(_) => screen = true,
+            None => {}
+        }
+    }
+    unsafe { RegCloseKey(h) };
+    if defaults.is_empty() {
+        if screen {
+            log!("saves: player 1's HKCU\\{real} has the engine's saved screen size but not its record of the build's defaults: player {} starts at the build's size until its copy has run once", slot + 1);
+        }
+        return;
+    }
+    let mut mh: HKEY = std::ptr::null_mut();
+    if unsafe { RegCreateKeyExW(HKEY_CURRENT_USER, w(mine).as_ptr(), 0, std::ptr::null(), REG_OPTION_NON_VOLATILE, KEY_READ | KEY_WRITE, std::ptr::null(), &mut mh, std::ptr::null_mut()) } != 0 {
+        log!("saves: player {}'s HKCU\\{mine} couldn't be made for the engine's screen defaults", slot + 1);
+        return;
+    }
+    let mut copied = Vec::new();
+    for (n, v) in &defaults {
+        let name = w(n);
+        let mut len = 0u32;
+        if unsafe { RegQueryValueExW(mh, name.as_ptr(), std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut(), &mut len) } == 0 {
+            continue;
+        }
+        if unsafe { RegSetValueExW(mh, name.as_ptr(), 0, REG_DWORD, (v as *const u32).cast(), 4) } == 0 {
+            copied.push(format!("{}={v}", n.split("_h").next().unwrap_or(n).trim_start_matches("Screenmanager ")));
+        }
+    }
+    unsafe { RegCloseKey(mh) };
+    if copied.is_empty() {
+        log!("saves: player {} has the engine's record of the build's screen defaults already ({} values)", slot + 1, defaults.len());
+    } else {
+        log!("saves: player {}'s keys get the engine's record of the build's screen defaults from player 1's ({}): the engine then reads the saved screen size, which a pane answers with its own", slot + 1, copied.join(", "));
+    }
+}
+
 /// A read-only open of a key the later player has none of, and that player 1's game was
 /// never seen writing (an installer's: the game's folder, its version): the real key is
 /// read. A key the game writes (its settings, PlayerPrefs, progress) is the player's own
@@ -490,6 +571,44 @@ mod tests {
         assert!(!read_through(HKCU, r"Software\Microsoft\Windows", 2), "not a game's");
         vfs::tests::uninstall();
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A later player's key gets the build's screen defaults player 1's holds, and only
+    /// those: not its saved size or anything else, and not over the player's own.
+    #[test]
+    fn a_later_player_starts_with_the_builds_screen_defaults() {
+        use windows_sys::Win32::System::Registry::{HKEY, HKEY_CURRENT_USER, KEY_ALL_ACCESS, REG_DWORD, REG_OPTION_NON_VOLATILE, RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegGetValueW, RegSetValueExW, RRF_RT_REG_DWORD};
+        let _g = crate::sys::lock(&vfs::tests::TEST_LOCK);
+        let w = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+        let tag = format!("{}{}", std::process::id(), std::mem::size_of::<usize>());
+        let real = format!(r"Software\PeerPartySeedTest{tag}\Game");
+        let game = format!("test-seed-{tag}");
+        let mine = format!(r"{}\PeerPartySeedTest{tag}\Game", layout::registry_key(&game, 1));
+        let set = |key: &str, vals: &[(&str, u32)]| {
+            let mut h: HKEY = std::ptr::null_mut();
+            assert_eq!(unsafe { RegCreateKeyExW(HKEY_CURRENT_USER, w(key).as_ptr(), 0, std::ptr::null(), REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, std::ptr::null(), &mut h, std::ptr::null_mut()) }, 0);
+            for (n, v) in vals {
+                unsafe { RegSetValueExW(h, w(n).as_ptr(), 0, REG_DWORD, (v as *const u32).cast(), 4) };
+            }
+            unsafe { RegCloseKey(h) };
+        };
+        let get = |key: &str, n: &str| {
+            let (mut v, mut len) = (0u32, 4u32);
+            let rc = unsafe { RegGetValueW(HKEY_CURRENT_USER, w(key).as_ptr(), w(n).as_ptr(), RRF_RT_REG_DWORD, std::ptr::null_mut(), (&mut v as *mut u32).cast(), &mut len) };
+            (rc == 0).then_some(v)
+        };
+        let (width_default, mode_default) = ("Screenmanager Resolution Width Default_h680557497", "Screenmanager Fullscreen mode Default_h401710285");
+        set(&real, &[(width_default, 1280), (mode_default, 3), ("Screenmanager Resolution Width_h182942802", 3440), ("Progress", 7)]);
+        set(&mine, &[(mode_default, 1)]);
+        seed_key(&real, &mine, 1);
+        assert_eq!(get(&mine, width_default), Some(1280), "the build's default");
+        assert_eq!(get(&mine, mode_default), Some(1), "the player's own stays");
+        assert_eq!(get(&mine, "Screenmanager Resolution Width_h182942802"), None, "player 1's saved size isn't copied");
+        assert_eq!(get(&mine, "Progress"), None, "nor the game's own values");
+        unsafe {
+            RegDeleteTreeW(HKEY_CURRENT_USER, w(&format!(r"Software\PeerPartySeedTest{tag}")).as_ptr());
+            RegDeleteTreeW(HKEY_CURRENT_USER, w(layout::registry_key(&game, 1).rsplit_once('\\').unwrap().0).as_ptr());
+        }
     }
 
     /// The real calls: player 2 writes `HKCU\Software\PeerPartyTest\Game`'s value; the

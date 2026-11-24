@@ -9,7 +9,10 @@
 //!   last ran fullscreen would start by taking the whole monitor, and
 
 //! - a split-screen copy's writes of `Screenmanager …` values don't happen, so playing
-//!   in split screen leaves the single-window settings as they were.
+//!   in split screen leaves the single-window settings as they were. The engine's record
+//!   of the build's defaults (`… Default_h…`) is written as usual: it's the build's, not
+//!   a setting, and without it the engine never reads the saved size at all (a later
+//!   player's key starts with player 1's, saves/registry.rs `seed_build_defaults`).
 //!
 //! kernelbase's registry calls are hooked (advapi32's forward there), only in a copy
 //! that has a pane.
@@ -48,6 +51,9 @@ pub enum Screen {
     FullscreenMode,
     /// Older engines' fullscreen switch (1 fullscreen).
     IsFullscreen,
+    /// The engine's record of the build's defaults (`… Default_h…`): when it differs from
+    /// the build's, or is missing, the saved size is taken as stale and not read.
+    Default,
     /// Another of the engine's screen settings (fullscreen mode, window position...).
     Other,
 }
@@ -56,8 +62,8 @@ pub enum Screen {
 /// "Default" ones are the build's defaults, not what the player last ran at.
 pub fn screen_value(name: &str) -> Option<Screen> {
     let rest = name.strip_prefix("Screenmanager ")?;
-    if rest.contains("Default") {
-        return Some(Screen::Other);
+    if rest.contains(" Default_h") {
+        return Some(Screen::Default);
     }
     Some(if rest.starts_with("Resolution Width_h") {
         Screen::Width
@@ -111,7 +117,7 @@ fn pane_value(which: Screen) -> Option<u32> {
         // Windowed: a pane is a window.
         Screen::FullscreenMode => Some(3),
         Screen::IsFullscreen => Some(0),
-        Screen::Other => None,
+        Screen::Default | Screen::Other => None,
     }
 }
 
@@ -144,13 +150,15 @@ fn patch(name: Option<String>, kind: *const u32, data: *mut u8, len: *const u32)
     }
 }
 
-/// Whether a write of value `name` doesn't happen (a split-screen copy's screen settings).
+/// Whether a write of value `name` doesn't happen (a split-screen copy's screen settings,
+/// not the build's defaults).
 fn skip_write(name: Option<String>) -> bool {
-    if !name.as_deref().is_some_and(|n| screen_value(n).is_some()) || crate::window::virtual_size().is_none() {
+    let Some(n) = name else { return false };
+    if !screen_value(&n).is_some_and(|s| s != Screen::Default) || crate::window::virtual_size().is_none() {
         return false;
     }
     if !TOLD_WRITE.swap(true, Ordering::Relaxed) {
-        log!("window: the game's screen settings aren't saved from split screen (the single-window ones stay)");
+        log!("window: the game's screen settings aren't saved from split screen (the single-window ones stay; first: {n})");
     }
     true
 }
@@ -164,7 +172,14 @@ fn missing(name: Option<String>, kind: *mut u32, data: *mut u8, len: *mut u32, r
     if rc != ERROR_FILE_NOT_FOUND || len.is_null() {
         return rc;
     }
-    let Some(v) = name.as_deref().and_then(screen_value).and_then(pane_value) else { return rc };
+    let Some(which) = name.as_deref().and_then(screen_value) else { return rc };
+    let Some(v) = pane_value(which) else {
+        static TOLD_NONE: AtomicBool = AtomicBool::new(false);
+        if which == Screen::Default && !TOLD_NONE.swap(true, Ordering::Relaxed) {
+            log!("window: the game has no record of the build's screen defaults ({}): the engine may start at the build's size, not its pane's", name.unwrap_or_default());
+        }
+        return rc;
+    };
     if !kind.is_null() {
         unsafe { *kind = REG_DWORD };
     }
@@ -262,10 +277,11 @@ mod tests {
     fn the_engines_screen_values_are_told_apart() {
         assert_eq!(screen_value("Screenmanager Resolution Width_h182942802"), Some(Screen::Width));
         assert_eq!(screen_value("Screenmanager Resolution Height_h2627697771"), Some(Screen::Height));
-        assert_eq!(screen_value("Screenmanager Resolution Width Default_h680557497"), Some(Screen::Other), "the build's default");
+        assert_eq!(screen_value("Screenmanager Resolution Width Default_h680557497"), Some(Screen::Default), "the build's default");
+        assert_eq!(screen_value("Screenmanager Resolution Use Native Default_h1405981789"), Some(Screen::Default));
         assert_eq!(screen_value("Screenmanager Fullscreen mode_h3630240806"), Some(Screen::FullscreenMode));
         assert_eq!(screen_value("Screenmanager Is Fullscreen mode_h3981298716"), Some(Screen::IsFullscreen));
-        assert_eq!(screen_value("Screenmanager Fullscreen mode Default_h401710285"), Some(Screen::Other), "the build's default");
+        assert_eq!(screen_value("Screenmanager Fullscreen mode Default_h401710285"), Some(Screen::Default), "the build's default");
         assert_eq!(screen_value("Screenmanager Resolution Use Native_h1405027254"), Some(Screen::Other));
         assert_eq!(screen_value("VSyncSetting_h1635279426"), None, "the game's own");
     }

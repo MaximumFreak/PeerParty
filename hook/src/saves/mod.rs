@@ -779,6 +779,7 @@ pub fn own_slot_from_launcher(slot: u32, why: &str) {
     log!("saves: this copy is player {} ({why}): its saves, registry and Steam Remote Storage are its own from the start", slot + 1);
     vfs::start(slot);
     vfs::load_noted();
+    registry::seed_build_defaults();
 }
 
 /// The LAN came up: a copy the launcher gave no player keeps its own saves when the LAN
@@ -804,6 +805,7 @@ pub fn learn_slot(lan: &peerparty_core::Lan) {
     log!("saves: this copy is the PC's copy {} (from its LAN slot, after the game started): saves are its own from now on", slot + 1);
     vfs::start(slot);
     vfs::load_noted();
+    registry::seed_build_defaults();
     // Called while the LAN is being set up: not from here (adopt_earlier_ids).
     std::thread::spawn(|| {
         arm_now();

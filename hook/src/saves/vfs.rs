@@ -556,6 +556,11 @@ pub fn load_noted() {
     }
 }
 
+/// The registry keys player 1's game was seen writing (`software\<vendor>\<product>`).
+pub fn noted_registry() -> Vec<String> {
+    crate::sys::lock(&NOTED_REGISTRY).iter().cloned().collect()
+}
+
 /// Whether player 1's game was seen writing registry key `path` (`Software\...`) or one
 /// above or below it.
 pub fn written_by_first(path: &str) -> bool {
