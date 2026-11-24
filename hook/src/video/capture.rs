@@ -80,9 +80,26 @@ impl Drop for Link {
 static LINK: Mutex<Option<Arc<Link>>> = Mutex::new(None);
 /// The compositor's `RingHeader::presents` counter as last seen by `pace()`.
 static LAST_PACED_PRESENT: AtomicU64 = AtomicU64::new(0);
+/// Drift-free frame deadline (microseconds since process start) for FPS caps and
+/// hidden-pane throttling; `0` means uninitialized.
+static NEXT_FRAME_US: AtomicU64 = AtomicU64::new(0);
+/// Last pacing interval (`0` when uninitialized): changing modes (visible <-> hidden or
+/// changing FPS cap) resets `NEXT_FRAME_US` cleanly.
+static LAST_INTERVAL_US: AtomicU64 = AtomicU64::new(0);
 /// Safety cap (ms) on waiting for the compositor's pace event so a stall or crash can
 /// never deadlock a copy.
 const PACE_TIMEOUT_MS: u32 = 35;
+/// Background tick interval (50 ms = 20 FPS) for panes hidden while another pane is zoomed,
+/// keeping LAN simulation and netcode alive while freeing GPU/CPU for the zoomed player.
+const HIDDEN_INTERVAL_US: u64 = 50_000;
+/// Snap window (1.5 ms) so a capped copy whose VBlank arrives just before its deadline
+/// releases right on the VBlank without slipping an extra refresh.
+const VBLANK_SNAP_US: u64 = 1_500;
+
+fn mono_us() -> u64 {
+    static START: std::sync::LazyLock<std::time::Instant> = std::sync::LazyLock::new(std::time::Instant::now);
+    START.elapsed().as_micros() as u64 + 1
+}
 
 /// Whether the session wants the frames, and has said where they go.
 pub fn enabled() -> bool {
@@ -116,6 +133,8 @@ pub fn configure_as(on: bool, ring: Option<&str>, event: Option<&str>, pace: Opt
     let ok = link.is_some();
     *crate::sys::lock(&LINK) = link;
     LAST_PACED_PRESENT.store(0, Ordering::Release);
+    NEXT_FRAME_US.store(0, Ordering::Release);
+    LAST_INTERVAL_US.store(0, Ordering::Release);
     // A new setup gets new sets: none of the old ones is drawn or reported again.
     CURRENT.store(0, Ordering::Release);
     crate::sys::lock(&REPORTED).clear();
@@ -203,22 +222,18 @@ pub fn sync_active() -> bool {
         && unsafe { RingHeader::from_raw(link.view, peerparty_protocol::frame_ring::BLOCK_SIZE) }.is_some_and(|h| h.sync_active())
 }
 
-/// Paces this copy to the compositor's refresh boundary when "Sync games to screen" is
-/// active: returns immediately (0 ms) if the compositor already presented since our last
-/// paced frame (slow game), otherwise waits for the compositor's next `Present(1, 0)`
-/// with a `PACE_TIMEOUT_MS` safety cap.
-pub fn pace() {
+/// Whether any form of frame pacing is active (compositor sync, hidden-pane throttle, or
+/// an explicit split-screen FPS cap).
+pub fn pace_active() -> bool {
     if !enabled() {
-        return;
+        return false;
     }
-    let Some(link) = crate::sys::lock(&LINK).clone() else { return };
-    if link.pace.is_null() {
-        return;
-    }
-    let Some(h) = (unsafe { RingHeader::from_raw(link.view, peerparty_protocol::frame_ring::BLOCK_SIZE) }) else {
-        return;
-    };
-    if !h.sync_active() {
+    let Some(link) = crate::sys::lock(&LINK).clone() else { return false };
+    unsafe { RingHeader::from_raw(link.view, peerparty_protocol::frame_ring::BLOCK_SIZE) }.is_some_and(|h| h.pace_active())
+}
+
+fn wait_vblank(h: &RingHeader, pace: HANDLE) {
+    if pace.is_null() {
         return;
     }
     let now = h.presents.load(Ordering::Acquire);
@@ -226,10 +241,86 @@ pub fn pace() {
     if now != prev {
         LAST_PACED_PRESENT.store(now, Ordering::Release);
         // Drain any stale signal so the next fast frame waits cleanly for a fresh VBlank.
-        unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(link.pace, 0) };
+        unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(pace, 0) };
         return;
     }
-    unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(link.pace, PACE_TIMEOUT_MS) };
+    unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(pace, PACE_TIMEOUT_MS) };
+    LAST_PACED_PRESENT.store(h.presents.load(Ordering::Acquire), Ordering::Release);
+}
+
+/// Paces this copy to the compositor's refresh boundary, an explicit FPS cap, or the
+/// 20 FPS background throttle while hidden behind a zoomed pane.
+pub fn pace() {
+    if !enabled() {
+        return;
+    }
+    let Some(link) = crate::sys::lock(&LINK).clone() else { return };
+    let Some(h) = (unsafe { RingHeader::from_raw(link.view, peerparty_protocol::frame_ring::BLOCK_SIZE) }) else {
+        return;
+    };
+    let sync = !link.pace.is_null() && h.sync_active();
+    let hidden = h.hidden();
+    let cap_us = u64::from(h.pace_us());
+    if !sync && !hidden && cap_us == 0 {
+        NEXT_FRAME_US.store(0, Ordering::Release);
+        LAST_INTERVAL_US.store(0, Ordering::Release);
+        return;
+    }
+    // Plain compositor VBlank sync with no FPS cap and pane visible.
+    if sync && !hidden && cap_us == 0 {
+        NEXT_FRAME_US.store(0, Ordering::Release);
+        LAST_INTERVAL_US.store(0, Ordering::Release);
+        wait_vblank(h, link.pace);
+        return;
+    }
+    let interval = if hidden { HIDDEN_INTERVAL_US } else { cap_us };
+    let now = mono_us();
+    let prev_interval = LAST_INTERVAL_US.swap(interval, Ordering::AcqRel);
+    let prev = if prev_interval == interval { NEXT_FRAME_US.load(Ordering::Acquire) } else { 0 };
+    if prev == 0 {
+        if sync && !hidden {
+            wait_vblank(h, link.pace);
+        }
+        NEXT_FRAME_US.store(mono_us(), Ordering::Release);
+        return;
+    }
+    let target = prev.saturating_add(interval);
+    if now < target {
+        loop {
+            let cur = mono_us();
+            if cur >= target {
+                break;
+            }
+            let rem = target - cur;
+            if sync && !hidden && rem <= VBLANK_SNAP_US {
+                break;
+            }
+            // Wait on `link.pace` (when available) so unzooming, turning off sync/cap, or
+            // landing on a VBlank wakes this copy immediately rather than sleeping blindly.
+            let max_slice = if hidden { 50 } else if sync { PACE_TIMEOUT_MS } else { 50 };
+            let wait_ms = ((rem + 500) / 1000).clamp(1, u64::from(max_slice)) as u32;
+            if !link.pace.is_null() {
+                unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(link.pace, wait_ms) };
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(u64::from(wait_ms)));
+            }
+            // Bail out immediately if unzoomed or cap cleared while waiting.
+            if hidden && !h.hidden() {
+                NEXT_FRAME_US.store(0, Ordering::Release);
+                LAST_PACED_PRESENT.store(h.presents.load(Ordering::Acquire), Ordering::Release);
+                return;
+            }
+            if !hidden && h.pace_us() == 0 {
+                NEXT_FRAME_US.store(0, Ordering::Release);
+                LAST_PACED_PRESENT.store(h.presents.load(Ordering::Acquire), Ordering::Release);
+                return;
+            }
+        }
+    }
+    let done = mono_us();
+    // Keep drift-free cadence when hitting the target; re-anchor after a slow frame.
+    let next_base = if done.saturating_sub(target) > interval { done } else { target };
+    NEXT_FRAME_US.store(next_base, Ordering::Release);
     LAST_PACED_PRESENT.store(h.presents.load(Ordering::Acquire), Ordering::Release);
 }
 
@@ -1463,6 +1554,41 @@ pub(crate) mod tests {
         pace();
         let ms = t2.elapsed().as_millis();
         assert!(ms >= 20 && ms < 200, "safety timeout bounded ({ms} ms)");
+
+        // Explicit FPS cap (40 FPS = 25 ms) paces even with VBlank sync turned off.
+        with_ring(|h| {
+            h.set_flag(FLAG_SYNC_WANTED, false);
+            h.set_pace_us(25_000);
+        });
+        assert!(!sync_active() && pace_active());
+        pace(); // establishes baseline
+        let t3 = std::time::Instant::now();
+        pace();
+        let cap_ms = t3.elapsed().as_millis();
+        assert!(cap_ms >= 18 && cap_ms < 120, "FPS cap waited ~25 ms ({cap_ms} ms)");
+
+        // Hidden-pane throttle wakes cleanly when unhidden and pace is signalled.
+        with_ring(|h| {
+            h.set_pace_us(0);
+            h.set_flag(peerparty_protocol::frame_ring::FLAG_HIDDEN, true);
+        });
+        pace(); // establishes hidden baseline
+        let ring_name_wake = ring_name.clone();
+        let ev_wake = pace_ev as usize;
+        let unhide = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            if let Some(l) = open_link(&ring_name_wake, None, None)
+                && let Some(h) = unsafe { RingHeader::from_raw(l.view, peerparty_protocol::frame_ring::BLOCK_SIZE) }
+            {
+                h.set_flag(peerparty_protocol::frame_ring::FLAG_HIDDEN, false);
+            }
+            unsafe { SetEvent(ev_wake as HANDLE) };
+        });
+        let t4 = std::time::Instant::now();
+        pace();
+        unhide.join().unwrap();
+        assert!(t4.elapsed().as_millis() < 200, "unhidden pane woke cleanly");
+        assert_eq!(NEXT_FRAME_US.load(Ordering::Acquire), 0, "unhide cleared hidden throttle state");
 
         configure(false, None, None);
         unsafe { CloseHandle(pace_ev) };

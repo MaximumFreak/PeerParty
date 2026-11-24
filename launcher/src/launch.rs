@@ -276,6 +276,16 @@ pub struct SplitScreen {
     /// Turn off compositor-locked frame pacing (`--no-sync`; on by default so copies
     /// don't render faster than the split-screen window displays them).
     pub no_sync: bool,
+    /// Per-pane render resolution percentage (`--render-scale 50..=100`; 100 = native).
+    pub render_scale: u8,
+    /// Turn off Contrast Adaptive Sharpening (CAS) when upscaling panes (`--no-upscale`).
+    pub no_upscale: bool,
+    /// Explicit per-copy FPS cap (`--fps 0|15..=240`; 0 = match display refresh).
+    pub fps: u16,
+    /// Turn off fair-share GPU memory budget reporting (`--no-vram-budget`).
+    pub no_vram_budget: bool,
+    /// Turn off CPU core partitioning and worker thread scaling (`--no-cpu-balance`).
+    pub no_cpu_balance: bool,
 }
 
 /// What a split-screen player plays with (`--inputs auto,kbm,pad`).
@@ -380,7 +390,21 @@ impl SplitScreen {
 
 impl Default for SplitScreen {
     fn default() -> Self {
-        SplitScreen { instances: 2, layout: LayoutPreset::Horizontal, inputs: Vec::new(), no_kbm: false, names: Vec::new(), monitor: None, stagger: StaggerMode::Smart, no_sync: false }
+        SplitScreen {
+            instances: 2,
+            layout: LayoutPreset::Horizontal,
+            inputs: Vec::new(),
+            no_kbm: false,
+            names: Vec::new(),
+            monitor: None,
+            stagger: StaggerMode::Smart,
+            no_sync: false,
+            render_scale: 100,
+            no_upscale: false,
+            fps: 0,
+            no_vram_budget: false,
+            no_cpu_balance: false,
+        }
     }
 }
 
@@ -1053,7 +1077,7 @@ mod tests {
         assert_eq!(SplitScreen::layout_named("1+2"), Some(LayoutPreset::BottomTwo));
         assert_eq!(SplitScreen::layout_named("grid"), Some(LayoutPreset::Grid2x2));
         assert_eq!(SplitScreen::layout_named("diagonal"), None);
-        assert_eq!(SplitScreen::default(), SplitScreen { instances: 2, layout: LayoutPreset::Horizontal, inputs: Vec::new(), no_kbm: false, names: Vec::new(), monitor: None, stagger: StaggerMode::Smart, no_sync: false });
+        assert_eq!(SplitScreen::default(), SplitScreen { instances: 2, layout: LayoutPreset::Horizontal, inputs: Vec::new(), no_kbm: false, names: Vec::new(), monitor: None, stagger: StaggerMode::Smart, no_sync: false, render_scale: 100, no_upscale: false, fps: 0, no_vram_budget: false, no_cpu_balance: false });
     }
 
     #[test]

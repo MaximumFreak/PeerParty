@@ -12,6 +12,7 @@ mod util;
 
 // The process: module watching, the launcher's pipe, the overlay, the LAN engine.
 mod child;
+mod cpu;
 mod instance;
 mod invite;
 mod ipc;

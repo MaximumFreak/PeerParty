@@ -788,3 +788,17 @@ studio.pad_fine = Trzymaj: dokładnie
 studio.pad_back = Wróć
 studio.pad_sync = Sync
 studio.pad_available = Kontroler
+
+game.adv_fps = Limit klatek
+game.adv_fps_display = Dopasuj do ekranu
+game.adv_fps_n = {n} FPS
+game.adv_fps_sub = Ogranicza liczbę klatek każdej kopii na podzielonym ekranie dla stabilniejszego tempa i mniejszego obciążenia GPU.
+game.adv_render_scale = Skala renderowania
+game.adv_render_scale_native = 100% (Natywna)
+game.adv_render_scale_sub = Renderuje każdą kopię poniżej rozmiaru jej panelu, aby oszczędzać GPU i VRAM, a potem ją skaluje.
+game.adv_upscale = Ostre skalowanie
+game.adv_upscale_sub = Używa adaptacyjnego wyostrzania kontrastu przy powiększaniu; wyłącz, aby użyć zwykłego skalowania dwuliniowego.
+game.adv_vram_budget = Dziel budżet VRAM
+game.adv_vram_budget_sub = Zgłasza każdej kopii jej sprawiedliwą część VRAM, aby silniki dobierały pule tekstur bez przycięć.
+game.adv_cpu_balance = Równoważ rdzenie CPU
+game.adv_cpu_balance_sub = Przydziela każdej kopii preferowane rdzenie CPU i skaluje wątki robocze, ograniczając rywalizację.

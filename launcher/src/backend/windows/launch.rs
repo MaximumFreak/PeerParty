@@ -29,7 +29,7 @@ use windows_sys::Win32::System::Threading::{
     TerminateProcess, WaitForSingleObject,
 };
 
-use super::{os_error, packaged, tree, wide, wide_bytes, wow64, wrapper};
+use super::{cpu, os_error, packaged, tree, wide, wide_bytes, wow64, wrapper};
 use crate::host::{self, SessionLaunch};
 use crate::launch::{self, ChildEnv, Exited, LaunchError, SplitScreen};
 use crate::ui::store::Prefs;
@@ -107,7 +107,7 @@ pub fn start(t: Target, env: ChildEnv, pipe: Option<host::pipe::Pipe>, prefs: Pr
 
     let tree = tree::Tree::new(root);
 
-    let pi = unsafe { start_injected(&exe, &cmdline, cwd, &env, &dll, x86, tree.as_ref())? };
+    let pi = unsafe { start_injected(&exe, &cmdline, cwd, &env, &dll, x86, tree.as_ref(), None)? };
     launch::remember(&t.listed);
     eprintln!(
         "peerparty: started {} (pid {}, {}), logs in {}",
@@ -199,6 +199,25 @@ pub fn start_session(t: Target, base_env: ChildEnv, split: &SplitScreen, prefs: 
     let panes = split.layout.compute_panes(bounds.width, bounds.height, count as usize);
     let slots = split.layout.to_slots(count as usize);
 
+    // Fair-share CPU core partitioning (soft Windows CPU Sets + reported logical core cap)
+    // and GPU VRAM budget sharing, unless turned off in settings.
+    let cpu_sets = if !split.no_cpu_balance && count >= 2 {
+        let all = cpu::query_cpu_sets();
+        let parts = cpu::partition_cpu_sets(&all, count as usize);
+        if !parts.is_empty() {
+            eprintln!("peerparty: split screen: balancing CPU cores across {count} copies ({} logical processors partitioned)", all.len());
+        }
+        parts
+    } else {
+        Vec::new()
+    };
+    let cpu_cores = if !split.no_cpu_balance && count >= 2 {
+        let total = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(0);
+        cpu::recommended_worker_cores(total, count)
+    } else {
+        None
+    };
+
     let ctx = SpawnCtx {
         exe: exe.clone(),
         args: t.args,
@@ -214,6 +233,8 @@ pub fn start_session(t: Target, base_env: ChildEnv, split: &SplitScreen, prefs: 
         bounds,
         dwm,
         count,
+        cpu_sets,
+        cpu_cores,
     };
 
     let simultaneous = count <= 1 || split.stagger == launch::StaggerMode::Fixed(0);
@@ -228,7 +249,10 @@ pub fn start_session(t: Target, base_env: ChildEnv, split: &SplitScreen, prefs: 
             width: p.width,
             height: p.height,
         });
-        let virt = pane.and_then(|p| slots.get(slot as usize).map(|s| s.aspect.size_for(p, s.fit, bounds.width, bounds.height)));
+        let virt = pane.and_then(|p| {
+            let (w, h) = slots.get(slot as usize)?.aspect.size_for(p, slots[slot as usize].fit, bounds.width, bounds.height);
+            Some(peerparty_protocol::session::scale_dimensions(w, h, split.render_scale))
+        });
         match ctx.spawn_slot(slot, pane, virt) {
             Ok((launch, copy)) => {
                 launches.push(launch);
@@ -266,7 +290,18 @@ pub fn start_session(t: Target, base_env: ChildEnv, split: &SplitScreen, prefs: 
     listen_for_close_with(host::close_session);
     host::run_session(
         launches,
-        host::SessionLook { layout: split.layout.clone(), bounds, pixels, no_kbm: split.no_kbm, stagger: split.stagger, sync: !split.no_sync, total_count: count as usize },
+        host::SessionLook {
+            layout: split.layout.clone(),
+            bounds,
+            pixels,
+            no_kbm: split.no_kbm,
+            stagger: split.stagger,
+            sync: !split.no_sync,
+            render_scale: split.render_scale,
+            upscale: !split.no_upscale,
+            fps: split.fps,
+            total_count: count as usize,
+        },
         spawner,
         &exe,
         prefs,
@@ -304,6 +339,8 @@ struct SpawnCtx {
     bounds: host::MonitorBounds,
     dwm: bool,
     count: u32,
+    cpu_sets: Vec<Vec<u32>>,
+    cpu_cores: Option<u32>,
 }
 
 impl SpawnCtx {
@@ -329,6 +366,12 @@ impl SpawnCtx {
         spec.identity_override = self.split.name(slot);
         // Its saves are that player's from the hook's start (hook saves/mod.rs).
         env.set(penv::PLAYER_SLOT, slot.to_string());
+        if !self.split.no_vram_budget && self.count >= 2 {
+            env.set_default(penv::VRAM_SHARE, self.count.to_string());
+        }
+        if let Some(cores) = self.cpu_cores {
+            env.set_default(penv::CPU_CORES, cores.to_string());
+        }
         if let Some(pane) = pane {
             let (vw, vh) = virt.unwrap_or((pane.width, pane.height));
             spec.pane = Some(peerparty_protocol::session::PaneRect { x: pane.x, y: pane.y, width: vw, height: vh });
@@ -348,7 +391,8 @@ impl SpawnCtx {
         // the game) ends once its game runs, and the copy is the game's programs from the
         // game's folder until the last of them ends, as a game started alone is (tree.rs).
         let tree = tree::Tree::new(self.root.as_deref());
-        let pi = unsafe { start_injected(&self.exe, &line, &self.cwd, &env, &self.dll, self.x86, tree.as_ref())? };
+        let preferred_cpus = self.cpu_sets.get(slot as usize).map(Vec::as_slice);
+        let pi = unsafe { start_injected(&self.exe, &line, &self.cwd, &env, &self.dll, self.x86, tree.as_ref(), preferred_cpus)? };
         eprintln!(
             "peerparty: started player {} ({}, pid {}, {})",
             slot + 1,
@@ -463,6 +507,7 @@ unsafe fn start_injected(
     dll: &Path,
     x86: bool,
     tree: Option<&tree::Tree>,
+    cpu_sets: Option<&[u32]>,
 ) -> Result<PROCESS_INFORMATION, LaunchError> {
     unsafe {
         let app = wide(exe);
@@ -503,6 +548,9 @@ unsafe fn start_injected(
         // Before it runs, so every program it starts is in the job too.
         if tree.is_some_and(|t| !t.add(pi.hProcess)) {
             eprintln!("peerparty: can't watch the programs the game starts ({}); waiting for this one only", std::io::Error::last_os_error());
+        }
+        if let Some(ids) = cpu_sets {
+            let _ = cpu::apply_cpu_sets(pi.hProcess, ids);
         }
         // An x64 game's hook loads once it runs (the APC): it says so on this event, and
         // a game it never loads in is reported (a 32-bit one's load was waited for).

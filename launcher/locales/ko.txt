@@ -754,3 +754,17 @@ studio.pad_fine = 누르기: 미세
 studio.pad_back = 뒤로
 studio.pad_sync = 동기화
 studio.pad_available = 컨트롤러
+
+game.adv_fps = 프레임 속도 제한
+game.adv_fps_display = 화면에 맞춤
+game.adv_fps_n = {n} FPS
+game.adv_fps_sub = 각 분할 화면 복사본의 FPS를 제한해 고주사율 화면에서 페이싱을 안정화하고 GPU 부하를 줄입니다.
+game.adv_render_scale = 렌더링 배율
+game.adv_render_scale_native = 100% (네이티브)
+game.adv_render_scale_sub = 각 복사본을 영역보다 낮게 렌더링해 GPU와 VRAM 사용량을 줄인 뒤 확대 표시합니다.
+game.adv_upscale = 선명한 업스케일링
+game.adv_upscale_sub = 화면 확대 시 대비 적응 선명화를 적용합니다. 끄면 일반 바이리니어 확대를 사용합니다.
+game.adv_vram_budget = VRAM 예산 분배
+game.adv_vram_budget_sub = 각 복사본에 공정한 VRAM 몫을 알려 엔진이 끊김 없이 텍스처 풀 크기를 조절하게 합니다.
+game.adv_cpu_balance = CPU 코어 분산
+game.adv_cpu_balance_sub = 각 복사본에 선호 CPU 코어를 배정하고 워커 스레드 수를 조절해 스레드 경합을 줄입니다.

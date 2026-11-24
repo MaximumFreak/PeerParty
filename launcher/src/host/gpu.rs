@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use peerparty_protocol::frame_ring::{FLAG_COMPOSITOR_LIVE, SLOTS};
+use peerparty_protocol::frame_ring::{FLAG_COMPOSITOR_LIVE, FLAG_HIDDEN, SLOTS};
 use peerparty_protocol::ipc::SurfaceMsg;
 use peerparty_protocol::session::PaneRect;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND};
@@ -202,8 +202,8 @@ impl Drop for SharedSurface {
 /// Full-texture UV rectangle `[u0, v0, u1, v1]`.
 pub const FULL_UV: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
 
-/// What a pane shows: where, its source UV crop, draw Z-order, from which ring, and
-/// which textures.
+/// What a pane shows: where, its source UV crop, draw Z-order, whether CAS sharpening
+/// applies when upscaled, from which ring, and which textures.
 #[derive(Clone)]
 pub struct PaneDraw {
     pub dest: PaneRect,
@@ -212,6 +212,8 @@ pub struct PaneDraw {
     pub uv: [f32; 4],
     /// Draw order (higher draws on top, for Picture-in-Picture overlays).
     pub z: u8,
+    /// Apply single-pass Contrast Adaptive Sharpening (CAS) when scaling the source up.
+    pub sharpen: bool,
     pub ring: Option<Arc<RingBlock>>,
     pub surface: Option<Arc<SharedSurface>>,
 }
@@ -228,7 +230,7 @@ impl PartialEq for PaneDraw {
             (None, None) => true,
             _ => false,
         };
-        self.dest == o.dest && self.uv == o.uv && self.z == o.z && same(&self.ring, &o.ring) && same_surface
+        self.dest == o.dest && self.uv == o.uv && self.z == o.z && self.sharpen == o.sharpen && same(&self.ring, &o.ring) && same_surface
     }
 }
 
@@ -373,6 +375,9 @@ cbuffer Pane : register(b0) {
     float sdr_white; // where SDR white goes on an HDR display, in scRGB (1.0 = 80 nits)
     float hdr_white; // the nits of an HDR frame shown as white on an SDR display
     float4 uv_rect;  // (u0, v0, u1 - u0, v1 - v0) source sub-rectangle
+    float2 src_inv;  // (1 / src_w, 1 / src_h) texel step for contrast-adaptive sharpening
+    float sharpen;   // 0 = plain bilinear, >0 = CAS sharpening strength when upscaling
+    float _pad;
 };
 float3 srgb_decode(float3 e) {
     e = saturate(e);
@@ -407,9 +412,28 @@ float3 finite(float3 c) {
     c = b > 0x7f800000 ? 0 : c;
     return clamp(c, -65504.0, 65504.0);
 }
+// Single-pass 5-tap Contrast Adaptive Sharpening (CAS) bounded strictly inside the
+// local [min, max] neighborhood so upscaled panes stay crisp with zero haloing or NaNs,
+// and flat areas remain bit-identical. Works on both [0, 1] SDR/PQ and >1 scRGB HDR.
+float3 sample_cas(float2 uv) {
+    float3 e = finite(t.Sample(s, uv).rgb);
+    if (sharpen <= 0.0) return e;
+    float2 uv_min = uv_rect.xy + src_inv * 0.5;
+    float2 uv_max = max(uv_min, uv_rect.xy + uv_rect.zw - src_inv * 0.5);
+    float3 b = finite(t.Sample(s, clamp(uv + float2(0, -src_inv.y), uv_min, uv_max)).rgb);
+    float3 d = finite(t.Sample(s, clamp(uv + float2(-src_inv.x, 0), uv_min, uv_max)).rgb);
+    float3 f = finite(t.Sample(s, clamp(uv + float2(src_inv.x, 0), uv_min, uv_max)).rgb);
+    float3 h = finite(t.Sample(s, clamp(uv + float2(0, src_inv.y), uv_min, uv_max)).rgb);
+    float3 mn = min(e, min(min(b, d), min(f, h)));
+    float3 mx = max(e, max(max(b, d), max(f, h)));
+    float3 peak = max(mx, 1.0);
+    float3 amp = saturate(min(max(mn, 0.0), max(peak - mx, 0.0)) / max(mx, 1e-5));
+    float3 w = -sqrt(amp) * (sharpen * 0.2);
+    return clamp((e + (b + d + f + h) * w) / (1.0 + 4.0 * w), mn, mx);
+}
 float4 ps(V i) : SV_Target {
     float2 uv = uv_rect.xy + i.uv * uv_rect.zw;
-    float3 c = finite(t.Sample(s, uv).rgb);
+    float3 c = sample_cas(uv);
     if (input == 0) return float4(output == 1 ? srgb_decode(c) * sdr_white : c, 1);
     float3 nits = input == 2 ? mul(BT2020_TO_709, pq_nits(c)) : c * 80.0;
     if (output == 1) return float4(nits / 80.0, 1);
@@ -417,7 +441,7 @@ float4 ps(V i) : SV_Target {
 }
 "#;
 
-/// A pane's `cbuffer Pane` (32 bytes, 16-byte aligned for D3D11).
+/// A pane's `cbuffer Pane` (48 bytes, 16-byte aligned for D3D11).
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Debug)]
 struct PaneParams {
@@ -426,7 +450,13 @@ struct PaneParams {
     sdr_white: f32,
     hdr_white: f32,
     uv_rect: [f32; 4],
+    src_inv: [f32; 2],
+    sharpen: f32,
+    _pad: f32,
 }
+
+/// Default CAS sharpening strength when a pane is scaled up and Sharp upscaling is on.
+const CAS_STRENGTH: f32 = 0.6;
 
 /// The nits an HDR frame's white is shown at on an SDR display (BT.2408's reference white).
 const HDR_WHITE_NITS: f32 = 203.0;
@@ -565,14 +595,24 @@ impl Display {
         if self.hdr { (10, peerparty_protocol::frame_ring::COLOR_SPACE_SCRGB) } else { (87, peerparty_protocol::frame_ring::COLOR_SPACE_SRGB) }
     }
 
-    /// `cbuffer Pane` for a pane of frames encoded as `input` with source UV `[u0, v0, u1, v1]`.
-    fn params(&self, input: u32, uv: [f32; 4]) -> PaneParams {
+    /// `cbuffer Pane` for a pane of frames encoded as `input` with source UV `[u0, v0, u1, v1]`,
+    /// source texture dimensions `src_size`, destination pixel rect `dest`, and whether
+    /// Contrast Adaptive Sharpening is enabled when upscaling.
+    fn params(&self, input: u32, uv: [f32; 4], src_size: (u32, u32), dest: PaneRect, sharpen_on: bool) -> PaneParams {
+        let uv_w = (uv[2] - uv[0]).abs();
+        let uv_h = (uv[3] - uv[1]).abs();
+        let eff_w = (src_size.0 as f32 * uv_w).round() as u32;
+        let eff_h = (src_size.1 as f32 * uv_h).round() as u32;
+        let upscaling = sharpen_on && src_size.0 > 0 && src_size.1 > 0 && (dest.width > eff_w || dest.height > eff_h);
         PaneParams {
             input,
             output: u32::from(self.hdr),
             sdr_white: self.sdr_white,
             hdr_white: HDR_WHITE_NITS,
             uv_rect: [uv[0], uv[1], uv[2] - uv[0], uv[3] - uv[1]],
+            src_inv: [if src_size.0 > 0 { 1.0 / src_size.0 as f32 } else { 0.0 }, if src_size.1 > 0 { 1.0 / src_size.1 as f32 } else { 0.0 }],
+            sharpen: if upscaling { CAS_STRENGTH } else { 0.0 },
+            _pad: 0.0,
         }
     }
 }
@@ -916,7 +956,7 @@ impl Renderer {
             }
             let vp: [f32; 6] = [d.x as f32, d.y as f32, d.width as f32, d.height as f32, 0.0, 1.0];
             vcall!(ctx, 44, fn(u32, *const [f32; 6]) -> (), 1, &vp);
-            let params = self.display.params(o.input, p.draw.uv);
+            let params = self.display.params(o.input, p.draw.uv, o.surface.size, d, p.draw.sharpen);
             if self.params != Some(params) {
                 // ID3D11DeviceContext::UpdateSubresource is slot 48.
                 vcall!(ctx, 48, fn(usize, u32, usize, *const PaneParams, u32, u32) -> (), self.cb, 0, 0, &params, 0, 0);
@@ -1016,7 +1056,7 @@ struct Pane {
 impl Default for Pane {
     fn default() -> Pane {
         Pane {
-            draw: PaneDraw { dest: PaneRect { x: 0, y: 0, width: 0, height: 0 }, uv: FULL_UV, z: 0, ring: None, surface: None },
+            draw: PaneDraw { dest: PaneRect { x: 0, y: 0, width: 0, height: 0 }, uv: FULL_UV, z: 0, sharpen: false, ring: None, surface: None },
             opened: None,
             previous: None,
             failed: None,
@@ -1350,6 +1390,7 @@ fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE, pause_on_occl
     for p in &panes {
         if let Some(r) = &p.draw.ring {
             r.header().set_flag(FLAG_COMPOSITOR_LIVE, false);
+            r.header().set_flag(FLAG_HIDDEN, false);
             r.signal_pace();
             r.header().stop_reading();
         }
@@ -1360,11 +1401,17 @@ fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE, pause_on_occl
 
 fn set_live(shared: &Shared, panes: &[Pane], presenting: bool) {
     let live: Vec<bool> = panes.iter().map(|p| p.shown().is_some_and(|o| o.last.is_some())).collect();
+    let any_visible = panes.iter().any(|p| p.draw.dest.width > 0 && p.draw.dest.height > 0);
     for (p, &has_frame) in panes.iter().zip(live.iter()) {
         if let Some(ring) = &p.draw.ring {
             let visible = p.draw.dest.width > 0 && p.draw.dest.height > 0;
             let active = presenting && has_frame && visible;
-            if ring.header().set_flag(FLAG_COMPOSITOR_LIVE, active) && !active {
+            // Throttle only panes explicitly hidden while another pane is zoomed on screen
+            // (never while the whole session window is minimized or occluded).
+            let hidden = presenting && any_visible && !visible;
+            let was_live = ring.header().set_flag(FLAG_COMPOSITOR_LIVE, active);
+            let was_hidden = ring.header().set_flag(FLAG_HIDDEN, hidden);
+            if (was_live && !active) || (was_hidden && !hidden) {
                 ring.signal_pace();
             }
         }
@@ -1511,7 +1558,7 @@ mod tests {
         // Test window isn't shown on an interactive desktop (and may run on an isolated
         // non-input desktop where Present returns DXGI_STATUS_OCCLUDED).
         let gpu = Gpu::start_for_test(hwnd).expect("the drawing thread");
-        gpu.set(vec![PaneDraw { dest: PaneRect { x: 0, y: 0, width: 128, height: 64 }, uv: FULL_UV, z: 0, ring: Some(ring.clone()), surface: Some(surface) }]);
+        gpu.set(vec![PaneDraw { dest: PaneRect { x: 0, y: 0, width: 128, height: 64 }, uv: FULL_UV, z: 0, sharpen: true, ring: Some(ring.clone()), surface: Some(surface) }]);
         let start = std::time::Instant::now();
         while !(gpu.live(0) && ring.header().presents.load(Ordering::SeqCst) > 0) {
             assert!(start.elapsed().as_secs() < 10, "drawn within 10 s");
@@ -1545,7 +1592,7 @@ mod tests {
         r.display = Display::SDR;
         let s2 = Arc::new(surface_again(&m));
         let mut pane = Pane::default();
-        pane.draw = PaneDraw { dest: PaneRect { x: 32, y: 16, width: 64, height: 32 }, uv: FULL_UV, z: 0, ring: None, surface: Some(s2.clone()) };
+        pane.draw = PaneDraw { dest: PaneRect { x: 32, y: 16, width: 64, height: 32 }, uv: FULL_UV, z: 0, sharpen: true, ring: None, surface: Some(s2.clone()) };
         pane.opened = r.open(&s2);
         assert!(pane.opened.is_some(), "the textures open on the window's device");
         let target_desc = TexDesc { width: 128, height: 64, mips: 1, array: 1, format: 87, samples: 1, quality: 0, usage: 0, bind: 0x20, cpu: 0, misc: 0 };
@@ -1661,7 +1708,7 @@ mod tests {
         r.params = None;
         let s = Arc::new(surface_again(&sets[set].0));
         let mut pane = Pane::default();
-        pane.draw = PaneDraw { dest: PaneRect { x: 0, y: 0, width: 16, height: 16 }, uv: FULL_UV, z: 0, ring: None, surface: Some(s.clone()) };
+        pane.draw = PaneDraw { dest: PaneRect { x: 0, y: 0, width: 16, height: 16 }, uv: FULL_UV, z: 0, sharpen: false, ring: None, surface: Some(s.clone()) };
         pane.opened = r.open(&s);
         assert!(pane.opened.is_some(), "set {set} opens");
         let desc = TexDesc { width: 16, height: 16, mips: 1, array: 1, format, samples: 1, quality: 0, usage: 0, bind: 0x20, cpu: 0, misc: 0 };
@@ -1786,7 +1833,7 @@ mod tests {
         let mut r = Renderer::new(hwnd, default_luid().expect("an adapter")).expect("a renderer");
         r.display = Display::SDR;
         let mut pane = Pane::default();
-        pane.draw = PaneDraw { dest: PaneRect { x: 0, y: 0, width: 16, height: 16 }, uv: FULL_UV, z: 0, ring: None, surface: Some(s.clone()) };
+        pane.draw = PaneDraw { dest: PaneRect { x: 0, y: 0, width: 16, height: 16 }, uv: FULL_UV, z: 0, sharpen: false, ring: None, surface: Some(s.clone()) };
         pane.opened = r.open(&s);
         let o = pane.opened.as_mut().expect("its texture");
         assert!(o.pixels);
@@ -1818,6 +1865,96 @@ mod tests {
         assert_eq!(input_of(87, 0), 0);
         assert_eq!(Display::SDR.swap_format(), (87, 0));
         assert_eq!(Display { hdr: true, sdr_white: 3.0 }.swap_format(), (10, 10));
+        // CAS sharpening activates only when enabled AND upscaling.
+        let p_up = Display::SDR.params(0, FULL_UV, (640, 360), PaneRect { x: 0, y: 0, width: 960, height: 540 }, true);
+        assert!(p_up.sharpen > 0.0);
+        let p_off = Display::SDR.params(0, FULL_UV, (640, 360), PaneRect { x: 0, y: 0, width: 960, height: 540 }, false);
+        assert_eq!(p_off.sharpen, 0.0);
+        let p_native = Display::SDR.params(0, FULL_UV, (960, 540), PaneRect { x: 0, y: 0, width: 960, height: 540 }, true);
+        assert_eq!(p_native.sharpen, 0.0, "1:1 native pane skips CAS");
+    }
+
+    /// Upscaling a low-res high-contrast pattern with CAS ON sharpens mid-edge contrast
+    /// relative to plain bilinear (CAS OFF) while staying strictly bounded in [min, max].
+    #[test]
+    fn cas_upscaling_sharpens_edges_and_can_be_disabled() {
+        use peerparty_protocol::frame_ring::{pixels_size, slot_bytes};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WS_POPUP};
+        let dir = std::env::temp_dir().join(format!("peerparty-gpu-cas-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (sw, sh) = (8u32, 8u32);
+        let stride = sw * 4;
+        let mut bytes = vec![0u8; pixels_size(stride, sh).unwrap()];
+        let s0 = slot_bytes(stride, sh).unwrap();
+        let _ = s0;
+        // Left half dark grey (40), right half light grey (215): bilinear blends across the
+        // middle columns when scaled 4x to 32x32, while CAS steepens that edge cleanly.
+        for y in 0..sh {
+            for x in 0..sw {
+                let v = if x < sw / 2 { 40u8 } else { 215u8 };
+                let off = (y * stride + x * 4) as usize;
+                bytes[off..off + 4].copy_from_slice(&[v, v, v, 0xff]);
+            }
+        }
+        let path = dir.join("pixels-cas-1");
+        std::fs::write(&path, &bytes).unwrap();
+        let m = SurfaceMsg {
+            pid: 1,
+            generation: 1,
+            textures: Vec::new(),
+            content: 0,
+            release: 0,
+            width: sw,
+            height: sh,
+            format: 87,
+            api: "d3d11".into(),
+            color_space: 0,
+            pixels: Some(path.to_string_lossy().into_owned()),
+            stride,
+        };
+        let s = Arc::new(SharedSurface::duplicate(&m).expect("pixel file maps"));
+        let class = wide("STATIC");
+        let hwnd = unsafe { CreateWindowExW(0, class.as_ptr(), class.as_ptr(), WS_POPUP, 0, 0, 32, 32, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null()) };
+        let mut r = Renderer::new(hwnd, default_luid().expect("adapter")).expect("renderer");
+        r.display = Display::SDR;
+        let desc = TexDesc { width: 32, height: 32, mips: 1, array: 1, format: 87, samples: 1, quality: 0, usage: 0, bind: 0x20, cpu: 0, misc: 0 };
+        let mut target = 0usize;
+        assert!(vcall!(r.dev, 5, fn(*const TexDesc, usize, *mut usize) -> i32, &desc, 0, &mut target) >= 0);
+        let mut rtv = 0usize;
+        assert!(vcall!(r.dev, 9, fn(usize, usize, *mut usize) -> i32, target, 0, &mut rtv) >= 0);
+
+        let mut pane = Pane::default();
+        pane.opened = r.open(&s);
+        r.upload(pane.opened.as_mut().unwrap(), 0, 1);
+
+        // Draw with CAS OFF (plain bilinear).
+        pane.draw = PaneDraw { dest: PaneRect { x: 0, y: 0, width: 32, height: 32 }, uv: FULL_UV, z: 0, sharpen: false, ring: None, surface: Some(s.clone()) };
+        r.draw(rtv, std::slice::from_ref(&pane), &[Some((0, 0))]);
+        let plain = read(&r, target, 32, 32);
+
+        // Draw with CAS ON.
+        pane.draw.sharpen = true;
+        r.draw(rtv, std::slice::from_ref(&pane), &[Some((0, 0))]);
+        let sharp = read(&r, target, 32, 32);
+
+        // Check mid-row pixels across the vertical edge: every pixel stays bounded in [40, 215],
+        // and the transition pixels just left/right of the seam become sharper (higher contrast).
+        let row = 16 * 32;
+        for x in 0..32 {
+            let v = sharp[row + x] & 0xff;
+            assert!((40..=215).contains(&v), "no ringing/overshoot at x={x}: {v}");
+        }
+        let plain_diff = (plain[row + 16] & 0xff) as i32 - (plain[row + 15] & 0xff) as i32;
+        let sharp_diff = (sharp[row + 16] & 0xff) as i32 - (sharp[row + 15] & 0xff) as i32;
+        assert!(sharp_diff > plain_diff, "CAS increased edge contrast ({sharp_diff} vs {plain_diff})");
+
+        release(rtv);
+        release(target);
+        drop(pane);
+        drop(r);
+        drop(s);
+        unsafe { DestroyWindow(hwnd) };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

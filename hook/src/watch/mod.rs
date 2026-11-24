@@ -79,6 +79,7 @@ pub fn init(module: *mut core::ffi::c_void) {
         }
     }
     crate::sys::wine::log_if_present();
+    crate::cpu::init_from_env();
     crate::window::init_from_env();
     let notified = register_notification();
     if !crate::child::is_helper() {

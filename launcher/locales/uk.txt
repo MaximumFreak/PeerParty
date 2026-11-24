@@ -788,3 +788,17 @@ studio.pad_fine = Утрим.: точно
 studio.pad_back = Назад
 studio.pad_sync = Синхр.
 studio.pad_available = Геймпад
+
+game.adv_fps = Обмеження частоти кадрів
+game.adv_fps_display = Як на екрані
+game.adv_fps_n = {n} FPS
+game.adv_fps_sub = Обмежує FPS кожної копії на розділеному екрані для рівномірного темпу та меншого навантаження на GPU.
+game.adv_render_scale = Масштаб рендерингу
+game.adv_render_scale_native = 100% (Рідний)
+game.adv_render_scale_sub = Рендерить кожну копію нижче розміру її області для економії GPU й VRAM, а потім масштабує.
+game.adv_upscale = Чітке масштабування
+game.adv_upscale_sub = Використовує контрастно-адаптивну різкість під час збільшення області; вимкніть для звичайного білінійного масштабування.
+game.adv_vram_budget = Ділити бюджет VRAM
+game.adv_vram_budget_sub = Повідомляє кожній копії її справедливу частку VRAM, щоб рушії налаштовували пули текстур без ривків.
+game.adv_cpu_balance = Балансувати ядра ЦП
+game.adv_cpu_balance_sub = Надає кожній копії переважні ядра ЦП та масштабує робочі потоки для зменшення конкуренції.

@@ -74,6 +74,15 @@ pub const COMPOSITOR: &str = "PEERPARTY_COMPOSITOR";
 /// `%LOCALAPPDATA%\peerparty\dxvk`): a split-screen copy of a Direct3D 9 game draws through
 /// it, so its frames reach the session's window through Vulkan.
 pub const DXVK: &str = "PEERPARTY_DXVK";
+/// Fair-share GPU memory budget divisor for split-screen copies (`2..=16`): clamps the
+/// VRAM budget reported to each copy (`QueryVideoMemoryInfo` / `VK_EXT_memory_budget`) so
+/// engines size their texture streaming pools for sharing one GPU instead of thrashing.
+/// Unset or `0`/`1`: off.
+pub const VRAM_SHARE: &str = "PEERPARTY_VRAM_SHARE";
+/// Logical processor count cap reported to a split-screen copy (`GetSystemInfo` /
+/// `GetNativeSystemInfo` / `GetActiveProcessorCount`) so N copies don't spawn N×all-cores
+/// busy-spinning worker threads. Unset or `0`: off.
+pub const CPU_CORES: &str = "PEERPARTY_CPU_CORES";
 
 /// `1` or `0`: this copy is or isn't a dedicated server (else guessed from its exe).
 pub const DEDICATED: &str = "PEERPARTY_DEDICATED";

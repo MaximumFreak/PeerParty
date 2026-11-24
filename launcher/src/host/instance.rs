@@ -205,6 +205,19 @@ impl InstanceConn {
         }
     }
 
+    /// Sets an explicit per-copy frame rate cap (`0` = uncapped / compositor VBlank only),
+    /// waking the copy immediately if the cap is relaxed or cleared.
+    pub fn set_fps_cap(&self, fps: u16) {
+        if let Some(ring) = &self.ring {
+            let us = if fps == 0 { 0 } else { 1_000_000 / u32::from(fps.clamp(15, 240)) };
+            let prev = ring.header().pace_us();
+            ring.header().set_pace_us(us);
+            if prev > 0 && (us == 0 || us < prev) {
+                ring.signal_pace();
+            }
+        }
+    }
+
     /// A block for its frames' ring, if its frames are the session's to draw: a file in
     /// the frames' directory when they come as `pixels` (`ring::pixel_frames`).
     pub fn make_ring(&mut self, pixels: bool) {

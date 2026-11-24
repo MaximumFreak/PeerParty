@@ -52,6 +52,12 @@ pub struct HookConfig {
 
     /// `PEERPARTY_MULTI_INSTANCE`: a second copy may start (set at all).
     pub multi_instance: bool,
+    /// `PEERPARTY_VRAM_SHARE`: split-screen copy count (`2..=16`) for fair-share VRAM
+    /// budget reporting (`video/vram.rs`).
+    pub vram_share: Option<u32>,
+    /// `PEERPARTY_CPU_CORES`: logical processor count cap (`1..=256`) for split-screen
+    /// copies (`cpu.rs`).
+    pub cpu_cores: Option<u32>,
     /// `PEERPARTY_COPY_SAVES` (set at all), `PEERPARTY_STEAM_SAVES`,
     /// `PEERPARTY_SEPARATE_SAVES`.
     pub copy_saves: bool,
@@ -139,6 +145,8 @@ impl HookConfig {
             room: text(env::ROOM),
             public: switch(env::PUBLIC),
             multi_instance: get(env::MULTI_INSTANCE).is_some(),
+            vram_share: text(env::VRAM_SHARE).and_then(|v| v.trim().parse::<u32>().ok()).filter(|&n| (2..=16).contains(&n)),
+            cpu_cores: text(env::CPU_CORES).and_then(|v| v.trim().parse::<u32>().ok()).filter(|&n| (1..=256).contains(&n)),
             copy_saves: get(env::COPY_SAVES).is_some(),
             steam_saves: switch(env::STEAM_SAVES),
             separate_saves: switch(env::SEPARATE_SAVES),

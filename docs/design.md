@@ -608,8 +608,27 @@ session; a Linux one (frames read back as pixels) isn't at the same level yet.
   `capture::pace()`. If the compositor's `presents` counter already advanced since the last
   frame (a copy running below the monitor's refresh rate), it returns at once with no stall;
   otherwise it waits for the pace event signalled right after the compositor's `Present(1, 0)`,
-  capped at 35 ms. The compositor clears `FLAG_COMPOSITOR_LIVE` and wakes waiting copies
-  whenever a pane is hidden, minimized, occluded or stopping, so a copy never stalls.
+  capped at 35 ms. An optional per-copy FPS cap (`--fps`, `RingHeader::pace_us`) paces copies
+  to a drift-free interval snapped to compositor VBlanks, and panes hidden while another pane
+  is zoomed (`FLAG_HIDDEN`) throttle to 20 FPS so LAN simulation stays alive while freeing
+  the GPU for the zoomed player. The compositor clears `FLAG_COMPOSITOR_LIVE` and wakes
+  waiting copies whenever a pane is hidden, minimized, occluded or stopping, so a copy never stalls.
+- **Performance & resource sharing** (`hook/src/video/vram.rs`, `hook/src/cpu.rs`,
+  `launcher/src/backend/windows/cpu.rs`, `launcher/src/host/gpu.rs`).
+  - **VRAM budget fair-share** (`PEERPARTY_VRAM_SHARE`, on by default; `--no-vram-budget`
+    turns it off): clamps `IDXGIAdapter3::QueryVideoMemoryInfo` (D3D11/12) and Vulkan's
+    `VK_EXT_memory_budget` device-local heaps to `min(real_budget, 85% * physical / N)`
+    (floored at 512 MiB) so engines size their own texture streaming pools for sharing one
+    GPU instead of thrashing over PCIe.
+  - **Render scale & sharp upscaling** (`--render-scale 50..=100`, `--no-upscale`): scales
+    each copy's virtual viewport down below its pane size and scales it back up in the
+    D3D11 compositor with an optional single-pass Contrast Adaptive Sharpening (CAS) shader
+    (active only when upscaling and toggleable off for plain bilinear sampling).
+  - **CPU balancing** (`PEERPARTY_CPU_CORES`, on by default; `--no-cpu-balance` turns it
+    off): assigns topology-aware soft Windows CPU Sets (`SetProcessDefaultCpuSets`, keeping
+    L3 cache domains separate on multi-CCD CPUs and balancing P/E cores fairly on hybrid
+    CPUs) and scales reported logical core counts (`GetSystemInfo`, `GetNativeSystemInfo`,
+    `GetActiveProcessorCount`) so N copies don't oversubscribe worker threads.
 - **The pane is the game's screen** (`hook/src/window.rs`). Each copy is told its pane:
   its window, display modes and screen size read as the pane's (or the aspect Layout
   Studio set), so the game renders at the pane's own size. A zoomed pane is told the

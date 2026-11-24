@@ -770,3 +770,17 @@ studio.pad_fine = Basılı: hassas
 studio.pad_back = Geri
 studio.pad_sync = Eşitle
 studio.pad_available = Kontrolcü
+
+game.adv_fps = Kare hızı sınırı
+game.adv_fps_display = Ekranla eşleştir
+game.adv_fps_n = {n} FPS
+game.adv_fps_sub = Daha dengeli akış ve daha düşük GPU yükü için her bölünmüş ekran kopyasının kare hızını sınırlar.
+game.adv_render_scale = İşleme ölçeği
+game.adv_render_scale_native = %100 (Doğal)
+game.adv_render_scale_sub = GPU yükünü ve VRAM kullanımını azaltmak için her kopyayı bölmesinden küçük işler ve büyüterek sığdırır.
+game.adv_upscale = Keskin ölçekleme
+game.adv_upscale_sub = Bir bölme büyütülürken kontrast uyarlamalı keskinleştirme kullanır; düz çift doğrusal ölçekleme için kapatın.
+game.adv_vram_budget = GPU bellek bütçesini paylaş
+game.adv_vram_budget_sub = Motorların takılmadan doku havuzu boyutlandırması için her kopyaya adil VRAM payını bildirir.
+game.adv_cpu_balance = CPU çekirdeklerini dengele
+game.adv_cpu_balance_sub = Çekirdek çekişmesini azaltmak için her kopyaya tercih edilen çekirdekler verir ve iş parçacıklarını ölçekler.

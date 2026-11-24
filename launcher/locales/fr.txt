@@ -770,3 +770,17 @@ studio.pad_fine = Maintenir : fin
 studio.pad_back = Retour
 studio.pad_sync = Sync
 studio.pad_available = Manette
+
+game.adv_fps = Limite d’images par seconde
+game.adv_fps_display = Fréquence de l’écran
+game.adv_fps_n = {n} FPS
+game.adv_fps_sub = Limite les FPS de chaque copie en écran partagé pour un rythme plus régulier et une charge GPU réduite.
+game.adv_render_scale = Échelle de rendu
+game.adv_render_scale_native = 100 % (Native)
+game.adv_render_scale_sub = Rend chaque copie sous la taille de son volet pour réduire la charge GPU et la VRAM, puis la met à l’échelle.
+game.adv_upscale = Mise à l’échelle nette
+game.adv_upscale_sub = Utilise un renforcement de netteté adaptatif lors de l’agrandissement ; désactivez pour un filtrage bilinéaire simple.
+game.adv_vram_budget = Partager le budget VRAM
+game.adv_vram_budget_sub = Indique à chaque copie sa part de VRAM afin que les moteurs dimensionnent leurs textures sans saccades.
+game.adv_cpu_balance = Équilibrer les cœurs CPU
+game.adv_cpu_balance_sub = Attribue des cœurs CPU préférés à chaque copie et ajuste les threads pour limiter la contention.

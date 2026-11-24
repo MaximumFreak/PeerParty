@@ -385,6 +385,8 @@ struct SessionHost {
     pixels: bool,
     /// Compositor-locked frame pacing ("Sync games to screen", ON by default).
     sync_frames: bool,
+    /// Explicit per-copy FPS cap (`0` = match display / uncapped).
+    fps_cap: u16,
     game_title: String,
 }
 
@@ -430,6 +432,9 @@ pub struct SessionLook {
     pub no_kbm: bool,
     pub stagger: StaggerMode,
     pub sync: bool,
+    pub render_scale: u8,
+    pub upscale: bool,
+    pub fps: u16,
     pub total_count: usize,
 }
 
@@ -456,10 +461,12 @@ pub fn run_session(instances: Vec<SessionLaunch>, look: SessionLook, spawner: Op
     let name = exe.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let title = game_title(exe, &name);
     // The window is made on this thread, which hands it its messages (desktop::wait).
-    let compositor = CompositorWindow::open(look.layout, look.bounds, total, &title, exe);
+    let mut compositor = CompositorWindow::open(look.layout, look.bounds, total, &title, exe);
+    compositor.set_quality(look.render_scale, look.upscale);
     let mut host = SessionHost::new(copies, Some(compositor), exe, prefs, packaged);
     host.pixels = look.pixels;
     host.sync_frames = look.sync;
+    host.fps_cap = look.fps;
     host.stagger = look.stagger;
     if let Some(sp) = spawner {
         let start = host.instances.len() as u32;
@@ -481,6 +488,7 @@ pub fn run_session(instances: Vec<SessionLaunch>, look: SessionLook, spawner: Op
         if draws {
             inst.make_ring(look.pixels);
             inst.set_sync(host.sync_frames);
+            inst.set_fps_cap(host.fps_cap);
             inst.send_capture(event.as_deref());
         }
     }
@@ -537,6 +545,7 @@ impl SessionHost {
             stagger_ready_at: None,
             pixels: false,
             sync_frames: true,
+            fps_cap: 0,
             game_title: title,
         };
         host.inputs = vec![SlotInput::Auto; host.instances.len()];
@@ -918,6 +927,7 @@ impl SessionHost {
                 if draws {
                     conn.make_ring(self.pixels);
                     conn.set_sync(self.sync_frames);
+                    conn.set_fps_cap(self.fps_cap);
                     conn.send_capture(event.as_deref());
                 }
                 self.instances.push(conn);

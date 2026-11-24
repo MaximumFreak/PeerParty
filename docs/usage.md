@@ -647,7 +647,7 @@ them from a game's panel (Players 2–4 with **Split screen** on, a layout and a
 or from a prompt:
 
 ```
-peerparty --split-screen [--instances 1..4] [--layout L] [--monitor N] [--inputs auto|kbm|pad,...] [--no-kbm] [--stagger smart|0..60] [--no-sync] [--names A,B,...] <game.exe> [args...]
+peerparty --split-screen [--instances 1..4] [--layout L] [--monitor N] [--inputs auto|kbm|pad,...] [--no-kbm] [--stagger smart|0..60] [--no-sync] [--fps 0|15..240] [--render-scale 50..100] [--no-upscale] [--no-vram-budget] [--no-cpu-balance] [--names A,B,...] <game.exe> [args...]
 ```
 
 - `--instances N`: how many copies (default 2).
@@ -675,6 +675,20 @@ peerparty --split-screen [--instances 1..4] [--layout L] [--monitor N] [--inputs
 - `--no-sync`: turns off **Sync games to screen** (the panel's Advanced > Split screen),
   which is on by default and keeps each copy from drawing frames faster than the
   session's window shows them.
+- `--fps 0|15..240`: caps each copy's frame rate (`0` matches the display refresh).
+  Useful on high-refresh monitors so two to four copies pace evenly instead of fighting
+  for full refresh rate.
+- `--render-scale 50..100`: renders each copy below its pane's pixel size (`100`, the
+  default, renders native) to cut GPU load and render-target VRAM, then scales it up in
+  the compositor.
+- `--no-upscale`: turns off **Sharp upscaling** (single-pass contrast-adaptive
+  sharpening when a pane is scaled up), using plain bilinear scaling instead.
+- `--no-vram-budget`: turns off **Share GPU memory budget** (`PEERPARTY_VRAM_SHARE`),
+  which by default reports each copy's fair share of VRAM so engines size their texture
+  streaming pools without stuttering.
+- `--no-cpu-balance`: turns off **Balance CPU cores** (`PEERPARTY_CPU_CORES` and
+  Windows CPU Sets), which by default assigns preferred CPU cores per copy and trims
+  reported worker core counts to reduce thread contention.
 - `--names A,B,...`: names of their own, in player order (a blank one keeps the usual:
   player 1 `PEERPARTY_NAME`, player 2 `PEERPARTY_OTHER_NAME`, then "name (3)").
 - `--player N` is for one copy: it plays alone as player N (1–4), with that player's

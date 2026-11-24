@@ -770,3 +770,17 @@ studio.pad_fine = Segurar: fino
 studio.pad_back = Voltar
 studio.pad_sync = Sync
 studio.pad_available = Controle
+
+game.adv_fps = Limite de quadros
+game.adv_fps_display = Igualar à tela
+game.adv_fps_n = {n} FPS
+game.adv_fps_sub = Limita a taxa de quadros de cada cópia em tela dividida para ritmo mais estável e menor carga da GPU.
+game.adv_render_scale = Escala de renderização
+game.adv_render_scale_native = 100% (Nativa)
+game.adv_render_scale_sub = Renderiza cada cópia abaixo do tamanho do painel para reduzir carga de GPU e VRAM e depois amplia.
+game.adv_upscale = Ampliação nítida
+game.adv_upscale_sub = Usa nitidez adaptativa por contraste ao ampliar um painel; desative para escala bilinear simples.
+game.adv_vram_budget = Dividir orçamento de VRAM
+game.adv_vram_budget_sub = Informa a cada cópia sua parte justa da VRAM para os motores ajustarem as texturas sem engasgos.
+game.adv_cpu_balance = Equilibrar núcleos de CPU
+game.adv_cpu_balance_sub = Dá núcleos preferenciais a cada cópia e ajusta threads de trabalho para reduzir disputa.

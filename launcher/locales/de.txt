@@ -770,3 +770,17 @@ studio.pad_fine = Halten: fein
 studio.pad_back = Zurück
 studio.pad_sync = Sync
 studio.pad_available = Controller
+
+game.adv_fps = Bildratenbegrenzung
+game.adv_fps_display = Bildschirm anpassen
+game.adv_fps_n = {n} FPS
+game.adv_fps_sub = Begrenzt die Bildrate jeder Splitscreen-Kopie für gleichmäßigere Darstellung und geringere GPU-Last.
+game.adv_render_scale = Render-Skalierung
+game.adv_render_scale_native = 100 % (Nativ)
+game.adv_render_scale_sub = Rendert jede Kopie unterhalb ihrer Bereichsgröße, um GPU-Last und VRAM zu sparen, und skaliert sie dann hoch.
+game.adv_upscale = Scharfe Hochskalierung
+game.adv_upscale_sub = Nutzt kontrastadaptive Schärfung beim Hochskalieren eines Bereichs; deaktivieren für einfache bilineare Skalierung.
+game.adv_vram_budget = GPU-Speicherbudget teilen
+game.adv_vram_budget_sub = Meldet jeder Kopie ihren fairen VRAM-Anteil, damit Engines Textur-Pools ohne Ruckler dimensionieren.
+game.adv_cpu_balance = CPU-Kerne verteilen
+game.adv_cpu_balance_sub = Weist jeder Kopie bevorzugte CPU-Kerne zu und skaliert Worker-Threads gegen Thread-Konkurrenz.

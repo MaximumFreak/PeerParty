@@ -754,3 +754,17 @@ studio.pad_fine = 按住: 微调
 studio.pad_back = 返回
 studio.pad_sync = 同步
 studio.pad_available = 手柄
+
+game.adv_fps = 帧率上限
+game.adv_fps_display = 与显示器一致
+game.adv_fps_n = {n} FPS
+game.adv_fps_sub = 限制每个分屏副本的帧率，在高刷新率屏幕上获得更稳定的帧节奏并降低 GPU 负载。
+game.adv_render_scale = 渲染比例
+game.adv_render_scale_native = 100%（原生）
+game.adv_render_scale_sub = 以低于窗格尺寸的分辨率渲染各副本以降低 GPU 负载与显存占用，再放大显示。
+game.adv_upscale = 锐化放大
+game.adv_upscale_sub = 放大窗格画面时启用对比度自适应锐化；关闭则使用普通双线性缩放。
+game.adv_vram_budget = 分配显存预算
+game.adv_vram_budget_sub = 向每个副本报告公平的显存份额，让游戏引擎合理控制纹理池大小以减少卡顿。
+game.adv_cpu_balance = 均衡 CPU 核心
+game.adv_cpu_balance_sub = 为每个副本分配首选 CPU 核心并缩放工作线程数，减少线程争抢。

@@ -241,6 +241,23 @@ impl VirtualAspect {
     }
 }
 
+/// Scales a pane's virtual render dimensions by `scale_pct` (`50..=100`; `0` or `>= 100`
+/// leaves them untouched). Results are rounded to even pixels and kept above a safe
+/// minimum floor so games never receive degenerate swapchain sizes.
+pub fn scale_dimensions(width: u32, height: u32, scale_pct: u8) -> (u32, u32) {
+    if width == 0 || height == 0 || scale_pct == 0 || scale_pct >= 100 {
+        return (width, height);
+    }
+    let pct = u64::from(scale_pct.clamp(50, 100));
+    let min_w = width.min(320).max(2);
+    let min_h = height.min(200).max(2);
+    let mut w = ((u64::from(width) * pct + 50) / 100) as u32;
+    let mut h = ((u64::from(height) * pct + 50) / 100) as u32;
+    w = (w & !1).clamp(min_w & !1, width);
+    h = (h & !1).clamp(min_h & !1, height);
+    (w.max(2), h.max(2))
+}
+
 /// One pane in a resolution-independent custom layout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PaneSlot {
@@ -767,6 +784,12 @@ mod tests {
         let aspect169 = VirtualAspect::Ratio { num: 16, den: 9 };
         assert_eq!(aspect169.size_for(tall, PaneFit::Fit, 1920, 1080), (960, 540));
         assert_eq!(aspect169.size_for(tall, PaneFit::Fill, 1920, 1080), (1920, 1080));
+        assert_eq!(scale_dimensions(1920, 1080, 100), (1920, 1080));
+        assert_eq!(scale_dimensions(1920, 1080, 0), (1920, 1080));
+        assert_eq!(scale_dimensions(1920, 1080, 75), (1440, 810));
+        assert_eq!(scale_dimensions(960, 1080, 50), (480, 540));
+        assert_eq!(scale_dimensions(960, 540, 67), (642, 362));
+        assert_eq!(scale_dimensions(300, 180, 50), (300, 180), "never shrinks below safe floor when already small");
     }
 
     #[test]

@@ -19,6 +19,7 @@ mod gl;
 mod overlay;
 mod pixels;
 mod vkshaders;
+pub(crate) mod vram;
 mod vulkan;
 
 use std::sync::Mutex;
@@ -247,11 +248,14 @@ pub fn module_loaded(name: &str, module: windows_sys::Win32::Foundation::HMODULE
         return;
     }
     match api {
-        Api::Vulkan if crate::ipc::enabled() && prefer_ingame() || capture::wanted() => vulkan::loaded_in_loader(),
+        Api::Vulkan if crate::ipc::enabled() && prefer_ingame() || capture::wanted() || vram::share().is_some() => vulkan::loaded_in_loader(),
         Api::D3d9 => d3d9::redirect(module),
         _ => {}
     }
-    if !WANTED.load(Ordering::Acquire) || api.state().load(Ordering::Acquire) != NOT_TRIED {
+    if !WANTED.load(Ordering::Acquire) && !(api == Api::Dxgi && vram::share().is_some()) {
+        return;
+    }
+    if api.state().load(Ordering::Acquire) != NOT_TRIED {
         return;
     }
     let module = name.to_string();

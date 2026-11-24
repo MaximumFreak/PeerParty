@@ -770,3 +770,17 @@ studio.pad_fine = Houd: fijn
 studio.pad_back = Terug
 studio.pad_sync = Sync
 studio.pad_available = Controller
+
+game.adv_fps = Framerate-limiet
+game.adv_fps_display = Scherm volgen
+game.adv_fps_n = {n} FPS
+game.adv_fps_sub = Begrenst de framerate van elke splitscreen-kopie voor stabielere pacing en lagere GPU-belasting.
+game.adv_render_scale = Renderschaal
+game.adv_render_scale_native = 100% (Natief)
+game.adv_render_scale_sub = Rendert elke kopie onder zijn vakgrootte om GPU en VRAM te besparen en schaalt daarna op.
+game.adv_upscale = Scherp opschalen
+game.adv_upscale_sub = Gebruikt contrast-adaptieve verscherping bij opschalen; zet uit voor gewone bilineaire schaling.
+game.adv_vram_budget = VRAM-budget delen
+game.adv_vram_budget_sub = Meldt elke kopie zijn eerlijke deel van het VRAM zodat engines texture-pools zonder haperingen instellen.
+game.adv_cpu_balance = CPU-kernen verdelen
+game.adv_cpu_balance_sub = Geeft elke kopie eigen voorkeurskernen en schaalt worker-threads tegen thread-concurrentie.

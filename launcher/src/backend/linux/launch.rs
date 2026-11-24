@@ -249,15 +249,19 @@ mod run {
             spec.input_assignment = split.input(slot).assignment(slot);
             spec.identity_override = split.name(slot);
             env.set(penv::PLAYER_SLOT, slot.to_string());
+            if !split.no_vram_budget && count >= 2 {
+                env.set_default(penv::VRAM_SHARE, count.to_string());
+            }
             if let Some(&pane) = panes.get(slot as usize) {
+                let (vw, vh) = peerparty_protocol::session::scale_dimensions(pane.width, pane.height, split.render_scale);
                 spec.pane = Some(peerparty_protocol::session::PaneRect {
                     x: bounds.x.saturating_add(pane.x),
                     y: bounds.y.saturating_add(pane.y),
-                    width: pane.width,
-                    height: pane.height,
+                    width: vw,
+                    height: vh,
                 });
-                spec.virtual_width = Some(pane.width);
-                spec.virtual_height = Some(pane.height);
+                spec.virtual_width = Some(vw);
+                spec.virtual_height = Some(vh);
                 spec.dpi = Some(bounds.dpi);
             }
             env.set(penv::INSTANCE, spec.to_json().to_string());
@@ -295,6 +299,9 @@ mod run {
             no_kbm: split.no_kbm,
             stagger: launch::StaggerMode::Fixed(0),
             sync: !split.no_sync,
+            render_scale: split.render_scale,
+            upscale: !split.no_upscale,
+            fps: split.fps,
             total_count: launches.len(),
         };
         host::run_session(launches, look, None, &t.exe, prefs, false);

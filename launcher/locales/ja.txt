@@ -754,3 +754,17 @@ studio.pad_fine = 長押し: 微調整
 studio.pad_back = 戻る
 studio.pad_sync = 同期
 studio.pad_available = コントローラー
+
+game.adv_fps = フレームレート上限
+game.adv_fps_display = 画面に合わせる
+game.adv_fps_n = {n} FPS
+game.adv_fps_sub = 分割画面の各コピーのフレームレートを制限し、高リフレッシュ画面での安定性とGPU負荷を改善します。
+game.adv_render_scale = レンダリング解像度
+game.adv_render_scale_native = 100% (ネイティブ)
+game.adv_render_scale_sub = 各コピーをペインより低く描画してGPU負荷とVRAM使用量を削減し、拡大表示します。
+game.adv_upscale = シャープ拡大
+game.adv_upscale_sub = 拡大時にコントラスト適応シャープニングを適用します。オフにすると通常のバイリニア拡大になります。
+game.adv_vram_budget = VRAM予算を配分
+game.adv_vram_budget_sub = 各コピーに公平なVRAM予算を通知し、テクスチャプール過剰によるカクつきを防ぎます。
+game.adv_cpu_balance = CPUコアを分散
+game.adv_cpu_balance_sub = 各コピーに優先CPUコアを割り当て、ワーカースレッド数を調整して競合を抑えます。

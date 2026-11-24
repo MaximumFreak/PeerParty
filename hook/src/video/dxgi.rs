@@ -195,6 +195,7 @@ pub fn install() -> bool {
     }
     drop(win);
     d3d12::install();
+    super::vram::install_dxgi();
     let mut n = 0;
     n += arm(&PRESENT, present, present_hook as Present, "Present");
     n += arm(&RESIZE, resize, resize_hook as Resize, "ResizeBuffers");
@@ -420,19 +421,21 @@ thread_local! {
 
 fn presenting(swap: usize, flags: u32, real: impl FnOnce(bool) -> i32) -> i32 {
     let outer = !IN_PRESENT.with(|p| p.replace(true));
-    let mut paced = false;
+    let mut sync_active = false;
+    let mut pace_active = false;
     if outer && flags & 1 == 0 {
         if !super::lower_layer_presents(|| window_of(swap)) {
             super::presented();
-            paced = capture::sync_active();
+            sync_active = capture::sync_active();
+            pace_active = sync_active || capture::pace_active();
         }
 
         let _ = std::panic::catch_unwind(|| on_present(swap));
     }
-    let hr = real(paced);
+    let hr = real(sync_active);
     if outer {
         IN_PRESENT.with(|p| p.set(false));
-        if paced {
+        if pace_active {
             capture::pace();
         }
     }

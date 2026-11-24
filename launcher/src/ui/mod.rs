@@ -688,6 +688,24 @@ impl App {
             if o.split_no_sync {
                 args.push("--no-sync".into());
             }
+            let scale = o.effective_split_render_scale();
+            if scale < 100 {
+                args.push("--render-scale".into());
+                args.push(scale.to_string());
+            }
+            if o.split_no_upscale {
+                args.push("--no-upscale".into());
+            }
+            if o.split_fps >= 15 {
+                args.push("--fps".into());
+                args.push(o.split_fps.min(240).to_string());
+            }
+            if o.split_no_vram_budget {
+                args.push("--no-vram-budget".into());
+            }
+            if o.split_no_cpu_balance {
+                args.push("--no-cpu-balance".into());
+            }
             if o.split_monitor >= 2 {
                 args.push("--monitor".into());
                 args.push(o.split_monitor.to_string());

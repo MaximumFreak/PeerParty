@@ -9,6 +9,7 @@
 //! method calls.
 
 pub mod console;
+pub mod cpu;
 pub mod http;
 pub mod invite;
 pub mod launch;

@@ -59,6 +59,7 @@ type QueuePresent = unsafe extern "system" fn(usize, *const PresentInfo) -> i32;
 type DestroySwapchain = unsafe extern "system" fn(usize, u64, usize);
 type DestroyDevice = unsafe extern "system" fn(usize, usize);
 type CreateSurface = unsafe extern "system" fn(usize, *const SurfaceInfo, usize, *mut u64) -> i32;
+type GetMemProps2 = unsafe extern "system" fn(usize, *mut super::vram::VkMemoryProperties2);
 
 static GET_DEVICE_PROC: OnceLock<GenericDetour<GetProc>> = OnceLock::new();
 static GET_INSTANCE_PROC: OnceLock<GenericDetour<GetProc>> = OnceLock::new();
@@ -74,6 +75,8 @@ struct Real {
     present: Pfn,
     destroy_device: Pfn,
     create_surface: Pfn,
+    get_mem_props2: Pfn,
+    get_mem_props2_khr: Pfn,
 }
 
 /// The last ones the game was given by either lookup. `vkGetInstanceProcAddr`'s are the
@@ -88,6 +91,8 @@ static REAL: Mutex<Real> = Mutex::new(Real {
     present: 0,
     destroy_device: 0,
     create_surface: 0,
+    get_mem_props2: 0,
+    get_mem_props2_khr: 0,
 });
 
 /// Per device: the real functions `vkGetDeviceProcAddr` gave for it.
@@ -347,11 +352,16 @@ fn install_now() {
         r.present = com::proc(m, c"vkQueuePresentKHR").unwrap_or(0);
         r.destroy_device = com::proc(m, c"vkDestroyDevice").unwrap_or(0);
         r.create_surface = com::proc(m, c"vkCreateWin32SurfaceKHR").unwrap_or(0);
+        r.get_mem_props2 = com::proc(m, c"vkGetPhysicalDeviceMemoryProperties2").unwrap_or(0);
+        r.get_mem_props2_khr = com::proc(m, c"vkGetPhysicalDeviceMemoryProperties2KHR").unwrap_or(0);
     }
     // The surface export always: a game calling it directly still has its windows known.
     let surface = with_lock(|| patch(&X_CREATE_SURFACE, m, c"vkCreateWin32SurfaceKHR", create_surface_export as CreateSurface));
     if surface == 0 {
         log!("present: Vulkan's vkCreateWin32SurfaceKHR export not patched (a surface made through it has no window known)");
+    }
+    if super::vram::share().is_some() {
+        let _ = with_lock(|| patch(&X_GET_MEM_PROPS2, m, c"vkGetPhysicalDeviceMemoryProperties2", get_mem_props2_export as GetMemProps2));
     }
     if super::capture::wanted() && !EXPORTS_PATCHED.swap(true, Ordering::AcqRel) {
         patch_exports(m);
@@ -379,6 +389,7 @@ static X_DESTROY_SWAPCHAIN: ExportDetour<DestroySwapchain> = OnceLock::new();
 static X_PRESENT: ExportDetour<QueuePresent> = OnceLock::new();
 static X_DESTROY_DEVICE: ExportDetour<DestroyDevice> = OnceLock::new();
 static X_CREATE_SURFACE: ExportDetour<CreateSurface> = OnceLock::new();
+static X_GET_MEM_PROPS2: ExportDetour<GetMemProps2> = OnceLock::new();
 /// The loader exports patched (`patch_exports`): a lookup that hands one out isn't
 /// wrapped again.
 static PATCHED: Mutex<Vec<Pfn>> = Mutex::new(Vec::new());
@@ -431,6 +442,8 @@ fn ours(name: &str, real: Pfn, dev: Option<usize>) -> Option<Pfn> {
         "vkQueuePresentKHR" => (|r, p| r.present = p, queue_present as *const () as usize),
         "vkDestroyDevice" => (|r, p| r.destroy_device = p, destroy_device as *const () as usize),
         "vkCreateWin32SurfaceKHR" => (|r, p| r.create_surface = p, create_surface as *const () as usize),
+        "vkGetPhysicalDeviceMemoryProperties2" if super::vram::share().is_some() => (|r, p| r.get_mem_props2 = p, get_mem_props2 as *const () as usize),
+        "vkGetPhysicalDeviceMemoryProperties2KHR" if super::vram::share().is_some() => (|r, p| r.get_mem_props2_khr = p, get_mem_props2_khr as *const () as usize),
         _ => return None,
     };
     set(&mut crate::sys::lock(&REAL), real);
@@ -465,6 +478,23 @@ unsafe extern "system" fn create_surface_export(inst: usize, info: *const Surfac
     let r = unsafe { X_CREATE_SURFACE.get().unwrap().call(inst, info, alloc, out) };
     note_surface(r, info, out);
     r
+}
+
+unsafe extern "system" fn get_mem_props2(phys: usize, props: *mut super::vram::VkMemoryProperties2) {
+    let real: GetMemProps2 = unsafe { std::mem::transmute(real_for(None, |r| r.get_mem_props2)) };
+    unsafe { real(phys, props) };
+    let _ = std::panic::catch_unwind(|| super::vram::clamp_vulkan_budget(props));
+}
+
+unsafe extern "system" fn get_mem_props2_khr(phys: usize, props: *mut super::vram::VkMemoryProperties2) {
+    let real: GetMemProps2 = unsafe { std::mem::transmute(real_for(None, |r| r.get_mem_props2_khr)) };
+    unsafe { real(phys, props) };
+    let _ = std::panic::catch_unwind(|| super::vram::clamp_vulkan_budget(props));
+}
+
+unsafe extern "system" fn get_mem_props2_export(phys: usize, props: *mut super::vram::VkMemoryProperties2) {
+    unsafe { X_GET_MEM_PROPS2.get().unwrap().call(phys, props) };
+    let _ = std::panic::catch_unwind(|| super::vram::clamp_vulkan_budget(props));
 }
 
 fn note_surface(r: i32, info: *const SurfaceInfo, out: *mut u64) {

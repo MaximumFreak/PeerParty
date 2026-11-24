@@ -556,6 +556,77 @@ fn advanced_split(ui: &mut egui::Ui, o: &mut GameOptions) {
     }
     ui.add(egui::Label::new(egui::RichText::new(t!("game.adv_sync_sub")).size(12.0).color(TEXT3)).wrap());
     ui.add_space(6.0);
+    ui.label(egui::RichText::new(t!("game.adv_fps")).size(13.0).color(TEXT2));
+    let fps_vals: [u16; 6] = [0, 30, 40, 60, 90, 120];
+    let fps_labels: Vec<String> = vec![
+        t!("game.adv_fps_display").to_string(),
+        t!("game.adv_fps_n", n = 30),
+        t!("game.adv_fps_n", n = 40),
+        t!("game.adv_fps_n", n = 60),
+        t!("game.adv_fps_n", n = 90),
+        t!("game.adv_fps_n", n = 120),
+    ];
+    let mut fi = fps_vals.iter().position(|&v| v == o.split_fps).unwrap_or(0);
+    if widgets::stepper(ui, "split-fps", &fps_labels, &mut fi, ui.available_width()).changed() {
+        o.split_fps = fps_vals[fi];
+    }
+    ui.add(egui::Label::new(egui::RichText::new(t!("game.adv_fps_sub")).size(12.0).color(TEXT3)).wrap());
+    ui.add_space(6.0);
+    ui.label(egui::RichText::new(t!("game.adv_render_scale")).size(13.0).color(TEXT2));
+    let scale_vals: [u8; 5] = [100, 85, 75, 67, 50];
+    let scale_labels: Vec<String> = vec![
+        t!("game.adv_render_scale_native").to_string(),
+        "85%".into(),
+        "75%".into(),
+        "67%".into(),
+        "50%".into(),
+    ];
+    let cur_scale = o.effective_split_render_scale();
+    let mut rsci = scale_vals.iter().position(|&v| v == cur_scale).unwrap_or(0);
+    if widgets::stepper(ui, "split-render-scale", &scale_labels, &mut rsci, ui.available_width()).changed() {
+        o.split_render_scale = scale_vals[rsci];
+    }
+    ui.add(egui::Label::new(egui::RichText::new(t!("game.adv_render_scale_sub")).size(12.0).color(TEXT3)).wrap());
+    ui.add_space(6.0);
+    let mut upscale = !o.split_no_upscale;
+    let upscale_changed = ui
+        .horizontal(|ui| {
+            let c = widgets::switch(ui, &mut upscale).changed();
+            ui.add(egui::Label::new(egui::RichText::new(t!("game.adv_upscale")).size(13.0).color(TEXT2)).wrap());
+            c
+        })
+        .inner;
+    if upscale_changed {
+        o.split_no_upscale = !upscale;
+    }
+    ui.add(egui::Label::new(egui::RichText::new(t!("game.adv_upscale_sub")).size(12.0).color(TEXT3)).wrap());
+    ui.add_space(6.0);
+    let mut vram = !o.split_no_vram_budget;
+    let vram_changed = ui
+        .horizontal(|ui| {
+            let c = widgets::switch(ui, &mut vram).changed();
+            ui.add(egui::Label::new(egui::RichText::new(t!("game.adv_vram_budget")).size(13.0).color(TEXT2)).wrap());
+            c
+        })
+        .inner;
+    if vram_changed {
+        o.split_no_vram_budget = !vram;
+    }
+    ui.add(egui::Label::new(egui::RichText::new(t!("game.adv_vram_budget_sub")).size(12.0).color(TEXT3)).wrap());
+    ui.add_space(6.0);
+    let mut cpu_bal = !o.split_no_cpu_balance;
+    let cpu_changed = ui
+        .horizontal(|ui| {
+            let c = widgets::switch(ui, &mut cpu_bal).changed();
+            ui.add(egui::Label::new(egui::RichText::new(t!("game.adv_cpu_balance")).size(13.0).color(TEXT2)).wrap());
+            c
+        })
+        .inner;
+    if cpu_changed {
+        o.split_no_cpu_balance = !cpu_bal;
+    }
+    ui.add(egui::Label::new(egui::RichText::new(t!("game.adv_cpu_balance_sub")).size(12.0).color(TEXT3)).wrap());
+    ui.add_space(6.0);
     ui.label(egui::RichText::new(t!("game.adv_stagger")).size(13.0).color(TEXT2));
     let stagger_vals = ["", "0", "5", "10", "15", "20", "30"];
     let stagger_labels: Vec<String> = vec![
@@ -606,7 +677,20 @@ fn advanced_split(ui: &mut egui::Ui, o: &mut GameOptions) {
 
 /// Anything under a game's Advanced that differs from the recommended.
 fn advanced_changed(o: &GameOptions) -> bool {
-    !o.modes.is_empty() || !o.skip.is_empty() || !o.game_key.is_empty() || o.exe.is_some() || !o.args.trim().is_empty() || !o.compositor.is_empty() || !o.dxvk.is_empty() || !o.split_stagger.is_empty() || o.split_no_sync
+    !o.modes.is_empty()
+        || !o.skip.is_empty()
+        || !o.game_key.is_empty()
+        || o.exe.is_some()
+        || !o.args.trim().is_empty()
+        || !o.compositor.is_empty()
+        || !o.dxvk.is_empty()
+        || !o.split_stagger.is_empty()
+        || o.split_no_sync
+        || o.effective_split_render_scale() < 100
+        || o.split_no_upscale
+        || o.split_fps != 0
+        || o.split_no_vram_budget
+        || o.split_no_cpu_balance
 }
 
 /// This PC's monitors, as `--monitor` numbers them, looked at every few seconds (one

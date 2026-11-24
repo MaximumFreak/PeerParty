@@ -771,3 +771,17 @@ studio.pad_fine = Hold: fine
 studio.pad_back = Back
 studio.pad_sync = Sync
 studio.pad_available = Controller
+
+game.adv_fps = Frame rate cap
+game.adv_fps_display = Match display
+game.adv_fps_n = {n} FPS
+game.adv_fps_sub = Caps each split-screen copy's frame rate for steadier pacing and lower GPU load on high-refresh displays.
+game.adv_render_scale = Render scale
+game.adv_render_scale_native = 100% (Native)
+game.adv_render_scale_sub = Renders each copy below its pane size to cut GPU load and video memory usage, then scales it up to fit.
+game.adv_upscale = Sharp upscaling
+game.adv_upscale_sub = Uses contrast-adaptive sharpening when a pane is scaled up; turn off for plain bilinear scaling.
+game.adv_vram_budget = Share GPU memory budget
+game.adv_vram_budget_sub = Reports each copy's fair share of VRAM so engines size texture pools without stuttering.
+game.adv_cpu_balance = Balance CPU cores
+game.adv_cpu_balance_sub = Gives each copy its own preferred CPU cores and scales worker threads to reduce thread contention.

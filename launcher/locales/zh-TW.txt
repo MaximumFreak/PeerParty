@@ -754,3 +754,17 @@ studio.pad_fine = 按住: 微調
 studio.pad_back = 返回
 studio.pad_sync = 同步
 studio.pad_available = 控制器
+
+game.adv_fps = 影格率上限
+game.adv_fps_display = 與顯示器一致
+game.adv_fps_n = {n} FPS
+game.adv_fps_sub = 限制每個分割畫面副本的影格率，在高更新率螢幕上維持穩定節奏並降低 GPU 負載。
+game.adv_render_scale = 算繪比例
+game.adv_render_scale_native = 100%（原生）
+game.adv_render_scale_sub = 以低於窗格尺寸的解析度算繪各副本以減少 GPU 負載與顯示記憶體用量，再放大顯示。
+game.adv_upscale = 銳化放大
+game.adv_upscale_sub = 放大窗格畫面時套用對比度自適應銳化；關閉則改用一般雙線性縮放。
+game.adv_vram_budget = 分配顯示記憶體預算
+game.adv_vram_budget_sub = 向每個副本回報公平的顯示記憶體份額，讓引擎合理調整貼圖池以避免卡頓。
+game.adv_cpu_balance = 平衡 CPU 核心
+game.adv_cpu_balance_sub = 為每個副本指派偏好 CPU 核心並調整工作執行緒數，減少執行緒爭搶。

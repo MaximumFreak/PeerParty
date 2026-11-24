@@ -247,6 +247,10 @@ pub struct CompositorWindow {
     panes: Vec<PaneRect>,
     /// Each copy's normalized slot (fit, virtual aspect, Z-order).
     slots: Vec<PaneSlot>,
+    /// Virtual render resolution percentage (`50..=100`; `100` = native pane size).
+    render_scale: u8,
+    /// Apply CAS sharpening in the GPU compositor when scaling a pane up.
+    upscale: bool,
     #[cfg(windows)]
     window: Option<win::HostWindow>,
     #[cfg(unix)]
@@ -265,6 +269,8 @@ impl CompositorWindow {
             zoomed: false,
             panes: Vec::new(),
             slots: Vec::new(),
+            render_scale: 100,
+            upscale: true,
             #[cfg(windows)]
             window: None,
             #[cfg(unix)]
@@ -272,6 +278,17 @@ impl CompositorWindow {
         };
         c.recompute();
         c
+    }
+
+    /// Sets the virtual render scale percentage (`50..=100`) and whether CAS sharpening
+    /// runs on upscaled panes.
+    pub fn set_quality(&mut self, render_scale: u8, upscale: bool) {
+        self.render_scale = if render_scale == 0 || render_scale >= 100 { 100 } else { render_scale.clamp(50, 100) };
+        self.upscale = upscale;
+        #[cfg(windows)]
+        if let Some(w) = self.window.as_mut() {
+            w.set_upscale(upscale);
+        }
     }
 
     /// The layout and, on Windows, its window, shown on `bounds` with `title` and `exe`'s icon.
@@ -317,14 +334,17 @@ impl CompositorWindow {
         &self.slots
     }
 
-    /// The virtual render size `(width, height)` copy `i` is told for its pane.
+    /// The virtual render size `(width, height)` copy `i` is told for its pane (with
+    /// `render_scale` applied when below 100%).
     pub fn virtual_size(&self, i: usize) -> Option<(u32, u32)> {
         let pane = self.told_panes().get(i).copied()?;
-        if self.zoomed && i == self.focus {
-            return Some((pane.width, pane.height));
-        }
-        let slot = self.slots.get(i).copied().unwrap_or_else(|| PaneSlot::new(peerparty_protocol::session::NormRect::FULL));
-        Some(slot.aspect.size_for(pane, slot.fit, self.bounds.width, self.bounds.height))
+        let (w, h) = if self.zoomed && i == self.focus {
+            (pane.width, pane.height)
+        } else {
+            let slot = self.slots.get(i).copied().unwrap_or_else(|| PaneSlot::new(peerparty_protocol::session::NormRect::FULL));
+            slot.aspect.size_for(pane, slot.fit, self.bounds.width, self.bounds.height)
+        };
+        Some(peerparty_protocol::session::scale_dimensions(w, h, self.render_scale))
     }
 
     /// Pane `i` on screen, as its copy is told it (`told_panes`).
@@ -1192,6 +1212,8 @@ mod win {
         pressed: Vec<(Held, isize, LPARAM)>,
         /// What changed in each copy's pane, for its log (`take_notes`).
         pub notes: Vec<(usize, String)>,
+        /// Whether CAS sharpening is enabled for upscaled panes.
+        upscale: bool,
     }
 
     impl HostWindow {
@@ -1263,7 +1285,14 @@ mod win {
                 }
             }
             let gpu = Gpu::start(hwnd);
-            Some(HostWindow { hwnd, shown: Vec::new(), gpu, surfaces: Vec::new(), hidden_for_minimize: false, icon_big, icon_small, cursor_screen: Vec::new(), confined: None, display: Vec::new(), pressed: Vec::new(), notes: Vec::new() })
+            Some(HostWindow { hwnd, shown: Vec::new(), gpu, surfaces: Vec::new(), hidden_for_minimize: false, icon_big, icon_small, cursor_screen: Vec::new(), confined: None, display: Vec::new(), pressed: Vec::new(), notes: Vec::new(), upscale: true })
+        }
+
+        pub fn set_upscale(&mut self, on: bool) {
+            if self.upscale != on {
+                self.upscale = on;
+                self.push_panes();
+            }
         }
 
         /// Where the mouse is in copy `i`'s window, on screen as the game counts it: where
@@ -1469,7 +1498,7 @@ mod win {
                             _ => (super::HIDDEN, FULL_UV, 0),
                         },
                     };
-                    PaneDraw { dest, uv, z, ring, surface }
+                    PaneDraw { dest, uv, z, sharpen: self.upscale, ring, surface }
                 })
                 .collect();
             gpu.set(panes);

@@ -44,6 +44,16 @@ pub struct GameOptions {
     pub split_stagger: String,
     /// Turn off compositor-locked frame pacing (`--no-sync`; false = sync ON by default).
     pub split_no_sync: bool,
+    /// Per-pane render resolution percentage (`--render-scale`; 0 or 100 = native, else 50..=100).
+    pub split_render_scale: u8,
+    /// Turn off Contrast Adaptive Sharpening (CAS) on upscaled panes (`--no-upscale`).
+    pub split_no_upscale: bool,
+    /// Explicit per-copy FPS cap (`--fps`; 0 = match display refresh).
+    pub split_fps: u16,
+    /// Turn off fair-share VRAM budget reporting (`--no-vram-budget`).
+    pub split_no_vram_budget: bool,
+    /// Turn off CPU core partitioning and worker thread scaling (`--no-cpu-balance`).
+    pub split_no_cpu_balance: bool,
     /// What each split-screen player plays with, by player: "auto", "kbm" or "pad"
     /// (`launch::SlotInput`); missing ones are "auto".
     pub split_inputs: Vec<String>,
@@ -150,6 +160,11 @@ impl GameOptions {
         v.iter().any(|i| *i != "auto").then(|| v.join(","))
     }
 
+    /// Effective render scale percentage (`50..=100`; 0 in older files reads as 100%).
+    pub fn effective_split_render_scale(&self) -> u8 {
+        if self.split_render_scale == 0 || self.split_render_scale >= 100 { 100 } else { self.split_render_scale.clamp(50, 100) }
+    }
+
     /// The settings a game can answer for itself (`None` follows `Prefs`), each with its
     /// field in `Prefs`.
     fn own_answers(&self) -> [(Option<bool>, fn(&mut Prefs) -> &mut bool); 4] {
@@ -171,6 +186,11 @@ impl Default for GameOptions {
             split_custom_layout: String::new(),
             split_stagger: String::new(),
             split_no_sync: false,
+            split_render_scale: 100,
+            split_no_upscale: false,
+            split_fps: 0,
+            split_no_vram_budget: false,
+            split_no_cpu_balance: false,
             split_inputs: Vec::new(),
             split_no_kbm: false,
             split_monitor: 0,
