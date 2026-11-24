@@ -60,7 +60,7 @@ The sidebar has three places:
 - **Play together**: who can join you in every game. People on your network always
   can; **Friends online** makes or joins a room code (copy, show, leave); **Anyone
   online** turns on public sessions (with the name strangers see, voice with them, and
-  the blocked players). Your name, invites, the controller invite buttons and voice
+  the blocked players). Your name, invites and voice
   chat are here too, and the **Internet play** switch that pauses the room and public
   sessions.
 - **Settings**: General (language, lighting and animations, what the window does when
@@ -156,7 +156,7 @@ peerparty --restore-save N BACKUP <game.exe>
 The launcher window's settings (`%LOCALAPPDATA%\peerparty\ui.json`: global ones and
 each game's own) apply however the game is started: from the window, a shortcut or
 Steam. `--set` changes one for a single run: `name=Alex`, `other_name=Sam`, `auto_accept=on`, `overlay=off`,
-`invite_buttons=guide|combo|both`, `toasts=off`, `voice=off`, `draw=window|ingame`,
+`toasts=off`, `voice=off`, `draw=window|ingame`,
 `mode.<service>=lan|official|auto`, `room=CODE` (empty: off), `public=on`, `internet=off`,
 `language=de` (empty: the system's), `effects=off`. A variable already set in the environment wins over
 both.
@@ -167,16 +167,13 @@ both.
   service is set to the official servers. Everything works with no internet: see
   "Offline" below.
 - `peerparty --invite`: the game in front invites every other player to where it is.
-  It says so, or fails (exit code 1) when no game took it. The window's "Invite players
-  at home" asks the game that was last in front.
+  It says so, or fails (exit code 1) when no game took it. The window's "Invite local
+  players" asks the game that was last in front.
   Bind it to a hotkey for games without an invite button.
 - `PEERPARTY_INVITES=auto`: invites from other players are accepted at once. The
   default is `ask`: the game hears an invite arrived (where its SDK has
   that event), a notification appears, and the player accepts or declines in the
   overlay.
-- `PEERPARTY_INVITE_BUTTONS=guide|combo|both`: controller buttons that invite every other
-  player without opening the overlay (the Home button, and/or View + Menu held for a
-  second). None by default.
 - `PEERPARTY_MODE_<SERVICE>=lan|official|auto` (`PHOTON`, `UGS`, `EOS`, `PLAYFAB`,
   `STEAM`, `GALAXY`; and `STEAMID`, default `auto`: `lan` shows the game a SteamID of its own for
   this PC so players never share one, `official` keeps the one its steam_api gives, `auto` is
@@ -759,11 +756,12 @@ How the window shows the copies (the game panel's Advanced > Split screen):
   graphics API that can't share them). `dwm` (**Game windows**) always shows the copies'
   own windows, for a game whose pane stays black. `pixels` (**Pixels**) copies the
   frames through memory instead: slower, for trying that path.
-- `PEERPARTY_DXVK=<folder>` (**Direct3D 9 through DXVK**): the folder of a DXVK release
-  you downloaded (`1`: `%LOCALAPPDATA%\peerparty\dxvk`). A Direct3D 9 game's
-  split-screen copies load its `d3d9.dll` and draw through Vulkan, so their frames reach
-  the window as other games' do; for an older Direct3D 9 game whose panes stay black.
-  Nothing in the game's folder is changed.
+- `PEERPARTY_DXVK=<folder>` (environment only): the folder of a DXVK release you
+  downloaded (`1`: `%LOCALAPPDATA%\peerparty\dxvk`). A Direct3D 9 game's split-screen
+  copies load its `d3d9.dll` and draw through Vulkan, so their frames reach the window as
+  other games' do; for an older Direct3D 9 game whose panes stay black, without changing
+  the game's folder. A `d3d9.dll` from DXVK already in the game's folder works the same
+  with nothing set.
 
 What split screen does for now: it runs on Windows; one keyboard and mouse is shared
 between the players, plus a controller each, for up to four players. Racing wheels and
@@ -982,8 +980,7 @@ Friends and invites (hook/src/steamlan.rs, eos/, invite.rs):
   `PEERPARTY_INVITES=auto`) accepts them at once.
 - For games without an invite button, these invite every other player on your network
   to where you are, in the game whose window is in front: the overlay's "Invite everyone
-  on your network", the window's "Invite players at home", or `peerparty --invite`; and,
-  only when turned on, the Home button or View + Menu held. Friends in your room and
+  on your network", the window's "Invite local players", or `peerparty --invite`. Friends in your room and
   public players are never invited this way: invite them one at a time from the
   overlay's Players page. A chime confirms it; an error chime means you aren't in a
   lobby yet.

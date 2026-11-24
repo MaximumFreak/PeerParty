@@ -767,16 +767,12 @@ fn settings_env(env: &mut ChildEnv, prefs: &Prefs, game: &store::GameOptions) ->
     if !prefs.other_name.trim().is_empty() {
         env.set_default(penv::OTHER_NAME, prefs.other_name.trim());
     }
-    // How a split-screen session shows its copies, and Direct3D 9 through DXVK in them:
-    // the game's own choice, unless the environment says.
+    // How a split-screen session shows its copies: the game's own choice, unless the
+    // environment says.
     if !game.compositor.trim().is_empty() {
         env.set_default(penv::COMPOSITOR, game.compositor.trim());
     }
-    if !game.dxvk.trim().is_empty() {
-        env.set_default(penv::DXVK, game.dxvk.trim());
-    }
     env.set_default(penv::INVITES, if prefs.auto_accept { "auto" } else { "ask" });
-    env.set_default(penv::INVITE_BUTTONS, &prefs.invite_buttons);
     env.set_default(penv::DRAW, &prefs.draw);
     if !prefs.voice {
         env.set_default(penv::VOICE, "0");
@@ -824,7 +820,7 @@ fn settings_env(env: &mut ChildEnv, prefs: &Prefs, game: &store::GameOptions) ->
 }
 
 /// `--set key=value`: one setting for this run (`auto_accept=on`, `overlay=off`,
-/// `invite_buttons=guide`, `voice=off`, `steam_saves=off`, `public_voice=off`, `internet=off`,
+/// `voice=off`, `steam_saves=off`, `public_voice=off`, `internet=off`,
 /// `language=de`, `effects=off`, `mode.photon=official`, ...).
 pub fn apply_set(p: &mut Prefs, k: &str, v: &str) {
     let on = matches!(v.to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes" | "auto");
@@ -838,7 +834,6 @@ pub fn apply_set(p: &mut Prefs, k: &str, v: &str) {
         "voice" => p.voice = on,
         "steam_saves" => p.steam_saves = on,
         "toasts" => p.toasts = on,
-        "invite_buttons" => p.invite_buttons = v.to_string(),
         "draw" => p.draw = v.to_string(),
         "room" => p.room = v.to_string(),
         "public" => p.public = on,

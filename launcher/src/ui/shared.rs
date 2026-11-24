@@ -12,19 +12,6 @@ use crate::t;
 use crate::ui::fx;
 use crate::ui::theme::{self, ACCENT, FIELD, VIOLET};
 
-/// Invite-button presets, in display/cycle order.
-pub const INVITE_BUTTON_VALUES: [&str; 4] = ["", "guide", "combo", "both"];
-
-/// Translated label for an `invite_buttons` value.
-pub fn invite_button_label(value: &str) -> &'static str {
-    match value {
-        "guide" => t!("together.ib_guide"),
-        "combo" => t!("together.ib_combo"),
-        "both" => t!("together.ib_both"),
-        _ => t!("together.ib_none"),
-    }
-}
-
 /// Controller glyph style values, in display/cycle order.
 pub const GLYPH_VALUES: [&str; 4] = ["auto", "xbox", "playstation", "nintendo"];
 

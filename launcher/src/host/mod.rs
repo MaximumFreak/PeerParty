@@ -2034,7 +2034,6 @@ impl SessionHost {
     fn send_settings(&self, i: usize) {
         let inst = &self.instances[i];
         inst.send(&HostMsg::Set { key: "auto_accept".into(), value: if self.prefs.auto_accept { "auto" } else { "ask" }.into() });
-        inst.send(&HostMsg::Set { key: "invite_buttons".into(), value: self.prefs.invite_buttons.clone() });
     }
 
     /// Navigation for copy `i`'s open overlay: from the keyboard (through the hooks) and
@@ -2472,16 +2471,14 @@ pub(crate) fn ctrl_alt(down: impl Fn(i32) -> bool) -> bool {
     (lalt && (lctrl || rctrl)) || (ralt && rctrl)
 }
 
-/// Whether Home / Guide opens the overlay: on, and not taken by inviting everyone.
+/// Whether Home / Guide opens the overlay.
 pub(super) fn guide_opens(prefs: &Prefs) -> bool {
-    prefs.hotkeys.guide && !matches!(prefs.invite_buttons.as_str(), "guide" | "both")
+    prefs.hotkeys.guide
 }
 
-/// The recorded chord, unless it's View + Menu while that also invites everyone.
+/// Whether a recorded chord (two buttons or more) opens the overlay.
 pub(super) fn chord_opens(prefs: &Prefs) -> bool {
-    let c = prefs.hotkeys.chord;
-    let view_menu = pad::BACK | pad::START;
-    c.count_ones() >= 2 && !(c == view_menu && matches!(prefs.invite_buttons.as_str(), "combo" | "both"))
+    prefs.hotkeys.chord.count_ones() >= 2
 }
 
 /// The Internet page's firewall row for a check's result.

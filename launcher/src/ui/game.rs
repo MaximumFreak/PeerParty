@@ -539,8 +539,8 @@ impl App {
     }
 }
 
-/// Split screen's rarely needed parts: how the window shows the copies
-/// (`PEERPARTY_COMPOSITOR`), and Direct3D 9 drawn through DXVK (`PEERPARTY_DXVK`).
+/// Split screen's rarely needed parts: frame pacing, start stagger and how the window
+/// shows the copies (`PEERPARTY_COMPOSITOR`).
 fn advanced_split(ui: &mut egui::Ui, o: &mut GameOptions) {
     widgets::section(ui, t!("game.adv_split"));
     let mut sync = !o.split_no_sync;
@@ -675,22 +675,6 @@ fn advanced_split(ui: &mut egui::Ui, o: &mut GameOptions) {
         }
     });
     ui.add(egui::Label::new(egui::RichText::new(t!("game.adv_compositor_sub")).size(12.0).color(TEXT3)).wrap());
-    ui.add_space(6.0);
-    ui.label(egui::RichText::new(t!("game.adv_dxvk")).size(13.0).color(TEXT2));
-    ui.add(egui::Label::new(egui::RichText::new(t!("game.adv_dxvk_sub")).size(12.0).color(TEXT3)).wrap());
-    if !o.dxvk.is_empty() {
-        ui.add(egui::Label::new(egui::RichText::new(&o.dxvk).monospace().size(12.0).color(TEXT2)).wrap());
-    }
-    ui.horizontal_wrapped(|ui| {
-        if widgets::button(ui, Some(Icon::Folder), t!("game.adv_dxvk_pick"), Kind::Secondary).clicked()
-            && let Some(dir) = rfd::FileDialog::new().set_title(t!("game.adv_dxvk")).pick_folder()
-        {
-            o.dxvk = dir.to_string_lossy().into_owned();
-        }
-        if !o.dxvk.is_empty() && widgets::button(ui, None, t!("game.adv_dxvk_off"), Kind::Ghost).clicked() {
-            o.dxvk.clear();
-        }
-    });
 }
 
 /// Anything under a game's Advanced that differs from the recommended.
@@ -701,7 +685,6 @@ fn advanced_changed(o: &GameOptions) -> bool {
         || o.exe.is_some()
         || !o.args.trim().is_empty()
         || !o.compositor.is_empty()
-        || !o.dxvk.is_empty()
         || !o.split_stagger.is_empty()
         || o.split_no_sync
         || o.effective_split_render_scale() < 100

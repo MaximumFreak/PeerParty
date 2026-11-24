@@ -66,9 +66,6 @@ pub struct GameOptions {
     /// How the split-screen window shows the copies (`PEERPARTY_COMPOSITOR`): "" (the
     /// default: their frames, drawn on the GPU), "dwm" (their windows) or "pixels".
     pub compositor: String,
-    /// A DXVK release's folder (`PEERPARTY_DXVK`): a Direct3D 9 game's split-screen copies
-    /// draw through it. Empty: off.
-    pub dxvk: String,
     // "Copy Player 1's saves to Player N" isn't kept here: it is for one start (the window's
     // `App::copy_saves`). A `copy_saves` an older ui.json has is ignored on reading and
     // gone at the next save.
@@ -195,7 +192,6 @@ impl Default for GameOptions {
             split_no_kbm: false,
             split_monitor: 0,
             compositor: String::new(),
-            dxvk: String::new(),
             args: String::new(),
             exe: None,
             auto_accept: None,
@@ -256,8 +252,6 @@ pub struct Prefs {
     pub fourth_name: String,
     /// Invites from other players are accepted without asking. Off: the overlay asks.
     pub auto_accept: bool,
-    /// Controller buttons that invite every other player: "", "guide", "combo" or "both".
-    pub invite_buttons: String,
     pub overlay: bool,
     pub hotkeys: Hotkeys,
     /// Overlay size, 0.75 to 1.5.
@@ -310,7 +304,6 @@ impl Default for Prefs {
             third_name: String::new(),
             fourth_name: String::new(),
             auto_accept: false,
-            invite_buttons: String::new(),
             overlay: true,
             hotkeys: Hotkeys::default(),
             overlay_scale: 1.0,

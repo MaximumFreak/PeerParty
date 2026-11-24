@@ -396,15 +396,6 @@ impl App {
                 widgets::switch(ui, &mut p.auto_accept);
             });
             widgets::divider(ui);
-            widgets::setting(ui, t!("together.invite_buttons"), t!("together.invite_buttons_sub"), |ui| {
-                let values = super::shared::INVITE_BUTTON_VALUES;
-                let labels: Vec<String> = values.iter().map(|v| super::shared::invite_button_label(v).to_string()).collect();
-                let mut i = values.iter().position(|v| *v == p.invite_buttons).unwrap_or(0);
-                if widgets::stepper(ui, "invite_buttons", &labels, &mut i, 220.0).changed() {
-                    p.invite_buttons = values[i].to_string();
-                }
-            });
-            widgets::divider(ui);
             widgets::setting(ui, t!("together.voice"), t!("together.voice_sub"), |ui| {
                 widgets::switch(ui, &mut p.voice);
             });

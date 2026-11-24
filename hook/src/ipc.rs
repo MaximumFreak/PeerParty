@@ -495,7 +495,6 @@ fn state() -> String {
         "settings",
         Json::obj(vec![
             ("auto_accept", Json::Bool(crate::config::settings::auto_accept())),
-            ("invite_buttons", Json::u64(u64::from(crate::config::settings::invite_buttons()))),
         ]),
     ));
     let lan = crate::net::lan_if_started();

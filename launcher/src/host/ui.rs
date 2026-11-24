@@ -405,7 +405,6 @@ enum Action {
     Accept(usize),
     Decline(usize),
     ToggleAutoAccept,
-    CycleInviteButtons(i32),
     ToggleToasts,
     ToggleInternet,
     Scale(i32),
@@ -1099,13 +1098,6 @@ impl Overlay {
                     // from the top of the list.
                     Row::toggle(t!("settings.toasts"), t!("overlay.s_toasts_detail"), prefs.toasts, Action::ToggleToasts),
                     Row::toggle(t!("together.auto_accept"), t!("overlay.s_auto_accept_detail"), prefs.auto_accept, Action::ToggleAutoAccept),
-                    Row::setting(
-                        t!("together.invite_buttons"),
-                        t!("overlay.s_invite_buttons_detail"),
-                        crate::ui::shared::invite_button_label(&prefs.invite_buttons),
-                        Action::CycleInviteButtons(1),
-                        (Action::CycleInviteButtons(-1), Action::CycleInviteButtons(1)),
-                    ),
                     Row::header(t!("settings.look")),
                     Row::setting(t!("settings.size"), "", format!("{:.0}%", prefs.overlay_scale * 100.0), Action::Scale(1), (Action::Scale(-1), Action::Scale(1))),
                     Row::setting(
@@ -1253,12 +1245,6 @@ impl Overlay {
             }
             Action::ToggleAutoAccept => {
                 prefs.auto_accept = !prefs.auto_accept;
-                out.push(Cmd::Prefs);
-            }
-            Action::CycleInviteButtons(d) => {
-                let opts = crate::ui::shared::INVITE_BUTTON_VALUES;
-                let i = opts.iter().position(|o| *o == prefs.invite_buttons).unwrap_or(0) as i32;
-                prefs.invite_buttons = opts[(i + d).rem_euclid(opts.len() as i32) as usize].to_string();
                 out.push(Cmd::Prefs);
             }
             Action::ToggleToasts => {
@@ -2428,7 +2414,7 @@ mod tests {
         // A multi-value row (the size, past a heading) still takes left / right.
         o.open(Page::Settings, false);
         draw(&ctx, &mut tex, &mut o, &mut prefs, Nav::default());
-        for _ in 0..3 {
+        for _ in 0..2 {
             draw(&ctx, &mut tex, &mut o, &mut prefs, Nav { down: true, ..Nav::default() });
         }
         let scale = prefs.overlay_scale;

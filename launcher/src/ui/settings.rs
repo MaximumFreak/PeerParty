@@ -474,7 +474,6 @@ fn take_resettable(p: &mut Prefs, from: &Prefs) {
     p.overlay_scale = from.overlay_scale;
     p.glyphs = from.glyphs.clone();
     p.draw = from.draw.clone();
-    p.invite_buttons = from.invite_buttons.clone();
     p.steam_saves = from.steam_saves;
     p.toasts = from.toasts;
     p.effects = from.effects;
@@ -525,10 +524,11 @@ mod tests {
         assert_eq!(Prefs::default().mode(&Default::default(), "steamid"), "auto");
     }
 
-    /// Undo puts back exactly what Reset changed, the controller buttons too.
+    /// Undo puts back exactly what Reset changed, the overlay's buttons too.
     #[test]
     fn reset_can_be_undone() {
-        let mut p = Prefs { overlay_scale: 1.5, invite_buttons: "lb+rb+y".into(), ..Prefs::default() };
+        let mut p = Prefs { overlay_scale: 1.5, ..Prefs::default() };
+        p.hotkeys.shift_f3 = !p.hotkeys.shift_f3;
         p.modes.insert("eos".into(), "official".into());
         let before = p.clone();
         reset_to_recommended(&mut p);

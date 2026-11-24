@@ -35,8 +35,6 @@ pub const MODE_PREFIX: &str = "PEERPARTY_MODE_";
 pub const DRAW: &str = "PEERPARTY_DRAW";
 /// Whether invites are accepted without asking (`auto`) or asked about (`ask`).
 pub const INVITES: &str = "PEERPARTY_INVITES";
-/// The controller buttons that invite (`guide`, `combo`, `both`).
-pub const INVITE_BUTTONS: &str = "PEERPARTY_INVITE_BUTTONS";
 /// Voice chat on or off (`parse_bool`).
 pub const VOICE: &str = "PEERPARTY_VOICE";
 /// Voice's echo cancellation on or off.

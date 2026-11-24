@@ -75,9 +75,8 @@ pub struct HookConfig {
     pub shared_save_paths: Vec<String>,
     /// `PEERPARTY_SWAP=inline`: functions are swapped in place, not in import tables.
     pub swap_inline: bool,
-    /// `PEERPARTY_INVITES`, `PEERPARTY_INVITE_BUTTONS`: their starting values.
+    /// `PEERPARTY_INVITES`: its starting value.
     pub invites: String,
-    pub invite_buttons: String,
     /// `PEERPARTY_VOICE`, `PEERPARTY_VOICE_AEC`.
     pub voice: Option<bool>,
     pub voice_aec: Option<bool>,
@@ -158,7 +157,6 @@ impl HookConfig {
             shared_save_paths: env::path_list(&get(env::SHARED_SAVE_PATHS).unwrap_or_default()).into_iter().map(String::from).collect(),
             swap_inline: get(env::SWAP).is_some_and(|v| v.trim().eq_ignore_ascii_case("inline")),
             invites: get(env::INVITES).unwrap_or_default(),
-            invite_buttons: get(env::INVITE_BUTTONS).unwrap_or_default(),
             voice: switch(env::VOICE),
             voice_aec: switch(env::VOICE_AEC),
             photon: switch(env::PHOTON),

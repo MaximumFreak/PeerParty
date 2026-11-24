@@ -365,7 +365,7 @@ pub enum HostMsg {
     /// The overlay's voice switches: the microphone, one player.
     Mic { on: bool },
     Mute { peer: String, on: bool },
-    /// A setting changed (`auto_accept`, `invite_buttons`, `internet`, ...).
+    /// A setting changed (`auto_accept`, `internet`, ...).
     Set { key: String, value: String },
     /// The overlay showed (with what opened it) or hid (with whether controller buttons
     /// are still held down from it).
@@ -749,7 +749,7 @@ mod tests {
             HostMsg::Unblock { peer: "00aa".into() },
             HostMsg::Mic { on: true },
             HostMsg::Mute { peer: "00aa".into(), on: false },
-            HostMsg::Set { key: "invite_buttons".into(), value: "guide".into() },
+            HostMsg::Set { key: "auto_accept".into(), value: "ask".into() },
             HostMsg::Overlay { visible: true, why: Some("Shift+Tab".into()), pads_held: false },
             HostMsg::Overlay { visible: false, why: None, pads_held: true },
             HostMsg::PadsHeld { on: false },

@@ -10,9 +10,7 @@
 //! - the overlay's "Invite everyone" button (a command over ipc.rs).
 //! - `peerparty --invite` (for a keyboard hotkey, e.g. from AutoHotkey), which sets the
 //!   named event `Local\peerparty.invite`.
-//! - only when turned on (`PEERPARTY_INVITE_BUTTONS`, or the setting): the Xbox (Guide)
-//!   button and/or View + Menu held together for a second, on any XInput controller. By
-//!   default the Guide button opens the overlay instead.
+//! - the launcher's "Invite local players" button, for the game that was in front.
 //!
 //! A game that never publishes where to join (no Steam rich presence `connect`, no SDK
 //! lobby PeerParty can hand over) but sends invites of its own (its friends list, through
@@ -720,7 +718,7 @@ pub fn decline(id: u64) -> bool {
 
 // ---- triggers ----
 
-/// Triggers act in the game in front: a controller and `--invite` reach every copy.
+/// Triggers act in the game in front: `--invite` reaches every copy.
 fn in_front() -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetForegroundWindow, GetWindowThreadProcessId,
@@ -750,38 +748,7 @@ pub fn start() {
     });
 }
 
-const GUIDE: u16 = 0x0400;
-const BACK: u16 = 0x0020;
-const START_BUTTON: u16 = 0x0010;
-const COMBO_HOLD: Duration = Duration::from_secs(1);
-
-/// `XInputGetStateEx`'s state: `XINPUT_STATE` and a DWORD of padding (20 bytes; a 16-byte
-/// `XINPUT_STATE` buffer is overrun).
-const STATE_LEN: usize = 20;
-
-type GetStateFn = unsafe extern "system" fn(u32, *mut [u8; STATE_LEN]) -> u32;
-
-/// `XInputGetStateEx` (ordinal 100) reports the Guide button; plain `XInputGetState`
-/// doesn't, so it's the fallback for the View + Menu combo only.
-fn xinput() -> Option<GetStateFn> {
-    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-    for dll in ["xinput1_4.dll", "xinput1_3.dll"] {
-        let wide: Vec<u16> = dll.encode_utf16().chain(Some(0)).collect();
-        let m = unsafe { LoadLibraryW(wide.as_ptr()) };
-        if m.is_null() {
-            continue;
-        }
-        let f = unsafe { GetProcAddress(m, 100 as *const u8) }
-            .or_else(|| unsafe { GetProcAddress(m, c"XInputGetState".as_ptr().cast()) });
-        if let Some(f) = f {
-            return Some(unsafe { std::mem::transmute::<_, GetStateFn>(f) });
-        }
-    }
-    None
-}
-
-/// Waits on the `--invite` event. Controllers are read only while invite buttons are
-/// turned on; with them off (the default) the thread sleeps in the wait.
+/// Waits on the `--invite` event and the launcher's button.
 fn run() {
     use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
     use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects, WaitForSingleObject};
@@ -794,23 +761,10 @@ fn run() {
     let front = front_slot();
     let me = std::process::id();
     let mut last_was_set = false;
-    let mut get_state: Option<Option<GetStateFn>> = None;
-    log!(
-        "invite triggers: `peerparty --invite`, the overlay{}",
-        match crate::config::settings::invite_buttons() {
-            0 => "",
-            b if b == crate::config::settings::GUIDE => ", the Xbox button",
-            b if b == crate::config::settings::COMBO => ", View+Menu",
-            _ => ", the Xbox button, View+Menu",
-        }
-    );
+    log!("invite triggers: `peerparty --invite`, the launcher's button, the overlay");
     let mut was_set = false;
-    let mut guide_down = [false; 4];
-    let mut combo_since: [Option<Instant>; 4] = [None; 4];
-    let mut combo_fired = [false; 4];
     loop {
-        let buttons = crate::config::settings::invite_buttons();
-        let wait = if buttons == 0 && !was_set && !last_was_set { 1000 } else { 50 };
+        let wait = if !was_set && !last_was_set { 1000 } else { 50 };
         if event.is_null() {
             std::thread::sleep(Duration::from_millis(u64::from(wait)));
         } else {
@@ -842,41 +796,6 @@ fn run() {
             }
             was_set = set;
             last_was_set = last_set;
-        }
-        if buttons == 0 || !in_front() {
-            guide_down = [false; 4];
-            combo_since = [None; 4];
-            continue;
-        }
-        let Some(get_state) = *get_state.get_or_insert_with(xinput) else { continue };
-        for pad in 0..4u32 {
-            let mut state = [0u8; STATE_LEN];
-            if unsafe { get_state(pad, &mut state) } != 0 {
-                continue;
-            }
-            let pressed = u16::from_le_bytes([state[4], state[5]]);
-            let i = pad as usize;
-            let guide = pressed & GUIDE != 0;
-            if guide && !guide_down[i] && buttons & crate::config::settings::GUIDE != 0 {
-                log!("invite: triggered by the Xbox button on pad {pad}");
-                everyone();
-            }
-            guide_down[i] = guide;
-            let combo = buttons & crate::config::settings::COMBO != 0
-                && pressed & (BACK | START_BUTTON) == (BACK | START_BUTTON);
-            match (combo, combo_since[i]) {
-                (true, None) => combo_since[i] = Some(Instant::now()),
-                (true, Some(t)) if !combo_fired[i] && t.elapsed() >= COMBO_HOLD => {
-                    combo_fired[i] = true;
-                    log!("invite: triggered by View+Menu on pad {pad}");
-                    everyone();
-                }
-                (false, _) => {
-                    combo_since[i] = None;
-                    combo_fired[i] = false;
-                }
-                _ => {}
-            }
         }
     }
 }
