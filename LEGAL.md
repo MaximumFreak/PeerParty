@@ -51,11 +51,15 @@ players on one PC, directly with friends, and after its online services have clo
 
 PeerParty's own files live under `%LOCALAPPDATA%\peerparty` (or in a `peerparty-data`
 folder beside `peerparty.exe` when portable mode is on), and its logs under
-`%TEMP%\peerparty\logs`. Outside those it writes only: copies of a game's saves under a
-PeerParty player's identity, next to the originals, which are only read; Windows Firewall rules for a
-game, when you press **Fix** and approve Windows' prompt; the key of its local
-certificate, in your Windows user's key store; and, while it starts an Xbox app game,
-Windows' debug setting for that package, which it clears at once.
+`%TEMP%\peerparty\logs`. Players 2–4's saves on this PC are in `saves\` there, and their
+registry settings under `HKCU\Software\PeerParty\Saves`; nothing of theirs is written
+beside player 1's saves. Outside those it writes only: copies of a game's saves under a
+PeerParty player's identity, next to the originals, which are only read; player 1's
+saves when you copy, swap, reset or restore them in the launcher's Saves card or with
+`--copy-save` and the like (what was there is backed up first, in `saves\`); Windows
+Firewall rules for a game, when you press **Fix** and approve Windows' prompt; the key
+of its local certificate, in your Windows user's key store; and, while it starts an
+Xbox app game, Windows' debug setting for that package, which it clears at once.
 
 The services PeerParty stands in for run inside the game's process, with a certificate
 trusted by that process alone; nothing is installed in Windows' certificate stores.

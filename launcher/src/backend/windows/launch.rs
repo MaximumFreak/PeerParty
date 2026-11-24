@@ -216,6 +216,8 @@ pub fn start_session(t: Target, base_env: ChildEnv, split: &SplitScreen, prefs: 
         spec.compositor_capture = !dwm;
         spec.input_assignment = split.input(slot).assignment(slot);
         spec.identity_override = split.name(slot);
+        // Its saves are that player's from the hook's start (hook saves/mod.rs).
+        env.set(penv::PLAYER_SLOT, slot.to_string());
         if let Some(&pane) = panes.get(slot as usize) {
             spec.pane = Some(peerparty_protocol::session::PaneRect {
                 x: bounds.x.saturating_add(pane.x),

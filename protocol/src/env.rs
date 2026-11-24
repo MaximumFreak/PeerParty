@@ -47,6 +47,22 @@ pub const STEAM_SAVES: &str = "PEERPARTY_STEAM_SAVES";
 pub const SEPARATE_SAVES: &str = "PEERPARTY_SEPARATE_SAVES";
 /// The second copy starts with a copy of the first's saves (`--copy-saves`).
 pub const COPY_SAVES: &str = "PEERPARTY_COPY_SAVES";
+/// The game's id for its players' saves (saves.rs `game_id`), so a game's starter and
+/// the game it starts keep the same folder.
+pub const SAVE_GAME: &str = "PEERPARTY_SAVE_GAME";
+/// The player this copy plays as (0 is player 1), when the launcher chose one: its
+/// saves, registry and Steam Remote Storage are that player's from the hook's start.
+pub const PLAYER_SLOT: &str = "PEERPARTY_PLAYER_SLOT";
+/// `1`: a later player with no saves of its own yet starts from a copy of player 1's
+/// (the launcher's "Start new players from Player 1's saves", `--copy-saves`).
+pub const SAVE_SEED: &str = "PEERPARTY_SAVE_SEED";
+/// `1`: player 1's copy notes where its saves are (saves.rs `Discovered`), for copying
+/// them to other players.
+pub const SAVE_WATCH: &str = "PEERPARTY_SAVE_WATCH";
+/// More folders that are the game's saves: full paths, separated by `;` (`path_list`).
+pub const SAVE_PATHS: &str = "PEERPARTY_SAVE_PATHS";
+/// Folders every player shares even when they look like saves (a big mods folder).
+pub const SHARED_SAVE_PATHS: &str = "PEERPARTY_SHARED_SAVE_PATHS";
 /// More than one copy of the game on this PC (`--multi-instance`).
 pub const MULTI_INSTANCE: &str = "PEERPARTY_MULTI_INSTANCE";
 /// How a split-screen session's window shows its copies: `gpu` (the default: it draws
@@ -240,6 +256,11 @@ pub fn env_mode(sdk_id: &str) -> SdkMode {
 /// ones dropped. Case is kept (`list_contains_ci` compares without it).
 pub fn parse_list(v: &str) -> Vec<&str> {
     v.split(|c: char| c == ',' || c == ';' || c.is_whitespace()).filter(|s| !s.is_empty()).collect()
+}
+
+/// A list of full paths, separated by `;` as `PATH` is (paths hold spaces and commas).
+pub fn path_list(v: &str) -> Vec<&str> {
+    v.split(';').map(str::trim).filter(|s| !s.is_empty()).collect()
 }
 
 /// Whether a list (`parse_list`) holds `item`, ignoring ASCII case.

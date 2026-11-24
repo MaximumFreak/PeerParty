@@ -45,9 +45,10 @@ itself still runs. PeerParty moves that part onto the players' own PCs:
   connect directly, through an encrypted tunnel.
 - **Several copies on one PC, or split screen.** Up to four players on one PC can play
   together in one split-screen window (each with their own controller and in-game
-  overlay), or two in separate windows. Each player gets their own identity and, for a
-  game whose saves aren't kept per player, their own saves, and they meet as LAN
-  players do.
+  overlay), or two in separate windows. Each player gets their own identity and their
+  own saves (player 1's stay where the game keeps them; players 2–4's are kept apart in
+  PeerParty's folder), and they meet as LAN players do. The launcher copies, swaps and
+  restores saves between any two players, and starts a game alone as any of them.
 - **An overlay in every game**: players, invites and settings, opened with the usual
   store hotkeys or a controller's Home button.
 
@@ -183,7 +184,9 @@ included. Options for one run go in front of the game's path (or of `%command%`)
 | `--set key=value` | Changes one setting this run, e.g. `name=Alex`, `voice=off`, `internet=off`. |
 | `--multi-instance` | Lets a second copy of the game start on the same PC. |
 | `--split-screen` | Starts 2–4 copies (`--instances N`, default 2) in one shared split-screen window (`--layout horizontal\|vertical\|grid`), each player on a controller or the keyboard and mouse (`--inputs auto\|kbm\|pad,...`), with names of their own (`--names A,B,...`). |
-| `--copy-saves` | This copy starts from player 1's whole save; its own save, if any, is moved aside as a backup. Only when given. |
+| `--monitor N` | With `--split-screen`: the monitor the session's window opens on (1 the main one, 2.. the others, left to right). |
+| `--player N` | Plays alone as player N (1–4): that player's saves, name and identity. |
+| `--copy-saves` | Later players start from a copy of player 1's saves; what they had is kept as a backup. Only when given. |
 | `--log-dir DIR` | Where the logs go. |
 
 Commands on their own:
@@ -193,6 +196,8 @@ Commands on their own:
 | `peerparty --new-room` | Makes a room code. |
 | `peerparty --net-test` | Checks this PC's path to the internet for internet play. |
 | `peerparty --invite` | The game in front invites every other player (bind it to a hotkey). |
+| `peerparty --saves <game.exe>` | Each player's saves for the game, and their backups. |
+| `peerparty --copy-save FROM TO <game.exe>` | Copies one player's saves to another (players 1–4); `--swap-saves A B`, `--reset-save N` and `--restore-save N BACKUP` too. What's replaced is backed up first. |
 | `peerparty --firewall game.exe` | Says whether Windows Firewall lets other players connect to the game; `--fix-firewall game.exe` (as administrator) lets them. |
 | `peerparty --blocked`, `--block FINGERPRINT`, `--unblock FINGERPRINT` | The public players you blocked. |
 | `peerparty --pads` | Lists the controllers the overlay reads. |

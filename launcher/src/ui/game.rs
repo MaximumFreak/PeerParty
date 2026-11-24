@@ -72,6 +72,20 @@ impl App {
                 self.play_button(ui, &g, &key, &o, &running, &mut actions);
                 ui.add_space(10.0);
                 let xbox = g.source == Source::Xbox;
+                // Alone, as which player: only once another player has saves here.
+                if !xbox && o.players <= 1 && (o.play_as >= 2 || self.later_saves(&key, &g, &o)) {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(t!("game.play_as_label")).size(13.0).color(TEXT2));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let labels: Vec<String> = (0..4u32).map(|s| t!("saves.player", n = s + 1, name = self.player_name(s))).collect();
+                            let mut i = usize::from(o.play_as.max(1) - 1).min(3);
+                            if widgets::stepper(ui, "play-as", &labels, &mut i, 220.0).changed() {
+                                o.play_as = if i == 0 { 0 } else { (i + 1) as u8 };
+                            }
+                        });
+                    });
+                    ui.add_space(6.0);
+                }
                 if !xbox {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(t!("game.players_here")).size(13.0).color(TEXT2));
@@ -182,29 +196,6 @@ impl App {
                             });
                         }
                     }
-                    // For the second copy, or the next one "Start another instance" adds. Not a
-                    // setting: it is off whenever the window starts and once a start used it.
-                    if self.sessions.copy_saves_offered(&key, o.players, !running.is_empty()) {
-                        let mut copy = self.sessions.copy_saves.contains(&key);
-                        let label = if o.uses_split_screen() && running.is_empty() && o.players > 2 {
-                            t!("game.copy_saves_others").to_string()
-                        } else {
-                            let to = self.sessions.copy_saves_target(&key);
-                            t!("game.copy_saves", player = to)
-                        };
-                        stacked(ui, &label, t!("game.copy_saves_sub"), |ui| {
-                            if widgets::switch(ui, &mut copy).changed() {
-                                if copy {
-                                    self.sessions.copy_saves.insert(key.clone());
-                                } else {
-                                    self.sessions.copy_saves.remove(&key);
-                                }
-                            }
-                        });
-                        if copy {
-                            widgets::note(ui, Icon::Warning, theme::WARN, t!("game.copy_saves_warn"));
-                        }
-                    }
                     // Only where a second copy on this PC is in play (two players here, or
                     // Play adding one): most players never start two, and never see it.
                     if o.players >= 2 || !running.is_empty() {
@@ -262,6 +253,12 @@ impl App {
                 }
                 ui.add_space(12.0);
                 self.who_can_join(ui, &key, &mut actions);
+                // Players' saves: where more than one player is in play, or a later
+                // player has saves of its own.
+                if !xbox && (o.players >= 2 || o.play_as >= 2 || self.later_saves(&key, &g, &o)) {
+                    ui.add_space(12.0);
+                    self.saves_card(ui, &g, &key, &mut o, &running, &mut actions);
+                }
                 ui.add_space(12.0);
                 let own = o.auto_accept.is_some() || o.overlay.is_some() || o.voice.is_some() || o.steam_saves.is_some();
                 fold(ui, "game-own", Icon::Sliders, t!("game.own_title"), t!("game.own_sub"), own, |ui| {
@@ -316,6 +313,7 @@ impl App {
             (_, _, false, true) => t!("game.already_running").to_string(),
             (true, _, true, _) => t!("game.play_split", n = o.players.clamp(2, 4)),
             (false, true, true, _) => t!("game.play_two").to_string(),
+            (false, false, true, _) if o.play_as >= 2 => t!("game.play_as", name = self.player_name(u32::from(o.play_as) - 1)),
             (false, false, true, _) => t!("game.play").to_string(),
             // With a copy running, Play adds one more, whatever the count says.
             (_, _, false, _) => t!("game.play_another").to_string(),
@@ -588,7 +586,7 @@ fn join_row(ui: &mut egui::Ui, icon: Icon, who: &str, status: &str, color: Color
 }
 
 /// A setting for a narrow column: the name over its control.
-fn stacked(ui: &mut egui::Ui, title: &str, detail: &str, control: impl FnOnce(&mut egui::Ui)) {
+pub(super) fn stacked(ui: &mut egui::Ui, title: &str, detail: &str, control: impl FnOnce(&mut egui::Ui)) {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         let w = ui.available_width() - 56.0;

@@ -364,6 +364,9 @@ pub struct Launch {
     /// `--set key=value`, `--room`, `--public`: settings for this run.
     pub sets: Vec<(String, String)>,
     pub split: Option<SplitScreen>,
+    /// `--player N`: one copy, as player N (0 is player 1): that player's saves, name and
+    /// identity.
+    pub player: Option<u32>,
 }
 
 /// Starts the game `l` names with PeerParty, hosts it, and returns how it ended.
@@ -442,6 +445,15 @@ pub fn start(l: Launch) -> Result<Exited, LaunchError> {
         env.remove(penv::COPY_SAVES);
     }
 
+    // Players' saves (saves.rs): which player this run is, its saves set up before the
+    // game starts, held while it runs.
+    let (_held, lone) = players_saves(Want { split: l.split.as_ref(), player: l.player, multi: l.multi_instance, copy_saves: l.copy_saves }, &listed, &exe, root.as_deref(), &game, &prefs, &mut env)?;
+    if let Some(slot) = lone {
+        env.set(penv::PLAYER_SLOT, slot.to_string());
+    } else {
+        env.remove(penv::PLAYER_SLOT);
+    }
+
     if let Some(split) = &l.split {
         // The first player's id is on disk before any copy looks for it (core's
         // `Identity::ensure_first`). Under Proton the copies keep theirs inside Wine.
@@ -458,6 +470,140 @@ pub fn start(l: Launch) -> Result<Exited, LaunchError> {
         connect(&mut env, p);
     }
     backend::start(target, env, pipe, prefs, &log_dir, root.as_deref())
+}
+
+/// Sets up the players' saves for a start: the game's id for them, the per-game save
+/// settings, which player a lone copy is (`--player`, a `--multi-instance` copy: the
+/// first player no other run holds) and copies from player 1's asked for, made before the
+/// game starts. Returns the players held for the run (released when it ends) and the
+/// player a lone copy is (`PEERPARTY_PLAYER_SLOT`; a session's copies get theirs each).
+/// What a start asks of the players' saves.
+struct Want<'a> {
+    split: Option<&'a SplitScreen>,
+    player: Option<u32>,
+    multi: bool,
+    copy_saves: bool,
+}
+
+fn players_saves(
+    l: Want,
+    listed: &std::path::Path,
+    exe: &std::path::Path,
+    root: Option<&std::path::Path>,
+    game: &store::GameOptions,
+    prefs: &Prefs,
+    env: &mut ChildEnv,
+) -> Result<(Vec<crate::saves::PlayerLock>, Option<u32>), LaunchError> {
+    use peerparty_protocol::saves::MAX_PLAYERS;
+    let listed = std::path::absolute(listed).unwrap_or_else(|_| listed.to_path_buf());
+    let saves = crate::saves::GameSaves::for_game(&store::key_of(&listed), Some(exe), root);
+    saves.note_start(exe, root, &game.save_paths);
+    env.set(penv::SAVE_GAME, &saves.id);
+    let shared = game.save_mode.eq_ignore_ascii_case("shared");
+    if shared {
+        env.set_default(penv::SEPARATE_SAVES, "0");
+    }
+    if !game.save_paths.is_empty() {
+        env.set_default(penv::SAVE_PATHS, game.save_paths.join(";"));
+    }
+    if !game.shared_save_paths.is_empty() {
+        env.set_default(penv::SHARED_SAVE_PATHS, game.shared_save_paths.join(";"));
+    }
+    let seed = game.seed_saves || l.copy_saves;
+    if seed {
+        env.set(penv::SAVE_SEED, "1");
+    } else {
+        env.remove(penv::SAVE_SEED);
+    }
+    // Player 1's copy notes where its saves are when other players are in play.
+    let many = game.players >= 2 || l.split.is_some() || l.multi || l.player.is_some_and(|p| p > 0);
+    if many || saves.later_players_have_saves() {
+        env.set(penv::SAVE_WATCH, "1");
+    }
+    let session = l.split.as_ref().map(|s| s.instances.min(MAX_PLAYERS));
+    // Copies first: the players aren't held yet.
+    if !shared {
+        let later: Vec<u32> = match (session, l.player) {
+            (Some(n), _) => (1..n).collect(),
+            (None, Some(p)) if p > 0 => vec![p],
+            _ => Vec::new(),
+        };
+        for p in later {
+            copy_from_first(&saves, p, l.copy_saves, seed);
+        }
+    }
+    if let Some(n) = session {
+        let mut held = Vec::new();
+        for p in 0..n {
+            held.push(saves.lock_player(p).map_err(|e| LaunchError::Other(format!("player {}: {e}", p + 1)))?);
+        }
+        return Ok((held, None));
+    }
+    if let Some(p) = l.player {
+        let lock = saves.lock_player(p).map_err(|_| LaunchError::Other(format!("player {} is already playing this game; start another player (--player)", p + 1)))?;
+        // Its name: the one set for that player, else the PC's numbering of copies.
+        let name = match p {
+            1 => prefs.other_name.trim(),
+            2 => prefs.third_name.trim(),
+            3 => prefs.fourth_name.trim(),
+            _ => "",
+        };
+        let mut spec = peerparty_protocol::session::InstanceSpec::solo(peerparty_protocol::session::InstanceId(0), p);
+        spec.identity_override = (!name.is_empty()).then(|| name.to_string());
+        env.set(penv::INSTANCE, spec.to_json().to_string());
+        eprintln!("peerparty: playing as player {} ({}): that player's saves, registry and Steam Cloud files", p + 1, if name.is_empty() { "its usual name" } else { name });
+        return Ok((vec![lock], Some(p)));
+    }
+    if l.multi {
+        return Ok(match saves.lock_first_free(0) {
+            Some((p, lock)) => {
+                if p > 0 && !shared {
+                    copy_from_first(&saves, p, l.copy_saves, seed);
+                }
+                eprintln!("peerparty: this copy is player {} (the first no other copy of the game is)", p + 1);
+                (vec![lock], Some(p))
+            }
+            None => {
+                eprintln!("peerparty: every player ({MAX_PLAYERS}) is playing this game already; this copy's saves are the ones its LAN slot gives");
+                (Vec::new(), None)
+            }
+        });
+    }
+    // Alone: player 1, when no other run is.
+    Ok(match saves.lock_player(0) {
+        Ok(lock) => (vec![lock], Some(0)),
+        Err(_) => (Vec::new(), None),
+    })
+}
+
+/// Before a later player's copy starts: player 1's saves copied to it, when asked
+/// (`--copy-saves`: replacing its own, kept as a backup; "Start new players from Player
+/// 1's saves": only while it has none). A game folder not known yet is copied by the
+/// hook when the game first uses it.
+fn copy_from_first(saves: &crate::saves::GameSaves, slot: u32, replace: bool, seed: bool) {
+    if !replace && !seed {
+        return;
+    }
+    let has = saves.inspect().get(slot as usize).is_some_and(|p| p.has_saves());
+    if !replace && has {
+        eprintln!("peerparty: player {} has saves of its own; player 1's aren't copied over them", slot + 1);
+        return;
+    }
+    if saves.discovered().is_empty() {
+        eprintln!("peerparty: where player 1's saves are isn't known yet: player {}'s start as a copy of player 1's as the game opens them", slot + 1);
+        return;
+    }
+    match saves.copy(0, slot) {
+        Ok(r) => eprintln!(
+            "peerparty: player 1's saves copied to player {} ({} files, {} registry keys{}){}",
+            slot + 1,
+            r.files,
+            r.keys,
+            r.backup.map(|b| format!("; its own kept as backup {b}")).unwrap_or_default(),
+            if r.notes.is_empty() { String::new() } else { format!(": {}", r.notes.join("; ")) }
+        ),
+        Err(e) => eprintln!("peerparty: player 1's saves weren't copied to player {} ({e}); the game copies them as it opens them", slot + 1),
+    }
 }
 
 /// The hook's connection to `pipe`: ours is the only one the game gets (and

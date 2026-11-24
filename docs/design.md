@@ -158,9 +158,34 @@ has no game or SDK code in it.
   SteamID of its own for this PC unless Valve's Steam client runs it (saves keyed by
   SteamID start, when the new id has none, from a copy of the save of an earlier
   PeerParty id kept in `slot-N.previous`, else the newest neighbouring PeerParty save,
-  else steam_api's; `hook/src/saves.rs`); a second copy gets a LAN one, and starts from
-  player 1's save only with `--copy-saves`, which replaces its own save and keeps it as
-  `.peerparty-before`.
+  else steam_api's; `hook/src/saves/mod.rs`); a later copy gets a LAN one. Its saves are
+  its own (**Players' saves**, below).
+- **Players' saves** (`protocol/src/saves.rs`, `hook/src/saves/`, `launcher/src/saves.rs`).
+  Player 1 keeps the real folders, registry and Steam Cloud. Players 2–4 each have a
+  folder of their own, `%LOCALAPPDATA%\peerparty\saves\<game>-<hash>\player-N`, and the
+  hook sends their game there from its first file call (the launcher says which player a
+  copy is: `PEERPARTY_PLAYER_SLOT`). A path falls in a zone (`classify`): Windows' data
+  folders (`AppData\LocalLow`, `Local`, `Roaming`, Documents, Saved Games) below the
+  folders every program shares (drivers' shader caches, Windows', stores', PeerParty's:
+  `EXCLUDED`), Steam's `userdata\<account>\<app>`, folders named for the game
+  (`PEERPARTY_SAVE_PATHS`), and the game's own folder. In the data folders the player's
+  folder is all there is: nothing of player 1's is read, so two copies never open one
+  file. The game's own folder is read through until written: a write copies the file
+  in first, a delete is noted (`whiteouts.txt`), folders named for saves aren't read
+  through, and the game's files are never written. kernelbase's file calls are hooked
+  (`CreateFile*`, attributes, listings, directories, delete, move, replace, copy
+  including `CopyFile2`, hard links, handle renames through `SetFileInformationByHandle`,
+  and the profile `.ini` calls), and the registry's key calls: a game's
+  `HKCU\Software\<vendor>` keys (Unity's PlayerPrefs) are under
+  `HKCU\Software\PeerParty\Saves\<game>\pN`, except a key only read that player 1's game
+  never writes (an installer's), which reads through. `ISteamRemoteStorage` is answered
+  from the player's `steam-remote` folder (`hook/src/steam/remote.rs`). Player 1's copy
+  notes where its game writes (`discovered.txt`); the launcher's save manager uses that
+  to copy, swap, reset and restore any player's saves (ids in names renamed to the other
+  player's, the replaced saves backed up first, five backups kept), and copies player
+  1's to a new player before the game starts when asked ("Start new players from Player
+  1's saves", `--copy-saves`); a game folder it doesn't know yet the hook copies the
+  first time the game uses it. `PEERPARTY_SEPARATE_SAVES=0` shares player 1's.
 - **Discovery** (`core/src/mesh.rs`): UDP broadcast beacons carrying the game key (the
   exe's name, or `PEERPARTY_GAME`), plus a peer board under `%LOCALAPPDATA%\peerparty\
   peers` so copies on one PC find each other with no network at all. Extra beacon
@@ -660,11 +685,13 @@ hand, attaching `peerparty.exe` (that exact name) is enough.
   back empty or offline; sign-in is answered locally (LEGAL.md).
 - Game files are never changed; PeerParty's own files live under
   `%LOCALAPPDATA%\peerparty`, or a `peerparty-data` folder beside peerparty.exe when it is
-  portable (launcher/src/portable.rs; logs under `%TEMP%\peerparty\logs`). Elsewhere it writes only
-  save copies under a PeerParty identity (originals only read), a second copy's own save
-  folder beside the game's (`Saves.peerparty-2`, see usage.md), firewall rules when the
-  player asks for the fix, its local certificate's key in the user's key store, and an
-  Xbox app package's debug setting while it starts that game (cleared at once).
+  portable (launcher/src/portable.rs; logs under `%TEMP%\peerparty\logs`). Players 2–4's
+  saves are in its `saves` folder and their registry under `HKCU\Software\PeerParty\Saves`.
+  Elsewhere it writes only save copies under a PeerParty identity (originals only read),
+  player 1's saves when the player copies, swaps, resets or restores them (backed up
+  first), firewall rules when the player asks for the fix, its local certificate's key
+  in the user's key store, and an Xbox app package's debug setting while it starts that
+  game (cleared at once).
 - Certificates are trusted inside the game only; nothing system-wide is installed.
 - Untrusted peers (public sessions) are bounded and blockable; PeerParty never shows
   addresses (they are still visible at the network level and on the DHT; see

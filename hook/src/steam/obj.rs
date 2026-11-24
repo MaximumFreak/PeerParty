@@ -126,6 +126,7 @@ fn overrides(family: &str, version: &str, server: bool) -> Vec<(&'static str, us
         "STEAMUSERSTATS_INTERFACE_VERSION" if !server => crate::steam::own::user_stats(),
         "STEAMAPPS_INTERFACE_VERSION" if !server => crate::steam::own::apps(),
         "STEAMUGC_INTERFACE_VERSION" if !server => crate::steam::own::ugc(),
+        "STEAMREMOTESTORAGE_INTERFACE_VERSION" if !server => crate::steam::remote::remote_storage(),
         _ => Vec::new(),
     }
 }
@@ -273,6 +274,7 @@ fn client() -> Vec<(&'static str, usize)> {
         ("GetISteamUserStats", get_user_stats as *const () as usize),
         ("GetISteamApps", get_apps as *const () as usize),
         ("GetISteamUGC", get_ugc as *const () as usize),
+        ("GetISteamRemoteStorage", get_remote_storage as *const () as usize),
         ("GetISteamController", get_controller as *const () as usize),
         ("GetISteamInput", get_input as *const () as usize),
     ]
@@ -301,6 +303,7 @@ client_getter!(get_generic, "GetISteamGenericInterface");
 client_getter!(get_user_stats, "GetISteamUserStats");
 client_getter!(get_apps, "GetISteamApps");
 client_getter!(get_ugc, "GetISteamUGC");
+client_getter!(get_remote_storage, "GetISteamRemoteStorage");
 client_getter!(get_controller, "GetISteamController");
 client_getter!(get_input, "GetISteamInput");
 
@@ -420,10 +423,11 @@ legacy!(legacy_game_server_utils, "SteamGameServerUtils");
 legacy!(legacy_user_stats, "SteamUserStats");
 legacy!(legacy_apps, "SteamApps");
 legacy!(legacy_ugc, "SteamUGC");
+legacy!(legacy_remote_storage, "SteamRemoteStorage");
 legacy!(legacy_controller, "SteamController");
 
 /// The old accessors' stand-in functions, by export name, for the by-name swap.
-static LEGACY_FNS: [(&str, LegacyFn); 14] = [
+static LEGACY_FNS: [(&str, LegacyFn); 15] = [
     ("SteamClient", legacy_client),
     ("SteamUser", legacy_user),
     ("SteamFriends", legacy_friends),
@@ -437,6 +441,7 @@ static LEGACY_FNS: [(&str, LegacyFn); 14] = [
     ("SteamUserStats", legacy_user_stats),
     ("SteamApps", legacy_apps),
     ("SteamUGC", legacy_ugc),
+    ("SteamRemoteStorage", legacy_remote_storage),
     ("SteamController", legacy_controller),
 ];
 
@@ -935,6 +940,7 @@ pub fn attach(base: usize, exports: &[Export]) -> Vec<usize> {
         ("SteamUserStats", "STEAMUSERSTATS_INTERFACE_VERSION", legacy_user_stats as LegacyFn, false),
         ("SteamApps", "STEAMAPPS_INTERFACE_VERSION", legacy_apps as LegacyFn, false),
         ("SteamUGC", "STEAMUGC_INTERFACE_VERSION", legacy_ugc as LegacyFn, false),
+        ("SteamRemoteStorage", "STEAMREMOTESTORAGE_INTERFACE_VERSION", legacy_remote_storage as LegacyFn, false),
         ("SteamController", "SteamController", legacy_controller as LegacyFn, false),
     ] {
         let Some(a) = find(export) else { continue };
@@ -1064,6 +1070,7 @@ fn family_of_class(stem: &str) -> Option<&'static str> {
         "steamuserstats" => "STEAMUSERSTATS_INTERFACE_VERSION",
         "steamapps" => "STEAMAPPS_INTERFACE_VERSION",
         "steamugc" => "STEAMUGC_INTERFACE_VERSION",
+        "steamremotestorage" => "STEAMREMOTESTORAGE_INTERFACE_VERSION",
         "steamcontroller" => "SteamController",
         _ => return None,
     })
@@ -1199,6 +1206,7 @@ fn flat_iface(family: &str) -> Option<&'static str> {
         "STEAMUSERSTATS_INTERFACE_VERSION" => "ISteamUserStats",
         "STEAMAPPS_INTERFACE_VERSION" => "ISteamApps",
         "STEAMUGC_INTERFACE_VERSION" => "ISteamUGC",
+        "STEAMREMOTESTORAGE_INTERFACE_VERSION" => "ISteamRemoteStorage",
         "SteamController" => "ISteamController",
         _ => return None,
     })

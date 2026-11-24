@@ -12,7 +12,7 @@ use crate::launch::{self, Launch, LaunchError, SplitScreen};
 use crate::{backend, firewall, host};
 use peerparty_protocol::session::LayoutPreset;
 
-pub const USAGE: &str = "usage: peerparty [--room CODE] [--public] [--set key=value] [--log-dir DIR] [--multi-instance] [--copy-saves] [--split-screen [--instances N] [--layout horizontal|vertical|grid] [--inputs auto|kbm|pad,...] [--names A,B,...] [--monitor N]] <game.exe> [args...]\n         plays the game through peerparty: the local network, plus the internet with --room or --public\n         a simple .bat or .cmd that starts the game works too: peerparty starts the program it runs\n         --set changes one setting for this run: name=Alex, voice=off, internet=off, overlay=off, auto_accept=on, ... (docs/usage.md)\n       peerparty --invite   (invites every other player to the game in front)\n       peerparty --new-room   (makes a room code for internet play)\n       peerparty --net-test   (checks this PC's internet path: STUN, NAT type, the DHT)\n       peerparty --pads   (lists the controllers the overlay reads, and their buttons)\n       peerparty --firewall <game.exe>   (whether Windows Firewall lets other players connect to it)\n       peerparty --fix-firewall <game.exe> [--public]   (as administrator: lets them, on private and domain networks, and public ones with --public)\n       peerparty --remove-firewall   (as administrator: removes every firewall rule peerparty added)\n       peerparty --blocked | --block FINGERPRINT | --unblock FINGERPRINT|all   (public players you blocked)\n       peerparty --friends | --friend FINGERPRINT | --unfriend FINGERPRINT|all   (friends for PEERPARTY_PUBLIC_FRIENDS_ONLY=1)";
+pub const USAGE: &str = "usage: peerparty [--room CODE] [--public] [--set key=value] [--log-dir DIR] [--multi-instance] [--copy-saves] [--player N] [--split-screen [--instances N] [--layout horizontal|vertical|grid] [--inputs auto|kbm|pad,...] [--names A,B,...] [--monitor N]] <game.exe> [args...]\n         plays the game through peerparty: the local network, plus the internet with --room or --public\n         a simple .bat or .cmd that starts the game works too: peerparty starts the program it runs\n         --set changes one setting for this run: name=Alex, voice=off, internet=off, overlay=off, auto_accept=on, ... (docs/usage.md)\n         --player N plays alone as player N (1-4): that player's saves, name and identity\n       peerparty --saves <game.exe>   (each player's saves for the game, and their backups)\n       peerparty --copy-save FROM TO <game.exe> | --swap-saves A B <game.exe> | --reset-save N <game.exe> | --restore-save N BACKUP <game.exe>   (players 1-4; the one replaced is backed up first)\n       peerparty --invite   (invites every other player to the game in front)\n       peerparty --new-room   (makes a room code for internet play)\n       peerparty --net-test   (checks this PC's internet path: STUN, NAT type, the DHT)\n       peerparty --pads   (lists the controllers the overlay reads, and their buttons)\n       peerparty --firewall <game.exe>   (whether Windows Firewall lets other players connect to it)\n       peerparty --fix-firewall <game.exe> [--public]   (as administrator: lets them, on private and domain networks, and public ones with --public)\n       peerparty --remove-firewall   (as administrator: removes every firewall rule peerparty added)\n       peerparty --blocked | --block FINGERPRINT | --unblock FINGERPRINT|all   (public players you blocked)\n       peerparty --friends | --friend FINGERPRINT | --unfriend FINGERPRINT|all   (friends for PEERPARTY_PUBLIC_FRIENDS_ONLY=1)";
 
 /// A parsed command-line invocation.
 pub enum Command {
@@ -26,7 +26,24 @@ pub enum Command {
     RemoveFirewall,
     Pads,
     Attach(Vec<String>),
+    Saves { op: SaveOp, game: PathBuf },
     Launch { launch: Launch, why_lines: bool },
+}
+
+/// A save manager command (saves.rs); players from 0.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SaveOp {
+    List,
+    Copy(u32, u32),
+    Swap(u32, u32),
+    Reset(u32),
+    Restore(u32, String),
+}
+
+/// A player number on the command line (1 to 4), from 0.
+fn player_arg(a: Option<OsString>) -> Result<u32, String> {
+    let raw = a.ok_or(USAGE)?.to_string_lossy().into_owned();
+    raw.trim().parse::<u32>().ok().filter(|n| (1..=peerparty_protocol::saves::MAX_PLAYERS).contains(n)).map(|n| n - 1).ok_or_else(|| format!("invalid player {raw:?} (expected 1 to {})", peerparty_protocol::saves::MAX_PLAYERS))
 }
 
 /// Parses command-line arguments (without `argv[0]`).
@@ -54,6 +71,23 @@ pub fn parse(raw: impl IntoIterator<Item = OsString>) -> Result<Command, String>
             Some("--copy-saves") => {
                 args.next();
                 launch.copy_saves = true;
+            }
+            Some("--player") => {
+                args.next();
+                launch.player = Some(player_arg(args.next())?);
+            }
+            Some(w @ ("--saves" | "--copy-save" | "--swap-saves" | "--reset-save" | "--restore-save")) => {
+                let w = w.to_string();
+                args.next();
+                let op = match w.as_str() {
+                    "--saves" => SaveOp::List,
+                    "--copy-save" => SaveOp::Copy(player_arg(args.next())?, player_arg(args.next())?),
+                    "--swap-saves" => SaveOp::Swap(player_arg(args.next())?, player_arg(args.next())?),
+                    "--reset-save" => SaveOp::Reset(player_arg(args.next())?),
+                    _ => SaveOp::Restore(player_arg(args.next())?, args.next().ok_or(USAGE)?.to_string_lossy().into_owned()),
+                };
+                let game = PathBuf::from(args.next().ok_or(USAGE)?);
+                return Ok(Command::Saves { op, game });
             }
             Some("--hosted") => {
                 args.next();
@@ -150,6 +184,9 @@ pub fn parse(raw: impl IntoIterator<Item = OsString>) -> Result<Command, String>
     // game page gives them: side by side, a pane is too thin to play in.
     if let Some(split) = launch.split.as_mut().filter(|s| !layout_given && s.instances >= 3) {
         split.layout = LayoutPreset::Grid2x2;
+    }
+    if launch.player.is_some() && launch.split.is_some() {
+        return Err("--player is for one copy; a split-screen session gives each copy its player".into());
     }
     launch.first = PathBuf::from(args.next().ok_or(USAGE)?);
     launch.args = args.collect();
@@ -250,8 +287,55 @@ fn run_utility(cmd: Command) -> Result<u32, LaunchError> {
             Ok(0)
         }
         Command::Attach(rest) => backend::attach(&rest),
+        Command::Saves { op, game } => save_command(op, &game).map_err(LaunchError::Other),
         Command::Launch { .. } => unreachable!(),
     }
+}
+
+/// `--saves` and the save manager's commands, for the game `game` names as the launcher
+/// knows it (its folder found as a start would).
+fn save_command(op: SaveOp, game: &std::path::Path) -> Result<u32, String> {
+    let exe = std::path::absolute(game).unwrap_or_else(|_| game.to_path_buf());
+    let settings = crate::ui::store::Settings::load();
+    let root = crate::gameroot::find(&exe, &settings.folders).map(|(r, _)| r);
+    let saves = crate::saves::GameSaves::for_game(&crate::ui::store::key_of(&exe), Some(&exe), root.as_deref());
+    let say = |what: &str, r: crate::saves::Report| {
+        eprintln!(
+            "peerparty: {what} ({} files, {} registry keys){}{}",
+            r.files,
+            r.keys,
+            r.backup.map(|b| format!("; what was replaced is backup {b}")).unwrap_or_default(),
+            if r.notes.is_empty() { String::new() } else { format!("; {}", r.notes.join("; ")) }
+        )
+    };
+    match op {
+        SaveOp::List => {
+            println!("{} ({})", exe.display(), saves.id);
+            for p in saves.inspect() {
+                let state = if p.running { ", playing now" } else { "" };
+                let kinds: Vec<&str> = p.kinds.iter().map(|k| k.label()).collect();
+                if p.has_saves() {
+                    println!("player {}: {} files, {} KB [{}]{state}", p.slot + 1, p.files, p.bytes.div_ceil(1024), kinds.join(", "));
+                } else {
+                    println!("player {}: no saves yet{state}", p.slot + 1);
+                }
+                if let Some(f) = &p.folder {
+                    println!("  {}", f.display());
+                }
+                for b in &p.backups {
+                    println!("  backup {}", b.id);
+                }
+            }
+            if saves.discovered().is_empty() {
+                eprintln!("peerparty: where player 1's saves are isn't known yet: start the game through peerparty with 2 players (or --player 2) once");
+            }
+        }
+        SaveOp::Copy(from, to) => say(&format!("player {}'s saves copied to player {}", from + 1, to + 1), saves.copy(from, to).map_err(|e| e.to_string())?),
+        SaveOp::Swap(a, b) => say(&format!("players {} and {} swapped saves", a + 1, b + 1), saves.swap(a, b).map_err(|e| e.to_string())?),
+        SaveOp::Reset(n) => say(&format!("player {} starts fresh", n + 1), saves.reset(n).map_err(|e| e.to_string())?),
+        SaveOp::Restore(n, id) => say(&format!("player {}'s saves are backup {id} again", n + 1), saves.restore(n, &id).map_err(|e| e.to_string())?),
+    }
+    Ok(0)
 }
 
 /// `--blocked`, `--block FP`, `--unblock FP|all`: the public-sessions block list.

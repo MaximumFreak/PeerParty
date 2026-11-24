@@ -68,6 +68,16 @@ pub struct GameOptions {
     pub skip: Vec<String>,
     /// The key players meet under (`PEERPARTY_GAME`); empty is the exe's name.
     pub game_key: String,
+    /// Players 2–4's saves: "" (each player's own, the default) or "shared" (player
+    /// 1's, `PEERPARTY_SEPARATE_SAVES=0`).
+    pub save_mode: String,
+    /// A later player with no saves yet starts from a copy of player 1's.
+    pub seed_saves: bool,
+    /// More folders of the game's saves, and folders every player shares.
+    pub save_paths: Vec<String>,
+    pub shared_save_paths: Vec<String>,
+    /// The player a lone copy plays as (1–4; 0 is player 1).
+    pub play_as: u8,
 }
 
 impl GameOptions {
@@ -137,6 +147,11 @@ impl Default for GameOptions {
             modes: HashMap::new(),
             skip: Vec::new(),
             game_key: String::new(),
+            save_mode: String::new(),
+            seed_saves: false,
+            save_paths: Vec::new(),
+            shared_save_paths: Vec::new(),
+            play_as: 0,
         }
     }
 }

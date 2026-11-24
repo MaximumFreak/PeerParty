@@ -57,6 +57,16 @@ pub struct HookConfig {
     pub copy_saves: bool,
     pub steam_saves: Option<bool>,
     pub separate_saves: Option<bool>,
+    /// `PEERPARTY_SAVE_GAME`: the game's id for its players' saves.
+    pub save_game: Option<String>,
+    /// `PEERPARTY_PLAYER_SLOT`: the player this copy plays as (0 is player 1).
+    pub player_slot: Option<u32>,
+    /// `PEERPARTY_SAVE_SEED`, `PEERPARTY_SAVE_WATCH`.
+    pub save_seed: bool,
+    pub save_watch: bool,
+    /// `PEERPARTY_SAVE_PATHS`, `PEERPARTY_SHARED_SAVE_PATHS`: full paths.
+    pub save_paths: Vec<String>,
+    pub shared_save_paths: Vec<String>,
     /// `PEERPARTY_SWAP=inline`: functions are swapped in place, not in import tables.
     pub swap_inline: bool,
     /// `PEERPARTY_INVITES`, `PEERPARTY_INVITE_BUTTONS`: their starting values.
@@ -132,6 +142,12 @@ impl HookConfig {
             copy_saves: get(env::COPY_SAVES).is_some(),
             steam_saves: switch(env::STEAM_SAVES),
             separate_saves: switch(env::SEPARATE_SAVES),
+            save_game: text(env::SAVE_GAME).map(|v| v.trim().to_string()).filter(|v| peerparty_protocol::saves::valid_game_id(v)),
+            player_slot: text(env::PLAYER_SLOT).and_then(|v| v.trim().parse::<u32>().ok()).filter(|s| *s < peerparty_protocol::saves::MAX_PLAYERS),
+            save_seed: switch(env::SAVE_SEED) == Some(true),
+            save_watch: switch(env::SAVE_WATCH) == Some(true),
+            save_paths: env::path_list(&get(env::SAVE_PATHS).unwrap_or_default()).into_iter().map(String::from).collect(),
+            shared_save_paths: env::path_list(&get(env::SHARED_SAVE_PATHS).unwrap_or_default()).into_iter().map(String::from).collect(),
             swap_inline: get(env::SWAP).is_some_and(|v| v.trim().eq_ignore_ascii_case("inline")),
             invites: get(env::INVITES).unwrap_or_default(),
             invite_buttons: get(env::INVITE_BUTTONS).unwrap_or_default(),

@@ -372,9 +372,11 @@ fn consider(m: Mod) {
             let n = crate::instance::attach_kernelbase(&table.code);
             log!("instance {} hooked {n}", m.full);
         }
-        if crate::saves::enabled() || crate::saves::own_saves() {
+        if crate::saves::enabled() || crate::saves::own_saves() || crate::saves::watching() {
             let n = crate::saves::attach_kernelbase(&table.code);
             log!("saves {} file hooks {n}", m.full);
+            let n = crate::saves::registry::attach_kernelbase(&table.code);
+            log!("saves {} registry hooks {n}", m.full);
         }
         let swaps = crate::net::enabled() && !crate::net::skip("swap");
         if swaps || crate::vr::needs_lookups() {

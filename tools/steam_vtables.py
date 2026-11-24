@@ -17,8 +17,8 @@ Valve sometimes added methods at the end of an interface without a new version s
 implements each version once, in its longest form, so where a version appears more than
 once the longest shape is kept (each shorter one must be a prefix of it).
 
-The SteamUtils, SteamUserStats, SteamApps, SteamUGC, SteamController and SteamInput
-tables were generated from Valve's SDK headers as Valve publishes them in its Proton
+The SteamUtils, SteamUserStats, SteamApps, SteamUGC, SteamController, SteamInput and
+SteamRemoteStorage tables were generated from Valve's SDK headers as Valve publishes them in its Proton
 repository (lsteamclient/steamworks_sdk_*/isteam*.h, one copy per SDK release, put in
 one folder with the SDK's name in front of each file's). That set starts at SDK 0.99,
 so it lacks some older versions the other families' tables have: generate only the
@@ -47,6 +47,7 @@ FAMILIES = {
     "ISteamUGC": ("STEAMUGC_INTERFACE_VERSION", "STEAMUGC_INTERFACE_VERSION"),
     "ISteamController": ("SteamController", "STEAMCONTROLLER_INTERFACE_VERSION"),
     "ISteamInput": ("SteamInput", "STEAMINPUT_INTERFACE_VERSION"),
+    "ISteamRemoteStorage": ("STEAMREMOTESTORAGE_INTERFACE_VERSION", "STEAMREMOTESTORAGE_INTERFACE_VERSION"),
 }
 # The Steamworks SDK defines STEAMNETWORKINGSOCKETS_ENABLE_SDR (steamnetworkingtypes.h):
 # the relay and ping methods are in Steam's networking interfaces.

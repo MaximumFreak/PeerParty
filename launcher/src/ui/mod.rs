@@ -28,6 +28,7 @@ mod pads;
 pub mod scan;
 pub mod settings;
 pub mod shared;
+mod saves;
 pub mod store;
 pub mod theme;
 mod together;
@@ -167,6 +168,8 @@ enum Action {
     MakeBat(String),
     /// Let the game through Windows Firewall (and on public networks too).
     FixFirewall(PathBuf, bool),
+    /// The Saves card's (saves.rs).
+    Saves(String, saves::Op),
 }
 
 /// A short message at the bottom of the window.
@@ -348,10 +351,6 @@ struct SessionManager {
     ended_tx: Sender<(u64, Option<i32>)>,
     ended_rx: Receiver<(u64, Option<i32>)>,
     pending: Vec<PendingStart>,
-    /// Games whose next extra copy starts from player 1's saves ("Copy Player 1's saves
-    /// to Player N"). Never saved: off whenever the window starts, and off again once a start
-    /// has used it, so a later Play can't replace a save by accident.
-    copy_saves: HashSet<String>,
     /// Close all on the Now playing card asked first: Close all again closes everything.
     confirm_close: bool,
     peerparty: PathBuf,
@@ -371,7 +370,6 @@ impl SessionManager {
             ended_tx,
             ended_rx,
             pending: Vec::new(),
-            copy_saves: HashSet::new(),
             confirm_close: false,
             peerparty,
             spark: None,
@@ -389,23 +387,6 @@ impl SessionManager {
         }
         p.sort();
         p
-    }
-
-    /// Whether "Copy Player 1's saves to Player N" is shown.
-    pub(super) fn copy_saves_offered(&mut self, key: &str, players: u8, running: bool) -> bool {
-        let waiting = self.pending.iter().any(|p| p.key == key);
-        let shown = (players >= 2 || running) && !waiting;
-        if !shown {
-            self.copy_saves.remove(key);
-        }
-        shown
-    }
-
-    /// The player the save switch is for: the next copy Play adds.
-    pub(super) fn copy_saves_target(&self, key: &str) -> u8 {
-        let running = self.running(key).last().copied().unwrap_or(0);
-        let waiting = self.pending.iter().filter(|p| p.key == key).map(|p| p.player).max().unwrap_or(0);
-        running.max(waiting).max(1) + 1
     }
 
     /// Starts peerparty.exe for a game; a thread of its own waits for it to end.
@@ -571,6 +552,8 @@ struct App {
     together: together::State,
     /// Settings' open section.
     settings_tab: settings::Tab,
+    /// The Saves card's state.
+    saves_view: saves::SavesView,
 }
 
 impl App {
@@ -599,6 +582,7 @@ impl App {
             welcome,
             together: together::State::default(),
             settings_tab: settings::Tab::General,
+            saves_view: saves::SavesView::default(),
         };
         app.rebuild();
         app
@@ -700,6 +684,10 @@ impl App {
             }
         } else if o.players >= 2 && g.source != Source::Xbox {
             args.push("--multi-instance".into());
+        } else if o.play_as >= 2 && g.source != Source::Xbox {
+            // Alone, as another player: that player's saves and name.
+            args.push("--player".into());
+            args.push(o.play_as.min(4).to_string());
         }
         args.push(o.exe.clone().unwrap_or_else(|| g.exe.clone()).to_string_lossy().into_owned());
         args.extend(store::split_args(&o.args));
@@ -729,13 +717,9 @@ impl App {
         let running = self.sessions.running(key);
         let first = running.last().map_or(1, |p| p + 1);
         let split_players = if o.uses_split_screen() && running.is_empty() && g.source != Source::Xbox { o.players.clamp(2, 4) } else { 0 };
-        let plan = plan(self.command(&g, &o), o.players, o.split_screen, !running.is_empty(), g.source == Source::Xbox, self.sessions.copy_saves.contains(key));
+        let plan = plan(self.command(&g, &o), o.players, o.split_screen, !running.is_empty(), g.source == Source::Xbox);
         if !self.spawn(key, &g.name, plan.now, first, split_players) {
             return;
-        }
-        // "Copy Player 1's saves to Player N" is for one start: off once a start used it.
-        if plan.copied {
-            self.sessions.copy_saves.remove(key);
         }
         self.sessions.spark = Some((Instant::now(), self.sessions.next_session.wrapping_mul(7919)));
         match plan.later {
@@ -925,6 +909,7 @@ impl App {
                 Action::Reveal(p) => platform::reveal(&p),
                 Action::MakeBat(k) => self.make_bat(&k),
                 Action::FixFirewall(exe, public) => self.fix_firewall(exe, public),
+                Action::Saves(k, op) => self.saves_op(&k, op),
             }
         }
     }
@@ -1456,8 +1441,6 @@ struct Plan {
     now: Vec<String>,
     /// Two players on this PC: the second copy, started after the wait.
     later: Option<Vec<String>>,
-    /// "Copy Player 1's saves to Player N" went into one of them.
-    copied: bool,
 }
 
 /// Drops leading `--split-screen`, `--instances <n>`, and `--layout <preset>` flags from
@@ -1479,13 +1462,12 @@ fn strip_split_flags(args: &[String]) -> Vec<String> {
 /// game's single-instance check hands focus to the running copy and quits). With
 /// nothing running and split screen on, one peerparty.exe starts every copy in a shared
 /// window; with split screen off and two players on this PC, the second copy follows
-/// later. `copy_saves` only ever goes to copies after the first: player 1's own save is
-/// never replaced.
-fn plan(command: Vec<String>, players: u8, split_screen: bool, running: bool, xbox: bool, copy_saves: bool) -> Plan {
-    let copy_saves = copy_saves && !xbox;
+/// later. (Which player each copy is, and its saves, the launch decides: launch.rs
+/// `players_saves`.)
+fn plan(command: Vec<String>, players: u8, split_screen: bool, running: bool, xbox: bool) -> Plan {
     let split = split_screen && players >= 2 && !xbox;
     if running {
-        let mut now = if command.first().is_some_and(|a| a == "--split-screen") {
+        let now = if command.first().is_some_and(|a| a == "--split-screen") {
             let mut rest = strip_split_flags(&command);
             rest.insert(0, "--multi-instance".into());
             rest
@@ -1496,32 +1478,13 @@ fn plan(command: Vec<String>, players: u8, split_screen: bool, running: bool, xb
             }
             cmd
         };
-        let mut copied = false;
-        if copy_saves {
-            now.insert(1, "--copy-saves".into());
-            copied = true;
-        }
-        return Plan { now, later: None, copied };
+        return Plan { now, later: None };
     }
     if split {
-        let mut now = command;
-        let mut copied = false;
-        if copy_saves {
-            now.insert(1, "--copy-saves".into());
-            copied = true;
-        }
-        return Plan { now, later: None, copied };
+        return Plan { now: command, later: None };
     }
-    let mut copied = false;
-    let later = (players >= 2 && !xbox).then(|| {
-        let mut later = command.clone();
-        if copy_saves {
-            later.insert(1, "--copy-saves".into());
-            copied = true;
-        }
-        later
-    });
-    Plan { now: command, later, copied }
+    let later = (players >= 2 && !xbox).then(|| command.clone());
+    Plan { now: command, later }
 }
 
 /// The .bat that starts a game through peerparty (`pp`, as the file names it) with
@@ -2007,39 +1970,29 @@ mod tests {
     }
 
     /// Play's plan: with a copy running, exactly one copy more, with --multi-instance;
-    /// with nothing running and two players, the second copy later. "Start from player
-    /// 1's saves" only ever goes to a copy after the first, and never into the command
-    /// a .bat or the game's page shows.
+    /// with nothing running and two players, the second copy later. The command a .bat
+    /// or the game's page shows has no --copy-saves.
     #[test]
-    fn play_starts_one_copy_more_and_copies_saves_only_into_a_later_one() {
+    fn play_starts_one_copy_more() {
         let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let one = s(&[r"C:\g\a.exe"]);
         let two = s(&["--multi-instance", r"C:\g\a.exe"]);
-        let copied = s(&["--multi-instance", "--copy-saves", r"C:\g\a.exe"]);
-        assert_eq!(plan(one.clone(), 1, false, false, false, true), Plan { now: one.clone(), later: None, copied: false });
-        assert_eq!(plan(two.clone(), 2, false, false, false, true), Plan { now: two.clone(), later: Some(copied.clone()), copied: true });
-        assert_eq!(plan(two.clone(), 2, false, false, false, false), Plan { now: two.clone(), later: Some(two.clone()), copied: false });
+        assert_eq!(plan(one.clone(), 1, false, false, false), Plan { now: one.clone(), later: None });
+        assert_eq!(plan(two.clone(), 2, false, false, false), Plan { now: two.clone(), later: Some(two.clone()) });
         for (cmd, players) in [(one.clone(), 1), (two.clone(), 2)] {
-            assert_eq!(plan(cmd, players, false, true, false, true), Plan { now: copied.clone(), later: None, copied: true }, "{players}");
+            assert_eq!(plan(cmd, players, false, true, false), Plan { now: two.clone(), later: None }, "{players}");
         }
-        assert_eq!(plan(one.clone(), 1, false, true, false, false).now, two);
-        assert_eq!(plan(one.clone(), 1, false, true, true, true), Plan { now: one, later: None, copied: false }, "an Xbox app game: one copy");
-        // Split screen: one peerparty.exe runs all copies; copy-saves goes on that command
-        // (start_session strips it for player 1). Adding another copy while running strips
-        // the split flags and launches one --multi-instance copy.
+        assert_eq!(plan(one.clone(), 1, false, true, true), Plan { now: one, later: None }, "an Xbox app game: one copy");
+        // Split screen: one peerparty.exe runs all copies. Adding another copy while
+        // running strips the split flags and launches one --multi-instance copy.
         let split = s(&["--split-screen", "--instances", "3", "--layout", "grid", r"C:\g\a.exe"]);
-        let split_copy = s(&["--split-screen", "--copy-saves", "--instances", "3", "--layout", "grid", r"C:\g\a.exe"]);
-        assert_eq!(plan(split.clone(), 3, true, false, false, false), Plan { now: split.clone(), later: None, copied: false });
-        assert_eq!(plan(split.clone(), 3, true, false, false, true), Plan { now: split_copy, later: None, copied: true });
-        assert_eq!(plan(split, 3, true, true, false, true), Plan { now: copied, later: None, copied: true });
-        // The command shown and kept in a .bat has no --copy-saves, whatever is switched on.
+        assert_eq!(plan(split.clone(), 3, true, false, false), Plan { now: split.clone(), later: None });
+        assert_eq!(plan(split, 3, true, true, false), Plan { now: two, later: None });
         let ctx = egui::Context::default();
         let mut app = App::with(ctx, Settings { onboarded: true, ..Settings::default() }, false);
         app.lib.scanned = sample();
         app.rebuild();
         let g = app.lib.entries[0].clone();
-        let key = store::key_of(&g.exe);
-        app.sessions.copy_saves.insert(key.clone());
         let o = GameOptions { players: 2, ..GameOptions::default() };
         assert!(!app.command(&g, &o).iter().any(|a| a == "--copy-saves"));
         let o_split = GameOptions { players: 4, split_screen: true, split_layout: "vertical".into(), ..GameOptions::default() };
@@ -2055,16 +2008,14 @@ mod tests {
         assert!(!cmd.iter().any(|a| a == "--copy-saves"));
     }
 
-    /// "Copy Player 1's saves to Player N" is never a setting: off when the window starts, off
-    /// once a start used it. Play with copy 2 waiting starts it now; Cancel drops it; and
-    /// when the game's last copy closes first, it isn't started on its own.
+    /// Play with copy 2 waiting starts it now; Cancel drops it; and when the game's last
+    /// copy closes first, it isn't started on its own.
     #[test]
-    fn the_save_copy_switch_is_for_one_start_and_a_waiting_copy_can_go_now_or_not() {
+    fn a_waiting_copy_can_go_now_or_not() {
         crate::i18n::set("en");
         let ctx = egui::Context::default();
         let mut settings = Settings { onboarded: true, after_launch: "keep".into(), ..Settings::default() };
         let mut app = App::with(ctx.clone(), settings.clone(), false);
-        assert!(app.sessions.copy_saves.is_empty(), "off when the window starts");
         app.lib.scanned = sample();
         app.rebuild();
         // Something harmless in peerparty.exe's place: it exits at once.
@@ -2072,12 +2023,10 @@ mod tests {
         let key = store::key_of(&app.lib.entries[0].exe);
         settings.games.insert(key.clone(), GameOptions { players: 2, ..GameOptions::default() });
         app.settings.games = settings.games.clone();
-        app.sessions.copy_saves.insert(key.clone());
         app.play(&key);
         assert_eq!(app.sessions.sessions.len(), 1);
         assert_eq!(app.sessions.pending.len(), 1);
-        assert!(app.sessions.pending[0].args.iter().any(|a| a == "--copy-saves"), "the second copy starts from player 1's saves");
-        assert!(app.sessions.copy_saves.is_empty(), "used, so off");
+        assert!(!app.sessions.pending[0].args.iter().any(|a| a == "--copy-saves"));
         // Too soon after the first: turned away. Then Play starts the waiting copy now.
         app.play(&key);
         assert_eq!((app.sessions.sessions.len(), app.sessions.pending.len()), (1, 1));
@@ -2104,38 +2053,14 @@ mod tests {
         assert!(app.sessions.pending.is_empty(), "nothing starts on its own after everything closed");
     }
 
+    /// A split-screen session counts all its players as running.
     #[test]
-    fn the_save_copy_switch_shows_at_two_players_or_with_a_copy_running() {
+    fn a_sessions_players_are_all_running() {
         let ctx = egui::Context::default();
         let mut app = App::with(ctx, Settings { onboarded: true, ..Settings::default() }, false);
-        assert!(!app.sessions.copy_saves_offered("k", 1, false));
-        assert!(app.sessions.copy_saves_offered("k", 2, false));
-        assert!(app.sessions.copy_saves_offered("k", 1, true));
-        app.sessions.copy_saves.insert("k".into());
-        assert!(app.sessions.copy_saves_offered("k", 1, true));
-        assert!(app.sessions.copy_saves.contains("k"), "still on while shown");
-        assert!(!app.sessions.copy_saves_offered("k", 1, false));
-        assert!(app.sessions.copy_saves.is_empty(), "never comes back on by itself");
-        app.sessions.copy_saves.insert("k".into());
-        assert!(app.sessions.copy_saves_offered("k", 2, false));
-        assert!(app.sessions.copy_saves.contains("k"));
-        crate::i18n::set("en");
-        assert_eq!(t!("game.copy_saves", player = app.sessions.copy_saves_target("k")), "Copy Player 1's saves to Player 2");
         let at = Instant::now();
-        app.sessions.sessions.push(Session { id: 1, key: "k".into(), name: "x".into(), player: 1, split_players: 0, started: at, stderr: Arc::default(), pid: 0 });
-        app.sessions.pending.push(PendingStart { at, key: "k".into(), name: "x".into(), args: vec![], player: 2 });
-        assert!(!app.sessions.copy_saves_offered("k", 2, true));
-        assert!(!app.sessions.copy_saves_offered("k", 1, true));
-        assert!(app.sessions.copy_saves.is_empty(), "hidden, so off");
-        app.sessions.pending.clear();
-        assert!(app.sessions.copy_saves_offered("k", 2, true), "back once copy 2 has started");
-        app.sessions.sessions.push(Session { id: 2, key: "k".into(), name: "x".into(), player: 2, split_players: 0, started: at, stderr: Arc::default(), pid: 0 });
-        assert_eq!(t!("game.copy_saves", player = app.sessions.copy_saves_target("k")), "Copy Player 1's saves to Player 3");
-        // A 3-player split-screen session counts all 3 players as running.
-        app.sessions.sessions.clear();
         app.sessions.sessions.push(Session { id: 3, key: "k".into(), name: "x".into(), player: 1, split_players: 3, started: at, stderr: Arc::default(), pid: 0 });
         assert_eq!(app.sessions.running("k"), vec![1, 2, 3]);
-        assert_eq!(app.sessions.copy_saves_target("k"), 4);
     }
 
     #[test]
@@ -2158,7 +2083,7 @@ mod tests {
         let mut tex = Textures::default();
         let mut frame = eframe::Frame::_new_kittest();
         let mut t = 0.0;
-        let scenes: [(&str, &dyn Fn(&mut App)); 13] = [
+        let scenes: [(&str, &dyn Fn(&mut App)); 14] = [
             ("library", &|a: &mut App| a.lib.selected = None),
             ("game", &|a: &mut App| a.lib.selected = Some(store::key_of(&a.lib.entries[3].exe))),
             ("together", &|a: &mut App| a.open_view(View::Together, false)),
@@ -2179,7 +2104,12 @@ mod tests {
                 a.nav.pad_mode = false;
                 let key = store::key_of(&a.lib.entries[3].exe);
                 a.settings.games.insert(key.clone(), GameOptions { players: 2, ..GameOptions::default() });
-                a.sessions.copy_saves.insert(key.clone());
+                a.lib.selected = Some(key);
+            }),
+            ("game-saves", &|a: &mut App| {
+                // A game that isn't an Xbox app's, two players: its Saves card.
+                let key = store::key_of(&a.lib.entries[0].exe);
+                a.settings.games.insert(key.clone(), GameOptions { players: 2, split_screen: true, seed_saves: true, ..GameOptions::default() });
                 a.lib.selected = Some(key);
             }),
             ("game-split", &|a: &mut App| {
@@ -2196,8 +2126,7 @@ mod tests {
             ("game-another", &|a: &mut App| {
                 a.sessions.pending.clear();
                 let key = store::key_of(&a.lib.entries[3].exe);
-                a.settings.games.insert(key.clone(), GameOptions { players: 1, ..GameOptions::default() });
-                a.sessions.copy_saves.insert(key);
+                a.settings.games.insert(key, GameOptions { players: 1, ..GameOptions::default() });
             }),
             ("settings-update", &|a: &mut App| {
                 a.sessions.sessions.clear();

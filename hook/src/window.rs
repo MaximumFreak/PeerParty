@@ -193,10 +193,16 @@ pub fn init_from_env() {
         }
         // A later player's saves are its own from the game's first look at them, not
         // from when its LAN comes up (saves.rs).
-        if spec.focus_spoof {
-            crate::saves::own_slot_from_session(spec.slot);
+        if spec.focus_spoof && crate::config::HookConfig::global().player_slot.is_none() {
+            crate::saves::own_slot_from_launcher(spec.slot, "a split-screen session's");
         }
         apply_spec(spec);
+    }
+    // The player the launcher chose: a session's copy, `--player N`, a numbered
+    // `--multi-instance` copy.
+    if let Some(slot) = crate::config::HookConfig::global().player_slot {
+        peerparty_core::want_slot(slot);
+        crate::saves::own_slot_from_launcher(slot, "the launcher's");
     }
 }
 

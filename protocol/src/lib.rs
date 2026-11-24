@@ -14,6 +14,7 @@
 //! - `transport`: where the control connection and the frame block are (named pipes and
 //!   mappings, or loopback TCP with a token and a file), as environment strings.
 //! - `session`: copies of a game sharing one screen.
+//! - `saves`: where players 2–4 keep their saves, and which paths are whose.
 //!
 //! No dependencies and no OS calls: it builds for the x64 and x86 hooks and for Linux
 //! alike.
@@ -24,6 +25,7 @@ pub mod frame_ring;
 pub mod input_shm;
 pub mod ipc;
 pub mod json;
+pub mod saves;
 pub mod session;
 pub mod shm;
 pub mod transport;

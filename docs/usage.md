@@ -143,9 +143,14 @@ out: update the add-on to get it.
 ### From a prompt
 
 ```
-peerparty [--room CODE] [--log-dir DIR] [--multi-instance] [--copy-saves] [--set key=value]... <game.exe> [args...]
+peerparty [--room CODE] [--log-dir DIR] [--multi-instance] [--copy-saves] [--player N] [--set key=value]... <game.exe> [args...]
 peerparty --new-room
 peerparty --net-test
+peerparty --saves <game.exe>
+peerparty --copy-save FROM TO <game.exe>
+peerparty --swap-saves A B <game.exe>
+peerparty --reset-save N <game.exe>
+peerparty --restore-save N BACKUP <game.exe>
 ```
 
 The launcher window's settings (`%LOCALAPPDATA%\peerparty\ui.json`: global ones and
@@ -240,24 +245,43 @@ both.
   blank one keeps the usual: player 1 `PEERPARTY_NAME`, player 2 `PEERPARTY_OTHER_NAME`,
   then "name (3)"). A game with a starter program (one that starts the real game and
   ends) stays in its pane: each copy is all the programs it started from the game's
-  folder. Players 2 to 4 keep saves the copies share apart from player 1's from the
-  game's first look at them (a `.peerparty-N` twin beside each, started from player 1's;
-  with `--copy-saves`, made from player 1's again). Voice chat uses the PC's microphone
+  folder. Players 2 to 4 have saves of their own from the game's first look at them
+  (**Players' saves**, below). Voice chat uses the PC's microphone
   and speakers once, through player 1's copy: the other copies send and play no voice.
   Closing the session's window (or Close all) asks every copy to close and save; what
   still runs 6 seconds later is ended, at once if asked again. PeerParty's exit code is
   player 1's, or another player's when theirs crashed.
-- `--copy-saves`: this copy starts from player 1's progress, for games that don't
-  offer multiplayer from a fresh save. A second copy plays under LAN ids (SteamID, EOS
-  id, PlayFab id); the first time the game touches a path that contains one, the same
-  path with the main id (the first copy's SteamID and ids) replaces it whole, folder or
-  file (a save over 1 GB isn't copied). Files are never merged by date. What was there
-  is renamed to `<name>.peerparty-before` beside it (the three latest backups are kept:
-  `.peerparty-before` is the newest, then `-2`, `-3`). Without the flag nothing is
-  copied, and `PEERPARTY_COPY_SAVES` is cleared, so a game library, shortcut or
-  command-line start never copies unless asked. The launcher's Play adds it only to the
-  copy it was asked for (a two-player start's second copy, or the one more copy Play
-  starts while one runs).
+- **Players' saves.** Player 1 plays with the game's saves where the game keeps them,
+  as it does alone. Players 2 to 4 each have their own, in PeerParty's folder
+  (`%LOCALAPPDATA%\peerparty\saves\<game>\player-N`): files the game keeps in
+  `AppData\LocalLow`, `AppData\Local`, `AppData\Roaming`, Documents, Saved Games and
+  Steam's `userdata`, its registry settings under `HKCU\Software\<company>` (Unity's
+  PlayerPrefs), and its Steam Cloud files. A new player starts with none (the game
+  starts fresh), unless "Start new players from Player 1's saves" is on. In the game's
+  own folder a player reads the game's files and writes its own copies; the game's
+  files are never changed. Nothing is written beside player 1's saves, so Steam Cloud
+  and the game never see the other players' files. The game page's **Saves** card (shown
+  with two players or more, or once a later player has saves) lists each player's saves
+  and backups, copies or swaps them between any two players (`Copy`, `Swap`), resets a
+  player (`Reset`: a fresh start, kept as a backup) and restores a backup; whatever is
+  replaced is backed up first, the five newest backups per player are kept, and nothing
+  changes while the game runs. Saves named by a player's id (its SteamID, PeerParty id
+  or PlayFab id) are renamed to the other player's on the way. `Play solo` (or `Play as`
+  on the game page, `--player N` on the command line) starts the game alone as that
+  player, with its saves and name, in a normal window with voice chat; a player can only
+  be playing once at a time. When where player 1's saves are isn't known yet (the game
+  hasn't run with two players), **Pick save folder…** says so. The same on the command
+  line: `--saves`, `--copy-save FROM TO`, `--swap-saves A B`, `--reset-save N` and
+  `--restore-save N BACKUP`, players numbered 1 to 4. Saves made by an older PeerParty
+  beside player 1's (`<save>.peerparty-2`) are taken over the first time the game uses
+  that folder.
+- `--copy-saves`: later players start from a copy of player 1's saves, for games that
+  don't offer multiplayer from a fresh save: the launcher copies them before the game
+  starts (what the player had is backed up), and the game copies a folder it doesn't
+  know yet the first time it uses it; saves under player 1's id (SteamID, EOS id,
+  PlayFab id) become the player's own ids'. A save over 1 GB isn't copied. Without the
+  flag nothing is copied, and `PEERPARTY_COPY_SAVES` is cleared, so a game library,
+  shortcut or command-line start never copies unless asked.
 - Player 1's own Steam saves: when the first copy is shown a SteamID of its own and
   that SteamID has no save folder yet (or only an empty one), it starts from a copy of
   the save of the id this PC used before: first one recorded in
@@ -265,9 +289,6 @@ both.
   then, with no record, the newest-modified sibling save folder of a PeerParty SteamID
   that isn't another copy's (every candidate and the choice are logged), then
   steam_api's own. A save for the new id that already has files is never touched.
-  Saves that some games
-  don't keep per player are shared by both copies already: back them up before playing
-  two copies at once.
 - `PEERPARTY_PLAYFAB=0` / `=1`: never / always answer PlayFab's web API locally
   (default: for games that ship or load PlayFab Party, Lobby & Matchmaking or the C SDK,
   decided at the first lookup since games sign in before loading them, and for any game
@@ -280,11 +301,15 @@ both.
 - `PEERPARTY_VIVOX=0` / `=1`: never / always answer Vivox voice chat on the LAN
   (default: whenever Unity Gaming Services are answered locally, since Vivox would
   refuse that sign-in).
-- `PEERPARTY_SEPARATE_SAVES=0`: a second copy of a game on one PC shares the first
-  copy's saves again. Normally, when a game's saves aren't kept per player, the
-  second copy gets its own save folder (or file) beside the first: the deepest folder
-  named for saves, else a file so named, never the game's own folder
-  (`Saves` → `Saves.peerparty-2`), started once from a copy of the first copy's.
+- `PEERPARTY_SEPARATE_SAVES=0` (the Saves card's "Shared with Player 1"): players 2 to 4
+  play with player 1's saves, as one player would.
+- `PEERPARTY_SAVE_PATHS=dir;dir`: more folders that are the game's saves (each player
+  gets its own copy of them); `PEERPARTY_SHARED_SAVE_PATHS=dir;dir`: folders every
+  player shares even where they'd be a player's own (a large mods folder in Documents).
+- `PEERPARTY_PLAYER_SLOT=N` (0 is player 1), `PEERPARTY_SAVE_GAME`, `PEERPARTY_SAVE_SEED`,
+  `PEERPARTY_SAVE_WATCH`: set by the launcher for each copy (which player it is, the
+  game's saves folder, "Start new players from Player 1's saves", player 1's copy noting
+  where its saves are).
 - `PEERPARTY_DEMONWARE=0`: PeerParty doesn't answer Demonware (Activision's online
   service), and the game reaches the real servers.
 - `PEERPARTY_LOOPBACK=1`: every socket binds to 127.0.0.1 and no beacons are broadcast,

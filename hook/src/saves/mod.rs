@@ -45,40 +45,39 @@
 //! never had random ids, has no file hooks). The hooks only look at the path; the
 //! game's call goes on unchanged.
 //!
-//! **A second copy's own saves** (`learn_slot`): a game whose saves aren't keyed by any
-//! id (one `savegame.dat` for whoever plays) has every copy on the PC reading and
-//! writing the same file, and a second copy, playing under a LAN identity, can take the
-//! first copy's save for someone else's and replace it (one game's save names its owner
-//! inside and was recreated over the player's). So in a copy in a slot other than the
-//! first, the save's folder (or file) gets a twin of the copy's own beside it, started
-//! from a copy of the first's the first time: `Saves` -> `Saves.peerparty-2`,
-//! `savegame.sav` -> `savegame.peerparty-2.sav`. The save is the deepest folder on the
-//! path whose name holds "save", else a file so named (under Windows' own `Saved Games`,
-//! the game's folder in it), never the game's own folder or one above it. The same hooks pass the game the
-//! twin's path instead (and deleting, moving, replacing, copying and setting attributes
-//! too, so a save written to a temporary file and renamed stays in the twin). The first
-//! copy's files are only read, to make the twin. `PEERPARTY_SEPARATE_SAVES=0` turns it
-//! off.
+//! **A later player's own saves** (vfs.rs): players 2–4 keep theirs in PeerParty's data
+//! folder, `<data>\saves\<game>\player-N`, from the hook's start when the launcher
+//! says which player a copy is (`PEERPARTY_PLAYER_SLOT`, a split-screen session's spec),
+//! else from when the LAN gives it a later slot. Its registry keys are its own too
+//! (registry.rs), and its Steam Remote Storage (steam/remote.rs). Player 1 keeps the real
+//! ones; with `PEERPARTY_SAVE_WATCH` its copy notes where they are, for the launcher's
+//! save manager. `PEERPARTY_SEPARATE_SAVES=0` shares player 1's.
+//!
+//! - hooks.rs: the file calls.
+//! - vfs.rs: where each path goes.
+//! - registry.rs: `HKCU\Software\<vendor>` keys.
+
+pub(crate) mod hooks;
+pub(crate) mod registry;
+pub(crate) mod vfs;
 
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{LazyLock, Mutex, OnceLock};
-
-use retour::GenericDetour;
+use std::sync::{LazyLock, Mutex};
 
 use crate::log;
-use crate::sys::pe::Export;
 use crate::sys::read;
 
-/// `--copy-saves`.
+/// `--copy-saves`, or a later player starting from player 1's saves (`SAVE_SEED`).
 pub fn enabled() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_COPY_SAVES.with(std::cell::Cell::get) {
         return on;
     }
-    crate::config::HookConfig::global().copy_saves
+    let c = crate::config::HookConfig::global();
+    c.copy_saves || c.save_seed
 }
 
 #[cfg(test)]
@@ -149,31 +148,13 @@ fn add_pair(ours: &str, from: &str, once: bool, fallback: bool) -> bool {
 }
 
 /// `--copy-saves`: paths containing `lan` get `main`'s copy first. Several mains for one
-/// LAN id are tried in the order learned, the first that exists winning. Either way, a
-/// path with `lan` in it is this copy's own already (`keyed_by_own_id`).
+/// LAN id are tried in the order learned, the first that exists winning.
 pub fn learn(lan: &str, main: &str) {
-    own_id(lan);
-    if enabled() && add(lan, main, false) {
+    // `--copy-saves` replaces the copy's save each run; starting from player 1's
+    // (`SAVE_SEED`) copies only while it has none.
+    if enabled() && add(lan, main, !crate::config::HookConfig::global().copy_saves) {
         log!("saves: paths with {lan} start from {main}'s copy");
     }
-}
-
-/// Ids of this copy's own (its LAN ids), as they appear in paths.
-static OWN_IDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-/// `id` is one of this copy's own: a save keyed by it is apart from the first copy's
-/// without a twin.
-fn own_id(id: &str) {
-    let id = id.to_ascii_lowercase();
-    let mut ids = crate::sys::lock(&OWN_IDS);
-    if !id.is_empty() && !ids.contains(&id) && ids.len() < 16 {
-        ids.push(id);
-    }
-}
-
-/// Whether `full` names a save keyed by one of this copy's own ids.
-fn keyed_by_own_id(full: &str) -> bool {
-    crate::sys::lock(&OWN_IDS).iter().any(|id| find_token(full, id).is_some())
 }
 
 /// The game was shown SteamID `own` in place of steam_api's `game`: saves under its
@@ -185,6 +166,12 @@ pub fn adopt_steam(own: u64, game: u64, earlier: &[u64]) {
     }
     if !adopt_on() {
         log!("saves: the game's saves under SteamID {own} start empty (PEERPARTY_STEAM_SAVES=0)");
+        return;
+    }
+    // A later player's saves start fresh unless asked to start from player 1's: steam_api's
+    // SteamID is player 1's.
+    if own_saves() && !enabled() {
+        log!("saves: player {}'s saves under SteamID {own} start empty (not from steam_api's SteamID's: that's player 1's)", save_slot() + 1);
         return;
     }
     let mut n = 0;
@@ -393,8 +380,6 @@ pub fn learn_lan(lan: &peerparty_core::Lan) {
     if lan.slot() == 0 || lan.slot() == u32::MAX || lan.server() {
         return;
     }
-    own_id(&lan.me().hex());
-    own_id(&crate::playfab::entity_of(lan.me()));
     if !enabled() {
         return;
     }
@@ -628,7 +613,7 @@ fn seen(path: &str) {
     // One spelling per save ("C:/x", "x" from the game's folder, "\\?\C:\x"), so DONE
     // knows a save it has copied whichever way the game names it next (under
     // --copy-saves a second copy would replace what this run has saved since).
-    let full = full_path(path).unwrap_or_else(|| path.to_string());
+    let full = vfs::full_path(path).unwrap_or_else(|| path.to_string());
     let path = match full.strip_prefix(r"\\?\") {
         Some(rest) if !rest.to_ascii_uppercase().starts_with(r"UNC\") => rest,
         _ => full.as_str(),
@@ -652,16 +637,19 @@ fn seen(path: &str) {
     if !crate::sys::lock(&DONE).insert(root.to_ascii_lowercase()) {
         return;
     }
-    let root_p = PathBuf::from(&root);
+    // A later player's id-keyed save is in its own folder: the copy goes there, from
+    // its own earlier one if it has it, else player 1's.
+    let root_p = sandboxed(&root).unwrap_or_else(|| PathBuf::from(&root));
     // Never over a save the new id has; an empty folder is no save yet.
     if once && root_p.exists() && !is_empty_dir(&root_p) {
-        log!("saves: {root} is the game's own already; nothing copied");
+        log!("saves: {} is the game's own already; nothing copied", root_p.display());
         return;
     }
     let tried: Vec<&(String, String, bool, bool)> = found.iter().filter(|f| f.0.eq_ignore_ascii_case(&root)).collect();
     // The order: the save under an id listed as an earlier one, one told from its
     // neighbours (a SteamID of its own only), then steam_api's.
-    let source = tried.iter().find(|f| !f.3 && Path::new(&f.1).exists()).map(|f| PathBuf::from(&f.1));
+    let own_first = |p: &str| sandboxed(p).filter(|s| s.exists()).unwrap_or_else(|| PathBuf::from(p));
+    let source = tried.iter().map(|f| (own_first(&f.1), f.3)).find(|(p, fallback)| !fallback && p.exists()).map(|(p, _)| p);
     let source = source.or_else(|| if once && tried.iter().any(|f| f.3) { guess_earlier(&root_p) } else { None });
     let source = source.or_else(|| tried.iter().find(|f| f.3 && Path::new(&f.1).exists()).map(|f| PathBuf::from(&f.1)));
     let Some(source_p) = source else {
@@ -680,15 +668,15 @@ fn seen(path: &str) {
             let _ = std::fs::remove_dir(&root_p);
         }
         match copy_fresh(&source_p, &root_p) {
-            Ok(n) => log!("saves: {source} -> {root} ({n} files copied, once)"),
-            Err(e) => log!("saves: copying {source} -> {root} failed: {e}"),
+            Ok(n) => log!("saves: {source} -> {} ({n} files copied, once)", root_p.display()),
+            Err(e) => log!("saves: copying {source} -> {} failed: {e}", root_p.display()),
         }
         return;
     }
     match replace(&source_p, &root_p) {
-        Ok((n, Some(b))) => log!("saves: {source} -> {root} ({n} files copied; what was there is now {})", b.display()),
-        Ok((n, None)) => log!("saves: {source} -> {root} ({n} files copied)"),
-        Err(e) => log!("saves: replacing {root} with {source} failed ({e}); {root} is as it was"),
+        Ok((n, Some(b))) => log!("saves: {source} -> {} ({n} files copied; what was there is now {})", root_p.display(), b.display()),
+        Ok((n, None)) => log!("saves: {source} -> {} ({n} files copied)", root_p.display()),
+        Err(e) => log!("saves: replacing {} with {source} failed ({e}); it is as it was", root_p.display()),
     }
 }
 
@@ -742,366 +730,103 @@ fn ansi(p: *const u8) -> Option<String> {
     (n > 0).then(|| String::from_utf16_lossy(&w[..n as usize]))
 }
 
-// ---- a second copy's own saves ----
+// ---- a later player's own saves ----
 
 /// The slot of a copy whose saves are its own (1 and up); 0 while off.
 static OWN_SLOT: AtomicU32 = AtomicU32::new(0);
+/// Whether the slot came from the launcher (`PEERPARTY_PLAYER_SLOT`, a session's spec):
+/// then the LAN's slot doesn't move the saves.
+static SLOT_GIVEN: AtomicBool = AtomicBool::new(false);
 
 /// Whether this copy's saves are its own (a later player's), known already.
 pub fn own_saves() -> bool {
     OWN_SLOT.load(Ordering::Relaxed) != 0
 }
 
-/// A split-screen session's later player (`slot` from its `InstanceSpec`, read at the
-/// hook's start): its saves are its own before the game first reads them. A game that
-/// reads its save before its LAN comes up would otherwise read, and keep writing, the
-/// first player's. The hooks go in at kernelbase (watch.rs).
-pub fn own_slot_from_session(slot: u32) {
-    if slot == 0 || slot == u32::MAX || crate::config::HookConfig::global().separate_saves == Some(false) {
+/// Whether player 1's copy notes where its saves are (`PEERPARTY_SAVE_WATCH`).
+pub fn watching() -> bool {
+    vfs::state().is_some_and(|s| s.slot == 0)
+}
+
+/// The player this copy's saves are (0 for player 1, or while not kept apart).
+pub fn save_slot() -> u32 {
+    OWN_SLOT.load(Ordering::Relaxed)
+}
+
+/// At the hook's start: the player the launcher made this copy (`PEERPARTY_PLAYER_SLOT`,
+/// or a split-screen session's spec), so its saves are its own before the game first
+/// reads them. A game that reads its save before its LAN comes up would otherwise read,
+/// and keep writing, player 1's. The hooks go in at kernelbase (watch.rs).
+pub fn own_slot_from_launcher(slot: u32, why: &str) {
+    let c = crate::config::HookConfig::global();
+    if slot == u32::MAX {
+        return;
+    }
+    if c.separate_saves == Some(false) {
+        if slot != 0 {
+            log!("saves: player {}'s saves are player 1's (PEERPARTY_SEPARATE_SAVES=0, \"Shared with Player 1\")", slot + 1);
+        }
+        return;
+    }
+    SLOT_GIVEN.store(true, Ordering::Relaxed);
+    if slot == 0 {
+        if c.save_watch {
+            vfs::start(0);
+        }
         return;
     }
     OWN_SLOT.store(slot, Ordering::Relaxed);
-    log!("saves: split-screen player {}: saves shared by every copy are this player's own from the start (a twin beside each, `.peerparty-{}`)", slot + 1, slot + 1);
+    log!("saves: this copy is player {} ({why}): its saves, registry and Steam Remote Storage are its own from the start", slot + 1);
+    vfs::start(slot);
+    vfs::load_noted();
 }
 
-/// The LAN came up: a player's copy in a slot other than the first keeps its own saves
-/// (module comment).
+/// The LAN came up: a copy the launcher gave no player keeps its own saves when the LAN
+/// made it a later one (`--multi-instance` started by hand).
 pub fn learn_slot(lan: &peerparty_core::Lan) {
     let slot = lan.slot();
-    if slot == 0 || slot == u32::MAX || lan.server() {
+    if slot == u32::MAX || lan.server() {
         return;
     }
-    if crate::config::HookConfig::global().separate_saves == Some(false) {
+    if SLOT_GIVEN.load(Ordering::Relaxed) {
+        let given = OWN_SLOT.load(Ordering::Relaxed);
+        if given != slot {
+            log!("saves: the LAN gave this copy player {}'s slot, but it was started as player {}: its saves stay player {}'s", slot + 1, given + 1, given + 1);
+        }
         return;
     }
-    let before = OWN_SLOT.swap(slot, Ordering::Relaxed);
-    if before == slot {
+    if slot == 0 || crate::config::HookConfig::global().separate_saves == Some(false) {
         return;
     }
-    if before != 0 {
-        log!("saves: the session made this player {}, but the LAN gave it copy {}'s slot: its saves are copy {}'s from now on", before + 1, slot + 1, slot + 1);
-    } else {
-        log!("saves: this copy is the PC's copy {}: saves shared by every copy are its own (a twin beside each, `.peerparty-{}`)", slot + 1, slot + 1);
+    if OWN_SLOT.swap(slot, Ordering::Relaxed) == slot {
+        return;
     }
+    log!("saves: this copy is the PC's copy {} (from its LAN slot, after the game started): saves are its own from now on", slot + 1);
+    vfs::start(slot);
+    vfs::load_noted();
     // Called while the LAN is being set up: not from here (adopt_earlier_ids).
-    std::thread::spawn(arm_now);
+    std::thread::spawn(|| {
+        arm_now();
+        registry::arm_now();
+    });
 }
 
-/// A path's Win32 long-path prefix (`\\?\`, not a UNC one's), and the path without it.
-fn split_verbatim(path: &str) -> (&str, &str) {
-    match path.strip_prefix(r"\\?\") {
-        Some(rest) if !rest.get(..4).is_some_and(|p| p.eq_ignore_ascii_case(r"UNC\")) => (r"\\?\", rest),
-        _ => ("", path),
-    }
+/// For an id-keyed save in a later player's copy: the player's own path for `real`.
+fn sandboxed(real: &str) -> Option<PathBuf> {
+    let st = vfs::state().filter(|s| s.slot != 0)?;
+    let full = vfs::full_path(real)?;
+    let (zone, rel) = peerparty_protocol::saves::classify(&st.roots, &full)?;
+    Some(peerparty_protocol::saves::sandbox_path(&st.fs, zone, &rel))
 }
 
-/// For a full path the game uses, in a copy whose saves are its own: (the save's root,
-/// its twin, the rest of the path after the root). None for a path outside any save.
-pub fn twin_of(full: &str, exe_dir: &str, slot: u32) -> Option<(String, String, String)> {
-    // A long path (`\\?\C:\...`) is the same save: its twin keeps the prefix.
-    let (prefix, full) = split_verbatim(full);
-    let (_, exe_dir) = split_verbatim(exe_dir);
-    let norm = full.replace('/', "\\");
-    if norm.starts_with("\\\\") || norm.to_ascii_lowercase().contains(".peerparty-") {
-        return None;
-    }
-    // Components, by where each starts and ends.
-    let mut comps: Vec<(usize, usize)> = Vec::new();
-    let mut start = 0;
-    for (i, c) in norm.char_indices() {
-        if c == '\\' {
-            if i > start {
-                comps.push((start, i));
-            }
-            start = i + 1;
-        }
-    }
-    if norm.len() > start {
-        comps.push((start, norm.len()));
-    }
-    let lower = norm.to_ascii_lowercase();
-    // The deepest folder named for saves, past the drive; else the file itself (or the
-    // folder the path names).
-    let named = |i: usize| lower[comps[i].0..comps[i].1].contains("save");
-    let last = comps.len().checked_sub(1)?;
-    let mut k = (1..last).rev().find(|&i| named(i)).or_else(|| (last >= 1 && named(last)).then_some(last))?;
-    // Windows' Saved Games holds every game's: its game folder is this game's save.
-    if &lower[comps[k].0..comps[k].1] == "saved games" {
-        k += 1;
-        if k >= comps.len() {
-            return None;
-        }
-    }
-    let (rs, re) = comps[k];
-    let root = &norm[..re];
-    let root_l = &lower[..re];
-    let exe = exe_dir.replace('/', "\\").trim_end_matches('\\').to_ascii_lowercase();
-    if exe == root_l || exe.starts_with(&format!("{root_l}\\")) {
-        return None;
-    }
-    let mark = format!(".peerparty-{}", slot + 1);
-    let is_last = k + 1 == comps.len();
-    let name = &norm[rs..re];
-    let twin = match name.rfind('.').filter(|&d| d > 0 && is_last) {
-        // A file: before its extension, so the game still knows it.
-        Some(d) => format!("{}{}{}{}", &norm[..rs], &name[..d], mark, &name[d..]),
-        None => format!("{root}{mark}"),
-    };
-    Some((format!("{prefix}{root}"), format!("{prefix}{twin}"), norm[re..].to_string()))
-}
-
-/// Roots whose twin this run has made (or found), and that twin.
-static TWINS: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Mutex::default);
-
-/// Makes `twin` from `root` the first time this run sees it (a twin already there is
-/// the copy's own and stays, unless `--copy-saves` asked for the first copy's again).
-/// The root's twin: the one made first, so a root reached two ways ("Saves v1.0"
-/// itself, a file in it) keeps one twin. Another thread asking meanwhile waits for the
-/// copy (`COPYING`): the twin is listed only once it's whole, so no thread is handed a
-/// path to a save still being copied (and a game finding none there doesn't start a
-/// new one that the copy then can't be renamed onto).
-fn make_twin(root: &str, twin: &str) -> String {
-    let key = root.to_ascii_lowercase();
-    if let Some(t) = crate::sys::lock(&TWINS).get(&key) {
-        return t.clone();
-    }
-    let _copying = crate::sys::lock(&COPYING);
-    if let Some(t) = crate::sys::lock(&TWINS).get(&key) {
-        return t.clone();
-    }
-    let (from, to) = (Path::new(root), Path::new(twin));
-    let too_big = || from.exists() && size_of_tree(from, MAX_COPY) >= MAX_COPY;
-    if to.exists() && enabled() && from.exists() && !too_big() {
-        // `--copy-saves`: the first copy's save over this one's, as for saves keyed by
-        // an id (`replace`); this one's is kept as a backup.
-        match replace(from, to) {
-            Ok((n, backup)) => log!(
-                "saves: {root} is {twin} in this copy, replaced by the first copy's for --copy-saves ({n} files copied; this copy's is kept as {})",
-                backup.map_or("nothing".into(), |b| b.display().to_string())
-            ),
-            Err(e) => log!("saves: {root} is {twin} in this copy; copying the first copy's over it for --copy-saves failed ({e}), so it stays as it was"),
-        }
-    } else if to.exists() {
-        log!("saves: {root} is {twin} in this copy (its own, kept from before)");
-    } else if too_big() {
-        log!("saves: {root} is {twin} in this copy; the first copy's is too big to copy here, so it starts empty");
-    } else if from.exists() {
-        match copy_fresh(from, to) {
-            Ok(n) => log!("saves: {root} is {twin} in this copy, started from the first copy's ({n} files copied)"),
-            Err(e) => log!("saves: {root} is {twin} in this copy; copying the first copy's failed ({e}), so it starts empty"),
-        }
-    } else {
-        log!("saves: {root} is {twin} in this copy (nothing there yet)");
-    }
-    crate::sys::lock(&TWINS).insert(key, twin.to_string());
-    twin.to_string()
-}
-
-/// The path the game gets instead of `path` in a copy whose saves are its own; the
-/// twin is made from the first copy's the first time.
-fn own_path(path: &str) -> Option<String> {
-    let slot = OWN_SLOT.load(Ordering::Relaxed);
-    if slot == 0 {
-        return None;
-    }
-    let full = full_path(path)?;
-    if under_any(&full, &not_saves()) {
-        return None;
-    }
-    let exe_dir = std::env::current_exe().ok()?.parent()?.to_string_lossy().into_owned();
-    let (root, mut twin, rest) = twin_of(&full, &exe_dir, slot)?;
-    // A save keyed by an id (the other way above, or one of this copy's own) is this
-    // copy's already.
-    let pairs = crate::sys::lock(&PAIRS).clone();
-    if !sources_of(&full, &pairs).is_empty() || keyed_by_own_id(&full) {
-        return None;
-    }
-    // A folder with a dot in its name ("MyGame v1.0") is a folder's twin, as it is
-    // when a file in it is opened, not a file's (BUSY is set: this passes through).
-    let folder = format!("{root}.peerparty-{}", slot + 1);
-    if twin != folder && Path::new(&root).is_dir() {
-        twin = folder;
-    }
-    let twin = make_twin(&root, &twin);
-    Some(format!("{twin}{rest}"))
-}
-
-/// Folders whose files are never a game's shared saves: PeerParty's own (its stores for
-/// services' cloud saves are kept per identity already, and a container a game named
-/// "saves" there isn't the game's folder), the folders tests point those stores at, and
-/// the temp folder.
-fn not_saves() -> Vec<String> {
-    let c = crate::config::HookConfig::global();
-    let mut v: Vec<String> = [&c.galaxy_dir, &c.playfab_dir, &c.ugs_dir, &c.log_dir]
-        .into_iter()
-        .flatten()
-        .map(|d| d.to_string_lossy().into_owned())
-        .chain(["TEMP", "TMP"].iter().filter_map(|k| std::env::var(k).ok()))
-        .collect();
-    if let Some(d) = crate::util::local_store::peerparty_dir() {
-        v.push(d.to_string_lossy().into_owned());
-    }
-    v
-}
-
-/// Whether `full` is one of `roots` or inside one (case and slashes aside).
-fn under_any(full: &str, roots: &[String]) -> bool {
-    let f = full.replace('/', "\\").to_ascii_lowercase();
-    roots.iter().any(|r| {
-        let r = r.replace('/', "\\").trim_end_matches('\\').to_ascii_lowercase();
-        !r.is_empty() && (f == r || f.starts_with(&format!("{r}\\")))
-    })
-}
-
-fn full_path(path: &str) -> Option<String> {
-    use windows_sys::Win32::Storage::FileSystem::GetFullPathNameW;
-    let w: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
-    let mut buf = vec![0u16; 1024];
-    let n = unsafe { GetFullPathNameW(w.as_ptr(), buf.len() as u32, buf.as_mut_ptr(), std::ptr::null_mut()) } as usize;
-    if n == 0 || n >= buf.len() {
-        return None;
-    }
-    Some(String::from_utf16_lossy(&buf[..n]))
-}
-
-/// `own_path` for a wide path the game passed: the twin's, NUL-terminated.
-fn own_w(name: *const u16) -> Option<Vec<u16>> {
-    if name.is_null() || OWN_SLOT.load(Ordering::Relaxed) == 0 || BUSY.with(|b| b.get()) {
-        return None;
-    }
-    BUSY.with(|b| b.set(true));
-    let r = std::panic::catch_unwind(|| read::wstr(name as usize).and_then(|p| own_path(&p))).ok().flatten();
-    BUSY.with(|b| b.set(false));
-    Some(r?.encode_utf16().chain(Some(0)).collect())
-}
-
-/// `own_w` for an ANSI path: the twin's in the system code page, NUL-terminated.
-fn own_a(name: *const u8) -> Option<Vec<u8>> {
-    use windows_sys::Win32::Globalization::{CP_ACP, WideCharToMultiByte};
-    if name.is_null() || OWN_SLOT.load(Ordering::Relaxed) == 0 || BUSY.with(|b| b.get()) {
-        return None;
-    }
-    BUSY.with(|b| b.set(true));
-    let r = std::panic::catch_unwind(|| ansi(name).and_then(|p| own_path(&p))).ok().flatten();
-    BUSY.with(|b| b.set(false));
-    let w: Vec<u16> = r?.encode_utf16().collect();
-    let n = unsafe { WideCharToMultiByte(CP_ACP, 0, w.as_ptr(), w.len() as i32, std::ptr::null_mut(), 0, std::ptr::null(), std::ptr::null_mut()) };
-    if n <= 0 {
-        return None;
-    }
-    let mut out = vec![0u8; n as usize + 1];
-    unsafe { WideCharToMultiByte(CP_ACP, 0, w.as_ptr(), w.len() as i32, out.as_mut_ptr(), n, std::ptr::null(), std::ptr::null_mut()) };
-    Some(out)
-}
-
-/// Rebinds `$name` to the twin's path when there is one (kept alive in `$keep`).
-macro_rules! own {
-    ($f:ident, $name:ident, $keep:ident) => {
-        let $keep = $f($name);
-        let $name = $keep.as_ref().map_or($name, |v| v.as_ptr());
-    };
-}
-
-// ---- kernelbase hooks ----
-
-type CreateFileW = unsafe extern "system" fn(*const u16, u32, u32, usize, u32, u32, isize) -> isize;
-type CreateFileA = unsafe extern "system" fn(*const u8, u32, u32, usize, u32, u32, isize) -> isize;
-type CreateFile2 = unsafe extern "system" fn(*const u16, u32, u32, u32, usize) -> isize;
-type GetFileAttributesW = unsafe extern "system" fn(*const u16) -> u32;
-type GetFileAttributesA = unsafe extern "system" fn(*const u8) -> u32;
-type GetFileAttributesExW = unsafe extern "system" fn(*const u16, i32, usize) -> i32;
-type GetFileAttributesExA = unsafe extern "system" fn(*const u8, i32, usize) -> i32;
-type FindFirstFileExW = unsafe extern "system" fn(*const u16, i32, usize, i32, usize, u32) -> isize;
-type FindFirstFileExA = unsafe extern "system" fn(*const u8, i32, usize, i32, usize, u32) -> isize;
-type CreateDirectoryW = unsafe extern "system" fn(*const u16, usize) -> i32;
-type CreateDirectoryA = unsafe extern "system" fn(*const u8, usize) -> i32;
-type OnePathW = unsafe extern "system" fn(*const u16) -> i32;
-type OnePathA = unsafe extern "system" fn(*const u8) -> i32;
-type SetAttrsW = unsafe extern "system" fn(*const u16, u32) -> i32;
-type SetAttrsA = unsafe extern "system" fn(*const u8, u32) -> i32;
-type MoveExW = unsafe extern "system" fn(*const u16, *const u16, u32) -> i32;
-type MoveExA = unsafe extern "system" fn(*const u8, *const u8, u32) -> i32;
-type MoveProgressW = unsafe extern "system" fn(*const u16, *const u16, usize, usize, u32) -> i32;
-type ReplaceW = unsafe extern "system" fn(*const u16, *const u16, *const u16, u32, usize, usize) -> i32;
-type CopyExW = unsafe extern "system" fn(*const u16, *const u16, usize, usize, usize, u32) -> i32;
-
-static CREATE_FILE: OnceLock<GenericDetour<CreateFileW>> = OnceLock::new();
-static CREATE_FILE_A: OnceLock<GenericDetour<CreateFileA>> = OnceLock::new();
-static CREATE_FILE2: OnceLock<GenericDetour<CreateFile2>> = OnceLock::new();
-static ATTRS: OnceLock<GenericDetour<GetFileAttributesW>> = OnceLock::new();
-static ATTRS_A: OnceLock<GenericDetour<GetFileAttributesA>> = OnceLock::new();
-static ATTRS_EX: OnceLock<GenericDetour<GetFileAttributesExW>> = OnceLock::new();
-static ATTRS_EX_A: OnceLock<GenericDetour<GetFileAttributesExA>> = OnceLock::new();
-static FIND: OnceLock<GenericDetour<FindFirstFileExW>> = OnceLock::new();
-static FIND_A: OnceLock<GenericDetour<FindFirstFileExA>> = OnceLock::new();
-static MKDIR: OnceLock<GenericDetour<CreateDirectoryW>> = OnceLock::new();
-static MKDIR_A: OnceLock<GenericDetour<CreateDirectoryA>> = OnceLock::new();
-static DELETE: OnceLock<GenericDetour<OnePathW>> = OnceLock::new();
-static DELETE_A: OnceLock<GenericDetour<OnePathA>> = OnceLock::new();
-static RMDIR: OnceLock<GenericDetour<OnePathW>> = OnceLock::new();
-static RMDIR_A: OnceLock<GenericDetour<OnePathA>> = OnceLock::new();
-static SET_ATTRS: OnceLock<GenericDetour<SetAttrsW>> = OnceLock::new();
-static SET_ATTRS_A: OnceLock<GenericDetour<SetAttrsA>> = OnceLock::new();
-static MOVE_EX: OnceLock<GenericDetour<MoveExW>> = OnceLock::new();
-static MOVE_EX_A: OnceLock<GenericDetour<MoveExA>> = OnceLock::new();
-static MOVE_PROGRESS: OnceLock<GenericDetour<MoveProgressW>> = OnceLock::new();
-static REPLACE: OnceLock<GenericDetour<ReplaceW>> = OnceLock::new();
-static COPY_EX: OnceLock<GenericDetour<CopyExW>> = OnceLock::new();
-
-static ARMED: AtomicBool = AtomicBool::new(false);
-
-fn arm<T>(exports: &[Export], name: &str, slot: &OnceLock<GenericDetour<T>>, detour: T) -> usize
-where
-    T: retour::Function + Copy + Send + Sync + 'static,
-{
-    if slot.get().is_some() {
-        return 0;
-    }
-    let Some(e) = exports.iter().find(|e| e.name == name) else {
-        return 0;
-    };
-    // `arm_now` hooks these while the game runs (its threads may be in them): the
-    // others are paused while each prologue is written (not at the hook's own start,
-    // before the game has threads: `sys::hook::frozen`).
-    let target: T = unsafe { T::from_ptr(e.addr as *const ()) };
-    usize::from(crate::sys::detour::try_arm(slot, target, detour, "saves", name, true) == crate::sys::detour::Armed::Hooked)
-}
-
-/// Arms the file hooks in kernelbase (once).
-pub fn attach_kernelbase(exports: &[Export]) -> usize {
-    if ARMED.swap(true, Ordering::SeqCst) {
-        return 0;
-    }
-    arm(exports, "CreateFileW", &CREATE_FILE, detour_create_file as CreateFileW)
-        + arm(exports, "CreateFileA", &CREATE_FILE_A, detour_create_file_a as CreateFileA)
-        + arm(exports, "CreateFile2", &CREATE_FILE2, detour_create_file2 as CreateFile2)
-        + arm(exports, "GetFileAttributesW", &ATTRS, detour_attrs as GetFileAttributesW)
-        + arm(exports, "GetFileAttributesA", &ATTRS_A, detour_attrs_a as GetFileAttributesA)
-        + arm(exports, "GetFileAttributesExW", &ATTRS_EX, detour_attrs_ex as GetFileAttributesExW)
-        + arm(exports, "GetFileAttributesExA", &ATTRS_EX_A, detour_attrs_ex_a as GetFileAttributesExA)
-        + arm(exports, "FindFirstFileExW", &FIND, detour_find as FindFirstFileExW)
-        + arm(exports, "FindFirstFileExA", &FIND_A, detour_find_a as FindFirstFileExA)
-        + arm(exports, "CreateDirectoryW", &MKDIR, detour_mkdir as CreateDirectoryW)
-        + arm(exports, "CreateDirectoryA", &MKDIR_A, detour_mkdir_a as CreateDirectoryA)
-        + arm(exports, "DeleteFileW", &DELETE, detour_delete as OnePathW)
-        + arm(exports, "DeleteFileA", &DELETE_A, detour_delete_a as OnePathA)
-        + arm(exports, "RemoveDirectoryW", &RMDIR, detour_rmdir as OnePathW)
-        + arm(exports, "RemoveDirectoryA", &RMDIR_A, detour_rmdir_a as OnePathA)
-        + arm(exports, "SetFileAttributesW", &SET_ATTRS, detour_set_attrs as SetAttrsW)
-        + arm(exports, "SetFileAttributesA", &SET_ATTRS_A, detour_set_attrs_a as SetAttrsA)
-        + arm(exports, "MoveFileExW", &MOVE_EX, detour_move_ex as MoveExW)
-        + arm(exports, "MoveFileExA", &MOVE_EX_A, detour_move_ex_a as MoveExA)
-        + arm(exports, "MoveFileWithProgressW", &MOVE_PROGRESS, detour_move_progress as MoveProgressW)
-        + arm(exports, "ReplaceFileW", &REPLACE, detour_replace as ReplaceW)
-        + arm(exports, "CopyFileExW", &COPY_EX, detour_copy_ex as CopyExW)
-}
+pub use hooks::attach_kernelbase;
 
 /// Arms the file hooks now, from kernelbase as it's loaded (also for a split-screen
 /// copy without saves of its own to keep apart: its CreateFile keeps other players'
 /// controllers from it, input/device.rs).
 pub fn arm_now() {
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-    if ARMED.load(Ordering::SeqCst) {
+    if hooks::armed() {
         return;
     }
     let name: Vec<u16> = "kernelbase.dll".encode_utf16().chain(Some(0)).collect();
@@ -1117,160 +842,6 @@ pub fn arm_now() {
         }
         Err(e) => log!("saves: kernelbase's exports unreadable ({e}); saves aren't copied"),
     }
-}
-
-/// A split-screen copy can't open another player's game controller (input/device.rs).
-fn not_there() -> isize {
-    unsafe { windows_sys::Win32::Foundation::SetLastError(windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND) };
-    -1
-}
-
-unsafe extern "system" fn detour_create_file(name: *const u16, access: u32, share: u32, sa: usize, disposition: u32, flags: u32, template: isize) -> isize {
-    if crate::input::refuse_open_w(name) {
-        return not_there();
-    }
-    touch(name);
-    let asked = name;
-    own!(own_w, name, own_name);
-    let h = unsafe { CREATE_FILE.get().unwrap().call(name, access, share, sa, disposition, flags, template) };
-    crate::input::opened_w(asked, h);
-    h
-}
-
-unsafe extern "system" fn detour_create_file_a(name: *const u8, access: u32, share: u32, sa: usize, disposition: u32, flags: u32, template: isize) -> isize {
-    if crate::input::refuse_open_a(name) {
-        return not_there();
-    }
-    touch_a(name);
-    let asked = name;
-    own!(own_a, name, own_name);
-    let h = unsafe { CREATE_FILE_A.get().unwrap().call(name, access, share, sa, disposition, flags, template) };
-    crate::input::opened_a(asked, h);
-    h
-}
-
-unsafe extern "system" fn detour_create_file2(name: *const u16, access: u32, share: u32, disposition: u32, params: usize) -> isize {
-    if crate::input::refuse_open_w(name) {
-        return not_there();
-    }
-    touch(name);
-    let asked = name;
-    own!(own_w, name, own_name);
-    let h = unsafe { CREATE_FILE2.get().unwrap().call(name, access, share, disposition, params) };
-    crate::input::opened_w(asked, h);
-    h
-}
-
-unsafe extern "system" fn detour_attrs(name: *const u16) -> u32 {
-    touch(name);
-    own!(own_w, name, own_name);
-    unsafe { ATTRS.get().unwrap().call(name) }
-}
-
-unsafe extern "system" fn detour_attrs_a(name: *const u8) -> u32 {
-    touch_a(name);
-    own!(own_a, name, own_name);
-    unsafe { ATTRS_A.get().unwrap().call(name) }
-}
-
-unsafe extern "system" fn detour_attrs_ex(name: *const u16, level: i32, info: usize) -> i32 {
-    touch(name);
-    own!(own_w, name, own_name);
-    unsafe { ATTRS_EX.get().unwrap().call(name, level, info) }
-}
-
-unsafe extern "system" fn detour_attrs_ex_a(name: *const u8, level: i32, info: usize) -> i32 {
-    touch_a(name);
-    own!(own_a, name, own_name);
-    unsafe { ATTRS_EX_A.get().unwrap().call(name, level, info) }
-}
-
-unsafe extern "system" fn detour_find(name: *const u16, level: i32, data: usize, op: i32, filter: usize, flags: u32) -> isize {
-    touch(name);
-    own!(own_w, name, own_name);
-    unsafe { FIND.get().unwrap().call(name, level, data, op, filter, flags) }
-}
-
-unsafe extern "system" fn detour_find_a(name: *const u8, level: i32, data: usize, op: i32, filter: usize, flags: u32) -> isize {
-    touch_a(name);
-    own!(own_a, name, own_name);
-    unsafe { FIND_A.get().unwrap().call(name, level, data, op, filter, flags) }
-}
-
-unsafe extern "system" fn detour_mkdir(name: *const u16, sa: usize) -> i32 {
-    touch(name);
-    own!(own_w, name, own_name);
-    unsafe { MKDIR.get().unwrap().call(name, sa) }
-}
-
-unsafe extern "system" fn detour_mkdir_a(name: *const u8, sa: usize) -> i32 {
-    touch_a(name);
-    own!(own_a, name, own_name);
-    unsafe { MKDIR_A.get().unwrap().call(name, sa) }
-}
-
-// Calls that only change files: the twin's path for a copy whose saves are its own
-// (no `touch`: that copies an id-keyed save in before the game reads it).
-
-unsafe extern "system" fn detour_delete(name: *const u16) -> i32 {
-    own!(own_w, name, own_name);
-    unsafe { DELETE.get().unwrap().call(name) }
-}
-
-unsafe extern "system" fn detour_delete_a(name: *const u8) -> i32 {
-    own!(own_a, name, own_name);
-    unsafe { DELETE_A.get().unwrap().call(name) }
-}
-
-unsafe extern "system" fn detour_rmdir(name: *const u16) -> i32 {
-    own!(own_w, name, own_name);
-    unsafe { RMDIR.get().unwrap().call(name) }
-}
-
-unsafe extern "system" fn detour_rmdir_a(name: *const u8) -> i32 {
-    own!(own_a, name, own_name);
-    unsafe { RMDIR_A.get().unwrap().call(name) }
-}
-
-unsafe extern "system" fn detour_set_attrs(name: *const u16, attrs: u32) -> i32 {
-    own!(own_w, name, own_name);
-    unsafe { SET_ATTRS.get().unwrap().call(name, attrs) }
-}
-
-unsafe extern "system" fn detour_set_attrs_a(name: *const u8, attrs: u32) -> i32 {
-    own!(own_a, name, own_name);
-    unsafe { SET_ATTRS_A.get().unwrap().call(name, attrs) }
-}
-
-unsafe extern "system" fn detour_move_ex(from: *const u16, to: *const u16, flags: u32) -> i32 {
-    own!(own_w, from, own_from);
-    own!(own_w, to, own_to);
-    unsafe { MOVE_EX.get().unwrap().call(from, to, flags) }
-}
-
-unsafe extern "system" fn detour_move_ex_a(from: *const u8, to: *const u8, flags: u32) -> i32 {
-    own!(own_a, from, own_from);
-    own!(own_a, to, own_to);
-    unsafe { MOVE_EX_A.get().unwrap().call(from, to, flags) }
-}
-
-unsafe extern "system" fn detour_move_progress(from: *const u16, to: *const u16, progress: usize, data: usize, flags: u32) -> i32 {
-    own!(own_w, from, own_from);
-    own!(own_w, to, own_to);
-    unsafe { MOVE_PROGRESS.get().unwrap().call(from, to, progress, data, flags) }
-}
-
-unsafe extern "system" fn detour_replace(replaced: *const u16, replacement: *const u16, backup: *const u16, flags: u32, a: usize, b: usize) -> i32 {
-    own!(own_w, replaced, own_replaced);
-    own!(own_w, replacement, own_replacement);
-    own!(own_w, backup, own_backup);
-    unsafe { REPLACE.get().unwrap().call(replaced, replacement, backup, flags, a, b) }
-}
-
-unsafe extern "system" fn detour_copy_ex(from: *const u16, to: *const u16, progress: usize, data: usize, cancel: usize, flags: u32) -> i32 {
-    own!(own_w, from, own_from);
-    own!(own_w, to, own_to);
-    unsafe { COPY_EX.get().unwrap().call(from, to, progress, data, cancel, flags) }
 }
 
 /// A store file that is there but can't be read as one (damaged, or not ours) is moved
@@ -1316,118 +887,6 @@ pub fn write_whole(path: &Path, data: &[u8]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-
-    /// A second copy's twin of a save shared by every copy: the deepest part named for
-    /// saves, never the game's own folder, and Windows' Saved Games only through the
-    /// game's folder in it.
-    #[test]
-    fn a_second_copy_gets_a_twin_of_shared_saves() {
-        let exe = r"C:\Games\Some Game";
-        let t = twin_of(r"C:\Games\Some Game\Profile\Player\Saves\savegame.dat", exe, 1).unwrap();
-        assert_eq!(t.0, r"C:\Games\Some Game\Profile\Player\Saves");
-        assert_eq!(t.1, r"C:\Games\Some Game\Profile\Player\Saves.peerparty-2");
-        assert_eq!(t.2, r"\savegame.dat");
-        // A search pattern inside the folder goes to the twin's.
-        assert_eq!(twin_of(r"C:\Games\Some Game\Profile\Player\Saves\*", exe, 2).unwrap().1, r"C:\Games\Some Game\Profile\Player\Saves.peerparty-3");
-        // A save file on its own keeps its extension.
-        let f = twin_of(r"C:\Users\a\Documents\My Games\Foo\savegame.sav", r"C:\Games\Foo", 1).unwrap();
-        assert_eq!(f.1, r"C:\Users\a\Documents\My Games\Foo\savegame.peerparty-2.sav");
-        assert_eq!(f.2, "");
-        // Unreal: SaveGames, not Saved.
-        let u = twin_of(r"C:\Users\a\AppData\Local\Foo\Saved\SaveGames\slot1.sav", r"C:\Games\Foo", 1).unwrap();
-        assert_eq!(u.1, r"C:\Users\a\AppData\Local\Foo\Saved\SaveGames.peerparty-2");
-        // Saved Games: the game's folder in it.
-        let g = twin_of(r"C:\Users\a\Saved Games\Foo\profile.bin", r"C:\Games\Foo", 1).unwrap();
-        assert_eq!(g.1, r"C:\Users\a\Saved Games\Foo.peerparty-2");
-        // The game's own folder (or one above it) is never a save.
-        assert_eq!(twin_of(r"C:\Games\Save The Date\data\x.pak", r"C:\Games\Save The Date", 1), None);
-        assert_eq!(twin_of(r"D:\Saves\Foo\game\x.pak", r"D:\Saves\Foo\game", 1), None);
-        // Paths with nothing named for saves, twins already, and device paths.
-        assert_eq!(twin_of(r"C:\Games\Foo\data\x.pak", r"C:\Games\Foo", 1), None);
-        assert_eq!(twin_of(r"C:\x\Saves.peerparty-2\a.dat", r"C:\Games\Foo", 1), None);
-        assert_eq!(twin_of(r"\\.\pipe\savepipe", r"C:\Games\Foo", 1), None);
-        // A long path is the same save, its twin a long path too; a UNC one isn't.
-        let l = twin_of(r"\\?\C:\Games\Some Game\Profile\Player\Saves\savegame.dat", exe, 1).unwrap();
-        assert_eq!(l.0, r"\\?\C:\Games\Some Game\Profile\Player\Saves");
-        assert_eq!(l.1, r"\\?\C:\Games\Some Game\Profile\Player\Saves.peerparty-2");
-        assert_eq!(l.2, r"\savegame.dat");
-        assert_eq!(twin_of(r"\\?\C:\Games\Some Game\data\Saves\x", r"\\?\C:\Games\Some Game\data\Saves", 1), None);
-        assert_eq!(twin_of(r"\\?\UNC\server\share\Saves\a.dat", exe, 1), None);
-    }
-
-    /// Threads asking for the same twin at once all get it whole: none is handed the
-    /// twin's path while the first copy's save is still being copied into it.
-    #[test]
-    fn threads_asking_for_a_twin_at_once_wait_for_it() {
-        let base = std::env::temp_dir().join(format!("peerparty-twin-race-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        let saves = base.join("Saves");
-        std::fs::create_dir_all(&saves).unwrap();
-        for i in 0..200 {
-            std::fs::write(saves.join(format!("part{i}.dat")), vec![i as u8; 4096]).unwrap();
-        }
-        let twin = base.join("Saves.peerparty-2");
-        let (root, to) = (saves.to_string_lossy().into_owned(), twin.to_string_lossy().into_owned());
-        let threads: Vec<_> = (0..6)
-            .map(|_| {
-                let (root, to) = (root.clone(), to.clone());
-                std::thread::spawn(move || {
-                    let got = make_twin(&root, &to);
-                    // What the thread was handed is all there.
-                    let n = std::fs::read_dir(&got).map(|d| d.count()).unwrap_or(0);
-                    (got, n)
-                })
-            })
-            .collect();
-        for t in threads {
-            let (got, n) = t.join().unwrap();
-            assert_eq!(got, to);
-            assert_eq!(n, 200, "a thread was handed a twin still being copied");
-        }
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    /// The first time, the twin starts as a copy of the first copy's save, which is
-    /// left as it was; a twin already there is kept.
-    #[test]
-    fn the_twin_starts_from_the_first_copys_save_once() {
-        let base = std::env::temp_dir().join(format!("peerparty-twin-{}", std::process::id()));
-        let saves = base.join("Saves");
-        std::fs::create_dir_all(&saves).unwrap();
-        std::fs::write(saves.join("savegame.dat"), b"first").unwrap();
-        let twin = base.join("Saves.peerparty-2");
-        make_twin(&saves.to_string_lossy(), &twin.to_string_lossy());
-        assert_eq!(std::fs::read(twin.join("savegame.dat")).unwrap(), b"first");
-        std::fs::write(twin.join("savegame.dat"), b"second").unwrap();
-        // Not copied again (this run or, the twin existing, the next).
-        crate::sys::lock(&TWINS).clear();
-        make_twin(&saves.to_string_lossy(), &twin.to_string_lossy());
-        assert_eq!(std::fs::read(twin.join("savegame.dat")).unwrap(), b"second");
-        assert_eq!(std::fs::read(saves.join("savegame.dat")).unwrap(), b"first");
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    /// With `--copy-saves`, a twin already there is replaced by the first copy's save,
-    /// and the copy's own is kept beside it as a backup.
-    #[test]
-    fn copy_saves_replaces_an_existing_twin_and_keeps_it_as_a_backup() {
-        let base = std::env::temp_dir().join(format!("peerparty-twin-copy-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        let saves = base.join("Saves");
-        std::fs::create_dir_all(&saves).unwrap();
-        std::fs::write(saves.join("savegame.dat"), b"first").unwrap();
-        let twin = base.join("Saves.peerparty-2");
-        std::fs::create_dir_all(&twin).unwrap();
-        std::fs::write(twin.join("savegame.dat"), b"own").unwrap();
-        TEST_COPY_SAVES.with(|c| c.set(Some(true)));
-        let got = make_twin(&saves.to_string_lossy(), &twin.to_string_lossy());
-        TEST_COPY_SAVES.with(|c| c.set(None));
-        assert_eq!(got, twin.to_string_lossy());
-        assert_eq!(std::fs::read(twin.join("savegame.dat")).unwrap(), b"first", "the first copy's save");
-        assert_eq!(std::fs::read(backup_name(&twin, 1).join("savegame.dat")).unwrap(), b"own", "the copy's own, kept");
-        assert_eq!(std::fs::read(saves.join("savegame.dat")).unwrap(), b"first", "the first copy's left as it was");
-        let _ = std::fs::remove_dir_all(&base);
-    }
 
     use super::*;
 
@@ -1696,15 +1155,6 @@ mod tests {
         // Only empty ones: none.
         assert_eq!(pick_newest(&[(base.join("x"), None)]), None);
         let _ = std::fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn peerparty_and_temp_folders_never_get_a_twin() {
-        let roots = vec![r"C:\Users\x\AppData\Local\peerparty".to_string(), r"C:\Users\x\Tmp\".to_string()];
-        assert!(under_any(r"C:\Users\x\AppData\Local\PeerParty\galaxy\g\ab\cloud\saves\cloud.sav", &roots));
-        assert!(under_any(r"c:/users/x/tmp/work/saves/a.sav", &roots));
-        assert!(!under_any(r"C:\Users\x\Tmp2\saves\a.sav", &roots));
-        assert!(!under_any(r"C:\Games\G\Saves\a.sav", &roots));
     }
 
     #[test]

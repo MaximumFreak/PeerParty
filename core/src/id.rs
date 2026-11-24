@@ -222,7 +222,24 @@ impl Identity {
     /// finds the first one's id at once (its saves start from the first player's),
     /// not only after that copy got round to making it.
     pub fn ensure_first(dir: &Path) {
-        let _ = IdentityKey::load_or_create(&dir.join("slot-0.ed25519"));
+        let _ = Self::ensure_slot(dir, 0);
+    }
+
+    /// Makes player `slot`'s key in `dir` if there's none yet, and gives its id: the
+    /// launcher knows every player's ids (to rename a save keyed by one when copying it
+    /// to another player) before that player has ever played.
+    pub fn ensure_slot(dir: &Path, slot: u32) -> Option<PeerId> {
+        if slot >= SLOTS || fs::create_dir_all(dir).is_err() {
+            return None;
+        }
+        let key = IdentityKey::load_or_create(&dir.join(format!("slot-{slot}.ed25519")));
+        Some(PeerId::of_key(&key.public()))
+    }
+
+    /// Player `slot`'s id, from its key in `dir` (None while it has none).
+    pub fn slot_id(dir: &Path, slot: u32) -> Option<PeerId> {
+        let text = fs::read_to_string(dir.join(format!("slot-{slot}.ed25519"))).ok()?;
+        IdentityKey::from_text(&text).map(|k| PeerId::of_key(&k.public()))
     }
 }
 
@@ -374,6 +391,19 @@ fn retire_old_id(dir: &Path, slot: u32, now: PeerId) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A player's key is made once, and is the one its claim then uses.
+    #[test]
+    fn a_players_id_is_known_before_it_plays() {
+        let dir = std::env::temp_dir().join(format!("peerparty-ensure-slot-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(Identity::slot_id(&dir, 2), None);
+        let made = Identity::ensure_slot(&dir, 2).unwrap();
+        assert_eq!(Identity::ensure_slot(&dir, 2), Some(made), "made once");
+        assert_eq!(Identity::slot_id(&dir, 2), Some(made));
+        assert_eq!(Identity::ensure_slot(&dir, SLOTS), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     /// The second player's name goes to copy 2 only; copy 1 keeps the player's name, and
     /// with none set, copy 2 is "name (2)" as before. The third and fourth are the first

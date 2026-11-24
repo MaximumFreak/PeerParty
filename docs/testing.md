@@ -29,7 +29,12 @@
 - Split screen (`tests/sdk/split_screen_test.py`, no DLL): one hidden two-player
   session (`peerparty --split-screen --instances 2`, `PEERPARTY_SESSION_HIDDEN=1`).
   Each copy is a starter that hands over to its game. The test checks both games
-  start and outlive their starters, then Close all ends them and the session.
+  start and outlive their starters, that their saves are apart (both open the same
+  save in `AppData\LocalLow` without sharing at the same moment, copy it with
+  `CopyFile2` and write the same `HKCU\Software` key; player 2 writes in the game's
+  folder too: player 1's are the real ones, player 2's in its own folder and key, the
+  game's folder unchanged), then that Close all ends them and the session, and that
+  `--player 2` alone reads player 2's save while a second `--player 2` is turned away.
 - Typed-IP games on async sockets (`tests/sdk/ipfwd_test.py`, no DLL): two copies in a
   fresh room over loopback, with LAN discovery off so each sees the other only at its
   stand-in address. Each answer's overlapped receive is collected seven ways (completion

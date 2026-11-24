@@ -248,6 +248,7 @@ mod run {
             spec.compositor_capture = !compositor.as_deref().is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "dwm" | "off" | "none"));
             spec.input_assignment = split.input(slot).assignment(slot);
             spec.identity_override = split.name(slot);
+            env.set(penv::PLAYER_SLOT, slot.to_string());
             if let Some(&pane) = panes.get(slot as usize) {
                 spec.pane = Some(peerparty_protocol::session::PaneRect {
                     x: bounds.x.saturating_add(pane.x),

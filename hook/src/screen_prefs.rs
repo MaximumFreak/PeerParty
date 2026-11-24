@@ -155,12 +155,41 @@ fn skip_write(name: Option<String>) -> bool {
     true
 }
 
+/// A read of value `name` that found none: the pane's value is answered for a saved
+/// screen value all the same (a later player's own registry starts empty, and the
+/// engine's default is the whole monitor). `rc` otherwise.
+fn missing(name: Option<String>, kind: *mut u32, data: *mut u8, len: *mut u32, rc: i32) -> i32 {
+    const ERROR_FILE_NOT_FOUND: i32 = 2;
+    const ERROR_MORE_DATA: i32 = 234;
+    if rc != ERROR_FILE_NOT_FOUND || len.is_null() {
+        return rc;
+    }
+    let Some(v) = name.as_deref().and_then(screen_value).and_then(pane_value) else { return rc };
+    if !kind.is_null() {
+        unsafe { *kind = REG_DWORD };
+    }
+    let room = unsafe { *len };
+    unsafe { *len = 4 };
+    if data.is_null() {
+        return ERROR_SUCCESS;
+    }
+    if room < 4 {
+        return ERROR_MORE_DATA;
+    }
+    unsafe { (data as *mut u32).write_unaligned(v) };
+    static TOLD_MISSING: AtomicBool = AtomicBool::new(false);
+    if !TOLD_MISSING.swap(true, Ordering::Relaxed) {
+        log!("window: the game has no saved screen setting {} yet; it reads as its pane's ({v})", name.unwrap_or_default());
+    }
+    ERROR_SUCCESS
+}
+
 unsafe extern "system" fn query_w(key: isize, name: *const u16, reserved: *mut u32, kind: *mut u32, data: *mut u8, len: *mut u32) -> i32 {
     let rc = unsafe { QUERY_W.get().unwrap().call(key, name, reserved, kind, data, len) };
     if rc == ERROR_SUCCESS && !data.is_null() {
         patch(name_w(name), kind, data, len);
     }
-    rc
+    missing(name_w(name), kind, data, len, rc)
 }
 
 unsafe extern "system" fn query_a(key: isize, name: *const u8, reserved: *mut u32, kind: *mut u32, data: *mut u8, len: *mut u32) -> i32 {
@@ -168,15 +197,23 @@ unsafe extern "system" fn query_a(key: isize, name: *const u8, reserved: *mut u3
     if rc == ERROR_SUCCESS && !data.is_null() {
         patch(name_a(name), kind, data, len);
     }
-    rc
+    missing(name_a(name), kind, data, len, rc)
 }
 
 unsafe extern "system" fn get_w(key: isize, sub: *const u16, name: *const u16, flags: u32, kind: *mut u32, data: *mut u8, len: *mut u32) -> i32 {
+    // A later player's own key, when the subkey names a game's (saves/registry.rs).
+    let routed = crate::saves::registry::subkey_w(key, sub);
+    let (key, sub) = routed.as_ref().map_or((key, sub), |(k, s)| (*k, s.as_ptr()));
     let rc = unsafe { GET_W.get().unwrap().call(key, sub, name, flags, kind, data, len) };
     if rc == ERROR_SUCCESS && !data.is_null() {
         patch(name_w(name), kind, data, len);
     }
-    rc
+    missing(name_w(name), kind, data, len, rc)
+}
+
+/// Whether RegGetValueW has this module's detour (saves/registry.rs then leaves it).
+pub fn get_value_hooked() -> bool {
+    GET_W.get().is_some()
 }
 
 unsafe extern "system" fn enum_w(key: isize, i: u32, name: *mut u16, name_len: *mut u32, reserved: *mut u32, kind: *mut u32, data: *mut u8, len: *mut u32) -> i32 {
