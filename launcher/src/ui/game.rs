@@ -553,13 +553,28 @@ fn advanced_split(ui: &mut egui::Ui, o: &mut GameOptions) {
         .inner;
     if sync_changed {
         o.split_no_sync = !sync;
+        if o.split_no_sync && o.split_fps.sync_divisor() > 1 {
+            o.split_fps = crate::launch::FpsCap::Display;
+        }
     }
     ui.add(egui::Label::new(egui::RichText::new(t!("game.adv_sync_sub")).size(12.0).color(TEXT3)).wrap());
     ui.add_space(6.0);
     ui.label(egui::RichText::new(t!("game.adv_fps")).size(13.0).color(TEXT2));
-    let fps_vals: [u16; 6] = [0, 30, 40, 60, 90, 120];
+    use crate::launch::FpsCap;
+    let fps_vals: [FpsCap; 8] = [
+        FpsCap::Display,
+        FpsCap::Divisor(2),
+        FpsCap::Divisor(3),
+        FpsCap::Fixed(30),
+        FpsCap::Fixed(40),
+        FpsCap::Fixed(60),
+        FpsCap::Fixed(90),
+        FpsCap::Fixed(120),
+    ];
     let fps_labels: Vec<String> = vec![
         t!("game.adv_fps_display").to_string(),
+        t!("game.adv_fps_div", d = 2),
+        t!("game.adv_fps_div", d = 3),
         t!("game.adv_fps_n", n = 30),
         t!("game.adv_fps_n", n = 40),
         t!("game.adv_fps_n", n = 60),
@@ -569,6 +584,9 @@ fn advanced_split(ui: &mut egui::Ui, o: &mut GameOptions) {
     let mut fi = fps_vals.iter().position(|&v| v == o.split_fps).unwrap_or(0);
     if widgets::stepper(ui, "split-fps", &fps_labels, &mut fi, ui.available_width()).changed() {
         o.split_fps = fps_vals[fi];
+        if o.split_fps.sync_divisor() > 1 {
+            o.split_no_sync = false;
+        }
     }
     ui.add(egui::Label::new(egui::RichText::new(t!("game.adv_fps_sub")).size(12.0).color(TEXT3)).wrap());
     ui.add_space(6.0);
@@ -688,7 +706,7 @@ fn advanced_changed(o: &GameOptions) -> bool {
         || o.split_no_sync
         || o.effective_split_render_scale() < 100
         || o.split_no_upscale
-        || o.split_fps != 0
+        || o.split_fps != crate::launch::FpsCap::Display
         || o.split_no_vram_budget
         || o.split_no_cpu_balance
 }

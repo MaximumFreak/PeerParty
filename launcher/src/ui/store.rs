@@ -48,8 +48,8 @@ pub struct GameOptions {
     pub split_render_scale: u8,
     /// Turn off Contrast Adaptive Sharpening (CAS) on upscaled panes (`--no-upscale`).
     pub split_no_upscale: bool,
-    /// Explicit per-copy FPS cap (`--fps`; 0 = match display refresh).
-    pub split_fps: u16,
+    /// Per-copy FPS cap (`--fps`; default = match display refresh, `"1/2"`/`"1/3"`, or `15..=240`).
+    pub split_fps: crate::launch::FpsCap,
     /// Turn off fair-share VRAM budget reporting (`--no-vram-budget`).
     pub split_no_vram_budget: bool,
     /// Turn off CPU core partitioning and worker thread scaling (`--no-cpu-balance`).
@@ -188,7 +188,7 @@ impl Default for GameOptions {
             split_no_sync: false,
             split_render_scale: 100,
             split_no_upscale: false,
-            split_fps: 0,
+            split_fps: crate::launch::FpsCap::Display,
             split_no_vram_budget: false,
             split_no_cpu_balance: false,
             split_inputs: Vec::new(),

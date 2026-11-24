@@ -25,7 +25,7 @@
 //! again when the window moves to another and once a second (HDR turned on or off, the
 //! SDR white level moved).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -239,6 +239,8 @@ struct Shared {
     want: Mutex<(u64, Vec<PaneDraw>)>,
     /// Which panes the thread draws.
     live: Mutex<Vec<bool>>,
+    /// DXGI `Present` sync interval (`1` = full refresh, `2` = 1/2, `3` = 1/3).
+    sync_interval: AtomicU32,
     quit: AtomicBool,
 }
 
@@ -283,7 +285,12 @@ impl Gpu {
             }
             return None;
         }
-        let shared = Arc::new(Shared { want: Mutex::new((0, Vec::new())), live: Mutex::new(Vec::new()), quit: AtomicBool::new(false) });
+        let shared = Arc::new(Shared {
+            want: Mutex::new((0, Vec::new())),
+            live: Mutex::new(Vec::new()),
+            sync_interval: AtomicU32::new(1),
+            quit: AtomicBool::new(false),
+        });
         let (frames, wake) = (Arc::new(Handle(frames)), Arc::new(Handle(wake)));
         let (s, f, w, h) = (shared.clone(), frames.clone(), wake.clone(), hwnd as usize);
         let thread = std::thread::Builder::new().name("peerparty-compositor".into()).spawn(move || run(h, &s, f.0, w.0, pause_on_occluded)).ok()?;
@@ -297,6 +304,14 @@ impl Gpu {
             w.0 += 1;
             w.1 = panes;
             drop(w);
+            unsafe { SetEvent(self.wake.0) };
+        }
+    }
+
+    /// Sets the DXGI `Present` sync interval (`1` = full refresh, `2` = 1/2, `3` = 1/3).
+    pub fn set_sync_interval(&self, interval: u8) {
+        let clamped = u32::from(interval.clamp(1, 4));
+        if self.shared.sync_interval.swap(clamped, Ordering::AcqRel) != clamped {
             unsafe { SetEvent(self.wake.0) };
         }
     }
@@ -1329,8 +1344,9 @@ fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE, pause_on_occl
         if !fresh && !dirty {
             continue;
         }
+        let sync_interval = shared.sync_interval.load(Ordering::Acquire).clamp(1, 4);
         if !r.waitable.is_null() {
-            unsafe { WaitForSingleObjectEx(r.waitable, 100, 1) };
+            unsafe { WaitForSingleObjectEx(r.waitable, 100 * sync_interval, 1) };
         }
         // Taken again once there's room: the frame event woke this for one copy's frame,
         // and another copy's of this same refresh, published while waiting, is drawn now.
@@ -1348,8 +1364,8 @@ fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE, pause_on_occl
             continue;
         };
         let drawn = r.draw(rtv, &panes, &take);
-        // IDXGISwapChain::Present (8): vsync.
-        let hr = vcall!(r.swap, 8, fn(u32, u32) -> i32, 1, 0);
+        // IDXGISwapChain::Present (8): vsync (1 = full, 2 = 1/2, 3 = 1/3 display refresh).
+        let hr = vcall!(r.swap, 8, fn(u32, u32) -> i32, sync_interval, 0);
         if pause_on_occluded && hr == DXGI_STATUS_OCCLUDED && occluded.is_none() {
             eprintln!("peerparty: session: the window can't be seen (the screen is locked, or a full-screen window covers it); nothing is drawn until it can");
             occluded = Some(std::time::Instant::now());

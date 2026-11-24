@@ -696,9 +696,9 @@ impl App {
             if o.split_no_upscale {
                 args.push("--no-upscale".into());
             }
-            if o.split_fps >= 15 {
+            if let Some(fps) = o.split_fps.to_arg() {
                 args.push("--fps".into());
-                args.push(o.split_fps.min(240).to_string());
+                args.push(fps);
             }
             if o.split_no_vram_budget {
                 args.push("--no-vram-budget".into());

@@ -280,12 +280,97 @@ pub struct SplitScreen {
     pub render_scale: u8,
     /// Turn off Contrast Adaptive Sharpening (CAS) when upscaling panes (`--no-upscale`).
     pub no_upscale: bool,
-    /// Explicit per-copy FPS cap (`--fps 0|15..=240`; 0 = match display refresh).
-    pub fps: u16,
+    /// Per-copy FPS cap (`--fps 0|1/2|1/3|15..=240`; default = match display refresh).
+    pub fps: FpsCap,
     /// Turn off fair-share GPU memory budget reporting (`--no-vram-budget`).
     pub no_vram_budget: bool,
     /// Turn off CPU core partitioning and worker thread scaling (`--no-cpu-balance`).
     pub no_cpu_balance: bool,
+}
+
+/// Per-copy split-screen frame rate cap (`--fps`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FpsCap {
+    /// Match the display's full refresh rate (compositor `Present(1, 0)`).
+    #[default]
+    Display,
+    /// Integer divisor of the display refresh rate (`2` = 1/2, `3` = 1/3) via the
+    /// compositor's DXGI sync interval (`Present(d, 0)`): locks directly to hardware
+    /// VBlanks with no pulldown judder or timer drift on fixed-refresh displays.
+    Divisor(u8),
+    /// Explicit fixed FPS cap (`15..=240`).
+    Fixed(u16),
+}
+
+impl FpsCap {
+    /// Parses `--fps` (`0`, `1/2` / `half`, `1/3` / `third`, or `15..=240`).
+    pub fn parse(raw: &str) -> Option<FpsCap> {
+        let s = raw.trim().to_ascii_lowercase();
+        match s.as_str() {
+            "0" | "display" => Some(FpsCap::Display),
+            "1/2" | "half" => Some(FpsCap::Divisor(2)),
+            "1/3" | "third" => Some(FpsCap::Divisor(3)),
+            _ => s.parse::<u16>().ok().filter(|n| (15..=240).contains(n)).map(FpsCap::Fixed),
+        }
+    }
+
+    /// CLI value for `--fps` (`None` when matching the display refresh).
+    pub fn to_arg(self) -> Option<String> {
+        match self {
+            FpsCap::Display => None,
+            FpsCap::Divisor(d) => Some(format!("1/{}", d.clamp(2, 3))),
+            FpsCap::Fixed(n) => Some(n.clamp(15, 240).to_string()),
+        }
+    }
+
+    /// Compositor DXGI sync interval (`1` for full refresh or fixed caps, `2` for 1/2,
+    /// `3` for 1/3).
+    pub fn sync_divisor(self) -> u8 {
+        match self {
+            FpsCap::Divisor(d) => d.clamp(2, 3),
+            FpsCap::Display | FpsCap::Fixed(_) => 1,
+        }
+    }
+}
+
+impl serde::Serialize for FpsCap {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match *self {
+            FpsCap::Display => serializer.serialize_u16(0),
+            FpsCap::Divisor(2) => serializer.serialize_str("1/2"),
+            FpsCap::Divisor(3) => serializer.serialize_str("1/3"),
+            FpsCap::Divisor(d) => serializer.serialize_str(&format!("1/{}", d.clamp(2, 3))),
+            FpsCap::Fixed(n) => serializer.serialize_u16(n.clamp(15, 240)),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for FpsCap {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visit;
+        impl serde::de::Visitor<'_> for Visit {
+            type Value = FpsCap;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("0, \"1/2\", \"1/3\", or an FPS integer in 15..=240")
+            }
+            fn visit_u64<E>(self, v: u64) -> Result<FpsCap, E> {
+                Ok(if (15..=240).contains(&v) { FpsCap::Fixed(v as u16) } else { FpsCap::Display })
+            }
+            fn visit_i64<E>(self, v: i64) -> Result<FpsCap, E> {
+                Ok(u64::try_from(v).ok().filter(|n| (15..=240).contains(n)).map_or(FpsCap::Display, |n| FpsCap::Fixed(n as u16)))
+            }
+            fn visit_str<E>(self, s: &str) -> Result<FpsCap, E> {
+                Ok(FpsCap::parse(s).unwrap_or(FpsCap::Display))
+            }
+            fn visit_none<E>(self) -> Result<FpsCap, E> {
+                Ok(FpsCap::Display)
+            }
+            fn visit_unit<E>(self) -> Result<FpsCap, E> {
+                Ok(FpsCap::Display)
+            }
+        }
+        deserializer.deserialize_any(Visit)
+    }
 }
 
 /// What a split-screen player plays with (`--inputs auto,kbm,pad`).
@@ -401,7 +486,7 @@ impl Default for SplitScreen {
             no_sync: false,
             render_scale: 100,
             no_upscale: false,
-            fps: 0,
+            fps: FpsCap::Display,
             no_vram_budget: false,
             no_cpu_balance: false,
         }
@@ -1077,7 +1162,23 @@ mod tests {
         assert_eq!(SplitScreen::layout_named("1+2"), Some(LayoutPreset::BottomTwo));
         assert_eq!(SplitScreen::layout_named("grid"), Some(LayoutPreset::Grid2x2));
         assert_eq!(SplitScreen::layout_named("diagonal"), None);
-        assert_eq!(SplitScreen::default(), SplitScreen { instances: 2, layout: LayoutPreset::Horizontal, inputs: Vec::new(), no_kbm: false, names: Vec::new(), monitor: None, stagger: StaggerMode::Smart, no_sync: false, render_scale: 100, no_upscale: false, fps: 0, no_vram_budget: false, no_cpu_balance: false });
+        assert_eq!(SplitScreen::default(), SplitScreen { instances: 2, layout: LayoutPreset::Horizontal, inputs: Vec::new(), no_kbm: false, names: Vec::new(), monitor: None, stagger: StaggerMode::Smart, no_sync: false, render_scale: 100, no_upscale: false, fps: FpsCap::Display, no_vram_budget: false, no_cpu_balance: false });
+        assert_eq!(FpsCap::parse("0"), Some(FpsCap::Display));
+        assert_eq!(FpsCap::parse("1/2"), Some(FpsCap::Divisor(2)));
+        assert_eq!(FpsCap::parse("half"), Some(FpsCap::Divisor(2)));
+        assert_eq!(FpsCap::parse("1/3"), Some(FpsCap::Divisor(3)));
+        assert_eq!(FpsCap::parse("third"), Some(FpsCap::Divisor(3)));
+        assert_eq!(FpsCap::parse("60"), Some(FpsCap::Fixed(60)));
+        assert_eq!(FpsCap::parse("1/4"), None);
+        assert_eq!((FpsCap::Display.sync_divisor(), FpsCap::Divisor(2).sync_divisor(), FpsCap::Divisor(3).sync_divisor(), FpsCap::Fixed(60).sync_divisor()), (1, 2, 3, 1));
+        assert_eq!(serde_json::to_string(&FpsCap::Display).unwrap(), "0");
+        assert_eq!(serde_json::to_string(&FpsCap::Fixed(60)).unwrap(), "60");
+        assert_eq!(serde_json::to_string(&FpsCap::Divisor(2)).unwrap(), "\"1/2\"");
+        assert_eq!(serde_json::to_string(&FpsCap::Divisor(3)).unwrap(), "\"1/3\"");
+        assert_eq!(serde_json::from_str::<FpsCap>("0").unwrap(), FpsCap::Display);
+        assert_eq!(serde_json::from_str::<FpsCap>("60").unwrap(), FpsCap::Fixed(60));
+        assert_eq!(serde_json::from_str::<FpsCap>("\"1/2\"").unwrap(), FpsCap::Divisor(2));
+        assert_eq!(serde_json::from_str::<FpsCap>("\"1/3\"").unwrap(), FpsCap::Divisor(3));
     }
 
     #[test]

@@ -86,9 +86,15 @@ static NEXT_FRAME_US: AtomicU64 = AtomicU64::new(0);
 /// Last pacing interval (`0` when uninitialized): changing modes (visible <-> hidden or
 /// changing FPS cap) resets `NEXT_FRAME_US` cleanly.
 static LAST_INTERVAL_US: AtomicU64 = AtomicU64::new(0);
-/// Safety cap (ms) on waiting for the compositor's pace event so a stall or crash can
-/// never deadlock a copy.
+/// Safety cap (ms) per compositor VBlank on waiting for the pace event so a stall or crash
+/// can never deadlock a copy; scales with `RingHeader::sync_divisor` (`1` -> 35 ms, `2` ->
+/// 70 ms, `3` -> 105 ms) so half- or third-rate VSync on 50-60 Hz displays never times out
+/// early.
 const PACE_TIMEOUT_MS: u32 = 35;
+
+fn pace_timeout_ms(divisor: u8) -> u32 {
+    PACE_TIMEOUT_MS * u32::from(divisor.clamp(1, 4))
+}
 /// Background tick interval (50 ms = 20 FPS) for panes hidden while another pane is zoomed,
 /// keeping LAN simulation and netcode alive while freeing GPU/CPU for the zoomed player.
 const HIDDEN_INTERVAL_US: u64 = 50_000;
@@ -244,7 +250,7 @@ fn wait_vblank(h: &RingHeader, pace: HANDLE) {
         unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(pace, 0) };
         return;
     }
-    unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(pace, PACE_TIMEOUT_MS) };
+    unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(pace, pace_timeout_ms(h.sync_divisor())) };
     LAST_PACED_PRESENT.store(h.presents.load(Ordering::Acquire), Ordering::Release);
 }
 
@@ -297,7 +303,7 @@ pub fn pace() {
             }
             // Wait on `link.pace` (when available) so unzooming, turning off sync/cap, or
             // landing on a VBlank wakes this copy immediately rather than sleeping blindly.
-            let max_slice = if hidden { 50 } else if sync { PACE_TIMEOUT_MS } else { 50 };
+            let max_slice = if hidden { 50 } else if sync { pace_timeout_ms(h.sync_divisor()) } else { 50 };
             let wait_ms = ((rem + 500) / 1000).clamp(1, u64::from(max_slice)) as u32;
             if !link.pace.is_null() {
                 unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(link.pace, wait_ms) };
@@ -1550,10 +1556,26 @@ pub(crate) mod tests {
         assert!(t1.elapsed().as_millis() < 100, "woke on pace signal");
 
         // Unsignalled safety timeout: returns in ~PACE_TIMEOUT_MS, never deadlocks.
+        assert_eq!((pace_timeout_ms(1), pace_timeout_ms(2), pace_timeout_ms(3)), (35, 70, 105));
         let t2 = std::time::Instant::now();
         pace();
         let ms = t2.elapsed().as_millis();
         assert!(ms >= 20 && ms < 200, "safety timeout bounded ({ms} ms)");
+
+        // Half-rate VSync divisor scales the safety timeout above 35 ms so a 60 Hz / 2
+        // compositor present (~33 ms) waits cleanly without timing out early.
+        with_ring(|h| h.set_sync_divisor(2));
+        let ev_half = pace_ev as usize;
+        let signaler2 = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(45));
+            unsafe { SetEvent(ev_half as HANDLE) };
+        });
+        let t_half = std::time::Instant::now();
+        pace();
+        signaler2.join().unwrap();
+        let half_ms = t_half.elapsed().as_millis();
+        assert!(half_ms >= 38 && half_ms < 200, "half-rate divisor waited for signal ({half_ms} ms)");
+        with_ring(|h| h.set_sync_divisor(1));
 
         // Explicit FPS cap (40 FPS = 25 ms) paces even with VBlank sync turned off.
         with_ring(|h| {

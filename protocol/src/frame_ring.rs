@@ -23,7 +23,8 @@
 //! | 96 | released_gen: four generations, the one each `released` value is of (0: none) |
 //! | 112 | flags: compositor frame-pacing bits (`FLAG_SYNC_WANTED`, `FLAG_COMPOSITOR_LIVE`, `FLAG_HIDDEN`) |
 //! | 116 | pace_us: minimum frame interval in microseconds (`0`: uncapped / VBlank only) |
-//! | 120 | reserved, zero |
+//! | 120 | sync_divisor: compositor VSync interval (`0` or `1`: full refresh, `2`: 1/2, `3`: 1/3) |
+//! | 124 | reserved, zero |
 //!
 //! A generation is one set of textures (`HookMsg::Surface`): the hook makes a new one when
 //! the game's frames change size or format, and a slot only means something within its
@@ -109,7 +110,9 @@ pub struct RingHeader {
     pub released_gen: [AtomicU32; 4],
     pub flags: AtomicU32,
     pub pace_us: AtomicU32,
-    pub reserved: [AtomicU64; 17],
+    pub sync_divisor: AtomicU32,
+    pub _pad: AtomicU32,
+    pub reserved: [AtomicU64; 16],
 }
 
 const _: () = assert!(std::mem::size_of::<RingHeader>() == BLOCK_SIZE);
@@ -121,6 +124,7 @@ const _: () = assert!(std::mem::offset_of!(RingHeader, presents) == 88);
 const _: () = assert!(std::mem::offset_of!(RingHeader, released_gen) == 96);
 const _: () = assert!(std::mem::offset_of!(RingHeader, flags) == 112);
 const _: () = assert!(std::mem::offset_of!(RingHeader, pace_us) == 116);
+const _: () = assert!(std::mem::offset_of!(RingHeader, sync_divisor) == 120);
 
 /// A frame the hook published: which generation and slot, its sequence number (24 bits,
 /// wrapping), and the content-fence value it is finished at.
@@ -166,6 +170,7 @@ impl RingHeader {
         self.presents.store(0, Ordering::SeqCst);
         self.flags.store(0, Ordering::SeqCst);
         self.pace_us.store(0, Ordering::SeqCst);
+        self.sync_divisor.store(1, Ordering::SeqCst);
         self.version.store(VERSION, Ordering::SeqCst);
         self.magic.store(MAGIC, Ordering::SeqCst);
     }
@@ -201,6 +206,17 @@ impl RingHeader {
     /// Sets the target minimum frame interval in microseconds (`0` clears the cap).
     pub fn set_pace_us(&self, us: u32) {
         self.pace_us.store(us, Ordering::Release);
+    }
+
+    /// Compositor VSync divisor (`1` = full refresh, `2` = 1/2, `3` = 1/3). A zero-initialised
+    /// block reads as `1`.
+    pub fn sync_divisor(&self) -> u8 {
+        self.sync_divisor.load(Ordering::Acquire).clamp(1, 4) as u8
+    }
+
+    /// Sets the compositor VSync divisor (`1..=4`).
+    pub fn set_sync_divisor(&self, divisor: u8) {
+        self.sync_divisor.store(u32::from(divisor.clamp(1, 4)), Ordering::Release);
     }
 
     /// Whether any form of hook-side frame pacing is active (compositor sync, hidden-pane
@@ -324,6 +340,13 @@ mod tests {
         assert!(r.pace_active());
         r.set_pace_us(0);
         assert!(!r.pace_active());
+        assert_eq!(r.sync_divisor(), 1);
+        r.set_sync_divisor(2);
+        assert_eq!(r.sync_divisor(), 2);
+        r.set_sync_divisor(3);
+        assert_eq!(r.sync_divisor(), 3);
+        r.set_sync_divisor(0);
+        assert_eq!(r.sync_divisor(), 1);
     }
 
     /// The hook never writes the slot published last or the one sampled, and moves on to

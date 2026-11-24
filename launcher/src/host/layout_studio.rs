@@ -55,6 +55,34 @@ pub struct PlayerInfo {
     pub gone: bool,
 }
 
+/// Compositor VSync pacing mode controlled live in Layout Studio.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StudioSync {
+    /// Lock copies to the full display refresh (`Present(1, 0)`).
+    Full,
+    /// Lock copies to half the display refresh (`Present(2, 0)`).
+    Half,
+    /// Lock copies to a third of the display refresh (`Present(3, 0)`).
+    Third,
+    /// Compositor VSync pacing off.
+    Off,
+}
+
+impl StudioSync {
+    /// Next mode when clicking the VSync pill or pressing Back (`Full -> Half -> Off -> Full`).
+    pub fn next(self) -> StudioSync {
+        match self {
+            StudioSync::Full => StudioSync::Half,
+            StudioSync::Half | StudioSync::Third => StudioSync::Off,
+            StudioSync::Off => StudioSync::Full,
+        }
+    }
+
+    pub fn is_on(self) -> bool {
+        !matches!(self, StudioSync::Off)
+    }
+}
+
 /// Snapshot of session state passed into Layout Studio each frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StudioInfo {
@@ -62,7 +90,7 @@ pub struct StudioInfo {
     pub screen: (u32, u32),
     pub keyboard: Option<usize>,
     pub zoomed: Option<usize>,
-    pub sync: bool,
+    pub sync: StudioSync,
 }
 
 /// Combined controller state passed into Layout Studio each frame.
@@ -92,12 +120,12 @@ pub enum StudioAction {
     ToggleZoom(usize),
     /// Cycle keyboard/mouse target (+1/-1 across players + Off).
     KeyboardStep(i32),
-    /// Turn compositor-locked frame pacing ("Sync games to screen") on or off live.
-    SetSync(bool),
+    /// Change compositor VSync pacing (`Full`, `Half`, `Third`, `Off`) live.
+    SetSync(StudioSync),
     /// Persist custom slots for this game in `ui.json`.
     Save(Vec<PaneSlot>),
-    /// Persist frame-sync preference for this game in `ui.json`.
-    SaveSync(bool),
+    /// Persist VSync mode for this game in `ui.json`.
+    SaveSync(StudioSync),
     /// Exit Layout Studio.
     Close,
 }
@@ -172,7 +200,7 @@ pub struct LayoutStudio {
     pub slots: Vec<PaneSlot>,
     /// Initial slots and sync setting when Studio opened (for Reset and Done auto-save).
     initial: Vec<PaneSlot>,
-    initial_sync: bool,
+    initial_sync: StudioSync,
     selected: usize,
     snap: bool,
     drag: Option<DragMode>,
@@ -209,7 +237,7 @@ impl LayoutStudio {
             active: false,
             slots: Vec::new(),
             initial: Vec::new(),
-            initial_sync: true,
+            initial_sync: StudioSync::Full,
             selected: 0,
             snap: true,
             drag: None,
@@ -239,8 +267,8 @@ impl LayoutStudio {
     }
 
     /// Opens Layout Studio over the live session with `slots`, initial `focus` pane,
-    /// current `sync` state, and initial controller snapshot `pad`.
-    pub fn open(&mut self, slots: Vec<PaneSlot>, focus: usize, sync: bool, bounds: ScreenRect, overlay_scale: f32, pad: StudioPad) {
+    /// current `sync` mode, and initial controller snapshot `pad`.
+    pub fn open(&mut self, slots: Vec<PaneSlot>, focus: usize, sync: StudioSync, bounds: ScreenRect, overlay_scale: f32, pad: StudioPad) {
         self.active = true;
         self.slots = slots.clone();
         self.initial = slots;
@@ -590,7 +618,7 @@ impl LayoutStudio {
                         self.dirty = true;
                     }
                     if pressed_pad & pad::BACK != 0 {
-                        actions.push(StudioAction::SetSync(!info.sync));
+                        actions.push(StudioAction::SetSync(info.sync.next()));
                         self.dirty = true;
                     }
                     if pressed_pad & pad::RSTICK != 0 {
@@ -725,10 +753,15 @@ impl LayoutStudio {
                                 actions.push(StudioAction::KeyboardStep(1));
                                 self.dirty = true;
                             }
-                            let sync_label = if info.sync { t!("studio.sync_on") } else { t!("studio.sync_off") };
+                            let sync_label = match info.sync {
+                                StudioSync::Full => t!("studio.sync_full"),
+                                StudioSync::Half => t!("studio.sync_half"),
+                                StudioSync::Third => t!("studio.sync_third"),
+                                StudioSync::Off => t!("studio.sync_off"),
+                            };
                             let sync_glyph = pad_browse.then_some(Glyph::Back);
-                            if pill_button(ui, sync_label, info.sync, false, sync_glyph, style, Some(t!("studio.tip_sync"))) {
-                                actions.push(StudioAction::SetSync(!info.sync));
+                            if pill_button(ui, sync_label, info.sync.is_on(), false, sync_glyph, style, Some(t!("studio.tip_sync"))) {
+                                actions.push(StudioAction::SetSync(info.sync.next()));
                                 self.dirty = true;
                             }
                             let alt_bypass = self.snap && self.alt_down;
@@ -1753,7 +1786,7 @@ mod tests {
             screen: (1280, 720),
             keyboard: Some(0),
             zoomed: None,
-            sync: true,
+            sync: StudioSync::Full,
         }
     }
 
@@ -1802,12 +1835,12 @@ mod tests {
         let mut s = LayoutStudio::new();
         let bounds = ScreenRect { left: 0, top: 0, right: 1280, bottom: 720 };
         let idle = StudioPad { connected: true, style: pad::Style::Xbox, ..Default::default() };
-        s.open(LayoutPreset::Horizontal.to_slots(2), 0, true, bounds, 1.0, idle);
+        s.open(LayoutPreset::Horizontal.to_slots(2), 0, StudioSync::Full, bounds, 1.0, idle);
         assert!(s.using_pad);
-        let info = test_info(2);
+        let mut info = test_info(2);
         let mut actions = Vec::new();
 
-        // Browse: LT mutes, RT toggles Full Screen, Back toggles Sync.
+        // Browse: LT mutes, RT toggles Full Screen, Back cycles VSync (Full -> Half -> Off -> Full).
         assert!(!s.handle_pad(StudioPad { lt: true, ..idle }, &info, &mut actions));
         assert_eq!(actions, vec![StudioAction::ToggleMute(0)]);
         actions.clear();
@@ -1815,8 +1848,19 @@ mod tests {
         assert_eq!(actions, vec![StudioAction::ToggleZoom(0)]);
         actions.clear();
         assert!(!s.handle_pad(StudioPad { buttons: pad::BACK, ..idle }, &info, &mut actions));
-        assert_eq!(actions, vec![StudioAction::SetSync(false)]);
+        assert_eq!(actions, vec![StudioAction::SetSync(StudioSync::Half)]);
         actions.clear();
+        assert!(!s.handle_pad(idle, &info, &mut actions));
+        info.sync = StudioSync::Half;
+        assert!(!s.handle_pad(StudioPad { buttons: pad::BACK, ..idle }, &info, &mut actions));
+        assert_eq!(actions, vec![StudioAction::SetSync(StudioSync::Off)]);
+        actions.clear();
+        assert!(!s.handle_pad(idle, &info, &mut actions));
+        info.sync = StudioSync::Off;
+        assert!(!s.handle_pad(StudioPad { buttons: pad::BACK, ..idle }, &info, &mut actions));
+        assert_eq!(actions, vec![StudioAction::SetSync(StudioSync::Full)]);
+        actions.clear();
+        info.sync = StudioSync::Full;
         // Release buttons before entering Adjust mode.
         assert!(!s.handle_pad(idle, &info, &mut actions));
 
@@ -1874,13 +1918,13 @@ mod tests {
         let mut s = LayoutStudio::new();
         let bounds = ScreenRect { left: 0, top: 0, right: 1280, bottom: 720 };
         let idle = StudioPad { connected: true, style: pad::Style::Xbox, ..Default::default() };
-        s.open(LayoutPreset::Horizontal.to_slots(2), 0, true, bounds, 1.0, idle);
+        s.open(LayoutPreset::Horizontal.to_slots(2), 0, StudioSync::Full, bounds, 1.0, idle);
         let mut info = test_info(2);
         s.last_info = Some(info.clone());
         s.dirty = false;
 
         // Simulating Sync or Mute toggled by host after tick() returned: next tick sees new info.
-        info.sync = false;
+        info.sync = StudioSync::Half;
         assert_ne!(s.last_info.as_ref(), Some(&info));
         s.last_info = Some(info.clone());
         info.players[0].muted = true;
@@ -1900,7 +1944,7 @@ mod tests {
             (true, PadMode::Adjust, pad::Style::PlayStation),
         ] {
             let pad = StudioPad { connected: using_pad, style, ..Default::default() };
-            s.open(LayoutPreset::TopTwo.to_slots(3), 0, true, bounds, 1.0, pad);
+            s.open(LayoutPreset::TopTwo.to_slots(3), 0, StudioSync::Full, bounds, 1.0, pad);
             s.using_pad = using_pad;
             s.pad_mode = pad_mode;
             s.ensure_fonts();

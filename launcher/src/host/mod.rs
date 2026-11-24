@@ -96,7 +96,7 @@ use audio::AudioMixer;
 use firewall_watch::{FirewallEvent, FirewallWatcher};
 use input_hub::InputHub;
 use instance::{InstanceConn, Surface, Viewport};
-use layout_studio::{LayoutStudio, PlayerInfo, StudioAction, StudioInfo, StudioPad};
+use layout_studio::{LayoutStudio, PlayerInfo, StudioAction, StudioInfo, StudioPad, StudioSync};
 use overlay_render::{FRAME_GAP, OverlayRenderer, scale_for};
 use prefs_sync::PrefsSync;
 use ui::{Cmd, Nav, Overlay, Page};
@@ -385,8 +385,8 @@ struct SessionHost {
     pixels: bool,
     /// Compositor-locked frame pacing ("Sync games to screen", ON by default).
     sync_frames: bool,
-    /// Explicit per-copy FPS cap (`0` = match display / uncapped).
-    fps_cap: u16,
+    /// Per-copy frame rate cap (`Display`, `Divisor(2|3)`, or `Fixed(15..=240)`).
+    fps_cap: crate::launch::FpsCap,
     game_title: String,
 }
 
@@ -434,7 +434,7 @@ pub struct SessionLook {
     pub sync: bool,
     pub render_scale: u8,
     pub upscale: bool,
-    pub fps: u16,
+    pub fps: crate::launch::FpsCap,
     pub total_count: usize,
 }
 
@@ -463,6 +463,7 @@ pub fn run_session(instances: Vec<SessionLaunch>, look: SessionLook, spawner: Op
     // The window is made on this thread, which hands it its messages (desktop::wait).
     let mut compositor = CompositorWindow::open(look.layout, look.bounds, total, &title, exe);
     compositor.set_quality(look.render_scale, look.upscale);
+    compositor.set_sync_interval(if look.sync { look.fps.sync_divisor() } else { 1 });
     let mut host = SessionHost::new(copies, Some(compositor), exe, prefs, packaged);
     host.pixels = look.pixels;
     host.sync_frames = look.sync;
@@ -488,7 +489,7 @@ pub fn run_session(instances: Vec<SessionLaunch>, look: SessionLook, spawner: Op
         if draws {
             inst.make_ring(look.pixels);
             inst.set_sync(host.sync_frames);
-            inst.set_fps_cap(host.fps_cap);
+            inst.set_fps_cap(host.fps_cap, host.sync_frames);
             inst.send_capture(event.as_deref());
         }
     }
@@ -545,7 +546,7 @@ impl SessionHost {
             stagger_ready_at: None,
             pixels: false,
             sync_frames: true,
-            fps_cap: 0,
+            fps_cap: crate::launch::FpsCap::Display,
             game_title: title,
         };
         host.inputs = vec![SlotInput::Auto; host.instances.len()];
@@ -695,6 +696,18 @@ impl SessionHost {
         StudioPad { buttons: self.pads.all, lt, rt, rx, ry, style, connected }
     }
 
+    fn studio_sync(&self) -> StudioSync {
+        if !self.sync_frames {
+            StudioSync::Off
+        } else {
+            match self.fps_cap.sync_divisor() {
+                2 => StudioSync::Half,
+                3 => StudioSync::Third,
+                _ => StudioSync::Full,
+            }
+        }
+    }
+
     /// Opens the live Layout Studio canvas over the split-screen panes.
     fn open_layout_studio(&mut self) {
         if self.layout_studio.active {
@@ -712,7 +725,7 @@ impl SessionHost {
         let pad = self.studio_pad();
         // Activate Studio before hiding any open overlay so input capture stays on seamlessly
         // without tearing down and reinstalling the low-level keyboard/mouse hooks.
-        self.layout_studio.open(slots, self.focus, self.sync_frames, rect, self.prefs.overlay_scale, pad);
+        self.layout_studio.open(slots, self.focus, self.studio_sync(), rect, self.prefs.overlay_scale, pad);
         for i in 0..self.panes.len() {
             if self.panes[i].visible {
                 self.hide(i);
@@ -790,7 +803,7 @@ impl SessionHost {
             screen: (bounds.width, bounds.height),
             keyboard: (!self.kbm_off).then_some(self.focus),
             zoomed,
-            sync: self.sync_frames,
+            sync: self.studio_sync(),
         };
         let pad = self.studio_pad();
         let actions = self.layout_studio.tick(rect, self.prefs.overlay_scale, self.started.elapsed().as_secs_f64(), pad, &info);
@@ -843,15 +856,32 @@ impl SessionHost {
                     self.keyboard_step(d);
                     self.layout_studio.dirty = true;
                 }
-                StudioAction::SetSync(on) => {
+                StudioAction::SetSync(mode) => {
+                    let on = mode.is_on();
                     self.sync_frames = on;
+                    match mode {
+                        StudioSync::Full => {
+                            if self.fps_cap.sync_divisor() > 1 {
+                                self.fps_cap = crate::launch::FpsCap::Display;
+                            }
+                        }
+                        StudioSync::Half => self.fps_cap = crate::launch::FpsCap::Divisor(2),
+                        StudioSync::Third => self.fps_cap = crate::launch::FpsCap::Divisor(3),
+                        StudioSync::Off => {}
+                    }
+                    let interval = if on { self.fps_cap.sync_divisor() } else { 1 };
+                    if let Some(c) = self.compositor.as_mut() {
+                        c.set_sync_interval(interval);
+                    }
                     for inst in &self.instances {
                         inst.set_sync(on);
+                        inst.set_fps_cap(self.fps_cap, on);
                     }
-                    let msg = if on {
-                        "session: sync games to screen turned on (copies paced to the display refresh)"
-                    } else {
-                        "session: sync games to screen turned off (copies render at their own frame rate)"
+                    let msg = match mode {
+                        StudioSync::Full => "session: VSync set to full display refresh",
+                        StudioSync::Half => "session: VSync set to 1/2 display refresh",
+                        StudioSync::Third => "session: VSync set to 1/3 display refresh",
+                        StudioSync::Off => "session: VSync turned off (copies render at their own frame rate)",
                     };
                     self.cur().send(&HostMsg::Note { text: msg.into() });
                     self.layout_studio.dirty = true;
@@ -864,10 +894,32 @@ impl SessionHost {
                     self.save_custom_layout(&slots);
                     self.panes_stale = true;
                 }
-                StudioAction::SaveSync(on) => {
+                StudioAction::SaveSync(mode) => {
                     let key = self.key.clone();
                     crate::ui::store::Settings::update(|s| {
-                        s.games.entry(key).or_default().split_no_sync = !on;
+                        let g = s.games.entry(key).or_default();
+                        match mode {
+                            StudioSync::Full => {
+                                g.split_no_sync = false;
+                                if g.split_fps.sync_divisor() > 1 {
+                                    g.split_fps = crate::launch::FpsCap::Display;
+                                }
+                            }
+                            StudioSync::Half => {
+                                g.split_no_sync = false;
+                                g.split_fps = crate::launch::FpsCap::Divisor(2);
+                            }
+                            StudioSync::Third => {
+                                g.split_no_sync = false;
+                                g.split_fps = crate::launch::FpsCap::Divisor(3);
+                            }
+                            StudioSync::Off => {
+                                g.split_no_sync = true;
+                                if g.split_fps.sync_divisor() > 1 {
+                                    g.split_fps = crate::launch::FpsCap::Display;
+                                }
+                            }
+                        }
                     });
                 }
                 StudioAction::Close => self.close_layout_studio(),
@@ -927,7 +979,7 @@ impl SessionHost {
                 if draws {
                     conn.make_ring(self.pixels);
                     conn.set_sync(self.sync_frames);
-                    conn.set_fps_cap(self.fps_cap);
+                    conn.set_fps_cap(self.fps_cap, self.sync_frames);
                     conn.send_capture(event.as_deref());
                 }
                 self.instances.push(conn);

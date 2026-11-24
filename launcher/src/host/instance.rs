@@ -205,16 +205,35 @@ impl InstanceConn {
         }
     }
 
-    /// Sets an explicit per-copy frame rate cap (`0` = uncapped / compositor VBlank only),
-    /// waking the copy immediately if the cap is relaxed or cleared.
-    pub fn set_fps_cap(&self, fps: u16) {
-        if let Some(ring) = &self.ring {
-            let us = if fps == 0 { 0 } else { 1_000_000 / u32::from(fps.clamp(15, 240)) };
-            let prev = ring.header().pace_us();
-            ring.header().set_pace_us(us);
-            if prev > 0 && (us == 0 || us < prev) {
-                ring.signal_pace();
+    /// Sets a split-screen copy's frame rate cap (`Display`, `Divisor(2|3)` via compositor
+    /// sync interval, or `Fixed(15..=240)`), waking the copy immediately if the cap is
+    /// relaxed or cleared.
+    pub fn set_fps_cap(&self, cap: crate::launch::FpsCap, sync: bool) {
+        let Some(ring) = &self.ring else { return };
+        let h = ring.header();
+        let has_pace = ring.pace_event_name().is_some();
+        let (us, div) = match cap {
+            crate::launch::FpsCap::Display => (0u32, 1u8),
+            crate::launch::FpsCap::Divisor(d) => {
+                let d = d.clamp(2, 3);
+                if sync && has_pace {
+                    (0, d)
+                } else if !has_pace {
+                    // Platforms without a cross-process VBlank pace event (Linux/Wine)
+                    // fall back to a timer interval based on 60 Hz.
+                    (1_000_000 * u32::from(d) / 60, 1)
+                } else {
+                    (0, 1)
+                }
             }
+            crate::launch::FpsCap::Fixed(fps) => (1_000_000 / u32::from(fps.clamp(15, 240)), 1),
+        };
+        let prev_us = h.pace_us();
+        let prev_div = h.sync_divisor();
+        h.set_sync_divisor(div);
+        h.set_pace_us(us);
+        if (prev_us > 0 && (us == 0 || us < prev_us)) || div < prev_div {
+            ring.signal_pace();
         }
     }
 

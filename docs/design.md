@@ -607,9 +607,12 @@ session; a Linux one (frames read back as pixels) isn't at the same level yet.
   swap chain so it never double-vsyncs against DWM, then after present calls
   `capture::pace()`. If the compositor's `presents` counter already advanced since the last
   frame (a copy running below the monitor's refresh rate), it returns at once with no stall;
-  otherwise it waits for the pace event signalled right after the compositor's `Present(1, 0)`,
-  capped at 35 ms. An optional per-copy FPS cap (`--fps`, `RingHeader::pace_us`) paces copies
-  to a drift-free interval snapped to compositor VBlanks, and panes hidden while another pane
+  otherwise it waits for the pace event signalled right after the compositor's `Present`,
+  capped at 35 ms per VSync interval (`RingHeader::sync_divisor`). Fractional refresh caps
+  (`--fps 1/2` or `1/3`) set the compositor's DXGI sync interval to 2 or 3 so every copy
+  locks in phase to hardware VBlanks with no pulldown judder or timer drift on fixed-refresh
+  displays; fixed FPS caps (`--fps 15..240`, `RingHeader::pace_us`) pace copies to a
+  drift-free interval snapped to compositor VBlanks, and panes hidden while another pane
   is zoomed (`FLAG_HIDDEN`) throttle to 20 FPS so LAN simulation stays alive while freeing
   the GPU for the zoomed player. The compositor clears `FLAG_COMPOSITOR_LIVE` and wakes
   waiting copies whenever a pane is hidden, minimized, occluded or stopping, so a copy never stalls.

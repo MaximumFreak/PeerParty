@@ -291,6 +291,17 @@ impl CompositorWindow {
         }
     }
 
+    /// Sets the compositor's VSync interval (`1` = full refresh, `2` = 1/2, `3` = 1/3).
+    pub fn set_sync_interval(&mut self, interval: u8) {
+        let interval = interval.clamp(1, 4);
+        #[cfg(windows)]
+        if let Some(w) = self.window.as_mut() {
+            w.set_sync_interval(interval);
+        }
+        #[cfg(not(windows))]
+        let _ = interval;
+    }
+
     /// The layout and, on Windows, its window, shown on `bounds` with `title` and `exe`'s icon.
     pub fn open(layout: LayoutPreset, bounds: MonitorBounds, count: usize, title: &str, exe: &Path) -> CompositorWindow {
         #[allow(unused_mut)]
@@ -1292,6 +1303,12 @@ mod win {
             if self.upscale != on {
                 self.upscale = on;
                 self.push_panes();
+            }
+        }
+
+        pub fn set_sync_interval(&mut self, interval: u8) {
+            if let Some(gpu) = &self.gpu {
+                gpu.set_sync_interval(interval);
             }
         }
 
