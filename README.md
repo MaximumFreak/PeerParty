@@ -10,7 +10,7 @@ the game with a small hook inside it. No game files change.
 <table>
   <tr>
     <td><img src="docs/images/launcher.png" alt="The PeerParty launcher: a library of games, one selected, with Play and who can join you"></td>
-    <td><img src="docs/images/overlay.png" alt="PeerParty's in-game overlay: an invite, and players on the network, in a room and in public sessions"></td>
+    <td><img src="docs/images/overlay.png" alt="PeerParty's in-game overlay: an invite, and players on the network and online, each listed once"></td>
   </tr>
   <tr>
     <td align="center">Launcher</td>
@@ -50,8 +50,8 @@ itself still runs. PeerParty moves that part onto the players' own PCs:
   PeerParty's folder), and they meet as LAN players do. The launcher copies, swaps and
   restores saves between any two players, and starts a game alone as any of them. See
   [Split screen](#split-screen) below.
-- **An overlay in every game**: players, invites and settings, opened with the usual
-  store hotkeys or a controller's Home button.
+- **An overlay in every game**: players, invites, the network and split screen's
+  players, opened with the usual store hotkeys or a controller's Home button.
 
 ## What it covers
 
@@ -94,8 +94,8 @@ SmartScreen says "Windows protected your PC" the first time, choose **More info*
 
 Double-click it for the launcher window. It lists your Steam, Epic, GOG and Xbox app
 games and any game folders you add; pick one and press **Play** (or A on a controller).
-The first run asks who you play with (people on your network, friends with a room code,
-anyone in public sessions); **Play together** changes it later. The window and the
+The first run asks how you play (split screen on this PC, people on your network,
+friends with a room code, anyone in public sessions); **Play together** changes it later. The window and the
 overlay speak your Windows language, and work with a mouse, a keyboard or a controller
 alone. Games started through PeerParty find each other: copies on other PCs on your
 network, and in your room or public sessions if you use them. A game's panel can start
@@ -109,7 +109,7 @@ itself, and never while a game runs. A copy that came with another app's add-on 
 
 Windows Firewall may ask to let the game accept connections the first time: allow it on
 private networks. If it's blocked (a cancelled prompt leaves a Block rule), the game's
-panel, the sidebar and the overlay's Home and Network pages say so, and **Fix** lets it
+panel, the sidebar and the overlay's Players and Network pages say so, and **Fix** lets it
 through (Windows asks for permission).
 
 ## Internet play
@@ -156,8 +156,10 @@ public players leave until you switch it back on.
 ## The overlay
 
 Shift+Tab, Shift+F3 or a controller's Home / Guide button opens an overlay over the game:
-the game's players on your LAN, in your room and in public sessions, your lobby, invites
-waiting for you, the internet play switch and settings. The game's own "invite friends"
+the game's players on this PC, your LAN, in your room and in public sessions, each listed
+once, your lobby, invites waiting for you, and the internet play switch; in split screen,
+a tab for this PC's players and their controllers. How it looks and opens is set in the
+launcher, and applies to a running game at once. The game's own "invite friends"
 buttons open it too. While it shows, the game gets no keyboard, mouse or controller
 input. When Xbox Game Bar opens over the game,
 the overlay stays open underneath and leaves the input to Game Bar until it closes.
@@ -170,7 +172,7 @@ copies of the game in one window, one pane per player:
 - **One window, drawn on the graphics card.** Each copy's frames go straight to the
   session's window through shared GPU textures, HDR included; a copy whose frames can't
   be shared that way shows its own window in its pane.
-- **Layout Studio** (Ctrl+Alt+E, or the overlay's Players page > **Arrange panes**):
+- **Layout Studio** (Ctrl+Alt+E, or the overlay's Split screen tab > **Arrange panes**):
   drag the dividers and corners while the games run, swap two players, pick how each
   game fills its pane and the aspect ratio it renders at, mute a pane's sound. **Done**
   keeps the layout for the game. Ctrl+Alt+L switches layout, Ctrl+Alt+Z zooms a pane onto

@@ -276,6 +276,14 @@ impl Checker {
         assess(rules, exe, *p)
     }
 
+    /// A checker that sees every game let in (no firewall on the network in use): for
+    /// pictures of the window, which mustn't show this PC's own firewall or network.
+    #[cfg(test)]
+    pub fn letting_everything_in() -> Checker {
+        let open = Profiles { current: 0, enabled: 0, block_all: 0, default_block: 0 };
+        Checker { seen: Some((Instant::now() + Duration::from_secs(3600), Vec::new(), open)) }
+    }
+
     /// Reads them again next time (after a fix).
     pub fn forget(&mut self) {
         self.seen = None;

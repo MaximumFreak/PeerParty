@@ -35,44 +35,53 @@ The sidebar has three places:
 
 - **Library**: the games, as covers or a list, with filters (All, Recent, each store,
   Games folder, Added, Hidden) and a search (Ctrl+F) that looks through All whichever
-  filter is picked (from Hidden, through the hidden games). A game's panel has Play, the
-  number of players on this PC (at 2–4: **Split screen** to keep every player in one
-  shared window with a layout picker, or separate windows at 2 players with **Second
-  instance starts after**), **Copy Player
+  filter is picked (from Hidden, through the hidden games). A game's panel has its
+  poster, Play, the number of players on this PC (at 2–4 a card with **Split screen** to
+  keep every player in one shared window, its layout, monitor and what each player plays
+  with, or separate windows at 2 players with **Second instance starts after**, and the
+  players' names), **Copy Player
   1's saves to Player N** (or to the other players in split screen; shown at 2–4 players, or at 1 once an instance runs and Play
   has become **Start another instance**, and not while an instance counts down; for
   the next instance only: it turns itself
   off once used, when no instance is left at 1 player, and every time the launcher
   starts, and warns that a save the new instance already has is replaced, with a
   backup kept), and **Player 2's name** (shown at 2 players, or once an instance runs;
-  the name the second instance on this PC goes by, `PEERPARTY_OTHER_NAME`). While the
+  the name the second instance on this PC goes by, `PEERPARTY_OTHER_NAME`; players 3
+  and 4 in split screen). While the
   second instance waits, Play reads **Start instance 2 now** and the Now playing card has
   Start now and Cancel. The Now playing card's **Close all** (after a yes) closes every
   game the window started, each instance: their windows are asked to close, and what
   still runs a few seconds later is ended. Then **Who can join you** (people on your network, with a
-  Windows Firewall check and Fix; your room; public sessions), **This game's own
+  Windows Firewall check and Fix; your room; public sessions; one line when two or more
+  play on this PC, unless the firewall blocks the game), **This game's own
   settings** (invites, overlay, voice and saves for this game alone) and **Advanced**
   (multiplayer through PeerParty on or off, online services, PeerParty layers to turn
   off, "Meet players of", the program, extra arguments, the exact
   `peerparty` command and a .bat shortcut). A dot on a folded section says something in
   it differs from the recommended. Double-click or Enter plays; right-click for Hide
   and the shortcut.
-- **Play together**: who can join you in every game. People on your network always
-  can; **Friends online** makes or joins a room code (copy, show, leave); **Anyone
-  online** turns on public sessions (with the name strangers see, voice with them, and
-  the blocked players). Your name, invites and voice
-  chat are here too, and the **Internet play** switch that pauses the room and public
-  sessions.
+- **Play together**: player names (yours, and players 2–4 on this PC) and who can join
+  you in every game. People on your network always can; **Friends online** makes or
+  joins a room code (copy, show, leave); **Anyone online** turns on public sessions
+  (with the name strangers see, voice with them, and the blocked players; what
+  strangers learn shows while it's on, or being turned on). Invites and voice chat are
+  here too, and, once there's a room or public sessions, the **Internet play** switch
+  that pauses them.
 - **Settings**: General (language, lighting and animations, what the window does when
-  a game starts, notifications), Overlay (on or off, the keys and controller buttons
-  that open it, its size, button pictures and how it's drawn), Library (game folders,
-  hidden games), Advanced (online services, existing saves under a new Steam player ID,
-  logs, the first-run setup, Reset to recommended) and About.
+  a game starts), Overlay (on or off, notifications, the keys and controller buttons
+  that open it, with **Record** for a controller chord, its size, button pictures and
+  how it's drawn), Library (game folders, hidden games), Advanced (online services,
+  existing saves under a new Steam player ID, logs, the first-run setup, Reset to
+  recommended) and About. A running game takes the overlay's settings and Accept
+  invites automatically from here within a second.
 
-The first time the window opens it asks three things (language and name, who you play
-with, and voice and invites to match) and writes them only when you press Start; Skip
-leaves everything as it was. A `ui.json` from an older PeerParty counts as set up.
-Settings > Advanced > Run setup asks again.
+The first time the window opens it asks three things (language and name; how you play:
+split screen on this PC, at home, friends online, anyone online; and what that means:
+Player 2's name for split screen, voice and invites when something online is picked)
+and writes them only when you press Start. Its last step says how to start split
+screen and shows a new room's code to copy. Skip leaves everything as it was. A
+`ui.json` from an older PeerParty counts as set up. Settings > Advanced > Run setup
+asks again.
 
 Mouse, keyboard and controller work everywhere. The controller works while the window
 is the foreground window: on the game grid the d-pad moves, A plays, X goes to the
@@ -304,8 +313,9 @@ both.
   window's game panel lists all but `calls` under Advanced, Parts of PeerParty, each
   switched on unless turned off for that game. When a turned-off layer is one the game
   needs (it loaded that service's SDK or looked up its servers; the general layers
-  always), the overlay's Home page says so, with what it costs and where to turn it
-  back on, and Invite names it instead of asking to host first.
+  always), the overlay's Network page says so (and Players, at its top), with what it
+  costs and where to turn it back on, and Invite names it instead of asking to host
+  first.
 - `PEERPARTY_GAME=name`: the game key players meet under, normally the exe's name
   less a dedicated server's "server" word, with any build tail kept
   (`mygame_server` meets `mygame`, `MyGameServer-Win64-Shipping` meets
@@ -532,7 +542,7 @@ In a game started through PeerParty, Photon (hook/src/photon/):
   27000-27002 alternatives). The first copy to look Photon up waits up to 3 s for a LAN
   peer that already hosts (lowest peer id wins), else hosts itself. Windows Firewall may
   ask to let the game accept connections the first time it hosts.
-- Photon has no invites, so rooms go by code. The overlay's Home page shows the room
+- Photon has no invites, so rooms go by code. The overlay's Players page shows the room
   you're in (code, who is there; the host publishes the member list in LAN presence so a
   joined player sees it too) with **Copy code**. **Invite** sends the code to the player;
   they get a row in their overlay and **Type it** closes the overlay and types the code
@@ -702,9 +712,9 @@ whichever way it reads controllers, and keeps acting as the window in front whil
 another pane has the keyboard and mouse. While the focused pane's game holds its
 cursor (an aiming game), the mouse stays inside that pane and its pointer hides; the
 pointer also hides once the mouse has sat still for a moment while players are on
-controllers. The overlay's Players page lists this PC's players: swap two players'
-controllers, free one for the next controller pressed, or hand the keyboard and mouse
-to another player.
+controllers. The overlay's **Split screen** tab (first, and where it opens unless an
+invite waits) lists this PC's players: swap two players' controllers, free one for the
+next controller pressed, or hand the keyboard and mouse to another player.
 
 Keys, with the session's window or a copy in front:
 
@@ -716,7 +726,7 @@ Keys, with the session's window or a copy in front:
   pane, which says so.
 
 **Layout Studio** arranges the panes over the running games (`Ctrl+Alt+E`, or the
-overlay's Players page > **Arrange panes**). Every change shows at once:
+overlay's Split screen tab > **Arrange panes**). Every change shows at once:
 
 - Drag a divider between panes to resize every pane along it; edges snap to halves,
   thirds, quarters and the other panes (**Snap** turns it off, `Alt` held drags freely).
@@ -803,7 +813,7 @@ tunnel. Off unless a code is set. How it works and its limits: docs/internet-dht
   `PEERPARTY_IPV6=0`).
 - **Firewall warnings.** Cancelling Windows' firewall prompt leaves rules that block the
   game. For games played through PeerParty, the launcher's game panel (Who can join you) and
-  sidebar, and the overlay (Home, Network, and a notification), say when Windows Firewall
+  sidebar, and the overlay (Players, Network, and a notification), say when Windows Firewall
   blocks the game on the network in use, or hasn't been told to let it in yet. **Fix**
   (or the overlay row's button) asks Windows for permission, turns off the Block rules
   for the game and adds an Allow rule (private and domain networks; public ones only when
@@ -884,9 +894,9 @@ PeerParty's SDK answers and, while the overlay shows, its controllers held still
 - Opens with **Shift+Tab** (Steam's and GOG's key) or **Shift+F3** (Epic's), optionally
   Shift+F1 (EA) and Shift+F2 (Ubisoft), any controller's **Home / Xbox Guide** button
   (it only opens the overlay; B or Start closes it), or a **controller chord** you record
-  in the overlay (Settings > Open the overlay with > Controller chord: hold two or more buttons; then holding
-  them a second opens it; none by default, since Windows takes View + Menu for its
-  on-screen keyboard). Every key that's on works in every game: a game
+  in the launcher (Settings > Overlay > Controller chord > Record: hold two or more
+  buttons for a second; then holding them a second opens it; none by default, since
+  Windows takes View + Menu for its on-screen keyboard). Every key that's on works in every game: a game
   started through PeerParty isn't started through its store, so the store's own overlay
   doesn't come up on the same key. Windows may open Game Bar on the Home
   button too (Settings > Gaming > Game Bar turns that off; the overlay says so once).
@@ -906,32 +916,38 @@ PeerParty's SDK answers and, while the overlay shows, its controllers held still
   dialogs open the Players page in invite mode (pick players, or everyone). Games hear it
   open and close as their store's overlay (`GameOverlayActivated_t`, EOS's display
   settings), so they pause or free the cursor as they do for Steam's.
-- Pages: **Home** (what needs you now: a firewall that keeps players out, with Fix;
-  invites waiting, accepted with A / Cross or declined with X / Square; Invite everyone
-  on your network;
-  who else is playing; the lobby you're in and its members; how you're online),
-  **Players** (invites waiting, then every other player of the game, on your network,
-  in your room or in public sessions: A / Cross joins them (asks them to invite you),
-  X / Square invites them; Details for players in your lobby, and Block for public
-  players; opened from the game's invite button, A invites; a different version of the
-  game is flagged; a dedicated server is listed by the name it advertises, as a
-  server, with Join only, which hands a Steam game Steam's own "join this server"
-  request with its address: its LAN address when it is listed on Steam, else the
-  address its PlayFab lobby advertises, as for a crossplay server), **Network** (this PC's Windows Firewall, which keeps out players at
-  home as much as online, with Fix; players on your network and those that can't be
-  reached; the internet play switch; your room and public sessions; **Connection
-  details**: the router, port forwarding, ping per player and the stand-in addresses)
-  and **Settings** (notifications, invites, size, button pictures; **Open the overlay
-  with**: the keys, the Home button and the controller chord). B goes back from a
-  player's details, the connection details and the keys, and closes from a page.
-  Players and Network show a badge when an invite waits or something keeps players
-  out.
+- Pages, for what can be done in the game now (how it looks and opens is set in the
+  launcher): **Players** (a line under the tabs with the lobby you're in; at the top
+  what keeps players out, with Fix; a Photon room's code; Invite everyone on your
+  network, when someone there can be invited; then every player once: invites waiting,
+  on the sender's row, then this PC's other copies, your network, the internet and
+  dedicated servers, each under its heading. The same buttons on every row: A / Cross
+  joins them (asks them to invite you), X / Square invites them (where the game has
+  somewhere to invite to), Y / Triangle opens their page; an invite's row accepts with
+  A and declines with X; someone in your lobby is muted with A while voice is on;
+  opened from the game's invite button, A invites. Internet players' rows show their
+  ping, and a different version of the game is flagged. A dedicated server is listed by
+  the name it advertises, with Join only, which hands a Steam game Steam's own "join
+  this server" request with its address: its LAN address when it is listed on Steam,
+  else the address its PlayFab lobby advertises, as for a crossplay server. A player's
+  page has how they're connected, the stand-in address to type for an internet player,
+  Mute their voice, Invite and Join where they apply, and Block for public players),
+  **Network** (this PC's Windows Firewall, which keeps out players at home as much as
+  online, with Fix; players on your network and those that can't be reached; the
+  internet play switch; your room and public sessions; **Connection details**: the
+  router, port forwarding, finding players, and the services PeerParty answers for),
+  and in a split-screen session **Split screen**, first (Layout Studio, each player's
+  controller, the keyboard and mouse). B goes back from a player's page and the
+  connection details (so does a click on the line naming them), and closes from a
+  page. Players and Network show a badge when an invite waits or something keeps
+  players out.
 - Controllers first: d-pad / stick moves, A / Cross acts, X / Square is the second
-  action, B / Circle goes back, LB / RB (or left / right on a row without a value)
-  switch pages, Start closes (Home only opens), a click on the dimmed game closes. Xbox pads
-  (and anything presented as XInput), DualShock 4, DualSense, Switch Pro and other HID
-  gamepads are read by peerparty.exe itself; glyphs follow the pad in use. Keyboard
-  (arrows, Enter, Esc, Q / E, Tab) and mouse work too.
+  action, Y / Triangle opens a player's page, B / Circle goes back, LB / RB (or left /
+  right on a row without a value) switch pages, Start closes (Home only opens), a click
+  on the dimmed game closes. Xbox pads (and anything presented as XInput), DualShock 4,
+  DualSense, Switch Pro and other HID gamepads are read by peerparty.exe itself; glyphs
+  follow the pad in use. Keyboard (arrows, Enter, Esc, Q / E, Tab, X, Y) and mouse work
+  too.
 - Nothing reaches the game while it shows: keyboard and mouse are taken by low-level
   hooks in peerparty.exe (only while open), controllers are held still in the game
   (XInput, DirectInput and raw-input HID at rest, DirectInput's sticks at the middle of
@@ -976,7 +992,7 @@ Friends and invites (hook/src/steamlan.rs, eos/, invite.rs):
 - Arriving invites wait for the player: the game hears it arrived
   where its SDK can (EOS's and Steam's "invite received", GOG's invitation), a
   notification shows, and accepting in the overlay sends the SDK's "accepted" event.
-  "Accept invites automatically" (overlay or launcher settings,
+  "Accept invites automatically" (the launcher's Play together, or a game's own settings,
   `PEERPARTY_INVITES=auto`) accepts them at once.
 - For games without an invite button, these invite every other player on your network
   to where you are, in the game whose window is in front: the overlay's "Invite everyone

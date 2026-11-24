@@ -2160,6 +2160,7 @@ mod tests {
         let mut settings = Settings { onboarded: true, ..Settings::default() };
         settings.prefs.room = peerparty_core::inet::RoomCode::generate().to_string();
         let mut app = App::with(ctx.clone(), settings, false);
+        app.checks.firewall = crate::firewall::Checker::letting_everything_in();
         app.lib.scanned = sample();
         app.rebuild();
         app.lib.category = Category::All;
@@ -2269,5 +2270,101 @@ mod tests {
                 image::RgbaImage::from_raw(w as u32, h as u32, rgba).unwrap().save(std::path::Path::new(d).join(format!("window-{name}.png"))).unwrap();
             }
         }
+    }
+
+    /// An abstract cover for a made-up game, drawn in code: a sky, a sun, stars at night
+    /// and layered hills, `seed` picking the colours and shapes.
+    fn cover_art(seed: u32) -> image::RgbaImage {
+        let (w, h) = (600u32, 900u32);
+        let palettes: [([u8; 3], [u8; 3], [u8; 3], bool); 6] = [
+            ([20, 24, 60], [240, 140, 80], [60, 30, 70], false),
+            ([8, 10, 30], [40, 50, 110], [20, 24, 50], true),
+            ([120, 190, 230], [250, 230, 200], [70, 130, 80], false),
+            ([60, 20, 80], [240, 90, 130], [40, 15, 50], true),
+            ([30, 70, 90], [200, 240, 230], [20, 60, 70], false),
+            ([90, 40, 20], [250, 200, 120], [70, 35, 25], false),
+        ];
+        let (top, horizon, ground, stars) = palettes[(seed % 6) as usize];
+        let mix = |a: [u8; 3], b: [u8; 3], t: f32| -> [u8; 3] { [0, 1, 2].map(|i| (f32::from(a[i]) + (f32::from(b[i]) - f32::from(a[i])) * t.clamp(0.0, 1.0)) as u8) };
+        let sun = (150.0 + (seed * 97 % 300) as f32, 230.0 + (seed * 53 % 200) as f32, 50.0 + (seed * 31 % 50) as f32);
+        let mut img = image::RgbaImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let (fx, fy) = (x as f32, y as f32 / h as f32);
+                let mut c = mix(top, horizon, fy / 0.65);
+                let d = ((fx - sun.0).powi(2) + (y as f32 - sun.1).powi(2)).sqrt();
+                c = if d < sun.2 { mix(c, [255, 245, 220], 0.9) } else { mix(c, horizon, (1.0 - (d - sun.2) / 220.0).max(0.0) * 0.5) };
+                if stars && fy < 0.5 && (x.wrapping_mul(73_856_093) ^ y.wrapping_mul(19_349_663) ^ seed.wrapping_mul(83_492_791)) % 1000 < 2 {
+                    c = [230, 230, 255];
+                }
+                for layer in 0..3 {
+                    let l = layer as f32;
+                    let (base, amp, freq, phase) = (0.55 + l * 0.12, 0.06 - l * 0.012, 0.008 + l * 0.005 + (seed % 5) as f32 * 0.001, seed as f32 * 1.7 + l);
+                    let hill = (base + amp * (fx * freq + phase).sin() + amp * 0.5 * (fx * freq * 2.3 + phase * 0.7).sin()) * h as f32;
+                    if y as f32 > hill {
+                        c = mix(ground, [5, 5, 10], l * 0.3 + (fy - 0.55).max(0.0));
+                    }
+                }
+                img.put_pixel(x, y, image::Rgba([c[0], c[1], c[2], 255]));
+            }
+        }
+        img
+    }
+
+    /// The README's launcher screenshot (docs/images/launcher.png): made-up games with
+    /// covers drawn in code, a made-up player, one game selected. Run by hand:
+    /// `PEERPARTY_PREVIEW_DIR=<dir> cargo test -p peerparty readme_ -- --ignored`.
+    #[test]
+    #[ignore = "makes the README's screenshots; run by hand with PEERPARTY_PREVIEW_DIR"]
+    fn readme_launcher_screenshot() {
+        let Some(dir) = std::env::var_os("PEERPARTY_PREVIEW_DIR") else { return };
+        crate::i18n::set("en");
+        let ctx = egui::Context::default();
+        egui_extras::install_image_loaders(&ctx);
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx);
+        let covers = std::env::temp_dir().join("peerparty-readme-covers");
+        std::fs::create_dir_all(&covers).unwrap();
+        let mut games = sample();
+        for (i, g) in games.iter_mut().enumerate() {
+            let p = covers.join(format!("{i}.png"));
+            cover_art(i as u32).save(&p).unwrap();
+            g.cover = Some(p);
+        }
+        let mut settings = Settings { onboarded: true, ..Settings::default() };
+        settings.prefs.name = "Robin".into();
+        settings.prefs.room = peerparty_core::inet::RoomCode::generate().to_string();
+        settings.prefs.public = true;
+        let mut app = App::with(ctx.clone(), settings, false);
+        app.checks.firewall = crate::firewall::Checker::letting_everything_in();
+        app.lib.scanned = games;
+        app.rebuild();
+        app.lib.category = Category::All;
+        app.lib.selected = app.lib.entries.iter().find(|g| g.name == "Cinder Valley").map(|g| store::key_of(&g.exe));
+        let (w, h) = (1440usize, 900usize);
+        let (mut tex, mut frame) = (Textures::default(), eframe::Frame::_new_kittest());
+        let mut canvas = Canvas::new(w, h);
+        // The covers load on a thread of their own: frames until they're in.
+        for i in 0..60 {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(w as f32, h as f32))),
+                time: Some(f64::from(i) * 0.4),
+                ..Default::default()
+            };
+            let out = ctx.run_ui(input, |ui| {
+                eframe::App::logic(&mut app, &ui.ctx().clone(), &mut frame);
+                eframe::App::ui(&mut app, ui, &mut frame);
+            });
+            tex.apply(out.textures_delta);
+            if i == 59 {
+                let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+                canvas.clear(theme::BG);
+                tex.draw(&mut canvas, &prims, out.pixels_per_point, (0.0, 0.0));
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+        let rgb: Vec<u8> = canvas.px.iter().flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, *p as u8]).collect();
+        image::RgbImage::from_raw(w as u32, h as u32, rgb).unwrap().save(std::path::Path::new(&dir).join("launcher.png")).unwrap();
     }
 }

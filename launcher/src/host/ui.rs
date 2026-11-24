@@ -2501,4 +2501,61 @@ mod tests {
         o.state.peers[1].server = true;
         assert_eq!(actions(&mut o, "cc"), [Action::Join(1)]);
     }
+
+    /// The README's overlay screenshot (docs/images/overlay.png): made-up players over a
+    /// dusk drawn in code. Run by hand:
+    /// `PEERPARTY_PREVIEW_DIR=<dir> cargo test -p peerparty readme_ -- --ignored`.
+    #[test]
+    #[ignore = "makes the README's screenshots; run by hand with PEERPARTY_PREVIEW_DIR"]
+    fn readme_overlay_screenshot() {
+        let Some(dir) = std::env::var_os("PEERPARTY_PREVIEW_DIR") else { return };
+        crate::i18n::set("en");
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let (mut tex, mut prefs) = (Textures::default(), Prefs::default());
+        let mut o = Overlay::new("Sample Game".into());
+        o.state = GameState::from_json(&serde_json::json!({
+            "t": "state",
+            "me": {"id": "aa", "name": "Robin"},
+            "voice": {"in_use": true, "mic": true},
+            "peers": [
+                {"id": "bb", "name": "Jules", "with_me": true, "ip": "192.168.1.24", "via": "lan"},
+                {"id": "cc", "name": "Mika", "with_me": true, "via": "room"},
+                {"id": "dd", "name": "Nova", "status": "In the menus", "via": "public", "fp": "4f2a-91c0-77de-0b13"},
+                {"id": "ee", "name": "Theo", "status": "Exploring", "ip": "192.168.1.31", "via": "lan"}
+            ],
+            "lobby": {"id": "x", "kind": "eos.lobby", "max": 4, "members": [
+                {"id": "aa", "name": "Robin", "owner": true}, {"id": "bb", "name": "Jules"}, {"id": "cc", "name": "Mika"}
+            ]},
+            "pending": [{"id": 3, "from": "dd", "name": "Nova", "kind": "invited you"}],
+            "can_invite": true,
+            "internet": [
+                {"mode": "room", "online": true, "nat": "hole-punch friendly", "peers": [{"name": "Mika", "rtt_ms": 28}]},
+                {"mode": "public", "online": true, "nat": "hole-punch friendly", "peers": [{"name": "Nova", "rtt_ms": 41}]}
+            ]
+        }));
+        o.open(Page::Players, false);
+        draw(&ctx, &mut tex, &mut o, &mut prefs, Nav::default());
+        let c = draw(&ctx, &mut tex, &mut o, &mut prefs, Nav::default());
+        // A dusk: a sky going warm toward the horizon, two ranges of hills.
+        let mix = |a: [f32; 3], b: [f32; 3], t: f32| -> [f32; 3] { [0, 1, 2].map(|i| a[i] + (b[i] - a[i]) * t.clamp(0.0, 1.0)) };
+        let rgb: Vec<u8> = c
+            .px
+            .iter()
+            .enumerate()
+            .flat_map(|(i, p)| {
+                let (x, y) = ((i % c.w) as f32, (i / c.w) as f32 / c.h as f32);
+                let mut bg = mix([18.0, 20.0, 48.0], [196.0, 110.0, 70.0], (y - 0.15) / 0.55);
+                for (base, amp, freq, color) in [(0.62, 0.05, 0.004, [52.0, 36.0, 70.0]), (0.74, 0.04, 0.007, [24.0, 20.0, 40.0])] {
+                    if y > base + amp * (x * freq).sin() + amp * 0.5 * (x * freq * 2.7 + 1.3).sin() {
+                        bg = color;
+                    }
+                }
+                // The overlay is drawn premultiplied over the game.
+                let a = (p >> 24) as f32 / 255.0;
+                [(p >> 16) & 0xff, (p >> 8) & 0xff, p & 0xff].into_iter().zip(bg).map(move |(v, b)| (v as f32 + b * (1.0 - a)).min(255.0) as u8)
+            })
+            .collect();
+        image::RgbImage::from_raw(c.w as u32, c.h as u32, rgb).unwrap().save(std::path::Path::new(&dir).join("overlay.png")).unwrap();
+    }
 }

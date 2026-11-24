@@ -569,6 +569,12 @@ connection is drained before the new one delivers, so nothing is lost or reorder
 - The game's own overlay calls (Steam's `ActivateGameOverlay*`, `EOS_UI_*`, Galaxy's
   invite dialog, the Xbox invite screens) open the matching overlay page, and games hear
   it open and close as their store's overlay.
+- Its pages (`host/ui.rs`) are for what can be done in the game now: Players (each
+  player once, invites on the sender's row, the same A / X / Y buttons on every row),
+  Network, and in a split-screen session Split screen first. How it looks and what
+  opens it are the launcher's settings: the session host looks at ui.json about once a
+  second and takes the overlay's settings and auto-accept that changed there
+  (`reload_prefs`), so a `--set` for the run stays until that setting is changed.
 
 ## Split screen (`launcher/src/host/`, `hook/src/video/`, `hook/src/input/`, `hook/src/saves/`)
 
@@ -677,8 +683,12 @@ peerparty.exe with per-game options. Settings live in `%LOCALAPPDATA%\peerparty\
 and apply however a game is started.
 
 - Three places: the library (`library.rs`, a game's panel in `game.rs`), Play together
-  (`together.rs`: who can join, for every game) and Settings (`settings.rs`); a
-  first-run setup over the library (`welcome.rs`) writes its answers only at the end.
+  (`together.rs`: player names and who can join, for every game) and Settings
+  (`settings.rs`, the overlay's look and keys, its controller chord recorded with the
+  window's own controller reader); a first-run setup over the library (`welcome.rs`:
+  split screen, home, friends online, anyone online) writes its answers only at the end.
+- The README's screenshots are made by two ignored tests (`readme_launcher_screenshot`,
+  `readme_overlay_screenshot`) from made-up players and games with covers drawn in code.
 - The look (`theme.rs`, `widgets.rs`, `fx.rs`, `icons.rs`) is shared with the overlay.
   Light is plain coloured meshes, so it costs the same on the GPU window and in the
   overlay's software canvas: a two-Gaussian bloom round shapes, radial lights, a
