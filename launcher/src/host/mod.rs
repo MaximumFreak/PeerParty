@@ -106,7 +106,7 @@ const VK_TAB: u32 = 0x09;
 const VK_F1: u32 = 0x70;
 const VK_F2: u32 = 0x71;
 const VK_F3: u32 = 0x72;
-const CHORD_HOLD: Duration = Duration::from_secs(1);
+pub(crate) const CHORD_HOLD: Duration = Duration::from_secs(1);
 /// Controller buttons (not the d-pad or the stick folded into it) still down when the
 /// overlay closes, the Start or B that closed it most often: the game's controllers stay
 /// held back until they're up, or this long (the hook gives up after 2 s by itself).
@@ -141,7 +141,7 @@ fn usable_hotkeys(on: [bool; 4], foreign: &[String], other: bool) -> [bool; 4] {
     if free.contains(&true) || other { free } else { on }
 }
 /// Recording a chord gives up after this long with no chord held.
-const RECORD_FOR: Duration = Duration::from_secs(10);
+pub(crate) const RECORD_FOR: Duration = Duration::from_secs(10);
 
 /// One copy of the game for `run_session`: what signals its end, its process, the
 /// connection its hook makes, and its place in the session (its slot, identity and

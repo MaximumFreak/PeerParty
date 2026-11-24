@@ -12,9 +12,13 @@ use crate::t;
 const CARD_W: f32 = 164.0;
 const CARD_H: f32 = 246.0;
 const GAP: f32 = 18.0;
-/// Room inside the scroll area so the first row's and first column's expanded hover /
-/// focus ring isn't clipped by the scroll viewport.
-const CARD_PAD: f32 = 4.0;
+/// Room around the covers inside the grid's scroll area, for a hovered or selected
+/// card's grown edge and glow (2.5 + 14): the area reaches this far past the content
+/// column on the left and right (into the page's margin), so the covers still line up
+/// with the search box above them.
+const GRID_PAD: f32 = 18.0;
+/// The same for the list's rows and their 10-point glow.
+const LIST_PAD: f32 = 12.0;
 const ROW_H: f32 = 56.0;
 /// The top bar's buttons (list / grid, rescan, Add) with their gaps: with Add's label,
 /// and with its icon alone.
@@ -41,7 +45,8 @@ impl App {
         self.top_bar(ui);
         ui.add_space(10.0);
         self.chips(ui);
-        ui.add_space(14.0);
+        // The scroll areas' own room makes up the rest of the gap.
+        ui.add_space(if self.settings.list_view { 14.0 - LIST_PAD } else { 0.0 });
         if self.settings.list_view {
             self.list(ui);
         } else {
@@ -131,14 +136,15 @@ impl App {
         });
     }
 
-    /// The scroll offset that brings row `row` of `row_h` into a view `view_h` tall.
-    fn offset_for(&self, ui: &egui::Ui, id: egui::Id, row: usize, row_h: f32, view_h: f32) -> Option<f32> {
+    /// The scroll offset that brings row `row` of `row_h` (after `pad` at the top) into
+    /// a view `view_h` tall.
+    fn offset_for(&self, ui: &egui::Ui, id: egui::Id, row: usize, row_h: f32, pad: f32, view_h: f32) -> Option<f32> {
         let cur = egui::scroll_area::State::load(ui.ctx(), id).map_or(0.0, |s| s.clamped_offset().y);
         let y = row as f32 * row_h;
         if y < cur {
             Some(y)
-        } else if y + row_h > cur + view_h {
-            Some(y + row_h - view_h)
+        } else if y + row_h + 2.0 * pad > cur + view_h {
+            Some(y + row_h + 2.0 * pad - view_h)
         } else {
             None
         }
@@ -150,35 +156,44 @@ impl App {
             self.empty_state(ui);
             return;
         }
-        let width = (ui.available_width() - 2.0 * CARD_PAD).max(CARD_W);
+        let width = ui.available_width().max(CARD_W);
         let cols = (((width + GAP) / (CARD_W + GAP)).floor() as usize).max(1);
         self.lib.grid_cols = cols;
         let rows = visible.len().div_ceil(cols);
         let mut actions = Vec::new();
         let mut need = Vec::new();
-        let mut area = egui::ScrollArea::vertical().id_salt("grid").auto_shrink([false, false]);
-        if std::mem::take(&mut self.lib.scroll_to_selected) {
-            let at = self.lib.selected.as_ref().and_then(|k| visible.iter().position(|&i| store::key_of(&self.lib.entries[i].exe) == *k));
-            if let Some(o) = at.and_then(|a| self.offset_for(ui, ui.make_persistent_id("grid"), a / cols, CARD_H + GAP, ui.available_height())) {
-                area = area.vertical_scroll_offset(o);
-            }
-        }
         // Cards spread evenly across the width.
         let spare = (width - cols as f32 * CARD_W - (cols - 1) as f32 * GAP).max(0.0);
         let gap = GAP + if cols > 1 { spare / (cols - 1) as f32 } else { 0.0 };
-        area.show_rows(ui, CARD_H + GAP, rows, |ui, range| {
-            ui.spacing_mut().item_spacing.y = 0.0;
-            for row in range {
-                ui.add_space(CARD_PAD);
-                ui.horizontal(|ui| {
-                    ui.add_space(CARD_PAD);
-                    ui.spacing_mut().item_spacing.x = gap.min(GAP + 24.0);
-                    for &i in visible.iter().skip(row * cols).take(cols) {
-                        self.card(ui, i, &mut actions, &mut need);
-                    }
-                });
-                ui.add_space(GAP - CARD_PAD);
+        let scroll_to = std::mem::take(&mut self.lib.scroll_to_selected);
+        widgets::bleed(ui, GRID_PAD, |ui| {
+            let mut area = egui::ScrollArea::vertical().id_salt("grid").auto_shrink([false, false]);
+            if scroll_to {
+                let at = self.lib.selected.as_ref().and_then(|k| visible.iter().position(|&i| store::key_of(&self.lib.entries[i].exe) == *k));
+                if let Some(o) = at.and_then(|a| self.offset_for(ui, ui.make_persistent_id("grid"), a / cols, CARD_H + GAP, GRID_PAD, ui.available_height())) {
+                    area = area.vertical_scroll_offset(o);
+                }
             }
+            area.show_rows(ui, CARD_H + GAP, rows, |ui, range| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                // Every pass adds the top room, so a row's place doesn't depend on which
+                // rows are drawn.
+                ui.add_space(GRID_PAD);
+                let last = range.end == rows;
+                for row in range {
+                    ui.horizontal(|ui| {
+                        ui.add_space(GRID_PAD);
+                        ui.spacing_mut().item_spacing.x = gap.min(GAP + 24.0);
+                        for &i in visible.iter().skip(row * cols).take(cols) {
+                            self.card(ui, i, &mut actions, &mut need);
+                        }
+                    });
+                    ui.add_space(GAP);
+                }
+                if last {
+                    ui.add_space(GRID_PAD - GAP.min(GRID_PAD));
+                }
+            });
         });
         self.request_icons(need);
         self.apply(actions);
@@ -237,11 +252,11 @@ impl App {
         let r = 12.0;
         let p = ui.painter().clone();
         let glow = self.icons.glow_of(g, &key);
-        fx::shadow(&p, rect, r, 18 + (10.0 * hot) as u8, 6, 110);
+        fx::shadow(&p, rect, r, 16 + (8.0 * hot) as u8, 6, 110);
         if sel > 0.0 {
-            fx::glow(&p, rect, r, ACCENT.gamma_multiply(0.5 * sel), 18.0);
+            fx::glow(&p, rect, r, ACCENT.gamma_multiply(0.5 * sel), 14.0);
         } else if hot > 0.0 {
-            fx::glow(&p, rect, r, glow.gamma_multiply(0.22 * hot), 16.0);
+            fx::glow(&p, rect, r, glow.gamma_multiply(0.22 * hot), 14.0);
         }
         self.paint_picture(ui, g, &key, rect, CornerRadius::same(r as u8), need);
         // The name on a dark fade at the bottom.
@@ -249,6 +264,7 @@ impl App {
         let mut job = egui::text::LayoutJob::simple(g.name.clone(), theme::strong(14.0), TEXT, CARD_W - 24.0);
         job.wrap.max_rows = 2;
         let galley = p.layout_job(job);
+        let cut = galley.elided;
         p.galley(pos2(rect.left() + 12.0, rect.bottom() - 12.0 - galley.size().y), galley, TEXT);
         widgets::badge(&p, rect.left_top() + vec2(10.0, 10.0), self.origin(g, &key), TEXT, true);
         if !self.sessions.running(&key).is_empty() {
@@ -269,7 +285,9 @@ impl App {
         if resp.double_clicked() {
             actions.push(Action::Play(key.clone()));
         }
-        let resp = if self.welcome.is_none() { resp.on_hover_text(g.exe.display().to_string()) } else { resp };
+        // Only a name cut short has a tooltip (the whole name); the program's path is in
+        // the list view and the game's Advanced.
+        let resp = if self.welcome.is_none() && cut { resp.on_hover_text(&g.name) } else { resp };
         resp.context_menu(|ui| self.menu(ui, g, &key, actions));
     }
 
@@ -302,59 +320,75 @@ impl App {
         }
         let mut actions = Vec::new();
         let mut need = Vec::new();
-        let mut area = egui::ScrollArea::vertical().id_salt("list").auto_shrink([false, false]);
-        if std::mem::take(&mut self.lib.scroll_to_selected) {
-            let at = self.lib.selected.as_ref().and_then(|k| visible.iter().position(|&i| store::key_of(&self.lib.entries[i].exe) == *k));
-            if let Some(o) = at.and_then(|a| self.offset_for(ui, ui.make_persistent_id("list"), a, ROW_H, ui.available_height())) {
-                area = area.vertical_scroll_offset(o);
+        let scroll_to = std::mem::take(&mut self.lib.scroll_to_selected);
+        let width = ui.available_width();
+        widgets::bleed(ui, LIST_PAD, |ui| {
+            let mut area = egui::ScrollArea::vertical().id_salt("list").auto_shrink([false, false]);
+            if scroll_to {
+                let at = self.lib.selected.as_ref().and_then(|k| visible.iter().position(|&i| store::key_of(&self.lib.entries[i].exe) == *k));
+                if let Some(o) = at.and_then(|a| self.offset_for(ui, ui.make_persistent_id("list"), a, ROW_H, LIST_PAD, ui.available_height())) {
+                    area = area.vertical_scroll_offset(o);
+                }
             }
-        }
-        area.show_rows(ui, ROW_H, visible.len(), |ui, range| {
-            for &i in &visible[range] {
-                let g = &self.lib.entries[i];
-                let key = store::key_of(&g.exe);
-                let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width() - 8.0, ROW_H - 6.0), Sense::click());
-                let selected = self.lib.selected.as_deref() == Some(key.as_str());
-                let hot = theme::anim(ui.ctx(), resp.id.with("hot"), resp.hovered());
-                let p = ui.painter().clone();
-                if selected {
-                    fx::glow(&p, rect, 10.0, ACCENT.gamma_multiply(0.3), 10.0);
-                    fx::gradient(&p, rect, 10.0, false, &[(0.0, theme::mix(theme::CARD, ACCENT, 0.35)), (1.0, theme::CARD)]);
-                } else {
-                    p.rect_filled(rect, 10.0, theme::mix(theme::CARD, theme::CARD_HI, hot));
-                }
-                if let Some(at) = hover_in(ui, rect) {
-                    fx::spotlight(&p, rect, 10.0, at, 220.0, Color32::from_white_alpha((14.0 * hot) as u8));
-                }
-                p.rect_stroke(rect, 10.0, Stroke::new(1.0, if selected { ACCENT_HI.gamma_multiply(0.6) } else { theme::line() }), StrokeKind::Inside);
-                let icon = Rect::from_min_size(rect.min + vec2(10.0, 7.0), Vec2::splat(rect.height() - 14.0));
-                match self.icons.icons.get(&key) {
-                    Some(IconSlot::Ready(tex)) => {
-                        p.image(tex.id(), icon, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            area.show_rows(ui, ROW_H, visible.len(), |ui, range| {
+                // Room at the top in every pass, so a row's place doesn't depend on which rows
+                // are drawn; and at the left, where the scroll area starts before the column.
+                ui.add_space(LIST_PAD);
+                let last = range.end == visible.len();
+                for &i in &visible[range] {
+                    let g = &self.lib.entries[i];
+                    let key = store::key_of(&g.exe);
+                    let (rect, resp) = ui
+                        .horizontal(|ui| {
+                            ui.add_space(LIST_PAD);
+                            ui.allocate_exact_size(vec2(width, ROW_H - 6.0), Sense::click())
+                        })
+                        .inner;
+                    let selected = self.lib.selected.as_deref() == Some(key.as_str());
+                    let hot = theme::anim(ui.ctx(), resp.id.with("hot"), resp.hovered());
+                    let p = ui.painter().clone();
+                    if selected {
+                        fx::glow(&p, rect, 10.0, ACCENT.gamma_multiply(0.3), 10.0);
+                        fx::gradient(&p, rect, 10.0, false, &[(0.0, theme::mix(theme::CARD, ACCENT, 0.35)), (1.0, theme::CARD)]);
+                    } else {
+                        p.rect_filled(rect, 10.0, theme::mix(theme::CARD, theme::CARD_HI, hot));
                     }
-                    None => need.push(key.clone()),
-                    _ => {
-                        p.rect_filled(icon, 6.0, theme::tint_for(&g.name));
+                    if let Some(at) = hover_in(ui, rect) {
+                        fx::spotlight(&p, rect, 10.0, at, 220.0, Color32::from_white_alpha((14.0 * hot) as u8));
                     }
+                    p.rect_stroke(rect, 10.0, Stroke::new(1.0, if selected { ACCENT_HI.gamma_multiply(0.6) } else { theme::line() }), StrokeKind::Inside);
+                    let icon = Rect::from_min_size(rect.min + vec2(10.0, 7.0), Vec2::splat(rect.height() - 14.0));
+                    match self.icons.icons.get(&key) {
+                        Some(IconSlot::Ready(tex)) => {
+                            p.image(tex.id(), icon, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                        }
+                        None => need.push(key.clone()),
+                        _ => {
+                            p.rect_filled(icon, 6.0, theme::tint_for(&g.name));
+                        }
+                    }
+                    let tx = icon.right() + 12.0;
+                    p.text(pos2(tx, rect.center().y - 8.0), Align2::LEFT_CENTER, &g.name, theme::strong(14.5), TEXT);
+                    let path = p.layout_no_wrap(g.exe.display().to_string(), theme::font(11.5), TEXT3);
+                    p.with_clip_rect(Rect::from_min_max(pos2(tx, rect.top()), pos2(rect.right() - 150.0, rect.bottom()))).galley(pos2(tx, rect.center().y + 3.0), path, TEXT3);
+                    let origin = self.origin(g, &key);
+                    let bw = p.layout_no_wrap(origin.to_string(), theme::strong(11.0), TEXT).size().x + 14.0;
+                    widgets::badge(&p, pos2(rect.right() - 14.0 - bw, rect.center().y - 10.0), origin, TEXT2, false);
+                    if !self.sessions.running(&key).is_empty() {
+                        fx::dot(&p, pos2(rect.right() - 30.0 - bw, rect.center().y), 4.5, theme::GOOD);
+                    }
+                    if resp.clicked() {
+                        actions.push(Action::Select(key.clone()));
+                    }
+                    if resp.double_clicked() {
+                        actions.push(Action::Play(key.clone()));
+                    }
+                    resp.context_menu(|ui| self.menu(ui, g, &key, &mut actions));
                 }
-                let tx = icon.right() + 12.0;
-                p.text(pos2(tx, rect.center().y - 8.0), Align2::LEFT_CENTER, &g.name, theme::strong(14.5), TEXT);
-                let path = p.layout_no_wrap(g.exe.display().to_string(), theme::font(11.5), TEXT3);
-                p.with_clip_rect(Rect::from_min_max(pos2(tx, rect.top()), pos2(rect.right() - 150.0, rect.bottom()))).galley(pos2(tx, rect.center().y + 3.0), path, TEXT3);
-                let origin = self.origin(g, &key);
-                let bw = p.layout_no_wrap(origin.to_string(), theme::strong(11.0), TEXT).size().x + 14.0;
-                widgets::badge(&p, pos2(rect.right() - 14.0 - bw, rect.center().y - 10.0), origin, TEXT2, false);
-                if !self.sessions.running(&key).is_empty() {
-                    fx::dot(&p, pos2(rect.right() - 30.0 - bw, rect.center().y), 4.5, theme::GOOD);
+                if last {
+                    ui.add_space(LIST_PAD);
                 }
-                if resp.clicked() {
-                    actions.push(Action::Select(key.clone()));
-                }
-                if resp.double_clicked() {
-                    actions.push(Action::Play(key.clone()));
-                }
-                resp.context_menu(|ui| self.menu(ui, g, &key, &mut actions));
-            }
+            });
         });
         self.request_icons(need);
         self.apply(actions);

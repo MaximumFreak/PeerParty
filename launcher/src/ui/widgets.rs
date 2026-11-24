@@ -321,6 +321,15 @@ pub fn setting<R>(ui: &mut Ui, title: &str, detail: &str, control: impl FnOnce(&
     out.unwrap()
 }
 
+/// A child ui reaching `pad` past the content column on the left and right (into the
+/// page's margin), for a scroll area whose cards' shadows and glows would otherwise be
+/// cut off at its edge. What's in it adds the same room back to line up.
+pub fn bleed<R>(ui: &mut Ui, pad: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let col = ui.available_rect_before_wrap();
+    let rect = Rect::from_min_max(pos2(col.left() - pad, col.top()), pos2(col.right() + pad, col.bottom()));
+    ui.scope_builder(egui::UiBuilder::new().max_rect(rect), add).inner
+}
+
 /// A hairline between settings in a card.
 pub fn divider(ui: &mut Ui) {
     ui.add_space(4.0);

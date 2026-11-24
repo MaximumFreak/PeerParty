@@ -14,6 +14,9 @@ use super::widgets::{self, Kind};
 use super::{App, first_focus};
 use crate::t;
 
+/// Room the pages' scroll areas leave beside their cards for the cards' shadows.
+pub(super) const CARD_ROOM: f32 = 8.0;
+
 #[derive(Default)]
 pub struct State {
     /// A friend's code being typed, while joining.
@@ -78,7 +81,11 @@ fn public_switch(ui: &mut egui::Ui, p: &mut Prefs, st: &mut State) {
         #[cfg(test)]
         ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("public-switch"), r.rect));
     });
-    widgets::note(ui, Icon::Warning, theme::WARN, t!("together.public_text"));
+    // What strangers learn: said while it's on, and before the yes that turns it on.
+    // Off, the switch's own line says what it is.
+    if p.public || st.confirm_public {
+        widgets::note(ui, Icon::Warning, theme::WARN, t!("together.public_text"));
+    }
     if st.confirm_public && !p.public {
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
@@ -118,7 +125,10 @@ impl App {
             self.together.refresh();
         }
         let before = self.settings.prefs.clone();
+        // Room at the sides for the cards' shadows.
+        widgets::bleed(ui, CARD_ROOM, |ui| {
         egui::ScrollArea::vertical().id_salt("together").auto_shrink([false, false]).show(ui, |ui| {
+        egui::Frame::new().inner_margin(egui::Margin::symmetric(CARD_ROOM as i8, 0)).show(ui, |ui| {
             ui.add_space(24.0);
             // Never wider than the window (set_max_width can widen a Ui), with a gutter for the scroll bar.
             ui.set_max_width((ui.available_width() - 26.0).min(1040.0));
@@ -144,9 +154,10 @@ impl App {
                 ui.add_space(14.0);
                 self.invites_card(ui);
             }
-            ui.add_space(14.0);
             self.internet_card(ui);
             ui.add_space(30.0);
+        });
+        });
         });
         if self.settings.prefs != before {
             self.save_settings();
@@ -156,6 +167,7 @@ impl App {
     fn name_card(&mut self, ui: &mut egui::Ui) {
         widgets::card(ui, |ui| {
             ui.set_width(ui.available_width());
+            widgets::card_title(ui, Icon::Person, ACCENT, t!("together.names_title"), "");
             let user = crate::platform::user_name();
             let p = &mut self.settings.prefs;
             // A controller lands on the room's buttons, not in a text field.
@@ -402,18 +414,18 @@ impl App {
         });
     }
 
+    /// The switch that pauses internet play: only once there's a room or public sessions
+    /// to pause.
     fn internet_card(&mut self, ui: &mut egui::Ui) {
         let p = &mut self.settings.prefs;
-        let configured = RoomCode::parse(p.room.trim()).is_some() || p.public;
+        if RoomCode::parse(p.room.trim()).is_none() && !p.public {
+            return;
+        }
+        ui.add_space(14.0);
         widgets::card(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.add_enabled_ui(configured, |ui| {
-                widgets::setting(ui, t!("together.internet"), if configured { t!("together.internet_sub") } else { t!("together.internet_unset") }, |ui| {
-                    let mut on = p.internet && configured;
-                    if widgets::switch(ui, &mut on).changed() {
-                        p.internet = on;
-                    }
-                });
+            widgets::setting(ui, t!("together.internet"), t!("together.internet_sub"), |ui| {
+                widgets::switch(ui, &mut p.internet);
             });
             ui.add_space(2.0);
             widgets::note(ui, Icon::Info, Color32::from_gray(120), t!("together.internet_how"));

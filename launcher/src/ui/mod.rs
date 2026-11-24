@@ -480,6 +480,9 @@ struct InputNav {
     focus_first: bool,
     /// The game panel's Play button takes the focus.
     focus_play: bool,
+    /// Recording the overlay's controller chord (Settings > Overlay): when it began, the
+    /// buttons held, and since when. The controller doesn't navigate meanwhile.
+    recording: Option<(Instant, u32, Instant)>,
 }
 
 impl InputNav {
@@ -492,6 +495,7 @@ impl InputNav {
             pad_mode: false,
             focus_first: false,
             focus_play: false,
+            recording: None,
         }
     }
 }
@@ -1059,6 +1063,13 @@ impl App {
         self.nav.pads.set_front(front);
         let now = Instant::now();
         let held = if front { self.nav.pads.held() } else { 0 };
+        if self.nav.recording.is_some() {
+            if front {
+                self.record_chord(held, now);
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return;
+        }
         let (b, pressed) = self.nav.pad_gate.filter(front, held, now);
         if !front {
             self.nav.repeat.reset();
@@ -1150,6 +1161,27 @@ impl App {
             return;
         }
         self.keys_for(raw, fire, &key);
+    }
+
+    /// Recording the chord: two or more buttons (Home aside) held unchanged for a second
+    /// become it, as in the overlay; nothing held for a while gives up.
+    fn record_chord(&mut self, pad: u32, now: Instant) {
+        let Some((started, held, since)) = self.nav.recording else { return };
+        let buttons = pad & !pad::HOME;
+        if buttons != held {
+            self.nav.recording = Some((started, buttons, now));
+        } else if buttons.count_ones() >= 2 && now - since >= crate::host::CHORD_HOLD {
+            self.settings.prefs.hotkeys.chord = buttons;
+            self.save_settings();
+            self.nav.recording = None;
+            // The buttons still held don't press anything here once it's done.
+            self.nav.pad_gate = padgate::PadGate::default();
+            eprintln!("peerparty: overlay chord recorded: {}", pad::names(buttons));
+            self.say(t!("toast.chord_set", buttons = pad::names(buttons)), true);
+        } else if buttons.count_ones() < 2 && now - started >= crate::host::RECORD_FOR {
+            self.nav.recording = None;
+            self.say(t!("toast.chord_none"), false);
+        }
     }
 
     fn keys_for(&self, raw: &mut egui::RawInput, fire: u32, key: &dyn Fn(&mut egui::RawInput, Key)) {
@@ -1260,78 +1292,92 @@ impl App {
             let mut confirm_close = self.sessions.confirm_close;
             let mut fix = None;
             let (mut start_now, mut cancel) = (None, None);
-            widgets::card(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(egui::RichText::new(t!("nav.now_playing").to_uppercase()).font(theme::strong(11.0)).color(TEXT3));
-                for s in &self.sessions.sessions {
-                    ui.horizontal(|ui| {
-                        let (d, _) = ui.allocate_exact_size(vec2(12.0, 18.0), Sense::hover());
-                        fx::dot(ui.painter(), d.center(), 4.0, theme::GOOD);
-                        let name = if s.split_players >= 2 {
-                            t!("nav.split_session", game = s.name, n = s.split_players)
-                        } else if s.player > 1 {
-                            t!("nav.instance", game = s.name, n = s.player)
-                        } else {
-                            s.name.clone()
-                        };
-                        ui.add(egui::Label::new(egui::RichText::new(name).size(13.0).color(TEXT)).truncate());
-                    });
-                }
-                for p in &self.sessions.pending {
-                    let left = p.at.saturating_duration_since(Instant::now()).as_secs() + 1;
-                    ui.label(egui::RichText::new(t!("nav.instance_in", game = p.name, player = p.player, n = left)).size(12.0).color(TEXT2));
-                    ui.horizontal(|ui| {
-                        if widgets::button(ui, None, t!("nav.start_now"), widgets::Kind::Secondary).clicked() {
-                            start_now = Some(p.key.clone());
-                        }
-                        if widgets::icon_button(ui, Icon::Close, t!("common.cancel")).clicked() {
-                            cancel = Some(p.key.clone());
-                        }
-                    });
-                }
-                for key in &keys {
-                    let Some(g) = self.lib.game(key) else { continue };
-                    let (g_name, exe) = (g.name.clone(), self.settings.options(key).exe.unwrap_or_else(|| g.exe.clone()));
-                    if g.source == Source::Xbox {
-                        continue;
-                    }
-                    let v = self.checks.firewall.verdict(&exe);
-                    if v.blocked() {
-                        widgets::note(ui, Icon::Shield, theme::WARN, &t!("nav.firewall_blocks", game = g_name));
-                        if widgets::button(ui, Some(Icon::Shield), t!("common.fix"), widgets::Kind::Secondary).clicked() {
-                            fix = Some(exe);
-                        }
-                    }
-                }
-                ui.add_space(2.0);
-                if widgets::wide_button(ui, Some(Icon::People), t!("nav.invite_everyone"), widgets::Kind::Secondary, 32.0)
-                    .on_hover_text(t!("nav.invite_everyone_tip"))
-                    .clicked()
-                {
-                    invite = true;
-                }
-                if !self.sessions.sessions.is_empty() {
-                    if !confirm_close {
-                        if widgets::wide_button(ui, Some(Icon::Close), t!("nav.close_all"), widgets::Kind::Ghost, 28.0)
-                            .on_hover_text(t!("nav.close_all_tip"))
-                            .clicked()
-                        {
-                            confirm_close = true;
-                        }
-                    } else {
-                        ui.add(egui::Label::new(egui::RichText::new(t!("nav.close_all_confirm")).size(12.0).color(TEXT)).wrap());
+            // The card reads top to bottom although the sidebar's foot stacks bottom up: it
+            // gets a top-down area as tall as it measured last time, measured again now.
+            let tall_id = ui.make_persistent_id("now_playing_height");
+            let tall = ui.ctx().data(|d| d.get_temp::<f32>(tall_id)).unwrap_or(0.0);
+            let area = vec2(ui.available_width(), tall);
+            let drawn = ui.allocate_ui_with_layout(area, egui::Layout::top_down(egui::Align::Min), |ui| {
+                widgets::card(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(egui::RichText::new(t!("nav.now_playing").to_uppercase()).font(theme::strong(11.0)).color(TEXT3));
+                    for s in &self.sessions.sessions {
                         ui.horizontal(|ui| {
-                            if widgets::button(ui, None, t!("nav.close_all"), widgets::Kind::Danger).clicked() {
-                                close_all = true;
-                                confirm_close = false;
+                            let (d, _) = ui.allocate_exact_size(vec2(12.0, 18.0), Sense::hover());
+                            fx::dot(ui.painter(), d.center(), 4.0, theme::GOOD);
+                            let name = if s.split_players >= 2 {
+                                t!("nav.split_session", game = s.name, n = s.split_players)
+                            } else if s.player > 1 {
+                                t!("nav.instance", game = s.name, n = s.player)
+                            } else {
+                                s.name.clone()
+                            };
+                            ui.add(egui::Label::new(egui::RichText::new(name).size(13.0).color(TEXT)).truncate());
+                        });
+                    }
+                    for p in &self.sessions.pending {
+                        let left = p.at.saturating_duration_since(Instant::now()).as_secs() + 1;
+                        ui.label(egui::RichText::new(t!("nav.instance_in", game = p.name, player = p.player, n = left)).size(12.0).color(TEXT2));
+                        ui.horizontal(|ui| {
+                            if widgets::button(ui, None, t!("nav.start_now"), widgets::Kind::Secondary).clicked() {
+                                start_now = Some(p.key.clone());
                             }
                             if widgets::icon_button(ui, Icon::Close, t!("common.cancel")).clicked() {
-                                confirm_close = false;
+                                cancel = Some(p.key.clone());
                             }
                         });
                     }
-                }
+                    for key in &keys {
+                        let Some(g) = self.lib.game(key) else { continue };
+                        let (g_name, exe) = (g.name.clone(), self.settings.options(key).exe.unwrap_or_else(|| g.exe.clone()));
+                        if g.source == Source::Xbox {
+                            continue;
+                        }
+                        let v = self.checks.firewall.verdict(&exe);
+                        if v.blocked() {
+                            widgets::note(ui, Icon::Shield, theme::WARN, &t!("nav.firewall_blocks", game = g_name));
+                            if widgets::button(ui, Some(Icon::Shield), t!("common.fix"), widgets::Kind::Secondary).clicked() {
+                                fix = Some(exe);
+                            }
+                        }
+                    }
+                    ui.add_space(2.0);
+                    if widgets::wide_button(ui, Some(Icon::People), t!("nav.invite_everyone"), widgets::Kind::Secondary, 32.0)
+                        .on_hover_text(t!("nav.invite_everyone_tip"))
+                        .clicked()
+                    {
+                        invite = true;
+                    }
+                    if !self.sessions.sessions.is_empty() {
+                        if !confirm_close {
+                            if widgets::wide_button(ui, Some(Icon::Close), t!("nav.close_all"), widgets::Kind::Ghost, 28.0)
+                                .on_hover_text(t!("nav.close_all_tip"))
+                                .clicked()
+                            {
+                                confirm_close = true;
+                            }
+                        } else {
+                            ui.add(egui::Label::new(egui::RichText::new(t!("nav.close_all_confirm")).size(12.0).color(TEXT)).wrap());
+                            ui.horizontal(|ui| {
+                                if widgets::button(ui, None, t!("nav.close_all"), widgets::Kind::Danger).clicked() {
+                                    close_all = true;
+                                    confirm_close = false;
+                                }
+                                if widgets::icon_button(ui, Icon::Close, t!("common.cancel")).clicked() {
+                                    confirm_close = false;
+                                }
+                            });
+                        }
+                    }
+                });
             });
+            let h = drawn.response.rect.height();
+            if (h - tall).abs() > 0.5 {
+                ui.ctx().data_mut(|d| d.insert_temp(tall_id, h));
+                // Not `request_discard`: a pass run again sees the same click, and "Close
+                // all" turns into its confirm button where the click was.
+                ui.ctx().request_repaint();
+            }
             if invite {
                 self.invite_everyone();
             }
@@ -1698,9 +1744,13 @@ impl eframe::App for App {
             .frame(egui::Frame::new().fill(SIDEBAR).inner_margin(Margin::symmetric(14, 0)))
             .show(ui, |ui| self.sidebar(ui));
         if let Some(key) = self.lib.selected.clone().filter(|_| self.view == View::Library) {
+            // A little wider where the window has room; 384 keeps the library's top bar
+            // whole in the narrowest window.
+            let wide = ui.ctx().content_rect().width() >= 1180.0;
             egui::Panel::right("game")
                 .resizable(false)
-                .exact_size(384.0)
+                .show_separator_line(false)
+                .exact_size(if wide { 408.0 } else { 384.0 })
                 .frame(egui::Frame::new().fill(theme::SURFACE).inner_margin(Margin::ZERO))
                 .show(ui, |ui| self.details(ui, key));
         }
@@ -1709,7 +1759,7 @@ impl eframe::App for App {
             .frame(egui::Frame::new().fill(theme::BG).inner_margin(Margin::symmetric(22, 0)))
             .show(ui, |ui| self.bottom_bar(ui));
         let mut content = Rect::NOTHING;
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::BG).inner_margin(Margin { left: 26, right: 18, top: 0, bottom: 0 })).show(ui, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::BG).inner_margin(Margin { left: 26, right: 26, top: 0, bottom: 0 })).show(ui, |ui| {
             content = ui.max_rect();
             let p = ui.painter();
             let full = ui.clip_rect();
@@ -2150,8 +2200,10 @@ mod tests {
                 a.lib.selected = Some(key);
             }),
             ("game-split", &|a: &mut App| {
-                let key = store::key_of(&a.lib.entries[3].exe);
-                a.settings.games.insert(key.clone(), GameOptions { players: 4, split_screen: true, split_layout: "grid".into(), ..GameOptions::default() });
+                // Three players (their layouts don't fit a row) in a game that isn't an
+                // Xbox app's.
+                let key = store::key_of(&a.lib.entries[1].exe);
+                a.settings.games.insert(key.clone(), GameOptions { players: 3, split_screen: true, split_layout: "top2".into(), ..GameOptions::default() });
                 a.lib.selected = Some(key);
             }),
             ("game-waiting", &|a: &mut App| {

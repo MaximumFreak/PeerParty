@@ -161,40 +161,41 @@ impl App {
                     }
                 });
             }
-            ui.add_space(8.0);
-            // From one player to another.
+            ui.add_space(6.0);
+            // From one player to another, folded away: rarely needed, and tall.
             let labels: Vec<String> = (0..shown).map(|k| t!("game.input_player", n = k + 1)).collect();
             self.saves_view.from = self.saves_view.from.min(shown - 1);
             self.saves_view.to = self.saves_view.to.min(shown - 1);
             if self.saves_view.from == self.saves_view.to {
                 self.saves_view.to = (self.saves_view.from + 1) % shown;
             }
-            ui.label(egui::RichText::new(t!("saves.transfer")).size(13.5).color(TEXT));
-            let w = (ui.available_width() / 2.0 - 16.0).max(120.0);
-            ui.horizontal(|ui| {
-                let mut from = self.saves_view.from;
-                if widgets::stepper(ui, "saves-from", &labels, &mut from, w).changed() {
-                    self.saves_view.from = from;
-                }
-                ui.label(egui::RichText::new("→").color(TEXT2));
-                let mut to = self.saves_view.to;
-                if widgets::stepper(ui, "saves-to", &labels, &mut to, w).changed() {
-                    self.saves_view.to = to;
-                }
-            });
-            let (from, to) = (self.saves_view.from as u32, self.saves_view.to as u32);
-            if players.get(to as usize).is_some_and(PlayerSaves::has_saves) {
-                let color = if to == 0 { theme::WARN } else { TEXT3 };
-                widgets::note(ui, Icon::Info, color, &t!("saves.replace_note", n = to + 1));
-            }
-            ui.horizontal_wrapped(|ui| {
-                ui.add_enabled_ui(!busy && from != to, |ui| {
-                    if widgets::button(ui, Some(Icon::Copy), t!("saves.copy"), Kind::Secondary).on_disabled_hover_text(t!("saves.running")).clicked() {
-                        actions.push(Action::Saves(key.to_string(), Op::Copy(from, to)));
+            egui::CollapsingHeader::new(egui::RichText::new(t!("saves.transfer")).size(13.5).color(TEXT)).id_salt(("saves-transfer", key)).show(ui, |ui| {
+                let w = (ui.available_width() / 2.0 - 16.0).max(120.0);
+                ui.horizontal(|ui| {
+                    let mut from = self.saves_view.from;
+                    if widgets::stepper(ui, "saves-from", &labels, &mut from, w).changed() {
+                        self.saves_view.from = from;
                     }
-                    if widgets::button(ui, Some(Icon::Refresh), t!("saves.swap"), Kind::Ghost).on_disabled_hover_text(t!("saves.running")).clicked() {
-                        actions.push(Action::Saves(key.to_string(), Op::Swap(from, to)));
+                    ui.label(egui::RichText::new("→").color(TEXT2));
+                    let mut to = self.saves_view.to;
+                    if widgets::stepper(ui, "saves-to", &labels, &mut to, w).changed() {
+                        self.saves_view.to = to;
                     }
+                });
+                let (from, to) = (self.saves_view.from as u32, self.saves_view.to as u32);
+                if players.get(to as usize).is_some_and(PlayerSaves::has_saves) {
+                    let color = if to == 0 { theme::WARN } else { TEXT3 };
+                    widgets::note(ui, Icon::Info, color, &t!("saves.replace_note", n = to + 1));
+                }
+                ui.horizontal_wrapped(|ui| {
+                    ui.add_enabled_ui(!busy && from != to, |ui| {
+                        if widgets::button(ui, Some(Icon::Copy), t!("saves.copy"), Kind::Secondary).on_disabled_hover_text(t!("saves.running")).clicked() {
+                            actions.push(Action::Saves(key.to_string(), Op::Copy(from, to)));
+                        }
+                        if widgets::button(ui, Some(Icon::Refresh), t!("saves.swap"), Kind::Ghost).on_disabled_hover_text(t!("saves.running")).clicked() {
+                            actions.push(Action::Saves(key.to_string(), Op::Swap(from, to)));
+                        }
+                    });
                 });
             });
             if busy {
@@ -212,7 +213,6 @@ impl App {
             // Backups, newest first, by player.
             let any_backups = players.iter().any(|p| !p.backups.is_empty());
             if any_backups {
-                ui.add_space(6.0);
                 egui::CollapsingHeader::new(egui::RichText::new(t!("saves.backups")).size(13.5).color(TEXT)).id_salt(("saves-backups", key)).show(ui, |ui| {
                     for p in players.iter().filter(|p| !p.backups.is_empty()) {
                         ui.label(egui::RichText::new(t!("saves.player", n = p.slot + 1, name = self.player_name(p.slot))).size(12.5).color(TEXT2));

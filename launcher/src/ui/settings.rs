@@ -94,17 +94,23 @@ impl App {
             }
         });
         ui.add_space(14.0);
+        // Room at the sides for the cards' shadows.
+        let room = super::together::CARD_ROOM;
+        widgets::bleed(ui, room, |ui| {
         egui::ScrollArea::vertical().id_salt(("settings", self.settings_tab as u8)).auto_shrink([false, false]).show(ui, |ui| {
+        egui::Frame::new().inner_margin(egui::Margin::symmetric(room as i8, 0)).show(ui, |ui| {
             // Never wider than the window (set_max_width can widen a Ui), with a gutter for the scroll bar.
             ui.set_max_width((ui.available_width() - 26.0).min(860.0));
             match self.settings_tab {
                 Tab::General => self.general(ui),
-                Tab::Overlay => overlay(ui, &mut self.settings.prefs, &mut self.nav.focus_first),
+                Tab::Overlay => overlay(ui, &mut self.settings.prefs, &mut self.nav.focus_first, &mut self.nav.recording),
                 Tab::Library => self.library_settings(ui),
                 Tab::Advanced => self.advanced_settings(ui),
                 Tab::About => self.about(ui),
             }
             ui.add_space(30.0);
+        });
+        });
         });
         if self.settings.prefs != before || self.settings.folders != folders_before || self.settings.after_launch != after_before {
             self.save_settings();
@@ -146,23 +152,7 @@ impl App {
                     *after = v.to_string();
                 }
             });
-            widgets::divider(ui);
-            let p = &mut self.settings.prefs;
-            widgets::setting(ui, t!("settings.toasts"), t!("settings.toasts_sub"), |ui| {
-                widgets::switch(ui, &mut p.toasts);
-            });
         });
-        ui.add_space(12.0);
-        let mut go = false;
-        widgets::card(ui, |ui| {
-            ui.set_width(ui.available_width());
-            widgets::setting(ui, t!("settings.name_moved"), t!("settings.name_moved_sub"), |ui| {
-                go = widgets::button(ui, Some(Icon::People), t!("nav.together"), Kind::Secondary).clicked();
-            });
-        });
-        if go {
-            self.open_view(View::Together, false);
-        }
     }
 
     fn library_settings(&mut self, ui: &mut egui::Ui) {
@@ -377,7 +367,10 @@ impl App {
     }
 }
 
-fn overlay(ui: &mut egui::Ui, p: &mut Prefs, focus: &mut bool) {
+/// Everything about the overlay: whether it shows, its notifications, what opens it
+/// (the controller chord recorded here), and how it looks. A game running picks changes
+/// up as they're saved.
+fn overlay(ui: &mut egui::Ui, p: &mut Prefs, focus: &mut bool, recording: &mut Option<(std::time::Instant, u32, std::time::Instant)>) {
     widgets::card(ui, |ui| {
         ui.set_width(ui.available_width());
         // Off, invites from the network and the room are accepted by the hook (nothing in
@@ -386,6 +379,10 @@ fn overlay(ui: &mut egui::Ui, p: &mut Prefs, focus: &mut bool) {
         widgets::setting(ui, t!("settings.overlay_on"), sub, |ui| {
             let r = widgets::switch(ui, &mut p.overlay);
             first_focus(&r, focus);
+        });
+        widgets::divider(ui);
+        widgets::setting(ui, t!("settings.toasts"), t!("settings.toasts_sub"), |ui| {
+            widgets::switch(ui, &mut p.toasts);
         });
     });
     ui.add_space(12.0);
@@ -406,10 +403,25 @@ fn overlay(ui: &mut egui::Ui, p: &mut Prefs, focus: &mut bool) {
             });
             widgets::divider(ui);
             let c = hk.chord;
-            let chord_text = if c.count_ones() >= 2 { t!("settings.chord_set", buttons = crate::host::pad::names(c)) } else { t!("settings.chord_none").to_string() };
+            let chord_text = match *recording {
+                Some((_, held, _)) if held != 0 => t!("hint.chord_held", buttons = crate::host::pad::names(held)),
+                Some(_) => t!("toast.hold_chord").to_string(),
+                None if c.count_ones() >= 2 => t!("settings.chord_set", buttons = crate::host::pad::names(c)),
+                None => t!("settings.chord_none").to_string(),
+            };
             widgets::setting(ui, t!("settings.chord"), &chord_text, |ui| {
-                if c.count_ones() >= 2 && widgets::button(ui, None, t!("common.clear"), Kind::Secondary).clicked() {
+                if recording.is_some() {
+                    if widgets::button(ui, None, t!("common.cancel"), Kind::Secondary).clicked() {
+                        *recording = None;
+                    }
+                    return;
+                }
+                if c.count_ones() >= 2 && widgets::button(ui, None, t!("common.clear"), Kind::Ghost).clicked() {
                     hk.chord = 0;
+                }
+                if widgets::button(ui, Some(Icon::Gamepad), t!("settings.chord_record"), Kind::Secondary).clicked() {
+                    let now = std::time::Instant::now();
+                    *recording = Some((now, 0, now));
                 }
             });
         });

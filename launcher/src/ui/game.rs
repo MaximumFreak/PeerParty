@@ -16,6 +16,8 @@ use crate::t;
 
 /// How long the Play button's spark lasts.
 const SPARK: Duration = Duration::from_millis(900);
+/// The panel's poster: 2:3, as the library's covers are.
+const POSTER: Vec2 = vec2(184.0, 276.0);
 
 impl App {
     pub(super) fn details(&mut self, ui: &mut egui::Ui, key: String) {
@@ -30,23 +32,20 @@ impl App {
         let full = ui.max_rect();
         let glow = self.icons.glow_of(&g, &key);
         {
+            // The panel's one divider (the panel draws none of its own).
             let p = ui.painter();
-            fx::light(p, pos2(full.center().x, full.top() + 120.0), vec2(full.width() * 0.85, 300.0), glow.gamma_multiply(0.20));
+            fx::light(p, pos2(full.center().x, full.top() + 160.0), vec2(full.width() * 0.85, 340.0), glow.gamma_multiply(0.20));
             p.rect_filled(Rect::from_min_max(full.left_top(), pos2(full.left() + 1.0, full.bottom())), 0.0, theme::line());
         }
         egui::ScrollArea::vertical().id_salt("game").auto_shrink([false, false]).show(ui, |ui| {
-            egui::Frame::new().inner_margin(egui::Margin { left: 22, right: 22, top: 14, bottom: 22 }).show(ui, |ui| {
+            egui::Frame::new().inner_margin(egui::Margin { left: 26, right: 26, top: 22, bottom: 26 }).show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                    if widgets::icon_button(ui, Icon::Close, t!("game.close")).clicked() {
-                        close = true;
-                    }
-                });
-                // The picture.
-                let w = ui.available_width();
-                let (pw, ph) = if g.cover.is_some() { (200.0, 300.0) } else { (w, 170.0) };
+                // The picture: a 2:3 poster like the library's, whether or not the game
+                // has a cover (one without is drawn from its art or icon), with Close
+                // beside its top.
+                let top = ui.cursor().min;
                 ui.vertical_centered(|ui| {
-                    let (rect, _) = ui.allocate_exact_size(vec2(pw, ph), Sense::hover());
+                    let (rect, _) = ui.allocate_exact_size(vec2(POSTER.x, POSTER.y), Sense::hover());
                     let p = ui.painter();
                     fx::shadow(p, rect, 14.0, 30, 12, 150);
                     fx::glow(p, rect, 14.0, glow.gamma_multiply(0.30), 34.0);
@@ -55,7 +54,13 @@ impl App {
                     ui.painter().rect_stroke(rect, 14.0, egui::Stroke::new(1.0, Color32::from_white_alpha(22)), egui::StrokeKind::Inside);
                     self.request_icons(need);
                 });
-                ui.add_space(16.0);
+                // Drawn over the poster's row, taking no room of its own.
+                let at = Rect::from_min_size(pos2(top.x + ui.available_width() - 34.0, top.y), vec2(34.0, 34.0));
+                let mut corner = ui.new_child(egui::UiBuilder::new().max_rect(at));
+                if widgets::icon_button(&mut corner, Icon::Close, t!("game.close")).clicked() {
+                    close = true;
+                }
+                ui.add_space(18.0);
                 ui.add(egui::Label::new(egui::RichText::new(&g.name).font(theme::strong(23.0)).color(TEXT)).wrap());
                 let running = self.sessions.running(&key);
                 ui.horizontal_wrapped(|ui| {
@@ -87,182 +92,14 @@ impl App {
                     ui.add_space(6.0);
                 }
                 if !xbox {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(t!("game.players_here")).size(13.0).color(TEXT2));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let mut n = o.players.clamp(1, 4);
-                            if widgets::segmented(ui, &mut n, &[(1u8, "1"), (2u8, "2"), (3u8, "3"), (4u8, "4")]) {
-                                let was = o.players;
-                                o.players = n;
-                                if n == 1 {
-                                    o.split_screen = false;
-                                    o.split_layout.clear();
-                                } else {
-                                    if was <= 1 || n >= 3 {
-                                        o.split_screen = true;
-                                    }
-                                    if n != 3 && matches!(o.split_layout.as_str(), "top2" | "bottom2") {
-                                        o.split_layout.clear();
-                                    }
-                                }
-                            }
-                        });
-                    });
                     if o.players >= 2 {
-                        let mut split = o.split_screen;
-                        stacked(ui, t!("game.split_screen"), t!("game.split_screen_sub"), |ui| {
-                            if widgets::switch(ui, &mut split).changed() {
-                                o.split_screen = split;
-                                // Turned on again later, two players start side by side
-                                // rather than in the grid three or four had.
-                                if !split {
-                                    o.split_layout.clear();
-                                }
-                                if !split && o.players > 2 {
-                                    o.players = 2;
-                                }
-                            }
-                        });
-                        if o.split_screen {
-                            ui.add_space(4.0);
-                            ui.label(egui::RichText::new(t!("game.split_layout")).size(13.5).color(TEXT));
-                            let mut layout = o.effective_split_layout();
-                            let mut layout_opts: Vec<(&str, &str)> = if o.players == 3 {
-                                vec![
-                                    ("top2", t!("game.layout_top2")),
-                                    ("bottom2", t!("game.layout_bottom2")),
-                                    ("horizontal", t!("game.layout_horizontal")),
-                                    ("grid", t!("game.layout_grid")),
-                                ]
-                            } else {
-                                vec![
-                                    ("horizontal", t!("game.layout_horizontal")),
-                                    ("vertical", t!("game.layout_vertical")),
-                                    ("grid", t!("game.layout_grid")),
-                                ]
-                            };
-                            if o.has_custom_layout() {
-                                layout_opts.push(("custom", t!("game.layout_custom")));
-                            }
-                            ui.push_id("split-layout", |ui| {
-                                if widgets::segmented(ui, &mut layout, &layout_opts) {
-                                    o.split_layout = layout.to_string();
-                                }
-                            });
-                            // Which monitor, once there's more than one.
-                            let monitors = monitors();
-                            if monitors.len() >= 2 || o.split_monitor >= 2 {
-                                ui.add_space(6.0);
-                                ui.label(egui::RichText::new(t!("game.monitor")).size(13.5).color(TEXT));
-                                let mut labels: Vec<String> = monitors
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i, b)| {
-                                        let size = format!("{}×{}", b.width, b.height);
-                                        if i == 0 { t!("game.monitor_main", size = size) } else { t!("game.monitor_n", n = i + 1, size = size) }
-                                    })
-                                    .collect();
-                                // One chosen that isn't plugged in now stays chosen.
-                                let want = usize::from(o.split_monitor.max(1));
-                                while labels.len() < want {
-                                    labels.push(t!("game.monitor_gone", n = labels.len() + 1));
-                                }
-                                let mut i = want - 1;
-                                if widgets::stepper(ui, "split-monitor", &labels, &mut i, ui.available_width()).changed() {
-                                    o.split_monitor = if i == 0 { 0 } else { (i + 1) as u8 };
-                                }
-                            }
-                            ui.add_space(6.0);
-                            ui.label(egui::RichText::new(t!("game.player_inputs")).size(13.5).color(TEXT));
-                            let input_opts = [("auto", t!("game.input_auto")), ("kbm", t!("game.input_kbm")), ("pad", t!("game.input_pad"))];
-                            for k in 0..usize::from(o.players.clamp(2, 4)) {
-                                ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new(t!("game.input_player", n = k + 1)).size(13.0).color(TEXT2));
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        let mut v = o.split_input(k);
-                                        ui.push_id(("split-input", k), |ui| {
-                                            if widgets::segmented(ui, &mut v, &input_opts) {
-                                                o.set_split_input(k, v);
-                                            }
-                                        });
-                                    });
-                                });
-                            }
-                            ui.add(egui::Label::new(egui::RichText::new(t!("game.inputs_note")).size(12.0).color(TEXT3)).wrap());
-                            let kbm_forced = o.has_kbm_player();
-                            let mut kbm_on = !o.split_no_kbm || kbm_forced;
-                            ui.add_enabled_ui(!kbm_forced, |ui| {
-                                stacked(ui, t!("game.split_kbm"), t!("game.split_kbm_sub"), |ui| {
-                                    if widgets::switch(ui, &mut kbm_on).changed() {
-                                        o.split_no_kbm = !kbm_on;
-                                    }
-                                });
-                            });
-                            ui.add_space(2.0);
-                            ui.add(egui::Label::new(egui::RichText::new(t!("game.split_screen_note")).size(12.0).color(TEXT3)).wrap());
-                        } else {
-                            ui.add(egui::Label::new(egui::RichText::new(t!("game.players_two_note")).size(12.0).color(TEXT3)).wrap());
-                            // The label wraps beside the stepper rather than running under it.
-                            ui.add_space(4.0);
-                            ui.horizontal(|ui| {
-                                let w = (ui.available_width() - 168.0).max(80.0);
-                                ui.vertical(|ui| {
-                                    ui.set_width(w);
-                                    ui.add(egui::Label::new(egui::RichText::new(t!("game.second_after")).size(13.5).color(TEXT)).wrap());
-                                });
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    let opts = store::SECOND_DELAYS;
-                                    let labels: Vec<String> = opts.iter().map(|s| t!("common.seconds", n = s)).collect();
-                                    let mut i = opts.iter().position(|s| *s >= self.settings.second_delay).unwrap_or(4);
-                                    if widgets::stepper(ui, "delay", &labels, &mut i, 160.0).changed() {
-                                        self.settings.second_delay = opts[i];
-                                        self.save_settings();
-                                    }
-                                });
-                            });
-                        }
-                    }
-                    // Only where a second copy on this PC is in play (two players here, or
-                    // Play adding one): most players never start two, and never see it.
-                    if o.players >= 2 || !running.is_empty() {
-                        let main = match self.settings.prefs.name.trim() {
-                            "" => crate::platform::user_name(),
-                            n => n.to_string(),
-                        };
-                        let hint = format!("{main} (2)");
-                        let mut name = self.settings.prefs.other_name.clone();
-                        // The name over its field: a text field doesn't fit beside it.
                         ui.add_space(4.0);
-                        ui.add(egui::Label::new(egui::RichText::new(t!("game.other_name")).size(13.5).color(TEXT)).wrap());
-                        ui.add_space(-2.0);
-                        ui.add(egui::Label::new(egui::RichText::new(t!("game.other_name_sub")).size(12.0).color(TEXT3)).wrap());
-                        ui.add_space(2.0);
-                        widgets::text_field(ui, &mut name, &hint, ui.available_width().min(260.0), 32);
-                        if name != self.settings.prefs.other_name {
-                            self.settings.prefs.other_name = name;
-                            self.save_settings();
-                        }
-                        // Players 3 and 4: split screen alone starts them.
-                        if o.uses_split_screen() && running.is_empty() {
-                            for n in 3..=o.players.min(4) {
-                                let saved = if n == 3 { &self.settings.prefs.third_name } else { &self.settings.prefs.fourth_name };
-                                let mut name = saved.clone();
-                                ui.add_space(4.0);
-                                ui.add(egui::Label::new(egui::RichText::new(t!("game.player_name", n = n)).size(13.5).color(TEXT)).wrap());
-                                ui.add_space(2.0);
-                                ui.push_id(("player-name", n), |ui| {
-                                    widgets::text_field(ui, &mut name, &format!("{main} ({n})"), ui.available_width().min(260.0), 32);
-                                });
-                                if name != *saved {
-                                    if n == 3 {
-                                        self.settings.prefs.third_name = name;
-                                    } else {
-                                        self.settings.prefs.fourth_name = name;
-                                    }
-                                    self.save_settings();
-                                }
-                            }
-                        }
+                        widgets::card(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            self.local_players(ui, &mut o, &running);
+                        });
+                    } else {
+                        self.local_players(ui, &mut o, &running);
                     }
                 } else {
                     widgets::note(ui, Icon::Info, TEXT3, t!("game.xbox_one_copy"));
@@ -278,7 +115,9 @@ impl App {
                     });
                 }
                 ui.add_space(12.0);
-                self.who_can_join(ui, &key, &mut actions);
+                // With players on this PC the panel is about them: who can join shrinks to
+                // a line (unless the firewall needs fixing).
+                self.who_can_join(ui, &key, !xbox && o.players >= 2, &mut actions);
                 // Players' saves: where more than one player is in play, or a later
                 // player has saves of its own.
                 if !xbox && (o.players >= 2 || o.play_as >= 2 || self.later_saves(&key, &g, &o)) {
@@ -323,6 +162,195 @@ impl App {
             self.save_settings();
         }
         self.apply(actions);
+    }
+
+    /// Players on this PC: how many, and with two or more how they share it (split
+    /// screen's layout, monitor and inputs, or when a second instance starts) and their
+    /// names. One player sees the count alone.
+    fn local_players(&mut self, ui: &mut egui::Ui, o: &mut GameOptions, running: &[u8]) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(t!("game.players_here")).size(13.5).color(if o.players >= 2 { TEXT } else { TEXT2 }));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let mut n = o.players.clamp(1, 4);
+                if widgets::segmented(ui, &mut n, &[(1u8, "1"), (2u8, "2"), (3u8, "3"), (4u8, "4")]) {
+                    let was = o.players;
+                    o.players = n;
+                    if n == 1 {
+                        o.split_screen = false;
+                        o.split_layout.clear();
+                    } else {
+                        if was <= 1 || n >= 3 {
+                            o.split_screen = true;
+                        }
+                        if n != 3 && matches!(o.split_layout.as_str(), "top2" | "bottom2") {
+                            o.split_layout.clear();
+                        }
+                    }
+                }
+            });
+        });
+        if o.players >= 2 {
+            widgets::divider(ui);
+            let mut split = o.split_screen;
+            stacked(ui, t!("game.split_screen"), t!("game.split_screen_sub"), |ui| {
+                if widgets::switch(ui, &mut split).changed() {
+                    o.split_screen = split;
+                    // Turned on again later, two players start side by side
+                    // rather than in the grid three or four had.
+                    if !split {
+                        o.split_layout.clear();
+                    }
+                    if !split && o.players > 2 {
+                        o.players = 2;
+                    }
+                }
+            });
+            if o.split_screen {
+                ui.add_space(8.0);
+                label_tip(ui, t!("game.split_layout"), t!("game.split_screen_note"));
+                let mut layout = o.effective_split_layout();
+                let mut layout_opts: Vec<(&str, &str)> = if o.players == 3 {
+                    vec![
+                        ("top2", t!("game.layout_top2")),
+                        ("bottom2", t!("game.layout_bottom2")),
+                        ("horizontal", t!("game.layout_horizontal")),
+                        ("grid", t!("game.layout_grid")),
+                    ]
+                } else {
+                    vec![
+                        ("horizontal", t!("game.layout_horizontal")),
+                        ("vertical", t!("game.layout_vertical")),
+                        ("grid", t!("game.layout_grid")),
+                    ]
+                };
+                if o.has_custom_layout() {
+                    layout_opts.push(("custom", t!("game.layout_custom")));
+                }
+                if choice(ui, "split-layout", &mut layout, &layout_opts, ui.available_width()) {
+                    o.split_layout = layout.to_string();
+                }
+                // Which monitor, once there's more than one.
+                let monitors = monitors();
+                if monitors.len() >= 2 || o.split_monitor >= 2 {
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new(t!("game.monitor")).size(13.5).color(TEXT));
+                    let mut labels: Vec<String> = monitors
+                        .iter()
+                        .enumerate()
+                        .map(|(i, b)| {
+                            let size = format!("{}×{}", b.width, b.height);
+                            if i == 0 { t!("game.monitor_main", size = size) } else { t!("game.monitor_n", n = i + 1, size = size) }
+                        })
+                        .collect();
+                    // One chosen that isn't plugged in now stays chosen.
+                    let want = usize::from(o.split_monitor.max(1));
+                    while labels.len() < want {
+                        labels.push(t!("game.monitor_gone", n = labels.len() + 1));
+                    }
+                    let mut i = want - 1;
+                    if widgets::stepper(ui, "split-monitor", &labels, &mut i, ui.available_width()).changed() {
+                        o.split_monitor = if i == 0 { 0 } else { (i + 1) as u8 };
+                    }
+                }
+                widgets::divider(ui);
+                label_tip(ui, t!("game.player_inputs"), t!("game.inputs_note"));
+                let input_opts = [("auto", t!("game.input_auto")), ("kbm", t!("game.input_kbm")), ("pad", t!("game.input_pad"))];
+                let seg_w = segmented_width(ui, &input_opts);
+                for k in 0..usize::from(o.players.clamp(2, 4)) {
+                    let label = egui::RichText::new(t!("game.input_player", n = k + 1)).size(13.0).color(TEXT2);
+                    let mut v = o.split_input(k);
+                    let mut pick = |ui: &mut egui::Ui| {
+                        ui.push_id(("split-input", k), |ui| {
+                            if widgets::segmented(ui, &mut v, &input_opts) {
+                                o.set_split_input(k, v);
+                            }
+                        });
+                    };
+                    // Beside its player where both fit, under it in a narrow panel.
+                    let label_w = ui.painter().layout_no_wrap(label.text().to_string(), theme::font(13.0), TEXT2).size().x;
+                    if label_w + 12.0 + seg_w <= ui.available_width() {
+                        ui.horizontal(|ui| {
+                            ui.label(label);
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| pick(ui));
+                        });
+                    } else {
+                        ui.label(label);
+                        pick(ui);
+                    }
+                }
+                let kbm_forced = o.has_kbm_player();
+                let mut kbm_on = !o.split_no_kbm || kbm_forced;
+                ui.add_enabled_ui(!kbm_forced, |ui| {
+                    stacked(ui, t!("game.split_kbm"), t!("game.split_kbm_sub"), |ui| {
+                        if widgets::switch(ui, &mut kbm_on).changed() {
+                            o.split_no_kbm = !kbm_on;
+                        }
+                    });
+                });
+            } else {
+                ui.add(egui::Label::new(egui::RichText::new(t!("game.players_two_note")).size(12.0).color(TEXT3)).wrap());
+                // The label wraps beside the stepper rather than running under it.
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let w = (ui.available_width() - 168.0).max(80.0);
+                    ui.vertical(|ui| {
+                        ui.set_width(w);
+                        ui.add(egui::Label::new(egui::RichText::new(t!("game.second_after")).size(13.5).color(TEXT)).wrap());
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let opts = store::SECOND_DELAYS;
+                        let labels: Vec<String> = opts.iter().map(|s| t!("common.seconds", n = s)).collect();
+                        let mut i = opts.iter().position(|s| *s >= self.settings.second_delay).unwrap_or(4);
+                        if widgets::stepper(ui, "delay", &labels, &mut i, 160.0).changed() {
+                            self.settings.second_delay = opts[i];
+                            self.save_settings();
+                        }
+                    });
+                });
+            }
+        }
+        // Names: only where a second copy on this PC is in play (two players here, or
+        // Play adding one); most players never start two, and never see them.
+        if o.players >= 2 || !running.is_empty() {
+            if o.players >= 2 {
+                widgets::divider(ui);
+            } else {
+                ui.add_space(8.0);
+            }
+            let main = match self.settings.prefs.name.trim() {
+                "" => crate::platform::user_name(),
+                n => n.to_string(),
+            };
+            // Players 3 and 4: split screen alone starts them.
+            let last = if o.uses_split_screen() && running.is_empty() { o.players.clamp(2, 4) } else { 2 };
+            for n in 2..=last {
+                let saved = match n {
+                    2 => &self.settings.prefs.other_name,
+                    3 => &self.settings.prefs.third_name,
+                    _ => &self.settings.prefs.fourth_name,
+                };
+                let mut name = saved.clone();
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(t!("game.player_name", n = n)).size(13.0).color(TEXT2));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let w = ui.available_width().clamp(120.0, 180.0);
+                        let field = ui.push_id(("player-name", n), |ui| widgets::text_field(ui, &mut name, &format!("{main} ({n})"), w, 32)).inner;
+                        if n == 2 {
+                            // Your own name stays as it is; only a second instance takes this one.
+                            field.on_hover_text(t!("game.other_name_sub"));
+                        }
+                    });
+                });
+                if name != *saved {
+                    match n {
+                        2 => self.settings.prefs.other_name = name,
+                        3 => self.settings.prefs.third_name = name,
+                        _ => self.settings.prefs.fourth_name = name,
+                    }
+                    self.save_settings();
+                }
+            }
+        }
     }
 
     fn play_button(&mut self, ui: &mut egui::Ui, g: &super::scan::Game, key: &str, o: &GameOptions, running: &[u8], actions: &mut Vec<Action>) {
@@ -402,11 +430,41 @@ impl App {
     }
 
     /// Who can play with you in this game: people on this network (unless the firewall
-    /// keeps them out, fixed here), friends with your room code, anyone online.
-    fn who_can_join(&mut self, ui: &mut egui::Ui, key: &str, actions: &mut Vec<Action>) {
+    /// keeps them out, fixed here), friends with your room code, anyone online. `compact`:
+    /// one line saying so, when nothing needs fixing.
+    fn who_can_join(&mut self, ui: &mut egui::Ui, key: &str, compact: bool, actions: &mut Vec<Action>) {
         let fw = self.firewall_for(key);
         let prefs = self.settings.prefs.clone();
         let mut open_together = false;
+        // Not "Windows will ask the first time": that's every game not yet played, and
+        // players on one PC don't go through the firewall.
+        let trouble = fw.as_ref().is_some_and(|(v, _)| v.blocked());
+        if compact && !trouble {
+            widgets::card(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(vec2(28.0, 28.0), Sense::hover());
+                    ui.painter().rect_filled(r, 8.0, theme::GOOD.gamma_multiply(0.14));
+                    Icon::People.paint(ui.painter(), r.center(), 14.0, theme::mix(theme::GOOD, Color32::WHITE, 0.25));
+                    ui.vertical(|ui| {
+                        ui.set_width((ui.available_width() - 44.0).max(60.0));
+                        ui.add_space(-1.0);
+                        ui.label(egui::RichText::new(t!("join.title")).size(13.5).color(TEXT));
+                        ui.add_space(-7.0);
+                        ui.add(egui::Label::new(egui::RichText::new(super::together::summary(&prefs)).size(12.0).color(TEXT2)).truncate());
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if widgets::icon_button(ui, Icon::ChevronRight, t!("join.change")).clicked() {
+                            open_together = true;
+                        }
+                    });
+                });
+            });
+            if open_together {
+                self.open_view(View::Together, false);
+            }
+            return;
+        }
         widgets::card(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(egui::RichText::new(t!("join.title")).font(theme::strong(15.0)).color(TEXT));
@@ -726,6 +784,38 @@ fn join_row(ui: &mut egui::Ui, icon: Icon, who: &str, status: &str, color: Color
     });
 }
 
+/// A label with an info mark after it whose tooltip says more, for what would otherwise
+/// be a paragraph under the control.
+fn label_tip(ui: &mut egui::Ui, text: &str, tip: &str) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(text).size(13.5).color(TEXT));
+        let (r, resp) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+        Icon::Info.paint(ui.painter(), r.center(), 13.0, if resp.hovered() { TEXT2 } else { TEXT3 });
+        resp.on_hover_text(tip);
+    });
+}
+
+/// How wide `widgets::segmented` draws these options.
+fn segmented_width<T>(ui: &egui::Ui, options: &[(T, &str)]) -> f32 {
+    let font = theme::strong(13.0);
+    options.iter().map(|(_, l)| ui.painter().layout_no_wrap(l.to_string(), font.clone(), TEXT).size().x + 26.0).sum::<f32>() + 6.0
+}
+
+/// One of a few options: side by side where they fit in `width`, else a stepper (three
+/// players' layouts and a custom one don't fit a row). Returns whether it changed.
+fn choice<T: PartialEq + Clone>(ui: &mut egui::Ui, id: &str, value: &mut T, options: &[(T, &str)], width: f32) -> bool {
+    if segmented_width(ui, options) <= width {
+        return ui.push_id(id, |ui| widgets::segmented(ui, value, options)).inner;
+    }
+    let labels: Vec<String> = options.iter().map(|(_, l)| l.to_string()).collect();
+    let mut i = options.iter().position(|(v, _)| v == value).unwrap_or(0);
+    if widgets::stepper(ui, id, &labels, &mut i, width).changed() {
+        *value = options[i].0.clone();
+        return true;
+    }
+    false
+}
+
 /// A setting for a narrow column: the name over its control.
 pub(super) fn stacked(ui: &mut egui::Ui, title: &str, detail: &str, control: impl FnOnce(&mut egui::Ui)) {
     ui.add_space(4.0);
@@ -770,8 +860,11 @@ pub(super) fn fold(ui: &mut egui::Ui, id: &str, icon: Icon, title: &str, sub: &s
     p.rect_stroke(rect, 12.0, egui::Stroke::new(1.0, theme::line()), egui::StrokeKind::Inside);
     icon.paint(p, pos2(rect.left() + 22.0, rect.center().y), 16.0, TEXT2);
     p.text(pos2(rect.left() + 44.0, rect.center().y - 8.0), egui::Align2::LEFT_CENTER, title, theme::strong(14.0), TEXT);
-    let g = p.layout_no_wrap(sub.to_string(), theme::font(12.0), TEXT3);
-    p.with_clip_rect(rect.shrink2(vec2(44.0, 0.0))).galley(pos2(rect.left() + 44.0, rect.center().y + 2.0), g, TEXT3);
+    let room = rect.width() - 44.0 - if changed { 52.0 } else { 36.0 };
+    let mut job = egui::text::LayoutJob::simple_singleline(sub.to_string(), theme::font(12.0), TEXT3);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(room.max(0.0));
+    let g = p.layout_job(job);
+    p.galley(pos2(rect.left() + 44.0, rect.center().y + 2.0), g, TEXT3);
     if changed {
         let c = pos2(rect.right() - 40.0, rect.center().y);
         fx::dot(p, c, 3.5, ACCENT);
