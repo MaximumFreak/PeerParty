@@ -104,6 +104,9 @@ pub fn configure_as(on: bool, ring: Option<&str>, event: Option<&str>, pixels: b
     let link = if on { ring.and_then(|r| open_link(r, event)) } else { None };
     let ok = link.is_some();
     *crate::sys::lock(&LINK) = link;
+    // A new setup gets new sets: none of the old ones is drawn or reported again.
+    CURRENT.store(0, Ordering::Release);
+    crate::sys::lock(&REPORTED).clear();
     let epoch = EPOCH.fetch_add(1, Ordering::AcqRel) + 1;
     let was = ENABLED.swap(ok, Ordering::AcqRel);
     if was && ok {
@@ -200,10 +203,74 @@ pub fn pick_except(generation: u32, release_completed: u64, taken: impl Fn(usize
     with_ring(|r| r.pick_except(generation, |v| v <= release_completed, taken)).flatten()
 }
 
+/// The set the session draws: the last one reported (0: none yet this setup), and when a
+/// frame of it was last published (`now_ms`).
+static CURRENT: AtomicU32 = AtomicU32::new(0);
+static CURRENT_AT: AtomicU64 = AtomicU64::new(0);
+/// The sets reported lately, to report one again (`take_over`).
+static REPORTED: Mutex<Vec<SurfaceMsg>> = Mutex::new(Vec::new());
+const KEEP_REPORTED: usize = 8;
+/// How long the set the session draws may go without a frame before another set the game
+/// presents is drawn instead.
+const TAKE_OVER_MS: u64 = 250;
+
+fn now_ms() -> u64 {
+    static START: std::sync::LazyLock<std::time::Instant> = std::sync::LazyLock::new(std::time::Instant::now);
+    START.elapsed().as_millis() as u64
+}
+
+/// Sends a set's `surface`, and makes it the set the session draws.
+pub(super) fn send_surface(m: SurfaceMsg) {
+    CURRENT.store(m.generation, Ordering::Release);
+    CURRENT_AT.store(now_ms(), Ordering::Release);
+    {
+        let mut r = crate::sys::lock(&REPORTED);
+        r.retain(|s| s.generation != m.generation);
+        if r.len() >= KEEP_REPORTED {
+            r.remove(0);
+        }
+        r.push(m.clone());
+    }
+    if crate::ipc::connected() {
+        crate::ipc::send(HookMsg::Surface(m));
+    }
+}
+
+/// Whether a frame of `generation` goes to the session. A game with two swap chains (one
+/// made for a fullscreen switch, say) can go back to presenting the first, whose set was
+/// reported before the other's and isn't made again: the session draws only the set
+/// reported last, so it kept the other's last frame for good. Once the set it draws has
+/// had no frame for `TAKE_OVER_MS`, a set still presenting is reported again and drawn.
+fn take_over(generation: u32) -> bool {
+    let now = now_ms();
+    let cur = CURRENT.load(Ordering::Acquire);
+    if cur == 0 || cur == generation {
+        CURRENT_AT.store(now, Ordering::Release);
+        return true;
+    }
+    let quiet = now.saturating_sub(CURRENT_AT.load(Ordering::Acquire));
+    if quiet < TAKE_OVER_MS {
+        return false;
+    }
+    let again = crate::sys::lock(&REPORTED).iter().find(|m| m.generation == generation).cloned();
+    let Some(m) = again else {
+        crate::log::throttled("video set gone", 4, |_| log!("gap: video: set {generation} presents but its report is gone (set {cur} is drawn): its frames aren't shown"));
+        return false;
+    };
+    crate::log::throttled("video set again", 8, |n| {
+        log!("video: the game presents set {generation} ({}x{}) again and set {cur} had no frame for {quiet} ms: the session's window draws set {generation} (switch {n})", m.width, m.height)
+    });
+    send_surface(m);
+    true
+}
+
 /// The copy into `slot` is submitted, finished at content-fence value `ready`: the
 /// session is told. The event is set while the link is held: a `HostMsg::Capture` closing
 /// it meanwhile would leave a handle that may already be another object's.
 pub fn publish(generation: u32, slot: usize, ready: u64) {
+    if !take_over(generation) {
+        return;
+    }
     let l = crate::sys::lock(&LINK);
     let Some(link) = l.as_ref() else { return };
     if let Some(h) = unsafe { RingHeader::from_raw(link.view, peerparty_protocol::frame_ring::BLOCK_SIZE) } {
@@ -250,22 +317,20 @@ pub struct Kind {
 fn report(generation: u32, textures: &[HANDLE], content: HANDLE, release: HANDLE, k: Kind, api: &str) {
     let Kind { width, height, format, color_space } = k;
     log!("video: frames for the session's window in {width}x{height} textures (format {format}, colour space {color_space}, {api}, set {generation})");
-    if crate::ipc::connected() {
-        crate::ipc::send(HookMsg::Surface(SurfaceMsg {
-            pid: std::process::id(),
-            generation,
-            textures: textures.iter().map(|h| *h as usize as u64).collect(),
-            content: content as usize as u64,
-            release: release as usize as u64,
-            width,
-            height,
-            format,
-            api: api.to_string(),
-            color_space,
-            pixels: None,
-            stride: 0,
-        }));
-    }
+    send_surface(SurfaceMsg {
+        pid: std::process::id(),
+        generation,
+        textures: textures.iter().map(|h| *h as usize as u64).collect(),
+        content: content as usize as u64,
+        release: release as usize as u64,
+        width,
+        height,
+        format,
+        api: api.to_string(),
+        color_space,
+        pixels: None,
+        stride: 0,
+    });
 }
 
 /// The typeless format of a back buffer's format family, so a copy works whichever view
@@ -1077,6 +1142,31 @@ pub(crate) mod tests {
         let f = std::fs::read_dir(dir).unwrap().filter_map(Result::ok).find(|e| e.file_name().to_string_lossy().starts_with("pixels-")).expect("a pixel file");
         let bytes = std::fs::read(f.path()).unwrap();
         bytes[slot * slot_bytes..slot * slot_bytes + n].to_vec()
+    }
+
+    /// A game that goes back to an earlier swap chain: its set, reported before the
+    /// other's, is drawn again once the other has gone quiet, and not before.
+    #[test]
+    fn an_earlier_set_presenting_again_is_drawn_again() {
+        let _turn = crate::sys::lock(&SERIAL);
+        let (_map, name) = session_ring();
+        configure(true, Some(&name), None);
+        let (a, b) = (next_generation(), next_generation());
+        for g in [a, b] {
+            send_surface(SurfaceMsg { generation: g, width: 4, height: 4, ..SurfaceMsg::default() });
+        }
+        publish(a, 0, 1);
+        assert!(published().is_none(), "set b was just reported: a's frame isn't drawn");
+        publish(b, 1, 1);
+        assert_eq!(published().map(|p| p.generation), Some(b));
+        std::thread::sleep(std::time::Duration::from_millis(TAKE_OVER_MS + 50));
+        publish(a, 0, 2);
+        assert_eq!(published().map(|p| p.generation), Some(a), "b went quiet: a is reported again and drawn");
+        assert_eq!(CURRENT.load(Ordering::Acquire), a);
+        publish(b, 2, 2);
+        assert_eq!(published().map(|p| p.generation), Some(a), "b presenting once more doesn't take it straight back");
+        configure(false, None, None);
+        assert_eq!(CURRENT.load(Ordering::Acquire), 0, "a new setup draws no old set");
     }
 
     /// A Direct3D 11 frame goes into a shared texture another device opens: the pixels

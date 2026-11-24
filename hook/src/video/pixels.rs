@@ -16,7 +16,7 @@
 use std::sync::Mutex;
 
 use peerparty_protocol::frame_ring::{bytes_per_pixel, pixels_size, slot_bytes};
-use peerparty_protocol::ipc::{HookMsg, SurfaceMsg};
+use peerparty_protocol::ipc::SurfaceMsg;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 
 use super::capture::{self, D3d11Ring, Kind, private_device, typeless};
@@ -128,22 +128,20 @@ impl PixelFile {
     pub fn report(&self, api: &str) {
         let Kind { width, height, format, color_space } = self.kind;
         log!("video: frames for the session's window as {width}x{height} pixels (format {format}, colour space {color_space}, {api}, set {})", self.generation);
-        if crate::ipc::connected() {
-            crate::ipc::send(HookMsg::Surface(SurfaceMsg {
-                pid: std::process::id(),
-                generation: self.generation,
-                textures: Vec::new(),
-                content: 0,
-                release: 0,
-                width,
-                height,
-                format,
-                api: api.to_string(),
-                color_space,
-                pixels: Some(self.path.clone()),
-                stride: self.stride,
-            }));
-        }
+        capture::send_surface(SurfaceMsg {
+            pid: std::process::id(),
+            generation: self.generation,
+            textures: Vec::new(),
+            content: 0,
+            release: 0,
+            width,
+            height,
+            format,
+            api: api.to_string(),
+            color_space,
+            pixels: Some(self.path.clone()),
+            stride: self.stride,
+        });
     }
 }
 
