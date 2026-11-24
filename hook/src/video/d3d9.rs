@@ -7,7 +7,8 @@
 //!
 //! In a split-screen pane, a device created or reset fullscreen is created or reset
 //! windowed (`IDirect3D9::CreateDevice` 16, `IDirect3D9Ex::CreateDeviceEx` 20): see
-//! fullscreen.rs.
+//! fullscreen.rs. Its display modes there read as the pane's size (d3d9modes.rs), so a
+//! fullscreen device made windowed is the pane's size too.
 //!
 //! When the session's window draws the copy's frames, each present's back buffer is
 //! copied for it too, overlay and all (d3d9capture.rs). Under DXVK (Proton's Direct3D 9,
@@ -20,6 +21,8 @@ use std::sync::{Mutex, OnceLock};
 
 #[path = "d3d9capture.rs"]
 mod d3d9capture;
+#[path = "d3d9modes.rs"]
+mod d3d9modes;
 pub use d3d9capture::redirect;
 
 use retour::GenericDetour;
@@ -111,6 +114,7 @@ pub fn install() -> bool {
         interval: 0x8000_0000, // IMMEDIATE
     };
     let mut addrs: Vec<(usize, &str)> = Vec::new();
+    let mut modes = 0;
     if let Some(f) = com::proc(m, c"Direct3DCreate9") {
         let create: unsafe extern "system" fn(u32) -> usize = unsafe { std::mem::transmute(f) };
         let d3d = unsafe { create(32) };
@@ -134,6 +138,7 @@ pub fn install() -> bool {
                 release(dev);
             }
             addrs.push((com::slot(d3d, 16), "CreateDevice"));
+            modes += d3d9modes::install(d3d, false);
             release(d3d);
         }
     }
@@ -159,6 +164,7 @@ pub fn install() -> bool {
                 addrs.push((create, "CreateDevice (9Ex)"));
             }
             addrs.push((com::slot(d3d, 20), "CreateDeviceEx"));
+            modes += d3d9modes::install(d3d, true);
             release(d3d);
         }
     }
@@ -177,6 +183,9 @@ pub fn install() -> bool {
             "CreateDevice (9Ex)" => arm(&CREATE_9EX, addr, create_9ex_hook as CreateDevice, label),
             _ => arm(&CREATE_EX, addr, create_ex_hook as CreateDeviceEx, label),
         };
+    }
+    if modes > 0 {
+        log!("video: Direct3D 9's display-mode calls hooked ({modes}): in a split-screen pane they answer the pane's size");
     }
     n > 0
 }
