@@ -444,11 +444,8 @@ unsafe extern "C" fn on_enter(
         } else {
             String::new()
         };
-        let key = if extra.is_empty() {
-            text.to_string()
-        } else {
-            format!("{text} {extra}")
-        };
+        // The name itself for a call without detail (most): nothing made per call.
+        let key: std::borrow::Cow<str> = if extra.is_empty() { std::borrow::Cow::Borrowed(&text) } else { format!("{text} {extra}").into() };
         log::throttled(&key, 4, |n| {
             if extra.is_empty() {
                 log!("call {text} n={n}");

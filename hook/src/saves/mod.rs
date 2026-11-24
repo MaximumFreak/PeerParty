@@ -618,8 +618,9 @@ fn seen(path: &str) {
         Some(rest) if !rest.to_ascii_uppercase().starts_with(r"UNC\") => rest,
         _ => full.as_str(),
     };
-    let pairs = crate::sys::lock(&PAIRS).clone();
-    let found = sources_of(path, &pairs);
+    // Matched in place: this runs for every file the game opens, and the ids are
+    // only copied for the rare line below.
+    let found = sources_of(path, &crate::sys::lock(&PAIRS));
     if found.first().is_some_and(|(root, ..)| !worth_copying(root, std::env::var("TEMP").ok().as_deref())) {
         return;
     }
@@ -629,7 +630,8 @@ fn seen(path: &str) {
         static SHOWN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let lower = path.to_ascii_lowercase();
         if (lower.contains("savegame") || lower.contains("my games")) && SHOWN.fetch_add(1, Ordering::Relaxed) < 40 {
-            log!("saves: the game's save path {path} holds none of the ids {}", pairs.iter().map(|p| p.ours.as_str()).collect::<Vec<_>>().join(", "));
+            let ids = crate::sys::lock(&PAIRS).iter().map(|p| p.ours.clone()).collect::<Vec<_>>().join(", ");
+            log!("saves: the game's save path {path} holds none of the ids {ids}");
         }
         return;
     };
@@ -839,7 +841,7 @@ pub fn arm_now() {
     }
     match unsafe { crate::sys::pe::exports(base.cast()) } {
         Ok(t) => {
-            let n = attach_kernelbase(&t.code);
+            let n = crate::sys::detour::batch(|| attach_kernelbase(&t.code));
             log!("saves file hooks {n}");
         }
         Err(e) => log!("saves: kernelbase's exports unreadable ({e}); saves aren't copied"),

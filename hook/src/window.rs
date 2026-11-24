@@ -667,7 +667,7 @@ pub fn attach_user32(exports: &[Export]) -> usize {
 fn install_loaded_user32() {
     INSTALL.call_once(|| {
         let Some(u32_mod) = module("user32.dll") else { return };
-        let n = arm_user32(&crate::sys::detour::Source::Loaded(&|s| proc_addr(u32_mod, s)));
+        let n = crate::sys::detour::batch(|| arm_user32(&crate::sys::detour::Source::Loaded(&|s| proc_addr(u32_mod, s))));
         log!("window: hooked {n} user32 viewport/focus entry points");
     });
 }

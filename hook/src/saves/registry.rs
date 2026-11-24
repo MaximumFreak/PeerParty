@@ -37,6 +37,30 @@ const WRITE_ACCESS: u32 = 0x2 | 0x4 | 0x1_0000 | 0x0200_0000 | 0x1000_0000 | 0x4
 /// Handles the game holds to `HKCU\Software` itself: a key opened under one is a path
 /// under `Software`.
 static SOFTWARE: LazyLock<Mutex<HashSet<isize>>> = LazyLock::new(Mutex::default);
+/// How many: none nearly always, and then every RegCloseKey and every open under some
+/// other key passes without the lock.
+static SOFTWARE_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `h` is a handle to `HKCU\Software` itself (`SOFTWARE`).
+fn follow(h: isize) {
+    let mut s = crate::sys::lock(&SOFTWARE);
+    s.insert(h);
+    SOFTWARE_LEN.store(s.len(), Ordering::Relaxed);
+}
+
+/// Handle `h` is closed: no longer followed.
+fn unfollow(h: isize) {
+    if SOFTWARE_LEN.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let mut s = crate::sys::lock(&SOFTWARE);
+    s.remove(&h);
+    SOFTWARE_LEN.store(s.len(), Ordering::Relaxed);
+}
+
+fn followed(h: isize) -> bool {
+    SOFTWARE_LEN.load(Ordering::Relaxed) != 0 && crate::sys::lock(&SOFTWARE).contains(&h)
+}
 static TOLD: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
@@ -49,7 +73,7 @@ pub fn route(key: isize, sub: &str, write: bool) -> Option<(isize, String)> {
     let st = vfs::state()?;
     let path = if key == HKCU {
         sub.to_string()
-    } else if crate::sys::lock(&SOFTWARE).contains(&key) {
+    } else if followed(key) {
         format!("Software\\{}", sub.trim_start_matches('\\'))
     } else {
         return None;
@@ -121,13 +145,13 @@ macro_rules! own {
 /// After a successful open: a handle to `HKCU\Software` itself is followed.
 fn opened_w(key: isize, sub: *const u16, out: *mut isize, rc: i32) {
     if rc == 0 && !out.is_null() && read_w(sub).is_some_and(|s| is_software(key, &s)) {
-        crate::sys::lock(&SOFTWARE).insert(unsafe { *out });
+        follow(unsafe { *out });
     }
 }
 
 fn opened_a(key: isize, sub: *const u8, out: *mut isize, rc: i32) {
     if rc == 0 && !out.is_null() && !sub.is_null() && super::ansi(sub).is_some_and(|s| is_software(key, &s)) {
-        crate::sys::lock(&SOFTWARE).insert(unsafe { *out });
+        follow(unsafe { *out });
     }
 }
 
@@ -237,7 +261,7 @@ pub fn arm_now() {
         return;
     }
     let kb = exports_of("kernelbase.dll");
-    let n = attach_kernelbase(&kb);
+    let n = crate::sys::detour::batch(|| attach_kernelbase(&kb));
     log!("saves registry hooks {n}");
 }
 
@@ -521,7 +545,7 @@ unsafe extern "system" fn delete_key_value_a(key: isize, sub: *const u8, value: 
 unsafe extern "system" fn close(key: isize) -> i32 {
     // Before the handle's value can be reused.
     if key != 0 {
-        crate::sys::lock(&SOFTWARE).remove(&key);
+        unfollow(key);
     }
     unsafe { CLOSE.get().unwrap().call(key) }
 }
@@ -542,9 +566,10 @@ mod tests {
         assert_eq!(route(HKCU, r"Software\Microsoft\Windows", true), None);
         assert_eq!(route(HKCU, r"Software", true), None);
         assert_eq!(route(0x1234, r"PeerPartyTest\Game", true), None, "a key not followed");
-        crate::sys::lock(&SOFTWARE).insert(0x1234);
+        follow(0x1234);
         assert_eq!(route(0x1234, r"PeerPartyTest\Game", true), Some((HKCU, r"Software\PeerParty\Saves\test-game-00000000\p2\PeerPartyTest\Game".into())), "under a handle to Software");
-        crate::sys::lock(&SOFTWARE).remove(&0x1234);
+        unfollow(0x1234);
+        assert_eq!(SOFTWARE_LEN.load(Ordering::Relaxed), 0);
         vfs::tests::install(vfs::tests::test_state(&base, 0, false));
         assert_eq!(route(HKCU, r"Software\PeerPartyTest\Game\Sub", true), None);
         let noted = std::fs::read_to_string(base.join(r"data\saves\test-game-00000000\player-1\discovered.txt")).unwrap();

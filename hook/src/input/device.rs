@@ -251,20 +251,29 @@ pub(super) fn is_others(d: &Hid, snap: &InputSnapshot) -> bool {
 
 /// Whether `path` names a HID device (`\\?\HID#...`, any case).
 pub(super) fn is_hid_path(path: &[u16]) -> bool {
-    const PREFIXES: [&str; 2] = ["\\\\?\\hid#", "\\\\.\\hid#"];
-    PREFIXES.iter().any(|p| {
-        let p: Vec<u16> = p.encode_utf16().collect();
-        path.len() >= p.len() && path.iter().zip(&p).all(|(a, b)| char::from_u32(u32::from(*a)).is_some_and(|c| c.to_ascii_lowercase() as u32 == u32::from(*b)))
-    })
+    const PREFIXES: [&[u8; 8]; 2] = [b"\\\\?\\hid#", b"\\\\.\\hid#"];
+    PREFIXES.iter().any(|p| path.len() >= p.len() && path.iter().zip(p.iter()).all(|(a, b)| u8::try_from(*a).is_ok_and(|c| c.to_ascii_lowercase() == *b)))
+}
+
+/// Whether the NUL-terminated path at `name` (wide, or ANSI when `wide` is false) starts
+/// as a HID device's (`is_hid_path`), from its first 8 characters: every CreateFile in a
+/// split-screen copy asks, and nearly none is one, so nothing is copied for them.
+fn hid_prefix(name: *const u8, wide: bool) -> bool {
+    let mut head = [0u16; 8];
+    for (i, c) in head.iter_mut().enumerate() {
+        *c = if wide { unsafe { *name.cast::<u16>().add(i) } } else { u16::from(unsafe { *name.add(i) }) };
+        if *c == 0 {
+            return false;
+        }
+    }
+    is_hid_path(&head)
 }
 
 /// Whether `path` is an XInput controller's HID side (`&IG_` in it): XInput's own
 /// routing and Windows.Gaming.Input's decide what a copy sees of those, and Windows'
 /// gamepad stack may open it for the game, so it's never refused.
 pub(super) fn is_xinput_path(path: &[u16]) -> bool {
-    let lower: Vec<u16> = path.iter().map(|c| if (u16::from(b'A')..=u16::from(b'Z')).contains(c) { c + 32 } else { *c }).collect();
-    let ig: Vec<u16> = "&ig_".encode_utf16().collect();
-    lower.windows(ig.len()).any(|w| w == ig.as_slice())
+    path.windows(4).any(|w| w.iter().zip(b"&ig_").all(|(a, b)| u8::try_from(*a).is_ok_and(|c| c.to_ascii_lowercase() == *b)))
 }
 
 /// Paths already judged, with what they are and whether the last open was refused.
@@ -503,14 +512,14 @@ fn wide_path(name: *const u16) -> Vec<u16> {
 
 /// The game's CreateFileW (or CreateFile2) of `name` returned `h`.
 pub(crate) fn opened_w(name: *const u16, h: isize) {
-    if !name.is_null() && super::shm::attached() {
+    if !name.is_null() && super::shm::attached() && h != -1 && h != 0 && hid_prefix(name.cast(), true) {
         opened(&wide_path(name), h);
     }
 }
 
 /// The game's CreateFileA of `name` returned `h`.
 pub(crate) fn opened_a(name: *const u8, h: isize) {
-    if name.is_null() || !super::shm::attached() {
+    if name.is_null() || !super::shm::attached() || h == -1 || h == 0 || !hid_prefix(name, false) {
         return;
     }
     let mut path = Vec::with_capacity(128);
@@ -526,7 +535,7 @@ pub(crate) fn opened_a(name: *const u8, h: isize) {
 
 /// `refuse_open` for a wide path pointer (CreateFileW, CreateFile2).
 pub(crate) fn refuse_open_w(name: *const u16) -> bool {
-    if name.is_null() || !super::shm::attached() {
+    if name.is_null() || !super::shm::attached() || !hid_prefix(name.cast(), true) {
         return false;
     }
     let mut path = Vec::with_capacity(128);
@@ -546,7 +555,7 @@ pub(crate) fn refuse_open_w(name: *const u16) -> bool {
 
 /// `refuse_open` for an ANSI path pointer (CreateFileA).
 pub(crate) fn refuse_open_a(name: *const u8) -> bool {
-    if name.is_null() || !super::shm::attached() {
+    if name.is_null() || !super::shm::attached() || !hid_prefix(name, false) {
         return false;
     }
     let mut path = Vec::with_capacity(128);
@@ -567,6 +576,20 @@ pub(crate) fn refuse_open_a(name: *const u8) -> bool {
 mod tests {
     use super::*;
     use peerparty_protocol::input_shm::{InputMode, VirtualPad};
+
+    #[test]
+    fn device_paths_are_told_without_copying() {
+        let w = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+        let hid = w(r"\\?\HID#VID_054C&PID_0CE6#7&1&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}");
+        let pad = w(r"\\.\hid#vid_045e&pid_028e&IG_00#8&2&0#{4d1e55b2}");
+        for (p, is_hid, is_pad) in [(&hid, true, false), (&pad, true, true), (&w(r"C:\Games\x\data.pak"), false, false), (&w(r"\\?\hi"), false, false)] {
+            assert_eq!(hid_prefix(p.as_ptr().cast(), true), is_hid, "{p:?}");
+            assert_eq!(is_hid_path(p), is_hid);
+            assert_eq!(is_xinput_path(p), is_pad);
+        }
+        assert!(hid_prefix(c"\\\\.\\HID#x".as_ptr().cast(), false));
+        assert!(!hid_prefix(c"\\\\.\\".as_ptr().cast(), false));
+    }
 
     #[test]
     fn only_the_copys_own_device_is_its_own() {

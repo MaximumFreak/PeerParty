@@ -49,7 +49,87 @@ where
         return Armed::Untouched;
     }
     let hook = slot.get().unwrap();
+    if freeze && defer(target.to_ptr() as usize, (hook as *const GenericDetour<T>).cast(), enable_one::<T>, tag, label) {
+        return Armed::Hooked;
+    }
     enable(&|| unsafe { hook.enable() }, target.to_ptr() as usize, freeze, tag, label)
+}
+
+/// Enables the detour at `hook` (a `GenericDetour<T>` in a slot, which lives as long
+/// as the process).
+unsafe fn enable_one<T: retour::Function>(hook: *const ()) -> retour::Result<()> {
+    unsafe { (*hook.cast::<GenericDetour<T>>()).enable() }
+}
+
+/// A detour made inside `batch`, to be enabled at its end.
+struct Deferred {
+    at: usize,
+    hook: *const (),
+    enable: unsafe fn(*const ()) -> retour::Result<()>,
+    name: String,
+}
+
+thread_local! {
+    /// While this thread runs `batch`: the detours it made, waiting to be enabled.
+    static BATCH: std::cell::RefCell<Option<Vec<Deferred>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Inside `batch`: notes a detour to enable at its end (true), else false.
+#[inline(never)]
+fn defer(at: usize, hook: *const (), enable: unsafe fn(*const ()) -> retour::Result<()>, tag: &str, label: &str) -> bool {
+    BATCH.with(|b| match b.borrow_mut().as_mut() {
+        Some(list) => {
+            list.push(Deferred { at, hook, enable, name: format!("{tag} {label}") });
+            true
+        }
+        None => false,
+    })
+}
+
+/// Runs `f`, whose `try_arm`s with freezing are enabled together at its end, with the
+/// game's other threads paused once for all of them rather than once each (each pause
+/// lists and stops every thread: dozens in a row were a stutter). `f` mustn't hold the
+/// hook lock; a `batch` inside another is part of it.
+pub fn batch<R>(f: impl FnOnce() -> R) -> R {
+    if BATCH.with(|b| b.borrow().is_some()) {
+        return f();
+    }
+    BATCH.with(|b| *b.borrow_mut() = Some(Vec::new()));
+    // Enabled however `f` ends (a panic too), so nothing stays made and switched off.
+    struct Finish;
+    impl Drop for Finish {
+        fn drop(&mut self) {
+            finish();
+        }
+    }
+    let _finish = Finish;
+    f()
+}
+
+#[inline(never)]
+fn finish() {
+    let list = BATCH.with(|b| b.borrow_mut().take()).unwrap_or_default();
+    if list.is_empty() {
+        return;
+    }
+    let _g = hook_lock();
+    let at: Vec<usize> = list.iter().map(|d| d.at).collect();
+    // Made before the pause: nothing may allocate while the other threads are stopped.
+    let mut failed: Vec<Option<retour::Error>> = Vec::with_capacity(list.len());
+    {
+        let _paused = crate::sys::hook::freeze(&at);
+        for d in &list {
+            failed.push(unsafe { (d.enable)(d.hook) }.err());
+        }
+    }
+    let mut n = 0;
+    for (d, e) in list.iter().zip(failed) {
+        match e {
+            Some(e) => log!("{} enable failed: {e}", d.name),
+            None => n += 1,
+        }
+    }
+    log!("hooks: {n} of {} enabled with the game's threads paused once", list.len());
 }
 
 /// A detour not made: already there (`None`), or retour's reason.
@@ -161,6 +241,36 @@ mod tests {
 
     extern "system" fn doubled(a: u64, b: u64, c: u64) -> u64 {
         SLOT.get().unwrap().call(a, b, c).wrapping_mul(2)
+    }
+
+    #[inline(never)]
+    extern "system" fn other(a: u64, b: u64, c: u64) -> u64 {
+        let (a, b, c) = (std::hint::black_box(a), std::hint::black_box(b), std::hint::black_box(c));
+        a.wrapping_mul(7_000_001).wrapping_sub(b.rotate_right(5)) ^ c.wrapping_mul(17)
+    }
+
+    static OTHER: OnceLock<GenericDetour<F>> = OnceLock::new();
+
+    extern "system" fn tripled(a: u64, b: u64, c: u64) -> u64 {
+        OTHER.get().unwrap().call(a, b, c).wrapping_mul(3)
+    }
+
+    /// Inside `batch`, a frozen arm is enabled at the end, not before.
+    #[test]
+    fn a_batch_enables_at_its_end() {
+        let f = other as F;
+        let want = other(3, 4, 5);
+        let armed = batch(|| {
+            let a = try_arm(&OTHER, f, tripled as F, "test", "other", true);
+            if a == Armed::Hooked {
+                assert_eq!(std::hint::black_box(f)(3, 4, 5), want, "not enabled yet");
+            }
+            a
+        });
+        if armed == Armed::Hooked {
+            assert_eq!(std::hint::black_box(f)(3, 4, 5), want.wrapping_mul(3));
+        }
+        assert!(BATCH.with(|b| b.borrow().is_none()));
     }
 
     #[test]

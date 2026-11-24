@@ -76,13 +76,15 @@ fn from_2020(c: [f32; 3]) -> [f32; 3] {
 
 /// A float16's value, kept finite: NaN is 0 and infinity the largest half (a game's
 /// stray NaN or infinite pixel shows as black or white, not spreading through the maths).
+/// A normal half is the float with the same mantissa and the exponent rebased (no
+/// powers worked out: three per pixel, millions a frame).
 fn half(h: u16) -> f32 {
-    let (s, e, m) = ((h >> 15) & 1, i32::from((h >> 10) & 0x1f), f32::from(h & 0x3ff));
+    let (s, e, m) = ((h >> 15) & 1, u32::from((h >> 10) & 0x1f), u32::from(h & 0x3ff));
     let v = match e {
-        0 => m * f32::powi(2.0, -24),
-        31 if m != 0.0 => return 0.0,
+        0 => m as f32 * (1.0 / 16_777_216.0),
+        31 if m != 0 => return 0.0,
         31 => 65504.0,
-        e => (1.0 + m / 1024.0) * f32::powi(2.0, e - 15),
+        e => f32::from_bits((e + 112) << 23 | m << 13),
     };
     if s == 1 { -v } else { v }
 }
@@ -139,6 +141,22 @@ pub fn to_bgra(format: u32, color_space: u32, src: &[u8], stride: usize, w: usiz
 
 #[cfg(test)]
 mod tests {
+
+    /// Every half, against the value worked out the long way.
+    #[test]
+    fn halves_convert_exactly() {
+        for h in 0..=u16::MAX {
+            let (s, e, m) = ((h >> 15) & 1, i32::from((h >> 10) & 0x1f), f32::from(h & 0x3ff));
+            let want = match e {
+                0 => m * f32::powi(2.0, -24),
+                31 if m != 0.0 => 0.0,
+                31 => 65504.0,
+                e => (1.0 + m / 1024.0) * f32::powi(2.0, e - 15),
+            };
+            let want = if s == 1 && !(e == 31 && m != 0.0) { -want } else { want };
+            assert_eq!(half(h).to_bits(), want.to_bits(), "{h:#06x}");
+        }
+    }
     use super::*;
 
     fn pq_code(nits: f32) -> u32 {

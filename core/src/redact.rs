@@ -273,6 +273,11 @@ pub fn scrub(key: &str, s: &str, with: Ipv4Addr) -> Option<String> {
 }
 
 fn scrub_ascii(key: &str, s: &str, with: Ipv4Addr) -> Option<String> {
+    // Every address has a digit or a colon; most values (names, flags) have neither,
+    // and get through without a buffer made for them.
+    if !s.bytes().any(|c| c.is_ascii_digit() || c == b':') {
+        return None;
+    }
     let versiony = names_a_version(key);
     let whole = s.trim();
     let b = s.as_bytes();
