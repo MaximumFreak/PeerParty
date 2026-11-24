@@ -170,10 +170,72 @@ impl GameSaves {
         layout::player_dir(&self.data, &self.id, slot)
     }
 
-    /// Where player 1's saves were seen.
+    /// Where player 1's saves were seen (logs and caches in the game's folder left
+    /// out), and where a Unity game keeps them before it was ever seen there.
     pub fn discovered(&self) -> Vec<Discovered> {
         let text = std::fs::read_to_string(self.player_dir(0).join(layout::DISCOVERED)).unwrap_or_default();
-        Discovered::parse_all(&text)
+        let mut all: Vec<Discovered> = Discovered::parse_all(&text)
+            .into_iter()
+            .filter(|d| !matches!(d, Discovered::Files { zone: Zone::GameDir, rel, .. } if layout::noise_in_game_dir(rel)))
+            .collect();
+        for guess in self.unity_saves() {
+            let same = |d: &Discovered| match (d, &guess) {
+                (Discovered::Files { zone: a, rel: r, .. }, Discovered::Files { zone: b, rel: s, .. }) => a == b && r.eq_ignore_ascii_case(s),
+                (Discovered::Registry(a), Discovered::Registry(b)) => a.eq_ignore_ascii_case(b),
+                _ => false,
+            };
+            if !all.iter().any(same) {
+                all.push(guess);
+            }
+        }
+        all
+    }
+
+    /// A Unity game's saves before player 1 ran it under PeerParty: its
+    /// `persistentDataPath` (`LocalLow\<company>\<product>`) and its PlayerPrefs key
+    /// (`HKCU\Software\<company>\<product>`), named by `<exe>_Data\app.info`, when they're
+    /// there. Without it the card said player 1 had no saves until the first run.
+    fn unity_saves(&self) -> Vec<Discovered> {
+        let Some(exe) = self.exe.as_deref() else { return Vec::new() };
+        let (Some(dir), Some(stem)) = (exe.parent(), exe.file_stem()) else { return Vec::new() };
+        let mut data = stem.to_os_string();
+        data.push("_Data");
+        let info = dir.join(data).join("app.info");
+        // Two short lines, company then product; anything else isn't Unity's.
+        if std::fs::metadata(&info).map_or(true, |m| m.len() > 4096) {
+            return Vec::new();
+        }
+        let text = std::fs::read_to_string(&info).unwrap_or_default();
+        let mut lines = text.lines().map(str::trim);
+        let ok = |s: &&str| !s.is_empty() && s.len() <= 128 && *s != "." && *s != ".." && !s.contains(['\\', '/', ':', '*', '?', '"', '<', '>', '|']);
+        let (Some(company), Some(product)) = (lines.next().filter(ok), lines.next().filter(ok)) else { return Vec::new() };
+        let rel = format!("{company}\\{product}");
+        let mut out = Vec::new();
+        if let Some(real) = layout::real_path(&self.roots, Zone::LocalLow, &rel).filter(|r| Path::new(r).is_dir()) {
+            out.push(Discovered::Files { zone: Zone::LocalLow, rel: rel.clone(), real });
+        }
+        let key = format!("Software\\{rel}");
+        if layout::game_registry_key(&key).is_some() && reg::exists(&key) {
+            out.push(Discovered::Registry(key));
+        }
+        out
+    }
+
+    /// Where player 1's saves are best shown: a game's folder in Windows' data folders
+    /// before one in its own folder, a folder of saves there before any other file.
+    fn best_place(&self) -> Option<(Zone, String, String)> {
+        let rank = |zone: Zone, rel: &str| match zone {
+            Zone::GameDir if layout::strict_in_game_dir(rel) => 1,
+            Zone::GameDir => 2,
+            _ => 0,
+        };
+        self.discovered()
+            .into_iter()
+            .filter_map(|d| match d {
+                Discovered::Files { zone, rel, real } if Path::new(&real).exists() => Some((zone, rel, real)),
+                _ => None,
+            })
+            .min_by_key(|(zone, rel, _)| rank(*zone, rel))
     }
 
     /// Notes where player 1's saves are by hand (a folder the player picked).
@@ -233,6 +295,7 @@ impl GameSaves {
     /// Every player's saves (players 1 to 4).
     pub fn inspect(&self) -> Vec<PlayerSaves> {
         let running = self.running();
+        let best = self.best_place();
         (0..layout::MAX_PLAYERS)
             .map(|slot| {
                 let mut p = PlayerSaves { slot, running: running.contains(&slot), backups: self.backups(slot), ..PlayerSaves::default() };
@@ -251,7 +314,6 @@ impl GameSaves {
                     for d in self.discovered() {
                         if let Discovered::Files { real, .. } = &d {
                             add(Path::new(real), SourceKind::Files, &mut p);
-                            p.folder = p.folder.take().or_else(|| Some(PathBuf::from(real)).filter(|f| f.exists()));
                         }
                         if let Discovered::Registry(k) = &d {
                             if reg::exists(k) && !p.kinds.contains(&SourceKind::Prefs) {
@@ -259,6 +321,7 @@ impl GameSaves {
                             }
                         }
                     }
+                    p.folder = best.as_ref().map(|(.., real)| PathBuf::from(real));
                 } else {
                     let dir = self.player_dir(slot);
                     add(&dir.join("fs"), SourceKind::Files, &mut p);
@@ -266,7 +329,9 @@ impl GameSaves {
                     if reg::exists(&layout::registry_key(&self.id, slot)) {
                         p.kinds.push(SourceKind::Prefs);
                     }
-                    p.folder = Some(dir.join("fs")).filter(|f| f.exists());
+                    // The same game folder as player 1's, when this player has it.
+                    let fs = dir.join("fs");
+                    p.folder = best.as_ref().map(|(zone, rel, _)| layout::sandbox_path(&fs, *zone, rel)).filter(|f| f.exists()).or_else(|| Some(fs).filter(|f| f.exists()));
                 }
                 for (path, kind) in self.store_entries(slot) {
                     add(&path, kind, &mut p);
@@ -1186,6 +1251,52 @@ mod tests {
         assert_eq!(g.copy(0, 4), Err(SaveError::BadPlayer(5)));
         assert_eq!(read(&mine.join("a.sav")), "p2");
         assert!(g.restore(1, r"..\x").is_err());
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// Player 1's folder before the game ran (a Unity game's, from `app.info`), a
+    /// mod loader's log and cache never counted as saves, and "Open folder" going to the
+    /// game's folder in LocalLow over a file it wrote in its own folder.
+    #[test]
+    fn player_ones_folder_is_found_and_shown_first() {
+        let b = base("place");
+        let g = game(&b);
+        let exe = g.exe.clone().unwrap();
+        let low = b.join(r"real\LocalLow\Made Up Co\Made Up Game");
+        std::fs::create_dir_all(&low).unwrap();
+        std::fs::write(low.join("slot0.data"), "x").unwrap();
+        assert!(g.discovered().is_empty(), "no app.info: not a Unity game");
+        let info = exe.parent().unwrap().join(r"testgame_Data\app.info");
+        std::fs::create_dir_all(info.parent().unwrap()).unwrap();
+        std::fs::write(&info, "Made Up Co\nMade Up Game").unwrap();
+        let found = g.discovered();
+        assert!(found.contains(&Discovered::Files { zone: Zone::LocalLow, rel: r"Made Up Co\Made Up Game".into(), real: low.to_string_lossy().into_owned() }), "{found:?}");
+        let p1 = &g.inspect()[0];
+        assert!(p1.has_saves());
+        assert_eq!(p1.folder.as_deref(), Some(low.as_path()));
+
+        // The hook's notes: a loader's config, log and cache first, then the game's folder.
+        let dir = g.player_dir(0);
+        std::fs::create_dir_all(&dir).unwrap();
+        let game_dir = exe.parent().unwrap();
+        let mut notes = String::new();
+        for rel in [r"Loader\config\Loader.cfg", r"Loader\LogOutput.log", r"Loader\cache\types.dat"] {
+            let f = game_dir.join(rel);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(&f, "x").unwrap();
+            notes += &(Discovered::Files { zone: Zone::GameDir, rel: rel.into(), real: f.to_string_lossy().into_owned() }.to_line() + "\r\n");
+        }
+        notes += &(Discovered::Files { zone: Zone::LocalLow, rel: r"Made Up Co\Made Up Game".into(), real: low.to_string_lossy().into_owned() }.to_line() + "\r\n");
+        std::fs::write(dir.join(layout::DISCOVERED), notes).unwrap();
+        let found = g.discovered();
+        assert_eq!(found.len(), 2, "the log and cache left out, the guess not doubled: {found:?}");
+        assert_eq!(g.inspect()[0].folder.as_deref(), Some(low.as_path()), "LocalLow before the game's folder");
+
+        // Player 2's own copy of that folder is what its "Open folder" shows.
+        let mine = layout::sandbox_path(&g.player_dir(1).join("fs"), Zone::LocalLow, r"Made Up Co\Made Up Game");
+        std::fs::create_dir_all(&mine).unwrap();
+        std::fs::write(mine.join("slot0.data"), "y").unwrap();
+        assert_eq!(g.inspect()[1].folder.as_deref(), Some(mine.as_path()));
         let _ = std::fs::remove_dir_all(&b);
     }
 

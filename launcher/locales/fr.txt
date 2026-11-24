@@ -680,6 +680,7 @@ saves.own = Chaque joueur a ses propres sauvegardes. Celles du joueur 1 restent 
 saves.shared = Tous les joueurs jouent avec les sauvegardes du joueur 1 (partagées).
 saves.player = Joueur {n} · {name}
 saves.none = Pas encore de sauvegarde
+saves.not_found = Pas encore trouvées
 saves.play_solo = Jouer seul
 saves.open = Ouvrir le dossier
 saves.reset = Réinitialiser

@@ -680,6 +680,7 @@ saves.own = Jeder Spieler hat eigene Spielstände. Die von Spieler 1 bleiben unv
 saves.shared = Alle Spieler spielen mit den Spielständen von Spieler 1 (gemeinsam).
 saves.player = Spieler {n} · {name}
 saves.none = Noch keine Spielstände
+saves.not_found = Noch nicht gefunden
 saves.play_solo = Allein spielen
 saves.open = Ordner öffnen
 saves.reset = Zurücksetzen

@@ -681,6 +681,7 @@ saves.own = Each player's saves are their own. Player 1's stay where the game ke
 saves.shared = Every player plays Player 1's saves (shared).
 saves.player = Player {n} · {name}
 saves.none = No saves yet
+saves.not_found = Not found yet
 saves.play_solo = Play solo
 saves.open = Open folder
 saves.reset = Reset

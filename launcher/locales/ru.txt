@@ -698,6 +698,7 @@ saves.own = У каждого игрока свои сохранения. Сох
 saves.shared = Все игроки играют на сохранениях игрока 1 (общие).
 saves.player = Игрок {n} · {name}
 saves.none = Сохранений пока нет
+saves.not_found = Пока не найдены
 saves.play_solo = Играть одному
 saves.open = Открыть папку
 saves.reset = Сбросить

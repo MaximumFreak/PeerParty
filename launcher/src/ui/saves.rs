@@ -129,6 +129,8 @@ impl App {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(egui::RichText::new(t!("saves.player", n = p.slot + 1, name = self.player_name(p.slot))).font(theme::strong(13.5)).color(TEXT));
                     let status = match p.newest {
+                        // Player 1's saves are wherever the game keeps them: unknown isn't none.
+                        _ if p.slot == 0 && !known => t!("saves.not_found").to_string(),
                         _ if !p.has_saves() => t!("saves.none").to_string(),
                         Some(t) => format!("{} · {}", size(p.bytes), ago(t)),
                         None => size(p.bytes),

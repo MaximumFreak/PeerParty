@@ -664,6 +664,7 @@ saves.own = セーブはプレイヤーごとに別々です。プレイヤー 1
 saves.shared = 全員がプレイヤー 1 のセーブで遊びます（共有）。
 saves.player = プレイヤー {n} · {name}
 saves.none = セーブはまだありません
+saves.not_found = まだ見つかっていません
 saves.play_solo = ひとりで遊ぶ
 saves.open = フォルダーを開く
 saves.reset = リセット

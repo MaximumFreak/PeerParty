@@ -680,6 +680,7 @@ saves.own = Her oyuncunun kendi kayıtları var. 1. oyuncunun kayıtları oyunun
 saves.shared = Tüm oyuncular 1. oyuncunun kayıtlarıyla oynar (ortak).
 saves.player = {n}. oyuncu · {name}
 saves.none = Henüz kayıt yok
+saves.not_found = Henüz bulunamadı
 saves.play_solo = Tek başına oyna
 saves.open = Klasörü aç
 saves.reset = Sıfırla

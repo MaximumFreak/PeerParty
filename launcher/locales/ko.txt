@@ -664,6 +664,7 @@ saves.own = 플레이어마다 저장 데이터가 따로 있습니다. 플레�
 saves.shared = 모든 플레이어가 플레이어 1의 저장 데이터로 플레이합니다(공유).
 saves.player = 플레이어 {n} · {name}
 saves.none = 아직 저장 데이터 없음
+saves.not_found = 아직 찾지 못함
 saves.play_solo = 혼자 플레이
 saves.open = 폴더 열기
 saves.reset = 초기화

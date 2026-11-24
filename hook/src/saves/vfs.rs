@@ -488,6 +488,12 @@ fn watch(st: &State, path: &str) {
     let Some((zone, rel)) = layout::classify(&st.roots, &full) else { return };
     let norm = layout::normalize(&full);
     let line = if zone == Zone::GameDir {
+        // Logs and caches aren't saves: noted, the save manager would list a mod
+        // loader's log as player 1's saves and open its folder.
+        if layout::noise_in_game_dir(&rel) {
+            crate::log::throttled("saves noise", 4, |_| log!("saves: player 1 wrote {norm} in the game's folder: a log or cache, not noted as saves"));
+            return;
+        }
         // A file the game wrote in its folder, as it is (a whole folder there could be
         // the game's data).
         Discovered::Files { zone, rel: rel.clone(), real: norm }

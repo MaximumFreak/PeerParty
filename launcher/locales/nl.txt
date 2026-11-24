@@ -680,6 +680,7 @@ saves.own = Elke speler heeft eigen saves. Die van speler 1 blijven onaangeroerd
 saves.shared = Alle spelers spelen met de saves van speler 1 (gedeeld).
 saves.player = Speler {n} · {name}
 saves.none = Nog geen saves
+saves.not_found = Nog niet gevonden
 saves.play_solo = Alleen spelen
 saves.open = Map openen
 saves.reset = Opnieuw beginnen

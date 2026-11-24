@@ -664,6 +664,7 @@ saves.own = 每位玩家的存檔各自獨立。玩家 1 的存檔原封不動�
 saves.shared = 所有玩家都使用玩家 1 的存檔（共用）。
 saves.player = 玩家 {n} · {name}
 saves.none = 還沒有存檔
+saves.not_found = 尚未找到
 saves.play_solo = 單獨遊玩
 saves.open = 開啟資料夾
 saves.reset = 重設

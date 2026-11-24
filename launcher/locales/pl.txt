@@ -698,6 +698,7 @@ saves.own = Każdy gracz ma własne zapisy. Zapisy gracza 1 zostają nietknięte
 saves.shared = Wszyscy gracze grają na zapisach gracza 1 (wspólne).
 saves.player = Gracz {n} · {name}
 saves.none = Brak zapisów
+saves.not_found = Jeszcze nie znaleziono
 saves.play_solo = Graj sam
 saves.open = Otwórz folder
 saves.reset = Wyczyść

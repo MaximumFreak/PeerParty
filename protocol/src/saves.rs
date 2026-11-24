@@ -339,6 +339,19 @@ pub fn strict_in_game_dir(rel: &str) -> bool {
     comps.iter().take(comps.len().saturating_sub(1)).any(|c| STRICT_GAME_DIR.contains(&c.to_ascii_lowercase().as_str()))
 }
 
+/// Folders in the game's own folder whose files are logs and caches, never saves.
+const NOISE_GAME_DIR: &[&str] = &["log", "logs", "cache", "caches", "crashes", "crashdumps", "crashreports", "shadercache"];
+/// Extensions of files in the game's own folder that are logs and leftovers, never saves.
+const NOISE_EXTENSIONS: &[&str] = &["log", "tmp", "dmp"];
+
+/// Whether a file the game wrote in its own folder is a log, cache or crash dump (a mod
+/// loader's log, say) rather than a save: the save manager doesn't list or copy it.
+pub fn noise_in_game_dir(rel: &str) -> bool {
+    let comps: Vec<String> = rel.split('\\').filter(|c| !c.is_empty()).map(str::to_ascii_lowercase).collect();
+    let Some((name, dirs)) = comps.split_last() else { return false };
+    dirs.iter().any(|c| NOISE_GAME_DIR.contains(&c.as_str())) || name.rsplit_once('.').is_some_and(|(_, ext)| NOISE_EXTENSIONS.contains(&ext))
+}
+
 /// One line of `discovered.txt`: where player 1's saves were seen.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Discovered {
@@ -565,6 +578,12 @@ mod tests {
         assert!(strict_in_game_dir(r"data\Profile\p.bin"));
         assert!(!strict_in_game_dir(r"SteamData"), "the folder alone");
         assert!(!strict_in_game_dir(r"BepInEx\LogOutput.log"));
+        for noise in [r"Loader\LogOutput.log", r"Loader\cache\types.dat", r"Logs\today.txt", r"crash.DMP", r"x.tmp"] {
+            assert!(noise_in_game_dir(noise), "{noise}");
+        }
+        for save in [r"Saves\slot1.dat", r"Loader\config\Loader.cfg", r"SteamData\user_stats.ini", "settings.ini", "logo"] {
+            assert!(!noise_in_game_dir(save), "{save}");
+        }
         assert_eq!(registry_key("g-00000000", 1), r"Software\PeerParty\Saves\g-00000000\p2");
     }
 
