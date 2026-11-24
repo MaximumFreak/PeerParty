@@ -2170,7 +2170,7 @@ mod tests {
         let mut tex = Textures::default();
         let mut frame = eframe::Frame::_new_kittest();
         let mut t = 0.0;
-        let scenes: [(&str, &dyn Fn(&mut App)); 14] = [
+        let scenes: [(&str, &dyn Fn(&mut App)); 15] = [
             ("library", &|a: &mut App| a.lib.selected = None),
             ("game", &|a: &mut App| a.lib.selected = Some(store::key_of(&a.lib.entries[3].exe))),
             ("together", &|a: &mut App| a.open_view(View::Together, false)),
@@ -2180,7 +2180,12 @@ mod tests {
                 a.view = View::Library;
                 a.welcome = Some(welcome::Welcome::new(&a.settings.prefs));
             }),
-            ("welcome-who", &|a: &mut App| a.welcome.as_mut().unwrap().step = 1),
+            ("welcome-who", &|a: &mut App| {
+                let w = a.welcome.as_mut().unwrap();
+                w.step = 1;
+                w.preview_choices(true, true, false);
+            }),
+            ("welcome-done", &|a: &mut App| a.welcome.as_mut().unwrap().step = 2),
             ("list", &|a: &mut App| {
                 a.welcome = None;
                 a.settings.list_view = true;

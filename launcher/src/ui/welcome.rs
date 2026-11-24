@@ -1,6 +1,8 @@
-//! The first-run setup, over the library: the language and your name, then who you
-//! play with (and voice and invites to match), then what was set. Nothing is written
-//! until Start; Back never writes. Every step works with a controller.
+//! The first-run setup, over the library: the language and your name, then how you
+//! play (split screen on this PC, your network, friends online, anyone online; voice
+//! and invites to match), then what that means, with a new room's code to copy.
+//! Nothing is written until Start; Back never writes. Every step works with a
+//! controller.
 
 use eframe::egui::{self, Color32, RichText, Sense, Vec2, pos2, vec2};
 
@@ -8,16 +10,26 @@ use peerparty_core::inet::RoomCode;
 
 use super::icons::Icon;
 use super::store::Prefs;
-use super::theme::{self, ACCENT, ACCENT_HI, GOOD, TEXT, TEXT2, TEXT3, VIOLET};
+use super::theme::{self, ACCENT, ACCENT_HI, GOOD, TEXT, TEXT2, TEXT3, VIOLET, WARN};
 use super::widgets::{self, Kind};
-use super::{App, View, first_focus, fx};
+use super::{App, first_focus, fx};
 use crate::t;
+
+/// Room right of a step for its scroll bar.
+const STEP_GUTTER: i8 = 14;
 
 pub struct Welcome {
     pub(super) step: usize,
     name: String,
     language: String,
+    /// Split screen on this PC: not a setting (that's each game's), but it asks for
+    /// Player 2's name, and the last step says how to start it.
+    split: bool,
+    player2: String,
     friends: bool,
+    /// The room Start makes when friends are chosen and there's none yet: made here so
+    /// the last step can show and copy its code before anything is saved.
+    new_room: String,
     public: bool,
     voice: bool,
     public_voice: bool,
@@ -34,7 +46,10 @@ impl Welcome {
             step: 0,
             name: p.name.clone(),
             language: p.language.clone(),
+            split: !p.other_name.trim().is_empty(),
+            player2: p.other_name.clone(),
             friends: RoomCode::parse(p.room.trim()).is_some(),
+            new_room: RoomCode::generate().to_string(),
             public: p.public,
             voice: p.voice,
             // Recommended off with strangers, whatever the stored default.
@@ -53,6 +68,12 @@ impl Welcome {
         Welcome { public_voice: p.public_voice, auto_accept: p.auto_accept, again: true, ..Welcome::new(p) }
     }
 
+    /// The previews' answers: split screen, friends, strangers.
+    #[cfg(test)]
+    pub(super) fn preview_choices(&mut self, split: bool, friends: bool, public: bool) {
+        (self.split, self.friends, self.public) = (split, friends, public);
+    }
+
     pub fn back(&mut self) {
         self.step = self.step.saturating_sub(1);
     }
@@ -67,9 +88,12 @@ impl Welcome {
         let mut cleared = None;
         p.name = self.name.trim().to_string();
         p.language = self.language.clone();
+        if self.split {
+            p.other_name = self.player2.trim().to_string();
+        }
         if self.friends {
             if !had_room {
-                p.room = RoomCode::generate().to_string();
+                p.room = self.new_room.clone();
             }
         } else if !p.room.trim().is_empty() {
             cleared = had_room.then(|| p.room.clone());
@@ -84,16 +108,29 @@ impl Welcome {
         p.internet = !self.again || p.internet || newly_online;
         cleared
     }
+
+    /// Only split screen picked (your network is always on): nothing online to ask
+    /// about, so voice and invites keep their recommended answers unasked.
+    fn split_only(&self) -> bool {
+        self.split && !self.friends && !self.public
+    }
+
+    /// The room code the last step shows: the one there is, else the one Start makes.
+    fn room_code(&self, p: &Prefs) -> String {
+        if RoomCode::parse(p.room.trim()).is_some() { p.room.trim().to_string() } else { self.new_room.clone() }
+    }
 }
 
-/// A big choice the setup offers: an icon, what it is, and whether it's picked.
-fn choice(ui: &mut egui::Ui, icon: Icon, color: Color32, title: &str, sub: &str, on: bool, fixed: bool) -> egui::Response {
+/// A big choice the setup offers: an icon, what it is, and whether it's picked. One
+/// that's always on (`fixed`) says so in a badge rather than a tick that can't be
+/// unticked.
+fn choice(ui: &mut egui::Ui, icon: Icon, color: Color32, title: &str, sub: &str, on: bool, fixed: Option<&str>) -> egui::Response {
     let w = ui.available_width();
     let galley = ui.painter().layout(sub.to_string(), theme::font(12.5), TEXT2, w - 120.0);
     let h = (galley.size().y + 46.0).max(70.0);
-    let (rect, resp) = ui.allocate_exact_size(vec2(w, h), if fixed { Sense::hover() } else { Sense::click() });
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, h), if fixed.is_some() { Sense::hover() } else { Sense::click() });
     let t = theme::anim(ui.ctx(), resp.id.with("on"), on);
-    let hot = theme::anim(ui.ctx(), resp.id.with("hot"), resp.hovered() && !fixed);
+    let hot = theme::anim(ui.ctx(), resp.id.with("hot"), resp.hovered() && fixed.is_none());
     let p = ui.painter();
     if t > 0.0 {
         fx::glow(p, rect, 14.0, color.gamma_multiply(0.28 * t), 16.0);
@@ -108,9 +145,12 @@ fn choice(ui: &mut egui::Ui, icon: Icon, color: Color32, title: &str, sub: &str,
     icon.paint(p, tile.center(), 19.0, Color32::WHITE);
     p.text(pos2(rect.left() + 72.0, rect.top() + 24.0), egui::Align2::LEFT_CENTER, title, theme::strong(15.5), TEXT);
     p.galley(pos2(rect.left() + 72.0, rect.top() + 38.0), galley, TEXT2);
-    // The tick on the right.
+    // The tick on the right, or the badge.
     let c = pos2(rect.right() - 30.0, rect.center().y);
-    if t > 0.0 {
+    if let Some(badge) = fixed {
+        let bw = p.layout_no_wrap(badge.to_string(), theme::strong(11.0), TEXT).size().x + 14.0;
+        widgets::badge(p, pos2(rect.right() - 18.0 - bw, rect.center().y - 10.0), badge, color, false);
+    } else if t > 0.0 {
         p.circle_filled(c, 12.0, color.gamma_multiply(t));
         Icon::Check.paint(p, c, 12.0, Color32::WHITE.gamma_multiply(t));
     } else {
@@ -146,15 +186,18 @@ impl App {
                 // The step scrolls when the window is too short for it (the smallest
                 // window, a large font, a long language); the dots and the buttons stay
                 // where they are. 190 is the card's margins, the dots, the buttons and a
-                // little air round the card. Each step starts at its top.
+                // little air round the card. Each step starts at its top, with a gutter on
+                // the right for the scroll bar.
                 egui::ScrollArea::vertical()
                     .id_salt(("welcome-step", w.step))
                     .max_height((screen.height() - 190.0).max(160.0))
                     .auto_shrink([false, true])
-                    .show(ui, |ui| match w.step {
-                        0 => self.welcome_hello(ui, &mut w, &mut done),
-                        1 => self.welcome_who(ui, &mut w),
-                        _ => self.welcome_done(ui, &w),
+                    .show(ui, |ui| {
+                        egui::Frame::new().inner_margin(egui::Margin { left: 0, right: STEP_GUTTER, top: 0, bottom: 0 }).show(ui, |ui| match w.step {
+                            0 => self.welcome_hello(ui, &mut w, &mut done),
+                            1 => self.welcome_who(ui, &mut w),
+                            _ => self.welcome_done(ui, &w),
+                        });
                     });
                 ui.add_space(20.0);
                 ui.horizontal(|ui| {
@@ -203,15 +246,12 @@ impl App {
         let _ = modal;
         match done {
             Some(apply) => {
+                // The library stays in front: the room's code was on the last step to copy.
                 if apply {
                     if let Some(room) = w.apply(&mut self.settings.prefs) {
                         self.together.left_room(room);
                     }
                     crate::i18n::set(&self.settings.prefs.language);
-                    if w.friends {
-                        self.open_view(View::Together, false);
-                        self.say(t!("welcome.room_ready"), true);
-                    }
                 }
                 self.settings.onboarded = true;
                 self.save_settings();
@@ -256,42 +296,84 @@ impl App {
         ui.label(RichText::new(t!("welcome.who")).font(theme::strong(24.0)).color(TEXT));
         ui.label(RichText::new(t!("welcome.who_sub")).color(TEXT2));
         ui.add_space(14.0);
-        choice(ui, Icon::Home, GOOD, t!("together.home"), t!("welcome.home"), true, true);
+        if choice(ui, Icon::Gamepad, WARN, t!("welcome.split_title"), t!("welcome.split"), w.split, None).clicked() {
+            w.split = !w.split;
+        }
         ui.add_space(8.0);
-        if choice(ui, Icon::People, ACCENT, t!("together.room"), t!("welcome.friends"), w.friends, false).clicked() {
+        choice(ui, Icon::Home, GOOD, t!("welcome.home_title"), t!("welcome.home"), true, Some(t!("together.home_sub")));
+        ui.add_space(8.0);
+        if choice(ui, Icon::People, ACCENT, t!("together.room"), t!("welcome.friends"), w.friends, None).clicked() {
             w.friends = !w.friends;
         }
         ui.add_space(8.0);
-        if choice(ui, Icon::Globe, VIOLET, t!("together.public"), t!("welcome.public"), w.public, false).clicked() {
+        if choice(ui, Icon::Globe, VIOLET, t!("together.public"), t!("welcome.public_short"), w.public, None).clicked() {
             w.public = !w.public;
         }
-        ui.add_space(14.0);
-        widgets::setting(ui, t!("together.voice"), t!("welcome.voice_sub"), |ui| {
-            widgets::switch(ui, &mut w.voice);
-        });
+        // What strangers learn, once they're chosen.
         if w.public {
-            widgets::setting(ui, t!("together.public_voice"), t!("welcome.public_voice_sub"), |ui| {
-                widgets::switch(ui, &mut w.public_voice);
+            ui.add_space(6.0);
+            widgets::note(ui, Icon::Warning, theme::WARN, t!("welcome.public"));
+        }
+        ui.add_space(14.0);
+        // Only what the choices above need.
+        if w.split {
+            let main = match w.name.trim() {
+                "" => crate::platform::user_name(),
+                n => n.to_string(),
+            };
+            widgets::setting(ui, &t!("game.player_name", n = 2), t!("welcome.player2_sub"), |ui| {
+                widgets::text_field(ui, &mut w.player2, &format!("{main} (2)"), 200.0, 32);
             });
         }
-        widgets::setting(ui, t!("together.auto_accept"), if w.public { t!("welcome.auto_accept_public") } else { t!("welcome.auto_accept_home") }, |ui| {
-            widgets::switch(ui, &mut w.auto_accept);
-        });
+        if !w.split_only() {
+            widgets::setting(ui, t!("together.voice"), t!("welcome.voice_sub"), |ui| {
+                widgets::switch(ui, &mut w.voice);
+            });
+            if w.public {
+                widgets::setting(ui, t!("together.public_voice"), t!("welcome.public_voice_sub"), |ui| {
+                    widgets::switch(ui, &mut w.public_voice);
+                });
+            }
+            widgets::setting(ui, t!("together.auto_accept"), if w.public { t!("welcome.auto_accept_public") } else { t!("welcome.auto_accept_home") }, |ui| {
+                widgets::switch(ui, &mut w.auto_accept);
+            });
+        }
     }
 
+    /// What was chosen, as what to do next: no list of what's off.
     fn welcome_done(&mut self, ui: &mut egui::Ui, w: &Welcome) {
         ui.label(RichText::new(t!("welcome.done")).font(theme::strong(24.0)).color(TEXT));
         ui.label(RichText::new(t!("welcome.done_sub")).color(TEXT2));
         ui.add_space(14.0);
-        let mut line = |icon: Icon, color: Color32, text: &str| {
-            widgets::note(ui, icon, color, text);
-            ui.add_space(2.0);
-        };
-        line(Icon::Home, GOOD, t!("welcome.sum_home"));
-        line(Icon::People, if w.friends { ACCENT } else { TEXT3 }, if w.friends { t!("welcome.sum_friends") } else { t!("welcome.sum_no_friends") });
-        line(Icon::Globe, if w.public { VIOLET } else { TEXT3 }, if w.public { t!("welcome.sum_public") } else { t!("welcome.sum_no_public") });
-        line(Icon::Mic, if w.voice { GOOD } else { TEXT3 }, if w.voice { t!("welcome.sum_voice") } else { t!("welcome.sum_no_voice") });
-        ui.add_space(10.0);
+        if w.split {
+            widgets::note(ui, Icon::Gamepad, WARN, t!("welcome.tip_split"));
+            ui.add_space(4.0);
+        }
+        widgets::note(ui, Icon::Home, GOOD, t!("welcome.sum_home"));
+        ui.add_space(4.0);
+        if w.friends {
+            let code = w.room_code(&self.settings.prefs);
+            let room = RoomCode::parse(&code).map(|c| t!("together.room_name", room = c.fingerprint())).unwrap_or_default();
+            widgets::card_with(ui, Some(ACCENT), |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new(room).font(theme::strong(16.0)).color(TEXT));
+                ui.label(RichText::new(super::together::masked(&code)).monospace().size(13.0).color(TEXT2));
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    if widgets::button(ui, Some(Icon::Copy), t!("together.copy_code"), Kind::Secondary).clicked() {
+                        ui.ctx().copy_text(code.clone());
+                        self.say(t!("together.copied"), true);
+                    }
+                    ui.label(RichText::new(t!("welcome.room_send")).size(12.5).color(TEXT3));
+                });
+            });
+            ui.add_space(4.0);
+        }
+        if w.public {
+            widgets::note(ui, Icon::Globe, VIOLET, t!("welcome.sum_public_on"));
+            ui.add_space(4.0);
+        }
+        ui.add_space(8.0);
         widgets::note(ui, Icon::Gamepad, TEXT3, t!("welcome.tip_overlay"));
         widgets::note(ui, Icon::Settings, TEXT3, t!("welcome.tip_change"));
     }
@@ -318,8 +400,9 @@ mod tests {
         theme::apply(&ctx);
         let mut app = App::with(ctx.clone(), Settings::default(), false);
         let mut w = Welcome::new(&app.settings.prefs);
-        // Step 1 at its longest: strangers on adds their voice switch.
-        (w.friends, w.public) = (true, true);
+        // Step 1 at its longest: split screen asks for Player 2's name, strangers add
+        // their warning and voice switch; the last step has the room's code too.
+        (w.split, w.friends, w.public) = (true, true, true);
         app.welcome = Some(w);
         let mut frame = eframe::Frame::_new_kittest();
         let (width, height) = (900.0, 560.0);
@@ -346,15 +429,18 @@ mod tests {
     fn answers_become_settings() {
         let mut p = Prefs::default();
         let mut w = Welcome::new(&p);
-        assert!(!w.friends && !w.public && w.auto_accept && !w.public_voice);
+        assert!(!w.split && !w.friends && !w.public && w.auto_accept && !w.public_voice);
         w.name = " Kim ".into();
         w.friends = true;
         w.public = true;
         w.voice = false;
+        // The code the last step showed is the one Start saves.
+        let shown = w.room_code(&p);
         w.apply(&mut p);
         assert_eq!(p.name, "Kim");
         let code = p.room.clone();
         assert!(RoomCode::parse(&code).is_some());
+        assert_eq!(code, shown);
         assert!(p.public && !p.public_voice && !p.voice);
         w.apply(&mut p);
         assert_eq!(p.room, code, "an existing room is kept");
@@ -362,6 +448,16 @@ mod tests {
         assert_eq!(w.apply(&mut p).as_deref(), Some(code.as_str()), "the room cleared is handed back");
         assert!(p.room.is_empty());
         assert_eq!(w.apply(&mut p), None);
+        // Split screen: Player 2's name; left out, the name stays as it was.
+        p.other_name = "Sam".into();
+        w.player2 = " Alex ".into();
+        w.apply(&mut p);
+        assert_eq!(p.other_name, "Sam");
+        w.split = true;
+        assert!(!w.split_only());
+        w.apply(&mut p);
+        assert_eq!(p.other_name, "Alex");
+        assert!(Welcome::again(&p).split, "a Player 2 name means split screen was chosen");
     }
 
     /// Run again from Settings, Start with every answer as it was changes no setting;

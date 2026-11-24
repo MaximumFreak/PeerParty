@@ -110,7 +110,7 @@ fn public_switch(ui: &mut egui::Ui, p: &mut Prefs, st: &mut State) {
 }
 
 /// A code with its middle hidden: "PP1-AB12-••••-••••-9F".
-fn masked(code: &str) -> String {
+pub(super) fn masked(code: &str) -> String {
     let parts: Vec<&str> = code.split('-').collect();
     if parts.len() < 3 {
         return "•".repeat(code.chars().count().min(12));
