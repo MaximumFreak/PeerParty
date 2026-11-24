@@ -349,9 +349,13 @@ impl GameSaves {
             .flatten()
             .flatten()
             .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-            .map(|e| Backup { id: e.file_name().to_string_lossy().into_owned(), path: e.path(), when: e.metadata().ok().and_then(|m| m.modified().ok()) })
+            .map(|e| Backup { id: e.file_name().to_string_lossy().into_owned(), path: e.path(), when: e.metadata().ok().and_then(|m| m.created().or_else(|_| m.modified()).ok()) })
             .collect();
-        v.sort_by(|a, b| b.id.cmp(&a.id));
+        // Newest first: by the id's second, then by when the folder was made. By id alone,
+        // two made in one second went by their reasons' names ("before-restore" ahead of
+        // a later "before-reset"), and pruning to the newest five could drop the newest.
+        let second = |b: &Backup| b.id.get(..15).map(str::to_string).unwrap_or_default();
+        v.sort_by(|a, b| second(b).cmp(&second(a)).then(b.when.cmp(&a.when)).then(b.id.cmp(&a.id)));
         v
     }
 
