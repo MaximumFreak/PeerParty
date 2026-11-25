@@ -1407,10 +1407,12 @@ mod win {
                 if !force_hide {
                     POINTER_CHANGED.store(if want_hide { 1 } else { 2 }, Ordering::Relaxed);
                 }
-                // The pointer's look is asked for again when it next moves; this shows the
-                // change at once.
+                // The pointer's look is asked for again when it next moves; set it on this
+                // thread too so hiding/showing takes effect at once even while `WH_MOUSE_LL`
+                // swallows mouse moves (an open overlay or Layout Studio).
                 let mut pt = POINT { x: 0, y: 0 };
                 unsafe {
+                    SetCursor(if want_hide { std::ptr::null_mut() } else { LoadCursorW(std::ptr::null_mut(), IDC_ARROW) });
                     GetCursorPos(&mut pt);
                     SetCursorPos(pt.x, pt.y);
                 }

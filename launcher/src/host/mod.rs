@@ -102,6 +102,8 @@ use prefs_sync::PrefsSync;
 use ui::{Cmd, Nav, Overlay, Page};
 
 const VK_SHIFT: i32 = 0x10;
+const VK_MENU: i32 = 0x12;
+const VK_ESCAPE: i32 = 0x1B;
 const VK_TAB: u32 = 0x09;
 const VK_F1: u32 = 0x70;
 const VK_F2: u32 = 0x71;
@@ -258,6 +260,11 @@ impl PaneNav {
 /// overlay): the opening hotkeys, Shift, and a split-screen session's keys.
 struct NavState {
     keys_down: [bool; 4],
+    /// Closing hotkeys (`HOTKEY_NAMES`) held at the last tick while the focused overlay
+    /// is open (rising-edge fallback alongside the low-level keyboard hook).
+    close_keys_down: [bool; 4],
+    /// Esc held at the last tick while the focused overlay is open (same fallback).
+    esc_down: bool,
     shift: bool,
     /// Opening hotkeys held at the last tick, seen whether or not they could open the
     /// overlay, so a press that couldn't says why in the game's log.
@@ -272,8 +279,44 @@ struct NavState {
 
 impl NavState {
     fn new() -> NavState {
-        NavState { keys_down: [false; 4], shift: false, diag_keys: [false; 4], diag_home: true, session_keys: [true; SESSION_KEYS.len()], given_home_at: None }
+        NavState {
+            keys_down: [false; 4],
+            close_keys_down: [true; 4],
+            esc_down: true,
+            shift: false,
+            diag_keys: [false; 4],
+            diag_home: true,
+            session_keys: [true; SESSION_KEYS.len()],
+            given_home_at: None,
+        }
     }
+}
+
+/// Rising-edge poll for `Esc` and the active overlay hotkeys (e.g. Shift+Tab) while the
+/// overlay is open, returning `(back, close)` and updating `esc_down` / `close_keys_down`.
+/// Mirrors Layout Studio's Esc poll so dismissing works even when another low-level
+/// keyboard hook ahead of ours handles or remaps keys, or when Shift stayed held from
+/// opening the overlay.
+fn poll_dismiss_keys(
+    hotkeys: [(bool, u32); 4],
+    shift: bool,
+    alt: bool,
+    esc_now: bool,
+    keys_now: [bool; 4],
+    esc_prev: &mut bool,
+    keys_prev: &mut [bool; 4],
+) -> (bool, bool) {
+    let back = esc_now && !*esc_prev;
+    *esc_prev = esc_now;
+    let mut close = false;
+    for (k, (on, _)) in hotkeys.iter().enumerate() {
+        let d = keys_now[k];
+        if *on && shift && !alt && d && !keys_prev[k] {
+            close = true;
+        }
+        keys_prev[k] = d;
+    }
+    (back, close)
 }
 
 /// How long after Home on a controller a copy was given a Home on one no copy was is
@@ -1057,16 +1100,19 @@ impl SessionHost {
     }
 
     /// Keeps the real mouse in the focused pane while its game has locked its cursor (an
-    /// aiming game), and hides the pointer while locked, while the game hid its cursor
-    /// (`ShowCursor`), or while the mouse sits idle with controllers active (or KBM off).
+    /// aiming game), and hides the pointer while locked, while the focused overlay or
+    /// Layout Studio owns the cursor (`WH_MOUSE_LL` anchors the system cursor while the
+    /// overlay draws its own), while the game hid its cursor (`ShowCursor`), or while the
+    /// mouse sits idle with controllers active (or KBM off).
     fn update_pointer(&mut self, front: bool) {
         let f = self.focus;
         let has_pad = self.input.pads().seat_info().iter().any(Option::is_some);
         let Some(c) = self.compositor.as_mut() else { return };
         let ours = front && c.hwnd() != 0 && desktop::in_front(std::process::id());
+        let overlay_owns = ours && (self.panes[f].visible || self.layout_studio.active) && !self.under_gamebar;
         let active = ours && !self.panes[f].visible && !self.layout_studio.active && self.instances.get(f).is_some_and(|i| !i.gone);
         let lock = active && !self.kbm_off && self.instances[f].cursor_locked;
-        let game_hide = active && !self.kbm_off && self.instances[f].cursor_hidden;
+        let game_hide = overlay_owns || (active && !self.kbm_off && self.instances[f].cursor_hidden);
         let idle_hide = active && (self.kbm_off || has_pad);
         if c.update_pointer(lock.then_some(f), game_hide, idle_hide) {
             let text = if lock {
@@ -1418,6 +1464,7 @@ impl SessionHost {
             self.under_gamebar = gamebar;
             self.gamebar_changed(gamebar);
         }
+        let was_focus_open = self.panes[self.focus].visible;
         for i in 0..self.panes.len() {
             if !self.panes[i].visible {
                 continue;
@@ -1442,6 +1489,7 @@ impl SessionHost {
                 self.frame_open(i);
             }
         }
+        let focus_just_closed = was_focus_open && !self.panes[self.focus].visible;
         if self.layout_studio.active {
             if !front || gamebar {
                 self.close_layout_studio();
@@ -1453,7 +1501,12 @@ impl SessionHost {
             // The game doesn't get the opening hotkeys (input.rs `watch_hotkeys`).
             let vks: Vec<u32> = self.hotkeys().iter().filter(|(on, _)| *on).map(|(_, vk)| *vk).collect();
             input::watch_hotkeys(&vks);
-            self.check_open();
+            if focus_just_closed {
+                let _ = input::take_hotkey();
+                self.nav.keys_down = [true; 4];
+            } else {
+                self.check_open();
+            }
         } else {
             input::watch_hotkeys(&[]);
             if !self.layout_studio.active {
@@ -2133,7 +2186,9 @@ impl SessionHost {
         p.nav.game_asked = None;
         p.render.hide_toast_window();
         if i == self.focus {
-            self.nav.shift = false;
+            self.nav.shift = down(VK_SHIFT);
+            self.nav.esc_down = down(VK_ESCAPE);
+            self.nav.close_keys_down = [down(VK_TAB as i32), down(VK_F3 as i32), down(VK_F1 as i32), down(VK_F2 as i32)];
         }
         self.update_capture();
         self.instances[i].send(&HostMsg::Overlay { visible: true, why: Some(why.to_string()), pads_held: held });
@@ -2156,6 +2211,7 @@ impl SessionHost {
         p.overlay.tip = None;
         // Keys still held when it closed don't reopen it.
         self.nav.keys_down = [true; 4];
+        let _ = input::take_hotkey();
         self.update_capture();
         let inst = &mut self.instances[i];
         inst.unseen.reset();
@@ -2190,19 +2246,25 @@ impl SessionHost {
         let taken = if i == self.focus { input::take() } else { Vec::new() };
         let shift = &mut self.nav.shift;
         let n = &mut self.panes[i].nav;
+        let mut hook_esc = false;
+        let mut hook_close = [false; 4];
         for ev in taken {
             match ev {
-                input::Input::Key { vk, down } => {
+                input::Input::Key { vk, down: is_down } => {
                     if vk == 0x10 || vk == 0xA0 || vk == 0xA1 {
-                        *shift = down;
+                        *shift = is_down;
                         continue;
                     }
-                    if !down {
+                    if !is_down {
                         continue;
                     }
-                    if *shift && hotkeys.iter().any(|(on, k)| *on && *k == vk) {
-                        nav.close = true;
-                        continue;
+                    let shift_now = *shift || down(VK_SHIFT);
+                    if shift_now && !down(VK_MENU) {
+                        if let Some(k) = hotkeys.iter().position(|(on, k)| *on && *k == vk) {
+                            nav.close = true;
+                            hook_close[k] = true;
+                            continue;
+                        }
                     }
                     match vk {
                         0x26 => nav.up = true,
@@ -2212,10 +2274,14 @@ impl SessionHost {
                         0x0D | 0x20 => nav.select = true,
                         0x2E | 0x58 => nav.second = true,
                         0x59 => nav.third = true,
-                        0x1B | 0x08 => nav.back = true,
+                        0x1B => {
+                            nav.back = true;
+                            hook_esc = true;
+                        }
+                        0x08 => nav.back = true,
                         0x51 | 0x21 => nav.prev_tab = true,
                         0x45 | 0x22 => nav.next_tab = true,
-                        0x09 if *shift => nav.prev_tab = true,
+                        0x09 if shift_now => nav.prev_tab = true,
                         0x09 => nav.next_tab = true,
                         _ => {}
                     }
@@ -2263,6 +2329,28 @@ impl SessionHost {
         if moved {
             n.pointer = true;
             events.insert(0, egui::Event::PointerMoved(n.cursor));
+        }
+        if i == self.focus {
+            let keys_now = [down(VK_TAB as i32), down(VK_F3 as i32), down(VK_F1 as i32), down(VK_F2 as i32)];
+            let (poll_back, poll_close) = poll_dismiss_keys(
+                hotkeys,
+                down(VK_SHIFT),
+                down(VK_MENU),
+                down(VK_ESCAPE),
+                keys_now,
+                &mut self.nav.esc_down,
+                &mut self.nav.close_keys_down,
+            );
+            nav.back |= poll_back;
+            nav.close |= poll_close;
+            if hook_esc {
+                self.nav.esc_down = true;
+            }
+            for k in 0..4 {
+                if hook_close[k] {
+                    self.nav.close_keys_down[k] = true;
+                }
+            }
         }
         let pad = self.pane_pad(i);
         if let Some(&style) = self.pane_styles().get(i) {
@@ -2680,6 +2768,27 @@ mod tests {
         assert_eq!(usable_hotkeys(only, &steam, false), only);
         let state = ui::GameState::from_json(&serde_json::json!({"t": "state", "foreign": ["steam", "epic"]}));
         assert_eq!(state.foreign, ["steam", "epic"]);
+    }
+
+    /// Esc and active Shift+<hotkey> dismiss the overlay on a rising edge even without
+    /// the low-level keyboard hook, without firing while the opening key is still held
+    /// or on Alt+Shift+Tab.
+    #[test]
+    fn dismiss_keys_fire_on_rising_edge_without_hook() {
+        let hk = [(true, VK_TAB), (true, VK_F3), (false, VK_F1), (false, VK_F2)];
+        // Opened by Shift+Tab (still held): doesn't close immediately.
+        let mut esc_prev = false;
+        let mut keys_prev = [true, false, false, false];
+        assert_eq!(poll_dismiss_keys(hk, true, false, false, [true, false, false, false], &mut esc_prev, &mut keys_prev), (false, false));
+        // Tab released while Shift stays held, then Tab pressed again -> closes.
+        assert_eq!(poll_dismiss_keys(hk, true, false, false, [false; 4], &mut esc_prev, &mut keys_prev), (false, false));
+        assert_eq!(poll_dismiss_keys(hk, true, false, false, [true, false, false, false], &mut esc_prev, &mut keys_prev), (false, true));
+        // Alt+Shift+Tab does not close.
+        assert_eq!(poll_dismiss_keys(hk, true, true, false, [false; 4], &mut esc_prev, &mut keys_prev), (false, false));
+        assert_eq!(poll_dismiss_keys(hk, true, true, false, [true, false, false, false], &mut esc_prev, &mut keys_prev), (false, false));
+        // Esc rising edge triggers back once, not while held.
+        assert_eq!(poll_dismiss_keys(hk, false, false, true, [false; 4], &mut esc_prev, &mut keys_prev), (true, false));
+        assert_eq!(poll_dismiss_keys(hk, false, false, true, [false; 4], &mut esc_prev, &mut keys_prev), (false, false));
     }
 
     /// What the Internet page's firewall row says for each kind of check result.
