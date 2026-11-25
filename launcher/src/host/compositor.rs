@@ -631,6 +631,16 @@ impl CompositorWindow {
         false
     }
 
+    /// Whether the pointer hid (true) or showed (false) for the mouse sitting idle or
+    /// moving since the last look, and the mouse moves that didn't move it, left out.
+    pub fn take_pointer_change(&mut self) -> Option<(bool, u64)> {
+        #[cfg(windows)]
+        if let Some(w) = self.window.as_mut() {
+            return w.take_pointer_change();
+        }
+        None
+    }
+
     /// Notifies copy `i`'s window that it is active/focused so engines like Unity accept
     /// forwarded keyboard & mouse input without stealing Win32 foreground from us.
     pub fn activate_pane(&self, i: usize, instances: &[InstanceConn]) {
@@ -761,7 +771,7 @@ impl CompositorWindow {
 #[cfg(windows)]
 mod win {
     use std::path::Path;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
     use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant};
 
@@ -919,6 +929,22 @@ mod win {
     static LAST_MOUSE_MS: AtomicU64 = AtomicU64::new(0);
     /// How long the mouse sits still before auto-hiding in controller/idle mode.
     const IDLE_HIDE_MS: u64 = 1500;
+    /// Where the last mouse move over the session's window was (`pack`; `NO_CLICK`: none).
+    /// Windows also sends a move when the mouse didn't move (`SetCursorPos` to where it
+    /// is, which showing a hidden pointer at once does, and windows changing under it):
+    /// those aren't the player using the mouse, so they neither show the pointer nor
+    /// reach the game (a menu would take them for the mouse and show its own cursor).
+    static LAST_MOVE: AtomicU64 = AtomicU64::new(NO_CLICK);
+    /// Moves left out as not moving, since the pointer last showed or hid.
+    static STILL_MOVES: AtomicU64 = AtomicU64::new(0);
+    /// The pointer hid (1) or showed (2) for the mouse sitting idle or moving, since the
+    /// last look (0: no change).
+    static POINTER_CHANGED: AtomicU8 = AtomicU8::new(0);
+
+    /// Whether a mouse move to client `(x, y)` moved it.
+    pub(super) fn moved(last: &AtomicU64, x: i32, y: i32) -> bool {
+        last.swap(pack(x, y), Ordering::Relaxed) != pack(x, y)
+    }
 
     fn mono_ms() -> u64 {
         static START: OnceLock<Instant> = OnceLock::new();
@@ -1022,9 +1048,14 @@ mod win {
             WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_RBUTTONDBLCLK | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_XBUTTONDOWN | WM_XBUTTONUP => {
                 let (x, y) = (i32::from(l as u16 as i16), i32::from((l >> 16) as u16 as i16));
                 let is_button_down = matches!(m, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN);
+                if m == WM_MOUSEMOVE && !moved(&LAST_MOVE, x, y) {
+                    STILL_MOVES.fetch_add(1, Ordering::Relaxed);
+                    return 0;
+                }
                 if m == WM_MOUSEMOVE || is_button_down {
                     LAST_MOUSE_MS.store(mono_ms(), Ordering::Relaxed);
                     if !FORCE_HIDE_POINTER.load(Ordering::Relaxed) && HIDE_POINTER.swap(false, Ordering::Relaxed) {
+                        POINTER_CHANGED.store(2, Ordering::Relaxed);
                         unsafe { SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_ARROW)) };
                     }
                 }
@@ -1268,6 +1299,9 @@ mod win {
             HIDE_POINTER.store(false, Ordering::Relaxed);
             FORCE_HIDE_POINTER.store(false, Ordering::Relaxed);
             LAST_MOUSE_MS.store(0, Ordering::Relaxed);
+            LAST_MOVE.store(NO_CLICK, Ordering::Relaxed);
+            STILL_MOVES.store(0, Ordering::Relaxed);
+            POINTER_CHANGED.store(0, Ordering::Relaxed);
             if let Ok(mut q) = input_queue().lock() {
                 q.clear();
             }
@@ -1369,6 +1403,9 @@ mod win {
             FORCE_HIDE_POINTER.store(force_hide, Ordering::Relaxed);
             let want_hide = force_hide || (idle_hide && mouse_idle());
             if HIDE_POINTER.swap(want_hide, Ordering::Relaxed) != want_hide {
+                if !force_hide {
+                    POINTER_CHANGED.store(if want_hide { 1 } else { 2 }, Ordering::Relaxed);
+                }
                 // The pointer's look is asked for again when it next moves; this shows the
                 // change at once.
                 let mut pt = POINT { x: 0, y: 0 };
@@ -1378,6 +1415,13 @@ mod win {
                 }
             }
             confine_changed
+        }
+
+        /// Whether the pointer hid (true) or showed (false) for the mouse sitting idle or
+        /// moving since the last look, and the moves left out as not moving meanwhile.
+        pub fn take_pointer_change(&mut self) -> Option<(bool, u64)> {
+            let c = POINTER_CHANGED.swap(0, Ordering::Relaxed);
+            (c != 0).then(|| (c == 1, STILL_MOVES.swap(0, Ordering::Relaxed)))
         }
 
         /// The client area on screen, with the window's monitor's DPI.
@@ -1861,6 +1905,16 @@ mod win {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn a_mouse_move_that_doesnt_move_is_left_out() {
+            let last = AtomicU64::new(NO_CLICK);
+            assert!(moved(&last, 1146, 816), "the first move moves");
+            assert!(!moved(&last, 1146, 816), "Windows' move to where it is");
+            assert!(moved(&last, 1147, 816));
+            assert!(moved(&last, -3, 816), "a move left of the window");
+            assert!(!moved(&last, -3, 816));
+        }
 
         #[test]
         fn the_thumbnail_properties_are_dwms() {

@@ -1076,6 +1076,14 @@ impl SessionHost {
             };
             self.instances[f].send(&HostMsg::Note { text });
         }
+        if let Some((hidden, still)) = c.take_pointer_change() {
+            let text = if hidden {
+                format!("session: the pointer hides: the mouse sat still while {} ({still} mouse moves that didn't move it left out)", if self.kbm_off { "keyboard and mouse are off" } else { "controllers play" })
+            } else {
+                format!("session: the pointer shows: the mouse moved ({still} mouse moves that didn't move it left out)")
+            };
+            self.instances[f].send(&HostMsg::Note { text });
+        }
     }
 
     /// Starts the session with keyboard and mouse kept from the games (controllers only),
