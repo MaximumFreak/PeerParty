@@ -977,12 +977,10 @@ impl Overlay {
     /// then this PC's other copies, your network, the internet, dedicated servers.
     fn player_rows(&self) -> Vec<Row> {
         let st = &self.state;
+        let in_real_lobby = st.lobby.as_ref().is_some_and(|l| l.kind != "photon.room");
         let mut rows: Vec<Row> = self.alert().into_iter().collect();
         if let Some(l) = st.lobby.as_ref().filter(|l| l.kind == "photon.room") {
             rows.push(self.room_row(l));
-        }
-        if st.codes {
-            rows.push(self.paste_row());
         }
         rows.extend(self.invite_all());
         if let Some((_, name, _)) = self.blocked.as_ref().filter(|b| b.2.elapsed() < BLOCK_UNDO) {
@@ -991,14 +989,18 @@ impl Overlay {
         if st.voice_in_use {
             rows.push(Row::toggle(t!("overlay.mic"), t!("overlay.mic_detail"), st.mic_on, Action::ToggleMic).icon(Icon::Mic, Tone::Plain));
         }
-        // Who sent an invite is listed with it, not again below.
+        // Who sent a real invite is listed with it, not again below. A room-code row
+        // stays visible until overwritten or dismissed and has no Details/Mute buttons,
+        // so its sender stays in the player list too.
         let mut listed = Vec::new();
         if !st.pending.is_empty() {
             rows.push(Row::header(t!("overlay.sec_invites")));
         }
         for (k, inv) in st.pending.iter().enumerate() {
             let from = st.peers.iter().position(|p| !inv.from.is_empty() && p.id == inv.from);
-            listed.extend(from);
+            if inv.code.is_empty() {
+                listed.extend(from);
+            }
             let row = if !inv.code.is_empty() {
                 Row::action(t!("overlay.code_from", name = inv.name, code = inv.code), t!("overlay.code_answer"), Action::Accept(k), t!("overlay.type_code"))
                     .second(Action::Decline(k), t!("overlay.dismiss"))
@@ -1012,6 +1014,12 @@ impl Overlay {
                 }
             };
             rows.push(Row { id: format!("invite {}", inv.id), ..row.icon(Icon::Bell, Tone::Good) });
+        }
+        // Typing a copied room code isn't relevant while inviting friends or while
+        // already in a real SDK lobby, and sits below waiting invites so accepting an
+        // invite or received code comes first.
+        if st.codes && !self.invite_mode && !in_real_lobby {
+            rows.push(self.paste_row());
         }
         let groups: [(&str, fn(&Peer) -> bool); 4] = [
             (t!("overlay.net_pc"), |p| p.this_pc && !p.server),
@@ -2245,6 +2253,41 @@ mod tests {
         out.clear();
         o.act(Action::Accept(0), &mut prefs, &mut out);
         assert!(out.iter().any(|c| matches!(c, Cmd::Hook(HostMsg::Accept { id: 7 }))) && out.iter().any(|c| matches!(c, Cmd::Close)));
+    }
+
+    /// A game that uses Photon alongside a real SDK lobby doesn't show "Type a copied
+    /// room code" while in that lobby or in the game's invite dialog, and a received
+    /// room code doesn't hide its sender from the player list.
+    #[test]
+    fn hybrid_lobby_hides_paste_and_code_keeps_sender_listed() {
+        crate::i18n::set("en");
+        let mut o = Overlay::new("Game".into());
+        o.state = sample_state();
+        o.state.codes = true;
+        o.state.can_invite = true;
+        o.state.lobby = Some(LobbyInfo { id: "steam:123".into(), kind: "steam.lobby".into(), max: 4, members: vec![("a".into(), "Timber".into(), true)] });
+        // Game's invite dialog: no PasteCode row, InviteAll is first.
+        o.open(Page::Players, true);
+        let rows = o.rows();
+        assert!(!rows.iter().any(|r| r.main == Action::PasteCode));
+        let first = rows.iter().find(|r| r.selectable).expect("first selectable");
+        assert_eq!(first.main, Action::InviteAll);
+        // Normal open while in the Steam lobby: still no PasteCode row, real invite wording.
+        o.open(Page::Players, false);
+        let rows = o.rows();
+        assert!(!rows.iter().any(|r| r.main == Action::PasteCode));
+        let invite = rows.iter().find(|r| r.main == Action::InviteAll).unwrap();
+        assert_eq!(invite.detail, t!("overlay.invite_all_detail"));
+        // Received room code from a known peer: peer stays listed below, and code sits above PasteCode.
+        o.state.lobby = None;
+        let peer_id = o.state.peers[0].id.clone();
+        o.state.pending = vec![PendingInvite { id: 9, from: peer_id.clone(), name: o.state.peers[0].name.clone(), kind: "sent you a room code".into(), code: "QWERT".into() }];
+        o.open(Page::Players, false);
+        let rows = o.rows();
+        let code_pos = rows.iter().position(|r| r.title.contains("QWERT")).expect("code row");
+        let paste_pos = rows.iter().position(|r| r.main == Action::PasteCode).expect("paste row");
+        assert!(code_pos < paste_pos, "received code comes before clipboard paste");
+        assert!(rows.iter().any(|r| r.id == format!("peer {peer_id}")), "sender stays in peer list");
     }
 
     /// Draws one frame and returns what it asked for.

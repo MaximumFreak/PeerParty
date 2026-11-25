@@ -228,20 +228,40 @@ fn learned_connect() -> Option<String> {
 /// Invites to a Steam lobby (the game's "invite to lobby"), with our `connect` presence
 /// for games that join through that instead.
 pub fn send_lobby(to: Option<PeerId>, lobby: Lobby) -> usize {
-    deliver(to, &my_connect(), Some(lobby))
+    deliver(to, &real_connect().unwrap_or_default(), Some(lobby))
 }
 
-/// Where a friend joining us through presence should go: the first carrier's that has
-/// one (Steam's `connect`, EOS's join info, the PlayFab lobby we're in, Galaxy's).
-fn my_connect() -> String {
+/// Where a friend joining us through an SDK's presence or learned invite should go
+/// (never a Photon room code).
+fn real_connect() -> Option<String> {
     if let Some(c) = carriers().iter().find_map(|c| (c.my_connect)().filter(|c| !c.is_empty())) {
+        return Some(c);
+    }
+    learned_connect()
+}
+
+/// Picks what `connect` string an invite carries: a real SDK connect string first; when
+/// we're in an invite-carrier lobby (`has_lobby`) leave it empty so the real lobby
+/// invite goes through; only fall back to a Photon room code when no carrier lobby or
+/// connect string exists.
+fn pick_connect(real: Option<String>, has_lobby: bool, room_code: Option<String>) -> String {
+    if let Some(c) = real.filter(|c| !c.is_empty()) {
         return c;
     }
-    if let Some(c) = learned_connect() {
-        return c;
+    if has_lobby {
+        return String::new();
     }
-    // A Photon room has no invite to give: the code to type goes instead.
-    crate::photon::room_view().map(|r| format!("{CODE_PREFIX}{}", r.code)).unwrap_or_default()
+    room_code.map(|code| format!("{CODE_PREFIX}{code}")).unwrap_or_default()
+}
+
+/// Where a friend joining us should go: the first carrier's presence (Steam's `connect`,
+/// EOS's join info, PlayFab, Galaxy) or a learned invite; otherwise, when we aren't in
+/// any carrier's lobby, the Photon room code to type.
+fn my_connect() -> String {
+    let real = real_connect();
+    let has_lobby = here().is_some();
+    let room = if real.is_none() && !has_lobby { crate::photon::room_view().map(|r| r.code) } else { None };
+    pick_connect(real, has_lobby, room)
 }
 
 /// What an invite to a game that joins by room code (Photon) carries: the code, for the
@@ -637,7 +657,7 @@ pub fn arrived(ev: &Event) {
         return;
     }
     let mut p = crate::sys::lock(&PENDING);
-    p.retain(|x| x.at.elapsed() < PENDING_FOR);
+    p.retain(|x| x.code().is_some() || x.at.elapsed() < PENDING_FOR);
     let k = key(*from, connect, lobby.as_ref());
     p.retain(|x| key(x.from, &x.connect, x.lobby.as_ref()) != k);
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
@@ -654,12 +674,13 @@ impl Pending {
 }
 
 /// A room code from another player (net.rs, instead of passing it to the game): it
-/// waits in the overlay until the player has it typed into their game.
+/// stays in the overlay (overwriting any earlier room code) until replaced by a new one
+/// or dismissed.
 pub fn code_arrived(from: PeerId, code: &str) {
     let Some(code) = crate::invite::typing::clean_code(code) else { return };
     let connect = format!("{CODE_PREFIX}{code}");
     let mut p = crate::sys::lock(&PENDING);
-    p.retain(|x| x.at.elapsed() < PENDING_FOR && !(x.from == from && x.connect == connect));
+    p.retain(|x| x.code().is_none() && x.at.elapsed() < PENDING_FOR);
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     log!("room code {code} from {from} waits for the player (pending {id})");
     push_pending(&mut p, Pending { id, from, connect, lobby: None, at: Instant::now() });
@@ -680,7 +701,7 @@ pub fn type_clipboard() {
 /// Invites waiting for the player, oldest first.
 pub fn pending() -> Vec<Pending> {
     let mut p = crate::sys::lock(&PENDING);
-    p.retain(|x| x.at.elapsed() < PENDING_FOR);
+    p.retain(|x| x.code().is_some() || x.at.elapsed() < PENDING_FOR);
     p.clone()
 }
 
@@ -691,19 +712,43 @@ fn take_pending(id: u64) -> Option<Pending> {
     Some(p.remove(i))
 }
 
-/// The player accepted an invite in the overlay: it goes to the front ends again, and
-/// this time they accept it.
-pub fn accept(id: u64) -> bool {
-    let Some(inv) = take_pending(id) else { return false };
-    if let Some(code) = inv.code() {
-        log!("room code {code} from {} accepted by the player: typing it into the game", inv.from);
-        crate::invite::typing::type_code(code.to_string());
-        return true;
+/// Looks up pending invite `id` for acceptance: a room code stays in `PENDING` (so the
+/// player can type it again if it missed the input box), while any other invite is
+/// removed.
+enum Accepted {
+    Code { from: PeerId, code: String },
+    Invite(Pending),
+}
+
+fn accept_pending(id: u64) -> Option<Accepted> {
+    let mut p = crate::sys::lock(&PENDING);
+    let i = p.iter().position(|x| x.id == id)?;
+    if let Some(code) = p[i].code().map(str::to_string) {
+        p[i].at = Instant::now();
+        return Some(Accepted::Code { from: p[i].from, code });
     }
-    log!("invite {id} from {} accepted by the player", inv.from);
-    crate::sys::lock(&FORCED).push((key(inv.from, &inv.connect, inv.lobby.as_ref()), None));
-    net::redeliver(Event::Invite { from: inv.from, connect: inv.connect, lobby: inv.lobby });
-    true
+    CHANGES.fetch_add(1, Ordering::Relaxed);
+    Some(Accepted::Invite(p.remove(i)))
+}
+
+/// The player accepted an invite in the overlay: a room code is typed into the game
+/// while staying available until overwritten or dismissed; anything else goes to the
+/// front ends again and this time they accept it.
+pub fn accept(id: u64) -> bool {
+    match accept_pending(id) {
+        None => false,
+        Some(Accepted::Code { from, code }) => {
+            log!("room code {code} from {from} accepted by the player: typing it into the game");
+            crate::invite::typing::type_code(code);
+            true
+        }
+        Some(Accepted::Invite(inv)) => {
+            log!("invite {id} from {} accepted by the player", inv.from);
+            crate::sys::lock(&FORCED).push((key(inv.from, &inv.connect, inv.lobby.as_ref()), None));
+            net::redeliver(Event::Invite { from: inv.from, connect: inv.connect, lobby: inv.lobby });
+            true
+        }
+    }
 }
 
 /// The player declined: a request to join hears no, anything else is just dropped.
@@ -940,5 +985,43 @@ mod tests {
         assert_eq!(why_not_for(&[], &[], &["vivox"], None, false), InviteBlock::HostFirst);
         // Another service PeerParty answers carries the invite: hosting there is what's missing.
         assert_eq!(why_not_for(&[Front::Eos], &[], &["steam"], None, false), InviteBlock::HostFirst);
+    }
+
+    /// A game in a real SDK lobby (Steam, EOS, PlayFab, Galaxy) sends that lobby invite
+    /// rather than a Photon room code, even when it also has a Photon room open.
+    #[test]
+    fn real_lobby_beats_photon_room_code() {
+        assert_eq!(pick_connect(None, true, Some("ABCD".into())), "");
+        assert_eq!(pick_connect(Some("+connect 1".into()), true, Some("ABCD".into())), "+connect 1");
+        assert_eq!(pick_connect(None, false, Some("ABCD".into())), format!("{CODE_PREFIX}ABCD"));
+        assert_eq!(pick_connect(None, false, None), "");
+    }
+
+    /// A received room code stays in the overlay after being typed (so the player can
+    /// retry if it missed the input box) until overwritten by a new code or dismissed.
+    #[test]
+    fn room_code_stays_until_overwritten_or_dismissed() {
+        let a = PeerId([31; 16]);
+        let b = PeerId([32; 16]);
+        code_arrived(a, "FIRST1");
+        let first_id = pending().iter().find(|x| x.code() == Some("FIRST1")).expect("first code").id;
+        // Accepting a room code returns it for typing without removing it from PENDING.
+        match accept_pending(first_id) {
+            Some(Accepted::Code { from, code }) => {
+                assert_eq!(from, a);
+                assert_eq!(code, "FIRST1");
+            }
+            _ => panic!("expected room code"),
+        }
+        assert!(pending().iter().any(|x| x.id == first_id && x.code() == Some("FIRST1")));
+        // Can be accepted again.
+        assert!(matches!(accept_pending(first_id), Some(Accepted::Code { code, .. }) if code == "FIRST1"));
+        // A new room code overwrites the old one.
+        code_arrived(b, "NEXT2");
+        assert!(pending().iter().all(|x| x.code() != Some("FIRST1")));
+        let next_id = pending().iter().find(|x| x.code() == Some("NEXT2")).expect("next code").id;
+        // Dismissing still removes it.
+        assert!(decline(next_id));
+        assert!(pending().iter().all(|x| x.code() != Some("NEXT2")));
     }
 }

@@ -1291,10 +1291,12 @@ impl SessionHost {
     }
 
     /// The hotkeys that open the overlay in this game: the ones that are on, but not one
-    /// a store overlay loaded in the game opens on too (`usable_hotkeys`).
+    /// a store overlay loaded in the game opens on too (`usable_hotkeys`). In a
+    /// split-screen session PeerParty's compositor window holds the foreground, so no
+    /// store overlay opens on its hotkey.
     fn hotkeys(&self) -> [(bool, u32); 4] {
         let hk = &self.prefs.hotkeys;
-        let foreign = &self.panes[self.focus].overlay.state.foreign;
+        let foreign: &[String] = if self.compositor.is_some() { &[] } else { &self.panes[self.focus].overlay.state.foreign };
         let on = usable_hotkeys([hk.shift_tab, hk.shift_f3, hk.shift_f1, hk.shift_f2], foreign, self.guide_opens() || self.chord_opens());
         [(on[0], VK_TAB), (on[1], VK_F3), (on[2], VK_F1), (on[3], VK_F2)]
     }
@@ -1380,6 +1382,11 @@ impl SessionHost {
 
     fn tick(&mut self) {
         input::heartbeat();
+        // Poll controllers before handling hook messages: when the game opens the
+        // overlay on a controller button press (its own Invite button), `show()` must
+        // see that button already down in `pad_prev` so `gather()` doesn't fire Row 0
+        // on the very first frame.
+        self.poll_pads();
         self.messages();
         self.reload_prefs();
         if let Some(i) = self.front_copy().filter(|&i| i != self.focus) {
@@ -1395,7 +1402,6 @@ impl SessionHost {
         self.firewall_tick();
         let front = self.in_front();
         self.track_focus(front);
-        self.poll_pads();
         self.watch_keyboard(front);
         // Game Bar opens over the whole screen: a session's whole window is looked at, so
         // one over another pane than the focused one's counts too.

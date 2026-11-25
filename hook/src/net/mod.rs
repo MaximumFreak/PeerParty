@@ -593,7 +593,18 @@ fn tick_into(lan: &Lan, q: &mut HashMap<Front, VecDeque<Event>>) {
                 continue;
             }
             if let Some(code) = connect.strip_prefix(crate::invite::CODE_PREFIX) {
-                crate::invite::code_arrived(*from, code);
+                if lobby.is_none() {
+                    crate::invite::code_arrived(*from, code);
+                    continue;
+                }
+                // An older copy sent a Photon room code alongside a real lobby: strip
+                // the code so the real lobby invite reaches the game.
+                let ev = Event::Invite { from: *from, connect: String::new(), lobby: lobby.clone() };
+                if already_there("", lobby.as_ref()) {
+                    continue;
+                }
+                crate::invite::arrived(&ev);
+                distribute(q, ev);
                 continue;
             }
             if already_there(connect, lobby.as_ref()) {

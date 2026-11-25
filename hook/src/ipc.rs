@@ -454,20 +454,40 @@ fn set_internet(value: &str) {
 }
 
 /// Other stores' overlays loaded in the game: their hotkeys stay theirs.
+///
+/// Steam's `steamclient` loads `GameOverlayRenderer` during `SteamAPI_Init` even when
+/// the game wasn't started from Steam (so `GameOverlayUI` isn't attached and Shift+Tab
+/// opens nothing). `SteamOverlayGameId` is only set when Steam started the game with
+/// its overlay. Split-screen copies sit behind PeerParty's compositor window, where no
+/// store overlay opens on its hotkey either.
 fn foreign_overlays() -> Vec<&'static str> {
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     let loaded = |n: &str| {
         let w: Vec<u16> = n.encode_utf16().chain(Some(0)).collect();
         !unsafe { GetModuleHandleW(w.as_ptr()) }.is_null()
     };
+    let steam_env = std::env::var_os("SteamOverlayGameId").is_some_and(|v| !v.is_empty());
+    detect_foreign_overlays(
+        crate::window::focus_spoofed(),
+        steam_env,
+        loaded("GameOverlayRenderer64.dll") || loaded("GameOverlayRenderer.dll"),
+        loaded("EOSOVH-Win64-Shipping.dll") || loaded("EOSOVH-Win32-Shipping.dll"),
+        loaded("igo64.dll") || loaded("igo32.dll"),
+    )
+}
+
+fn detect_foreign_overlays(split_screen: bool, steam_overlay_env: bool, steam_dll: bool, epic_dll: bool, ea_dll: bool) -> Vec<&'static str> {
+    if split_screen {
+        return Vec::new();
+    }
     let mut out = Vec::new();
-    if loaded("GameOverlayRenderer64.dll") || loaded("GameOverlayRenderer.dll") {
+    if steam_overlay_env && steam_dll {
         out.push("steam");
     }
-    if loaded("EOSOVH-Win64-Shipping.dll") || loaded("EOSOVH-Win32-Shipping.dll") {
+    if epic_dll {
         out.push("epic");
     }
-    if loaded("igo64.dll") || loaded("igo32.dll") {
+    if ea_dll {
         out.push("ea");
     }
     out
@@ -731,5 +751,15 @@ mod tests {
         assert_eq!(HostMsg::from_line(r#"{"t":"accept","id":18446744073709551615}"#), Some(HostMsg::Accept { id: u64::MAX }));
         assert_eq!(HostMsg::from_line(r#"{"t":"mute","peer":"00aa","on":true}"#), Some(HostMsg::Mute { peer: "00aa".into(), on: true }));
         assert_eq!(peer_of("not hex"), None);
+    }
+
+    /// Steam's overlay DLL loaded without Steam's overlay env (a game started outside
+    /// Steam) isn't an active overlay, and split screen never yields keys to one.
+    #[test]
+    fn foreign_overlays_need_an_active_overlay() {
+        assert_eq!(detect_foreign_overlays(false, false, true, false, false), Vec::<&str>::new());
+        assert_eq!(detect_foreign_overlays(false, true, true, false, false), vec!["steam"]);
+        assert_eq!(detect_foreign_overlays(false, false, true, true, true), vec!["epic", "ea"]);
+        assert_eq!(detect_foreign_overlays(true, true, true, true, true), Vec::<&str>::new());
     }
 }
