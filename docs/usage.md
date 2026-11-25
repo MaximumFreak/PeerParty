@@ -356,6 +356,13 @@ both.
 - `PEERPARTY_SWAP=inline`: swap SDK functions by hooking kernelbase's `GetProcAddress`
   instead of pointing the game modules' `GetProcAddress` imports at PeerParty (the
   default, which leaves Windows' own code untouched, for compatibility).
+- `PEERPARTY_LIBRARY=<folder>` (the window only): the library shows only the Steam games
+  in a folder laid out like Steam's (`steamapps\appmanifest_<id>.acf`, each with its
+  `steamapps\common\<installdir>` holding an .exe, and covers in
+  `appcache\librarycache\<id>_library_600x900.jpg`), and none of the PC's stores or game
+  folders: for a recording or screenshot that mustn't show your own games. An
+  `installdir` that is a full path lists a game installed elsewhere, so a real one can be
+  started from among them.
 
 The same thing from a prompt (x64 or x86):
 

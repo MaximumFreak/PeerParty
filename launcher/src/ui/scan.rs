@@ -61,11 +61,23 @@ pub fn scan(folders: Vec<PathBuf>, tx: Sender<Found>) {
     let send = |g: Game| {
         let _ = tx.send(Found::Game(g));
     };
-    crate::platform::scan_installed_games(&send);
-    for root in folders {
-        folder(&root, &send);
+    if let Some(shown) = shown_library() {
+        // A recording's library: the stores and game folders of this PC would show its
+        // owner's games.
+        eprintln!("peerparty: library: only the Steam games in {} ({}); the PC's stores and game folders aren't read", shown.display(), peerparty_protocol::env::LIBRARY);
+        steam_games(&shown, &steam_libraries(&shown), &send);
+    } else {
+        crate::platform::scan_installed_games(&send);
+        for root in folders {
+            folder(&root, &send);
+        }
     }
     let _ = tx.send(Found::Done);
+}
+
+/// `PEERPARTY_LIBRARY`'s folder, when it names one.
+fn shown_library() -> Option<PathBuf> {
+    std::env::var_os(peerparty_protocol::env::LIBRARY).map(PathBuf::from).filter(|p| p.is_absolute() && p.is_dir())
 }
 
 /// Strips `(v1.2)` and `[GOG]` style tags from a folder name.
@@ -162,6 +174,8 @@ pub fn steam_games(steam: &Path, libs: &[PathBuf], send: &dyn Fn(Game)) {
             if id == STEAMWORKS_SAMPLE || STEAM_TOOLS.iter().any(|t| name.starts_with(t)) {
                 continue;
             }
+            // A full path stays as it is (`join` replaces): a recording's library
+            // (PEERPARTY_LIBRARY) lists a game installed in the real one that way.
             let dir = lib.join("common").join(&installdir);
             let Some(exe) = mainexe::find(&dir) else { continue };
             let (cover, art) = steam_art(steam, &id);
@@ -244,5 +258,30 @@ mod tests {
         assert_eq!(acf_value(acf, "appid").as_deref(), Some("1234570"));
         assert_eq!(acf_value(acf, "name").as_deref(), Some("Some Game's Sequel 3"));
         assert_eq!(acf_value(acf, "path"), None);
+    }
+
+    #[test]
+    fn a_recordings_library_lists_its_own_games_and_one_installed_elsewhere() {
+        let root = std::env::temp_dir().join(format!("peerparty-shown-library-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (shown, real) = (root.join("shown"), root.join("real").join("Lantern"));
+        let apps = shown.join("steamapps");
+        fs::create_dir_all(apps.join("common").join("Made Up")).unwrap();
+        fs::create_dir_all(&real).unwrap();
+        fs::create_dir_all(shown.join("appcache").join("librarycache")).unwrap();
+        fs::write(apps.join("common").join("Made Up").join("MadeUp.exe"), "MZ").unwrap();
+        fs::write(real.join("Lantern.exe"), "MZ").unwrap();
+        fs::write(shown.join("appcache").join("librarycache").join("11_library_600x900.jpg"), "").unwrap();
+        let acf = |id: &str, name: &str, dir: &str| format!("\"AppState\"\n{{\n\t\"appid\"\t\t\"{id}\"\n\t\"name\"\t\t\"{name}\"\n\t\"installdir\"\t\t\"{dir}\"\n}}");
+        fs::write(apps.join("appmanifest_11.acf"), acf("11", "Made Up", "Made Up")).unwrap();
+        fs::write(apps.join("appmanifest_12.acf"), acf("12", "Lantern", &real.display().to_string().replace('\\', "\\\\"))).unwrap();
+        let found = std::cell::RefCell::new(Vec::new());
+        steam_games(&shown, &steam_libraries(&shown), &|g| found.borrow_mut().push(g));
+        let mut found = found.into_inner();
+        found.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(found.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(), ["Lantern", "Made Up"]);
+        assert_eq!(found[0].exe, real.join("Lantern.exe"));
+        assert!(found[1].cover.is_some());
+        let _ = fs::remove_dir_all(&root);
     }
 }

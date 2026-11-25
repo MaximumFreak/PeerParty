@@ -152,6 +152,10 @@ pub const ICON_DIR: &str = "PEERPARTY_ICON_DIR";
 /// Screenshots of the window and overlay for the docs (`PREVIEW_DIR`, `PREVIEW_SIZE`).
 pub const PREVIEW_DIR: &str = "PEERPARTY_PREVIEW_DIR";
 pub const PREVIEW_SIZE: &str = "PEERPARTY_PREVIEW_SIZE";
+/// A folder laid out like Steam's (`steamapps\appmanifest_*.acf`, `appcache\librarycache`):
+/// the window's library is only the Steam games in it, none of the PC's own, for
+/// recordings and screenshots that mustn't show them.
+pub const LIBRARY: &str = "PEERPARTY_LIBRARY";
 /// Arguments for the window's own tests.
 pub const TEST_ARGV: &str = "PEERPARTY_TEST_ARGV";
 /// `1`: a split-screen session's window is made but never shown or put in front (the
