@@ -603,6 +603,13 @@ pub struct PlayerSeat {
 const BLOCK_ARMED: Duration = Duration::from_secs(5);
 const BLOCK_UNDO: Duration = Duration::from_secs(30);
 
+/// How long a toast stays on screen: enough to notice it in the corner of a game and read
+/// longer notices without rushing (8–15 s by UTF-8 length, which tracks CJK reading time too).
+fn toast_duration(title: &str, detail: &str) -> Duration {
+    let bytes = title.len() + detail.len();
+    Duration::from_secs((7 + bytes / 15).clamp(8, 15) as u64)
+}
+
 /// The notice for someone new in the game: a player "is playing too", a dedicated
 /// server "is running", and nothing for another copy on this PC (the player's own).
 pub fn arrival_text(p: &Peer) -> Option<String> {
@@ -743,16 +750,19 @@ impl Overlay {
     /// A result to show: under the panel while it's open, else as a notification.
     pub fn note(&mut self, title: String, detail: String, visible: bool) {
         if visible {
-            self.notice = Some((format!("{title}: {detail}"), Instant::now() + Duration::from_secs(6)));
+            let d = toast_duration(&title, &detail);
+            self.notice = Some((format!("{title}: {detail}"), Instant::now() + d));
         } else {
             self.toast(title, detail);
         }
     }
 
     pub fn toast(&mut self, title: impl Into<String>, detail: impl Into<String>) {
+        let (title, detail) = (title.into(), detail.into());
+        let d = toast_duration(&title, &detail);
         let now = Instant::now();
         self.toasts.retain(|t| t.until > now);
-        self.toasts.push(Toast { title: title.into(), detail: detail.into(), until: now + Duration::from_secs(7) });
+        self.toasts.push(Toast { title, detail, until: now + d });
         if self.toasts.len() > 3 {
             self.toasts.remove(0);
         }
@@ -2500,6 +2510,14 @@ mod tests {
         o.state.can_invite = true;
         o.state.peers[1].server = true;
         assert_eq!(actions(&mut o, "cc"), [Action::Join(1)]);
+    }
+
+    #[test]
+    fn toast_duration_scales_with_length() {
+        assert_eq!(toast_duration("Sam is playing too", "LAN"), Duration::from_secs(8));
+        let saves = toast_duration("EOS saves stay on this PC", "Saved locally by PeerParty. They won't sync to the cloud");
+        assert!(saves >= Duration::from_secs(12), "saves toast should stay readable: {saves:?}");
+        assert_eq!(toast_duration("Title", &"x".repeat(300)), Duration::from_secs(15));
     }
 
     /// The README's overlay screenshot (docs/images/overlay.png): made-up players over a

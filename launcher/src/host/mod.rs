@@ -1676,9 +1676,9 @@ impl SessionHost {
                 p.overlay.notice(&note, p.visible);
                 p.render.dirty = true;
             }
-            HookMsg::LocalSaves { service, path } => {
+            HookMsg::LocalSaves { service, .. } => {
                 let p = &mut self.panes[i];
-                p.overlay.note(crate::t!("toast.local_saves", service = service), crate::t!("toast.local_saves_detail", service = service, path = path), p.visible);
+                p.overlay.note(crate::t!("toast.local_saves", service = service), crate::t!("toast.local_saves_detail").into(), p.visible);
                 p.render.dirty = true;
             }
             HookMsg::Close => self.hide(i),
