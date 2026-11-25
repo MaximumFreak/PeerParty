@@ -1,22 +1,82 @@
 # PeerParty
 
-**PeerParty** lets PC games play together over the LAN, or over the internet with
-friends or anyone playing the same game, without the online services their multiplayer
-was built on. Whatever a game uses (Steamworks, Epic Online Services, PlayFab, GOG
-Galaxy, Photon, Unity Gaming Services or Demonware), its lobbies, invites, friends, voice and
-connections run between the copies themselves. It's one Windows program that starts
-the game with a small hook inside it. No game files change.
+**Make your PC games split screen + LAN.** PeerParty starts several copies of a game on
+one PC in a single split-screen window, each player with their own controller and their
+own saves, and lets copies on your network, or friends online, play together. No servers,
+no accounts, no internet needed for local play. Free, open source, one portable `.exe`.
+
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=EozvfkHUrTE"><img src="docs/images/trailer.jpg" width="820" alt="Watch the PeerParty trailer on YouTube (1:36)"></a>
+</p>
+
+<p align="center">
+  <a href="../../releases/latest"><b>Download peerparty.exe</b></a> ·
+  <a href="docs/usage.md">How to use it</a> ·
+  <a href="https://www.youtube.com/watch?v=EozvfkHUrTE">Watch the trailer</a>
+</p>
+
+It works with almost any game whose multiplayer is peer-to-peer: whatever the game uses
+(Steamworks, Epic Online Services, PlayFab, GOG Galaxy, Photon, Unity Gaming Services or
+Demonware), its lobbies, invites, friends, voice and connections run between the copies
+themselves. PeerParty starts the game with a small hook inside it; no game files change.
+
+## 🎮 Split screen on one PC
+
+<img src="docs/images/split-screen.jpg" alt="Four players in one game on one PC, each in their own pane of a single split-screen window">
+
+Pick a game, pick how many players, press **Play**. Every player gets a copy of the game
+of their own, and the copies meet in the game's own lobby as if they were on a LAN.
+
+- **One window, drawn on the graphics card.** Each copy's frames go straight into one
+  shared window, HDR included. Resize it, or open it on another monitor or the TV.
+- **A controller each**, or the keyboard and mouse for one player. Hand controllers
+  around, or the keyboard and mouse, while you play.
+- **Everyone's own saves.** Player 1 keeps the game's usual saves; the others get their
+  own, kept apart. Copy, swap or restore saves between players from the launcher.
+- **Joining takes one click.** Host in one pane, press **Invite** in the overlay, and the
+  other players are pulled into your lobby.
+
+<img src="docs/images/layout-studio.jpg" alt="Layout Studio: one large pane with three smaller picture-in-picture panes, each with its own scale, ratio and sound buttons">
+
+**Layout Studio** (Ctrl+Alt+E) rearranges the panes while the games run: side by side,
+top and bottom, a grid or picture-in-picture, or drag the dividers and corners wherever
+you like. Swap two players, set how each game fills its pane, mute a pane. [More on split
+screen](#split-screen).
+
+## 🌐 LAN and online, without the servers
 
 <table>
   <tr>
-    <td><img src="docs/images/launcher.png" alt="The PeerParty launcher: a library of games, one selected, with Play and who can join you"></td>
-    <td><img src="docs/images/overlay.png" alt="PeerParty's in-game overlay: an invite, and players on the network and online, each listed once"></td>
+    <td width="50%"><img src="docs/images/overlay-split.jpg" alt="PeerParty's overlay open in one player's pane, offering to invite everyone on the network; the other players' panes show the game's menu"></td>
+    <td width="50%"><img src="docs/images/overlay.png" alt="PeerParty's in-game overlay: an invite, and players on the network and online, each listed once"></td>
   </tr>
   <tr>
-    <td align="center">Launcher</td>
-    <td align="center">In-game overlay</td>
+    <td align="center">The overlay in split screen</td>
+    <td align="center">Players on your network and online</td>
   </tr>
 </table>
+
+- **LAN play for games that only have online play.** PCs on one network find each other's
+  games in the game's own lobby browser, invite each other and play, with no internet
+  connection at all.
+- **Friends online with a room code.** Share a code; your friends show up like LAN
+  players. Nothing to forward or host in most homes.
+- **Public sessions.** Turn them on and anyone playing the same game through PeerParty
+  shows up in the game's own lobby browser or server list.
+- **An overlay in every game** (Shift+Tab, Shift+F3 or a controller's Home button):
+  who's playing, invites, the network, and split screen's players and controllers.
+
+Split screen and network play mix: two players on the couch can join friends on another
+PC, or online, in the same lobby.
+
+## 📚 Your whole library
+
+<img src="docs/images/launcher.jpg" alt="The PeerParty launcher: a library of Steam games, one selected, set to four players in a split-screen grid">
+
+The launcher finds your Steam, Epic, GOG and Xbox app games, and any game folder you
+add. Choose the players on this PC, the layout and what each player plays with, then
+**Play**. It works with a mouse, a keyboard or a controller alone, and speaks your
+Windows language.
 
 ## Keeping multiplayer alive
 
@@ -29,29 +89,9 @@ itself still runs. PeerParty moves that part onto the players' own PCs:
 - **LAN play needs only the network**, not even an internet connection.
 - **Internet play uses only shared public infrastructure**: the BitTorrent DHT, which no
   single company runs, to find players, and public STUN servers to see through routers.
-  Players then connect directly.
+  Players then connect directly, through an encrypted tunnel.
 - **Open source (MIT).** Anyone can build it, fix it and carry it on, whatever happens to
   this project.
-
-## Why use it
-
-- **LAN play for games that only have online play.** Two or more PCs on one network find
-  each other's games in the game's own lobby browser, invite each other and play, with
-  no internet connection and no PeerParty account.
-- **Internet play with no server and no setup.** Turn on public sessions and anyone
-  playing the same game through PeerParty shows up in the game's own lobby browser or
-  server list, like a LAN player. To play with friends only, share a private room code
-  instead. Either way, players find each other through the public BitTorrent DHT and
-  connect directly, through an encrypted tunnel.
-- **Several copies on one PC, or split screen.** Up to four players on one PC can play
-  together in one split-screen window (each with their own controller and in-game
-  overlay), or two in separate windows. Each player gets their own identity and their
-  own saves (player 1's stay where the game keeps them; players 2–4's are kept apart in
-  PeerParty's folder), and they meet as LAN players do. The launcher copies, swaps and
-  restores saves between any two players, and starts a game alone as any of them. See
-  [Split screen](#split-screen) below.
-- **An overlay in every game**: players, invites, the network and split screen's
-  players, opened with the usual store hotkeys or a controller's Home button.
 
 ## What it covers
 

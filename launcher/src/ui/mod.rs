@@ -2472,7 +2472,7 @@ mod tests {
         img
     }
 
-    /// The README's launcher screenshot (docs/images/launcher.png): made-up games with
+    /// A screenshot of the launcher for docs and reviews (launcher.png): made-up games with
     /// covers drawn in code, a made-up player, one game selected. Run by hand:
     /// `PEERPARTY_PREVIEW_DIR=<dir> cargo test -p peerparty readme_ -- --ignored`.
     #[test]

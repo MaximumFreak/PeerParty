@@ -66,8 +66,9 @@ it does and docs/usage.md how to use it; this file is about how changes get in.
   like). Anything copyleft, or with no licence, isn't taken; the release check refuses it.
 - **No game names.** Code, comments, tests and docs describe SDK behaviour, not which
   game showed it ("a game that ...", not the title). Test fixtures use made-up names.
-  Screenshots (`docs/images`) show made-up players, games and covers only: no real
-  game, store art or logo.
+  The README's pictures (`docs/images`) may show real games, taken from recordings of
+  them running through PeerParty; the text and alt text around them still don't name
+  the game, and players' names are made up.
 - **Addresses stay hidden.** Internet peers' addresses never reach the game, the overlay,
   names or logs (`core/src/inet/redact.rs`; short tags unless `PEERPARTY_INET_DEBUG=1`).
   New code that logs or shows an address goes through `redact`.

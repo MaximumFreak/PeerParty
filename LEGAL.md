@@ -112,7 +112,9 @@ compatible with.
   Entertainment Inc.
 - Nintendo and Nintendo Switch are trademarks of Nintendo.
 - BattlEye is a trademark of BattlEye Innovations e.K.
-- All other trademarks and game names are the property of their owners.
+- All other trademarks, game names and game artwork are the property of their owners.
+  Screenshots and the trailer show games running through PeerParty only to show what it
+  does.
 
 ## Contact
 
