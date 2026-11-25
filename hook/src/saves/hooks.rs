@@ -4,7 +4,8 @@
 //! (`touch`), and in a later player's copy sends it to the player's own folder
 //! (vfs.rs `route`). Handle-based renames (`SetFileInformationByHandle`) get their
 //! target sent the same way, so a save written to a temporary file and renamed onto the
-//! real name stays the player's.
+//! real name stays the player's. In a split-screen copy, CreateFile also sends an Unreal
+//! game's settings file to PeerParty's copy of it (screen_ini.rs).
 //!
 //! They're only armed when needed (saves/mod.rs).
 
@@ -68,6 +69,18 @@ fn own_a(name: *const u8, intent: Intent) -> Own<u8> {
     let mut out = vec![0u8; n as usize + 1];
     unsafe { WideCharToMultiByte(CP_ACP, 0, w.as_ptr(), w.len() as i32, out.as_mut_ptr(), n, std::ptr::null(), std::ptr::null_mut()) };
     Own::To(out)
+}
+
+/// Unreal's settings file in a split-screen copy (screen_ini.rs), after `own_w` gave
+/// the copy's own path.
+fn ini_w(name: *const u16, intent: Intent) -> Own<u16> {
+    if name.is_null() || BUSY.with(|b| b.get()) || crate::window::virtual_size().is_none() {
+        return Own::Same;
+    }
+    BUSY.with(|b| b.set(true));
+    let r = std::panic::catch_unwind(|| read::wstr(name as usize).and_then(|p| super::screen_ini::route(&p, intent))).unwrap_or(None);
+    BUSY.with(|b| b.set(false));
+    r.map_or(Own::Same, |p| Own::To(p.encode_utf16().chain(Some(0)).collect()))
 }
 
 /// A move's source the call moved away (vfs.rs `gone`).
@@ -322,7 +335,9 @@ unsafe extern "system" fn detour_create_file(name: *const u16, access: u32, shar
     }
     touch(name);
     let asked = name;
-    own!(own_w, name, open_intent(access, disposition, flags), keep, not_there());
+    let intent = open_intent(access, disposition, flags);
+    own!(own_w, name, intent, keep, not_there());
+    own!(ini_w, name, intent, keep_ini, not_there());
     let h = unsafe { CREATE_FILE.get().unwrap().call(name, access, share, sa, disposition, flags, template) };
     crate::input::opened_w(asked, h);
     h
@@ -348,7 +363,9 @@ unsafe extern "system" fn detour_create_file2(name: *const u16, access: u32, sha
     let asked = name;
     // CREATEFILE2_EXTENDED_PARAMETERS: dwSize, dwFileAttributes, dwFileFlags.
     let flags = if params != 0 && crate::sys::win::readable(params, 12) { unsafe { *((params + 8) as *const u32) } } else { 0 };
-    own!(own_w, name, open_intent(access, disposition, flags), keep, not_there());
+    let intent = open_intent(access, disposition, flags);
+    own!(own_w, name, intent, keep, not_there());
+    own!(ini_w, name, intent, keep_ini, not_there());
     let h = unsafe { CREATE_FILE2.get().unwrap().call(name, access, share, disposition, params) };
     crate::input::opened_w(asked, h);
     h

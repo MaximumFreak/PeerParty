@@ -54,6 +54,15 @@ pub(crate) fn lower_layer_presents(hwnd: impl FnOnce() -> usize) -> bool {
     vulkan::presents_to(hwnd()) || vulkan::presented_recently()
 }
 
+/// The copy's pane was resized to `w`x`h`: a game that asked for exclusive fullscreen
+/// sizes its frames from its own settings there, so it's said that it won't follow.
+pub fn pane_resized(w: u32, h: u32) {
+    if fullscreen::exclusive_wanted() {
+        let (vw, vh, _, api) = *crate::sys::lock(&LAST_VIEWPORT);
+        log!("video: the pane is {w}x{h} now, but the game draws exclusive fullscreen ({vw}x{vh}, {api}), which sizes its frames from the game's settings: they're scaled into the pane until the game changes its resolution or window mode itself");
+    }
+}
+
 /// The graphics API PeerParty draws into ("" until a frame has been drawn there).
 
 pub fn api() -> &'static str {

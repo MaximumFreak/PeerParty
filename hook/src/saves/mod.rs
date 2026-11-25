@@ -56,9 +56,11 @@
 //! - hooks.rs: the file calls.
 //! - vfs.rs: where each path goes.
 //! - registry.rs: `HKCU\Software\<vendor>` keys.
+//! - screen_ini.rs: an Unreal game's screen settings in a split-screen pane.
 
 pub(crate) mod hooks;
 pub(crate) mod registry;
+pub(crate) mod screen_ini;
 pub(crate) mod vfs;
 
 use std::cell::Cell;

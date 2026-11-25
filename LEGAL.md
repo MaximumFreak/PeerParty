@@ -56,7 +56,9 @@ registry settings under `HKCU\Software\PeerParty\Saves`; nothing of theirs is wr
 beside player 1's saves. Outside those it writes only: copies of a game's saves under a
 PeerParty player's identity, next to the originals, which are only read; player 1's
 saves when you copy, swap, reset or restore them in the launcher's Saves card or with
-`--copy-save` and the like (what was there is backed up first, in `saves\`); Windows
+`--copy-save` and the like (what was there is backed up first, in `saves\`); the
+settings file of an Unreal game played in split screen, with what the game saved there
+but your own window mode and resolution kept; Windows
 Firewall rules for a game, when you press **Fix** and approve Windows' prompt; the key
 of its local certificate, in your Windows user's key store; and, while it starts an
 Xbox app game, Windows' debug setting for that package, which it clears at once.

@@ -641,7 +641,12 @@ session; a Linux one (frames read back as pixels) isn't at the same level yet.
 - **The pane is the game's screen** (`hook/src/window.rs`). Each copy is told its pane:
   its window, display modes and screen size read as the pane's (or the aspect Layout
   Studio set), so the game renders at the pane's own size. A zoomed pane is told the
-  whole window. The copy keeps reading as the window in front (`GetForegroundWindow`,
+  whole window. A game's saved resolution reads as the pane's too: Unity's registry
+  values (`hook/src/screen_prefs.rs`), and Unreal's `GameUserSettings.ini`, read as a
+  fullscreen window at the pane's size, since in exclusive fullscreen Unreal doesn't
+  follow its window when the pane is resized (`hook/src/saves/screen_ini.rs`; what the
+  game saves goes back to its file with the single-window values kept). The copy keeps
+  reading as the window in front (`GetForegroundWindow`,
   `GetFocus` and focus-loss messages) while another pane has the keyboard and mouse.
 - **Input** (`protocol/src/input_shm.rs`, `host/input_hub.rs`, `hook/src/input/`). The
   host reads every controller, the keyboard and the mouse, and writes each copy's share

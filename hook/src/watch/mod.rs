@@ -374,9 +374,14 @@ fn consider(m: Mod) {
             let n = crate::instance::attach_kernelbase(&table.code);
             log!("instance {} hooked {n}", m.full);
         }
-        if crate::saves::enabled() || crate::saves::own_saves() || crate::saves::watching() {
+        let saves = crate::saves::enabled() || crate::saves::own_saves() || crate::saves::watching();
+        // A copy in a pane opens an Unreal game's settings file as saves/screen_ini.rs
+        // says, from the game's first read of it.
+        if saves || crate::window::virtual_size().is_some() {
             let n = crate::saves::attach_kernelbase(&table.code);
             log!("saves {} file hooks {n}", m.full);
+        }
+        if saves {
             let n = crate::saves::registry::attach_kernelbase(&table.code);
             log!("saves {} registry hooks {n}", m.full);
         }
@@ -392,7 +397,7 @@ fn consider(m: Mod) {
         if crate::net::enabled() && !crate::net::skip("invite") && !crate::child::is_helper() {
             crate::invite::start();
         }
-        if crate::net::enabled() {
+        if crate::net::enabled() || crate::window::virtual_size().is_some() {
             crate::sys::exitlog::attach(&table.code);
         }
         if crate::child::enabled() {

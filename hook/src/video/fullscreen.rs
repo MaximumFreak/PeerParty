@@ -58,6 +58,11 @@ pub fn keep_windowed() -> bool {
     crate::window::in_pane()
 }
 
+/// Whether a swap chain of the game's is one it asked to be fullscreen.
+pub fn exclusive_wanted() -> bool {
+    !crate::sys::lock(&WANTED).is_empty()
+}
+
 /// Says once that the game asked for fullscreen.
 pub fn told(how: &str) {
     if !TOLD.swap(true, Ordering::Relaxed) {

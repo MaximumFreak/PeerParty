@@ -2,7 +2,8 @@
 //! runtime's `exit` / `abort` reach ntdll's `RtlExitUserProcess`; `TerminateProcess` on
 //! itself goes through kernelbase) is logged with the code and the modules on the
 //! caller's stack, so an `abort()` deep in a game (exit code 3, no crash dump) still
-//! says where it came from.
+//! says where it came from. The exit also lets the network layer and a split-screen
+//! copy's Unreal settings (saves/screen_ini.rs) finish up.
 
 use std::sync::OnceLock;
 
@@ -67,6 +68,7 @@ unsafe extern "system" fn exit_hook(code: u32) {
         log!("exit: the process exits with code {code} ({code:#x}); called from {}", stack());
     }
     crate::net::on_exit();
+    crate::saves::screen_ini::on_exit();
     unsafe { EXIT.get().unwrap().call(code) }
 }
 
@@ -77,6 +79,7 @@ unsafe extern "system" fn terminate_hook(process: usize, code: u32) -> i32 {
     }
     if me {
         crate::net::on_exit();
+        crate::saves::screen_ini::on_exit();
     }
     unsafe { TERMINATE.get().unwrap().call(process, code) }
 }

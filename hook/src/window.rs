@@ -475,7 +475,13 @@ pub fn update_spec(spec: InstanceSpec) {
     let pane = spec.pane;
     let slot = spec.slot;
     let had = wants_hooks();
+    let before = virtual_size();
     apply_spec(spec);
+    if let (Some(_), Some((w, h))) = (before, virtual_size())
+        && before != Some((w, h))
+    {
+        crate::video::pane_resized(w, h);
+    }
     if wants_hooks() {
         install_loaded_user32();
         if !had {
