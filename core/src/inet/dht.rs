@@ -160,6 +160,9 @@ pub fn is_dht(d: &[u8]) -> bool {
 const ALPHA: usize = 6;
 const K: usize = 8;
 const MAX_CANDS: usize = 128;
+/// Cached nodes added to one lookup (closest to the target): leaves room for the
+/// bootstrap seeds and reaches them within a few timeouts if the cache went stale.
+const MAX_CACHED_LOOKUP: usize = K * 2;
 const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(25);
 const MAX_NODES: usize = 256;
@@ -186,6 +189,8 @@ struct Lookup {
     started: Instant,
     cands: Vec<Cand>,
     values: usize,
+    evicted: usize,
+    seeded: bool,
 }
 
 impl Lookup {
@@ -221,6 +226,12 @@ pub struct Done {
     pub replied: usize,
     pub values: usize,
     pub announced: usize,
+    /// Dead cached nodes dropped during this lookup.
+    pub evicted: usize,
+    /// Whether this lookup queried any bootstrap seed.
+    pub seeded: bool,
+    /// Whether this lookup hit LOOKUP_TIMEOUT before settling.
+    pub timed_out: bool,
 }
 
 /// An `announce_peer` due: to, topic, port, token, lookup id.
@@ -304,9 +315,21 @@ impl Dht {
     pub fn lookup(&mut self, target: [u8; 20], announce: Option<u16>, now: Instant) -> u64 {
         let id = self.next_lookup;
         self.next_lookup += 1;
-        let mut l = Lookup { id, target, announce, started: now, cands: Vec::new(), values: 0 };
-        for (n, a) in &self.nodes {
-            l.add(*a, Some(*n));
+        let mut l = Lookup { id, target, announce, started: now, cands: Vec::new(), values: 0, evicted: 0, seeded: false };
+        // Seed with the closest cached nodes only, leaving room for the bootstrap seeds:
+        // a stale cache full of dead nodes must never crowd them out or burn the whole
+        // lookup timeout before falling back to them.
+        let cached_cap = MAX_CACHED_LOOKUP.min(MAX_CANDS.saturating_sub(self.seeds.len()));
+        if cached_cap > 0 && !self.nodes.is_empty() {
+            let mut closest: Vec<([u8; 20], SocketAddr, [u8; 20])> = self
+                .nodes
+                .iter()
+                .map(|&(n, a)| (std::array::from_fn(|i| n[i] ^ target[i]), a, n))
+                .collect();
+            closest.sort_by_key(|(dist, _, _)| *dist);
+            for (_, a, n) in closest.into_iter().take(cached_cap) {
+                l.add(a, Some(n));
+            }
         }
         for s in &self.seeds {
             l.add(*s, None);
@@ -341,12 +364,19 @@ impl Dht {
         let mut done = Vec::new();
         let mut sends: Vec<(SocketAddr, [u8; 20], u64)> = Vec::new();
         let mut announces: Vec<Announce> = Vec::new();
+        let seeds = &self.seeds;
+        let nodes = &mut self.nodes;
         self.lookups.retain_mut(|l| {
             for c in &mut l.cands {
                 if let Ask::Asked(at) = c.ask
                     && now.duration_since(at) >= QUERY_TIMEOUT
                 {
                     c.ask = Ask::Failed;
+                    let before = nodes.len();
+                    nodes.retain(|(_, a)| *a != c.addr);
+                    if nodes.len() < before {
+                        l.evicted += before - nodes.len();
+                    }
                 }
             }
             let live: Vec<usize> = (0..l.cands.len()).filter(|&i| l.cands[i].ask != Ask::Failed).collect();
@@ -358,6 +388,9 @@ impl Dht {
                 }
                 if l.cands[i].ask == Ask::New {
                     l.cands[i].ask = Ask::Asked(now);
+                    if seeds.contains(&l.cands[i].addr) {
+                        l.seeded = true;
+                    }
                     sends.push((l.cands[i].addr, l.target, l.id));
                     outstanding += 1;
                 }
@@ -365,7 +398,8 @@ impl Dht {
             let closest = &live[..live.len().min(K)];
             let settled = outstanding == 0
                 && closest.iter().all(|&i| l.cands[i].ask == Ask::Replied);
-            if !(settled || now.duration_since(l.started) >= LOOKUP_TIMEOUT || live.is_empty()) {
+            let timed_out = now.duration_since(l.started) >= LOOKUP_TIMEOUT;
+            if !(settled || timed_out || live.is_empty()) {
                 return true;
             }
             let replied: Vec<&Cand> = l.cands.iter().filter(|c| c.ask == Ask::Replied).collect();
@@ -376,7 +410,16 @@ impl Dht {
                     announced += 1;
                 }
             }
-            done.push(Done { id: l.id, target: l.target, replied: replied.len(), values: l.values, announced });
+            done.push(Done {
+                id: l.id,
+                target: l.target,
+                replied: replied.len(),
+                values: l.values,
+                announced,
+                evicted: l.evicted,
+                seeded: l.seeded,
+                timed_out: timed_out && !settled && !live.is_empty(),
+            });
             false
         });
         for (to, target, lookup) in sends {
@@ -428,6 +471,11 @@ impl Dht {
             if let Some(c) = cand {
                 c.ask = Ask::Failed;
             }
+            let before = self.nodes.len();
+            self.nodes.retain(|(_, a)| *a != from);
+            if self.nodes.len() < before {
+                lookup.evicted += before - self.nodes.len();
+            }
             return true;
         }
         self.replies += 1;
@@ -444,9 +492,8 @@ impl Dht {
             }
         }
         lookup.cands.sort_by_key(|a| a.dist);
-        if let Some(n) = node
-            && !self.nodes.iter().any(|(_, a)| *a == from)
-        {
+        if let Some(n) = node {
+            self.nodes.retain(|(_, a)| *a != from);
             if self.nodes.len() >= MAX_NODES {
                 self.nodes.remove(0);
             }
@@ -721,6 +768,49 @@ mod tests {
         let done = d.tick(t0 + QUERY_TIMEOUT);
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].replied, 0);
+        assert!(done[0].seeded);
+        assert!(!done[0].timed_out);
         assert!(!d.busy());
+    }
+
+    #[test]
+    fn stale_cached_nodes_dont_crowd_out_seeds_and_are_evicted() {
+        let seed_addr: SocketAddr = "10.0.0.1:6881".parse().unwrap();
+        let me: SocketAddr = "10.0.0.2:5000".parse().unwrap();
+        // More dead cached nodes than MAX_CANDS: before the fix, the seed was dropped
+        // from the lookup and dead cached nodes stayed in the cache forever.
+        let cached: Vec<([u8; 20], SocketAddr)> = (0..200u16)
+            .map(|i| ([i as u8; 20], SocketAddr::from(([10, 0, 1, (i % 250) as u8 + 1], 10000 + i))))
+            .collect();
+        let mut d = Dht::new(vec![seed_addr], cached);
+        d.allow_private = true;
+        let mut seed = TestNode::default();
+        let started = Instant::now();
+        let mut now = started;
+        d.lookup([0x55; 20], Some(5000), now);
+        let mut done = Vec::new();
+        for _ in 0..10 {
+            done.extend(d.tick(now));
+            for (to, q) in d.drain_out() {
+                if to == seed_addr
+                    && let Some(r) = seed.answer(me, &q)
+                {
+                    assert!(d.handle(seed_addr, &r));
+                }
+            }
+            if !done.is_empty() {
+                break;
+            }
+            now += QUERY_TIMEOUT;
+        }
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].replied, 1);
+        assert_eq!(done[0].announced, 1);
+        assert_eq!(done[0].evicted, MAX_CACHED_LOOKUP);
+        assert!(done[0].seeded);
+        assert!(!done[0].timed_out);
+        assert!(now.duration_since(started) < LOOKUP_TIMEOUT);
+        assert_eq!(d.good_nodes().len(), 200 - MAX_CACHED_LOOKUP + 1);
+        assert_eq!(d.good_nodes().last().map(|(_, a)| *a), Some(seed_addr));
     }
 }

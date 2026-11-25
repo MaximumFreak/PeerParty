@@ -660,7 +660,9 @@ impl Inet {
         };
         let me = PeerInfo { id: host.me(), game: host.game(), name };
         let max_sessions = if pubs.is_some() { PUBLIC_MAX_SESSIONS } else { MAX_SESSIONS };
-        let mut dht = cfg.dht.then(|| Dht::new(Vec::new(), load_nodes(&cfg.node_cache)));
+        let cached_nodes = load_nodes(&cfg.node_cache);
+        let cached_count = cached_nodes.len();
+        let mut dht = cfg.dht.then(|| Dht::new(Vec::new(), cached_nodes));
         if let Some(d) = &mut dht {
             d.allow_private = cfg.allow_private;
         }
@@ -725,7 +727,7 @@ impl Inet {
             "started: room {} udp {local_port}, ipv6 {}, dht {}, {} static peer(s)",
             sh.cfg.room.fingerprint(),
             sh.sock6.as_ref().and_then(|s| s.local_addr().ok()).map_or("off".to_string(), |a| format!("udp {}", a.port())),
-            if sh.cfg.dht { "on" } else { "off" },
+            if sh.cfg.dht { format!("on ({cached_count} cached node(s))") } else { "off".into() },
             sh.cfg.peers.len()
         ));
         if sh.cfg.dht && sh.cfg.early_lookup_every != disc::EARLY_LOOKUP_EVERY {

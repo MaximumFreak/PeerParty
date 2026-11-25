@@ -639,6 +639,7 @@ fn state() -> String {
                 .collect();
             internet.push(Json::obj(vec![
                 ("mode", Json::str(mode)),
+                ("room", Json::str(st.room.clone())),
                 ("online", Json::Bool(st.public.is_some())),
                 ("nat", Json::str(st.nat.describe())),
                 ("port_map", Json::str(st.port_map.clone().unwrap_or_default())),

@@ -215,47 +215,95 @@ impl App {
             let st = &mut self.together;
             let focus = &mut self.nav.focus_first;
             let room = p.room.trim().to_string();
-            match RoomCode::parse(&room) {
-                Some(code) => {
-                    // The room's name, big, and the code itself hidden until asked.
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(t!("together.room_name", room = code.fingerprint())).font(theme::strong(22.0)).color(TEXT));
-                    });
-                    let shown = if st.show_code { room.clone() } else { masked(&room) };
-                    egui::Frame::new().fill(theme::FIELD).corner_radius(10).inner_margin(egui::Margin::symmetric(12, 9)).stroke(egui::Stroke::new(1.0, theme::line())).show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.add(egui::Label::new(RichText::new(shown).monospace().size(13.5).color(TEXT2)).wrap());
-                    });
-                    ui.add_space(4.0);
-                    ui.horizontal_wrapped(|ui| {
-                        let r = widgets::button(ui, Some(Icon::Copy), t!("together.copy_code"), Kind::Primary);
-                        first_focus(&r, focus);
-                        if r.clicked() {
-                            ui.ctx().copy_text(room.clone());
-                            say = Some(t!("together.copied").to_string());
-                        }
-                        let label = if st.show_code { t!("together.hide_code") } else { t!("together.show_code") };
-                        if widgets::button(ui, Some(Icon::Hidden), label, Kind::Secondary).clicked() {
-                            st.show_code = !st.show_code;
-                        }
-                        if widgets::button(ui, Some(Icon::Leave), t!("together.leave"), Kind::Danger).on_hover_text(t!("together.leave_tip")).clicked() {
-                            st.left = Some(room.clone());
-                            p.room.clear();
-                            st.show_code = false;
-                        }
-                    });
-                    ui.add_space(4.0);
-                    widgets::note(ui, Icon::Lock, TEXT3, t!("together.room_private"));
+            if let Some(code) = &mut st.join {
+                ui.label(RichText::new(t!("together.join_prompt")).color(TEXT2));
+                let r = widgets::text_field(ui, code, "PP1-XXXX-XXXX-…", ui.available_width(), 64);
+                if std::mem::take(&mut st.join_focus) {
+                    r.request_focus();
                 }
-                None if !room.is_empty() => {
-                    widgets::note(ui, Icon::Warning, theme::BAD, t!("together.bad_code"));
-                    let r = widgets::button(ui, None, t!("common.clear"), Kind::Secondary);
-                    first_focus(&r, focus);
-                    if r.clicked() {
-                        p.room.clear();
+                let valid = RoomCode::parse(code.trim()).is_some();
+                if !code.trim().is_empty() && !valid {
+                    widgets::note(ui, Icon::Warning, theme::WARN, t!("together.join_invalid"));
+                }
+                let mut done = None;
+                // Enter in the field joins, Esc cancels.
+                if r.lost_focus() {
+                    let (enter, esc) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+                    if enter && valid {
+                        done = Some(Some(code.trim().to_string()));
+                    } else if esc {
+                        done = Some(None);
                     }
                 }
-                None => match &mut st.join {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add_enabled_ui(valid, |ui| widgets::button(ui, Some(Icon::Check), t!("together.join_go"), Kind::Primary)).inner.clicked() {
+                        done = Some(Some(code.trim().to_string()));
+                    }
+                    if widgets::button(ui, Some(Icon::Paste), t!("together.paste"), Kind::Secondary).clicked() {
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                        r.request_focus();
+                    }
+                    if widgets::button(ui, None, t!("common.cancel"), Kind::Ghost).clicked() {
+                        done = Some(None);
+                    }
+                });
+                widgets::note(ui, Icon::Keyboard, TEXT3, t!("together.join_keyboard"));
+                if let Some(d) = done {
+                    if let Some(c) = d {
+                        if RoomCode::parse(&room).is_some() && room != c {
+                            st.left = Some(room);
+                        }
+                        p.room = c;
+                        p.internet = true;
+                        st.show_code = false;
+                    }
+                    st.join = None;
+                }
+            } else {
+                match RoomCode::parse(&room) {
+                    Some(code) => {
+                        // The room's name, big, and the code itself hidden until asked.
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(t!("together.room_name", room = code.fingerprint())).font(theme::strong(22.0)).color(TEXT));
+                        });
+                        let shown = if st.show_code { room.clone() } else { masked(&room) };
+                        egui::Frame::new().fill(theme::FIELD).corner_radius(10).inner_margin(egui::Margin::symmetric(12, 9)).stroke(egui::Stroke::new(1.0, theme::line())).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.add(egui::Label::new(RichText::new(shown).monospace().size(13.5).color(TEXT2)).wrap());
+                        });
+                        ui.add_space(4.0);
+                        ui.horizontal_wrapped(|ui| {
+                            let r = widgets::button(ui, Some(Icon::Copy), t!("together.copy_code"), Kind::Primary);
+                            first_focus(&r, focus);
+                            if r.clicked() {
+                                ui.ctx().copy_text(room.clone());
+                                say = Some(t!("together.copied").to_string());
+                            }
+                            let label = if st.show_code { t!("together.hide_code") } else { t!("together.show_code") };
+                            if widgets::button(ui, Some(Icon::Hidden), label, Kind::Secondary).clicked() {
+                                st.show_code = !st.show_code;
+                            }
+                            if widgets::button(ui, Some(Icon::Link), t!("together.join"), Kind::Secondary).clicked() {
+                                st.join = Some(String::new());
+                                st.join_focus = true;
+                            }
+                            if widgets::button(ui, Some(Icon::Leave), t!("together.leave"), Kind::Danger).on_hover_text(t!("together.leave_tip")).clicked() {
+                                st.left = Some(room.clone());
+                                p.room.clear();
+                                st.show_code = false;
+                            }
+                        });
+                        ui.add_space(4.0);
+                        widgets::note(ui, Icon::Lock, TEXT3, t!("together.room_private"));
+                    }
+                    None if !room.is_empty() => {
+                        widgets::note(ui, Icon::Warning, theme::BAD, t!("together.bad_code"));
+                        let r = widgets::button(ui, None, t!("common.clear"), Kind::Secondary);
+                        first_focus(&r, focus);
+                        if r.clicked() {
+                            p.room.clear();
+                        }
+                    }
                     None => {
                         ui.add(egui::Label::new(RichText::new(t!("together.room_text")).color(TEXT2)).wrap());
                         ui.add_space(6.0);
@@ -282,48 +330,7 @@ impl App {
                             }
                         });
                     }
-                    Some(code) => {
-                        ui.label(RichText::new(t!("together.join_prompt")).color(TEXT2));
-                        let r = widgets::text_field(ui, code, "PP1-XXXX-XXXX-…", ui.available_width(), 64);
-                        if std::mem::take(&mut st.join_focus) {
-                            r.request_focus();
-                        }
-                        let valid = RoomCode::parse(code.trim()).is_some();
-                        if !code.trim().is_empty() && !valid {
-                            widgets::note(ui, Icon::Warning, theme::WARN, t!("together.join_invalid"));
-                        }
-                        let mut done = None;
-                        // Enter in the field joins, Esc cancels.
-                        if r.lost_focus() {
-                            let (enter, esc) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
-                            if enter && valid {
-                                done = Some(Some(code.trim().to_string()));
-                            } else if esc {
-                                done = Some(None);
-                            }
-                        }
-                        ui.horizontal_wrapped(|ui| {
-                            if ui.add_enabled_ui(valid, |ui| widgets::button(ui, Some(Icon::Check), t!("together.join_go"), Kind::Primary)).inner.clicked() {
-                                done = Some(Some(code.trim().to_string()));
-                            }
-                            if widgets::button(ui, Some(Icon::Paste), t!("together.paste"), Kind::Secondary).clicked() {
-                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::RequestPaste);
-                                r.request_focus();
-                            }
-                            if widgets::button(ui, None, t!("common.cancel"), Kind::Ghost).clicked() {
-                                done = Some(None);
-                            }
-                        });
-                        widgets::note(ui, Icon::Keyboard, TEXT3, t!("together.join_keyboard"));
-                        if let Some(d) = done {
-                            if let Some(c) = d {
-                                p.room = c;
-                                p.internet = true;
-                            }
-                            st.join = None;
-                        }
-                    }
-                },
+                }
             }
         });
         if let Some(s) = say {
@@ -469,5 +476,42 @@ mod tests {
         assert!(p.public && !st.confirm_public, "yes turns them on");
         run(&mut p, &mut st, Some("public-switch"));
         assert!(!p.public && !st.confirm_public, "off is at once");
+    }
+
+    /// Joining a friend's room works directly when you already have a room, and remembers
+    /// the old one so nothing is lost.
+    #[test]
+    fn joining_replaces_an_existing_room_without_leaving_first() {
+        crate::i18n::set("en");
+        let ctx = egui::Context::default();
+        let mut app = super::super::App::with(ctx.clone(), super::super::store::Settings::default(), false);
+        let first = RoomCode::generate().to_string();
+        let friend = RoomCode::generate().to_string();
+        app.settings.prefs.room = first.clone();
+        app.settings.prefs.internet = false;
+        app.together.join = Some(friend.clone());
+        let run = |app: &mut super::super::App, events: Vec<egui::Event>, t: f64| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 700.0))),
+                time: Some(t),
+                events,
+                ..Default::default()
+            };
+            ctx.run_ui(input, |ui| app.room_card(ui)).textures_delta.clear();
+        };
+        run(&mut app, Vec::new(), 0.5);
+        // Verify the Join form shows even when already in a room, and Enter switches rooms.
+        assert_eq!(app.together.join.as_deref(), Some(friend.as_str()));
+        let mut events = Vec::new();
+        for pressed in [true, false] {
+            events.push(egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed, repeat: false, modifiers: egui::Modifiers::NONE });
+        }
+        app.together.join_focus = true;
+        run(&mut app, Vec::new(), 1.0);
+        run(&mut app, events, 1.5);
+        assert_eq!(app.settings.prefs.room, friend);
+        assert!(app.settings.prefs.internet);
+        assert_eq!(app.together.left.as_deref(), Some(first.as_str()));
+        assert!(app.together.join.is_none());
     }
 }

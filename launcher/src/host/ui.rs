@@ -89,6 +89,8 @@ pub struct Firewall {
 pub struct NetInfo {
     /// "room" or "public".
     pub mode: String,
+    /// The room's fingerprint ("public" for public sessions, empty from older hooks).
+    pub room: String,
     /// We know our internet address (STUN or the DHT answered).
     pub online: bool,
     pub nat: String,
@@ -270,6 +272,7 @@ impl GameState {
                     let num = |k: &str| n.get(k).and_then(Value::as_f64).unwrap_or(0.0).max(0.0) as u64;
                     NetInfo {
                         mode: s(n, "mode"),
+                        room: no_ip(&s(n, "room")),
                         online: n.get("online").and_then(Value::as_bool).unwrap_or(false),
                         nat: no_ip(&s(n, "nat")),
                         port_map: no_ip(&s(n, "port_map")),
@@ -1104,7 +1107,13 @@ impl Overlay {
         }
         if st.internet_on {
             for n in &st.internet {
-                let title = if n.mode == "public" { t!("overlay.net_public", n = n.peers.len()) } else { t!("overlay.net_room", n = n.peers.len()) };
+                let title = if n.mode == "public" {
+                    t!("overlay.net_public", n = n.peers.len())
+                } else if !n.room.is_empty() {
+                    format!("{}  \u{b7}  {}", t!("overlay.net_room", n = n.peers.len()), t!("together.room_name", room = n.room))
+                } else {
+                    t!("overlay.net_room", n = n.peers.len())
+                };
                 let detail = if n.online { t!("overlay.net_online", nat = if n.nat.is_empty() { t!("overlay.unknown").to_string() } else { n.nat.clone() }) } else { t!("overlay.net_looking").to_string() };
                 rows.push(Row::info(title, detail).icon(if n.mode == "public" { Icon::Globe } else { Icon::People }, if n.online { Tone::Good } else { Tone::Plain }));
             }
@@ -1123,7 +1132,14 @@ impl Overlay {
         let st = &self.state;
         let mut rows = Vec::new();
         for n in &st.internet {
-            rows.push(Row::header(if n.mode == "public" { t!("overlay.via_public") } else { t!("overlay.via_room") }));
+            let header = if n.mode == "public" {
+                t!("overlay.via_public").to_string()
+            } else if !n.room.is_empty() {
+                format!("{}  \u{b7}  {}", t!("overlay.via_room"), t!("together.room_name", room = n.room))
+            } else {
+                t!("overlay.via_room").to_string()
+            };
+            rows.push(Row::header(header));
             rows.push(Row::info(t!("overlay.d_router"), if n.nat.is_empty() { t!("overlay.unknown").to_string() } else { n.nat.clone() }));
             rows.push(Row::info(t!("overlay.d_ports"), if n.port_map.is_empty() { t!("overlay.d_ports_none").to_string() } else { n.port_map.clone() }));
             rows.push(Row::info(t!("overlay.d_dht"), t!("overlay.d_dht_detail", nodes = n.dht_nodes, found = n.found)));
@@ -1964,6 +1980,28 @@ mod tests {
         let rows = o.rows();
         assert!(rows.iter().all(|r| r.main != Action::ToggleInternet));
         assert!(rows.iter().any(|r| r.title == "Internet play isn't set up"));
+
+        // Room fingerprint shows on Network and Connection details so friends can compare rooms.
+        o.state = GameState::from_json(&serde_json::json!({
+            "t": "state",
+            "internet_on": true,
+            "internet_configured": true,
+            "internet": [{
+                "mode": "room",
+                "room": "a1b2c3d4",
+                "online": true,
+                "nat": "hole-punch friendly",
+                "port_map": "",
+                "dht_nodes": 40,
+                "found": 1,
+                "blocked": 0,
+                "peers": []
+            }]
+        }));
+        o.open(Page::Network, false);
+        assert!(o.rows().iter().any(|r| r.title.contains("Room a1b2c3d4")), "network row names the room");
+        o.open(Page::Details, false);
+        assert!(o.rows().iter().any(|r| r.title.contains("Room a1b2c3d4")), "details header names the room");
     }
 
     /// A firewall problem is the Network page's first row (and Players'): Fix asks the host to fix it

@@ -223,7 +223,11 @@ pub(super) fn disc_tick(sh: &Arc<Shared>, now: Instant) {
             && statics.len() >= sh.cfg.peers.len().min(1);
         d.next_resolve = now + if ok { Duration::from_secs(600) } else { Duration::from_secs(30) };
         if !ok {
-            sh.log("couldn't look up some names (offline?): trying again in 30 s");
+            sh.log(&format!(
+                "couldn't look up some names (offline?): {} bootstrap, {} stun; trying again in 30 s",
+                seeds.len(),
+                stuns.len()
+            ));
         }
         if let Some(x) = &mut d.dht
             && !seeds.is_empty()
@@ -280,10 +284,29 @@ pub(super) fn disc_tick(sh: &Arc<Shared>, now: Instant) {
     // DHT: announce and look up this hour's topic (and the last hour's, early on).
     let connected = sh.sessions.lock().unwrap().values().any(|s| s.confirmed);
     if let Some(x) = &mut d.dht {
+        let slot = unix_now() / SLOT_SECS;
         for done in x.tick(now) {
+            let mut extra = String::new();
+            if done.timed_out {
+                extra.push_str(", timed out");
+            }
+            if done.evicted > 0 {
+                extra.push_str(&format!(", evicted {} dead cached node(s)", done.evicted));
+            }
+            if done.seeded {
+                extra.push_str(", queried bootstrap seeds");
+            }
             sh.log(&format!(
-                "dht lookup {}: {} node(s) answered, {} address(es) found, announced to {}",
-                done.id, done.replied, done.values, done.announced
+                "dht lookup {}: {} node(s) answered, {} address(es) found, announced to {} (slot {slot}, topic {:02x}{:02x}{:02x}{:02x}, cache {} node(s){extra})",
+                done.id,
+                done.replied,
+                done.values,
+                done.announced,
+                done.target[0],
+                done.target[1],
+                done.target[2],
+                done.target[3],
+                x.good_nodes().len()
             ));
         }
         if d.next_lookup <= now && !x.busy() {

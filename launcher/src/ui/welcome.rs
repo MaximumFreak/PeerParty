@@ -30,6 +30,11 @@ pub struct Welcome {
     /// The room Start makes when friends are chosen and there's none yet: made here so
     /// the last step can show and copy its code before anything is saved.
     new_room: String,
+    /// A friend's code being pasted or typed on the last step, instead of making one.
+    join: Option<String>,
+    join_focus: bool,
+    /// The player joined a friend's room on the last step (overrides any existing room).
+    joined: bool,
     public: bool,
     voice: bool,
     public_voice: bool,
@@ -50,6 +55,9 @@ impl Welcome {
             player2: p.other_name.clone(),
             friends: RoomCode::parse(p.room.trim()).is_some(),
             new_room: RoomCode::generate().to_string(),
+            join: None,
+            join_focus: false,
+            joined: false,
             public: p.public,
             voice: p.voice,
             // Recommended off with strangers, whatever the stored default.
@@ -84,7 +92,7 @@ impl Welcome {
         let had_room = RoomCode::parse(p.room.trim()).is_some();
         // Internet play newly chosen turns the internet on; run again with the same
         // answers, a pause the player chose stays.
-        let newly_online = (self.friends && !had_room) || (self.public && !p.public);
+        let newly_online = (self.friends && (!had_room || self.joined)) || (self.public && !p.public);
         let mut cleared = None;
         p.name = self.name.trim().to_string();
         p.language = self.language.clone();
@@ -92,7 +100,12 @@ impl Welcome {
             p.other_name = self.player2.trim().to_string();
         }
         if self.friends {
-            if !had_room {
+            if self.joined {
+                if had_room && p.room.trim() != self.new_room {
+                    cleared = Some(p.room.clone());
+                }
+                p.room = self.new_room.clone();
+            } else if !had_room {
                 p.room = self.new_room.clone();
             }
         } else if !p.room.trim().is_empty() {
@@ -115,9 +128,16 @@ impl Welcome {
         self.split && !self.friends && !self.public
     }
 
-    /// The room code the last step shows: the one there is, else the one Start makes.
+    /// The room code the last step shows: the one joined here, else the one there is,
+    /// else the one Start makes.
     fn room_code(&self, p: &Prefs) -> String {
-        if RoomCode::parse(p.room.trim()).is_some() { p.room.trim().to_string() } else { self.new_room.clone() }
+        if self.joined {
+            self.new_room.clone()
+        } else if RoomCode::parse(p.room.trim()).is_some() {
+            p.room.trim().to_string()
+        } else {
+            self.new_room.clone()
+        }
     }
 }
 
@@ -196,7 +216,7 @@ impl App {
                         egui::Frame::new().inner_margin(egui::Margin { left: 0, right: STEP_GUTTER, top: 0, bottom: 0 }).show(ui, |ui| match w.step {
                             0 => self.welcome_hello(ui, &mut w, &mut done),
                             1 => self.welcome_who(ui, &mut w),
-                            _ => self.welcome_done(ui, &w),
+                            _ => self.welcome_done(ui, &mut w),
                         });
                     });
                 ui.add_space(20.0);
@@ -341,7 +361,7 @@ impl App {
     }
 
     /// What was chosen, as what to do next: no list of what's off.
-    fn welcome_done(&mut self, ui: &mut egui::Ui, w: &Welcome) {
+    fn welcome_done(&mut self, ui: &mut egui::Ui, w: &mut Welcome) {
         ui.label(RichText::new(t!("welcome.done")).font(theme::strong(24.0)).color(TEXT));
         ui.label(RichText::new(t!("welcome.done_sub")).color(TEXT2));
         ui.add_space(14.0);
@@ -356,16 +376,60 @@ impl App {
             let room = RoomCode::parse(&code).map(|c| t!("together.room_name", room = c.fingerprint())).unwrap_or_default();
             widgets::card_with(ui, Some(ACCENT), |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(RichText::new(room).font(theme::strong(16.0)).color(TEXT));
-                ui.label(RichText::new(super::together::masked(&code)).monospace().size(13.0).color(TEXT2));
-                ui.add_space(4.0);
-                ui.horizontal_wrapped(|ui| {
-                    if widgets::button(ui, Some(Icon::Copy), t!("together.copy_code"), Kind::Secondary).clicked() {
-                        ui.ctx().copy_text(code.clone());
-                        self.say(t!("together.copied"), true);
+                if let Some(input) = &mut w.join {
+                    ui.label(RichText::new(t!("together.join_prompt")).color(TEXT2));
+                    let r = widgets::text_field(ui, input, "PP1-XXXX-XXXX-…", ui.available_width(), 64);
+                    if std::mem::take(&mut w.join_focus) {
+                        r.request_focus();
                     }
-                    ui.label(RichText::new(t!("welcome.room_send")).size(12.5).color(TEXT3));
-                });
+                    let valid = RoomCode::parse(input.trim()).is_some();
+                    if !input.trim().is_empty() && !valid {
+                        widgets::note(ui, Icon::Warning, WARN, t!("together.join_invalid"));
+                    }
+                    let mut finish = None;
+                    if r.lost_focus() {
+                        let (enter, esc) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+                        if enter && valid {
+                            finish = Some(Some(input.trim().to_string()));
+                        } else if esc {
+                            finish = Some(None);
+                        }
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.add_enabled_ui(valid, |ui| widgets::button(ui, Some(Icon::Check), t!("together.join_go"), Kind::Primary)).inner.clicked() {
+                            finish = Some(Some(input.trim().to_string()));
+                        }
+                        if widgets::button(ui, Some(Icon::Paste), t!("together.paste"), Kind::Secondary).clicked() {
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                            r.request_focus();
+                        }
+                        if widgets::button(ui, None, t!("common.cancel"), Kind::Ghost).clicked() {
+                            finish = Some(None);
+                        }
+                    });
+                    if let Some(d) = finish {
+                        if let Some(c) = d {
+                            w.new_room = c;
+                            w.joined = true;
+                        }
+                        w.join = None;
+                    }
+                } else {
+                    ui.label(RichText::new(room).font(theme::strong(16.0)).color(TEXT));
+                    ui.label(RichText::new(super::together::masked(&code)).monospace().size(13.0).color(TEXT2));
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if widgets::button(ui, Some(Icon::Copy), t!("together.copy_code"), Kind::Secondary).clicked() {
+                            ui.ctx().copy_text(code.clone());
+                            self.say(t!("together.copied"), true);
+                        }
+                        if widgets::button(ui, Some(Icon::Link), t!("together.join"), Kind::Secondary).clicked() {
+                            w.join = Some(String::new());
+                            w.join_focus = true;
+                        }
+                        ui.label(RichText::new(t!("welcome.room_send")).size(12.5).color(TEXT3));
+                    });
+                }
             });
             ui.add_space(4.0);
         }
@@ -444,8 +508,14 @@ mod tests {
         assert!(p.public && !p.public_voice && !p.voice);
         w.apply(&mut p);
         assert_eq!(p.room, code, "an existing room is kept");
+        let friend = RoomCode::generate().to_string();
+        w.new_room = friend.clone();
+        w.joined = true;
+        assert_eq!(w.room_code(&p), friend, "a joined code is shown before Start");
+        assert_eq!(w.apply(&mut p).as_deref(), Some(code.as_str()), "joining a friend's room hands back the replaced room");
+        assert_eq!(p.room, friend);
         w.friends = false;
-        assert_eq!(w.apply(&mut p).as_deref(), Some(code.as_str()), "the room cleared is handed back");
+        assert_eq!(w.apply(&mut p).as_deref(), Some(friend.as_str()), "the room cleared is handed back");
         assert!(p.room.is_empty());
         assert_eq!(w.apply(&mut p), None);
         // Split screen: Player 2's name; left out, the name stays as it was.
