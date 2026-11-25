@@ -590,19 +590,20 @@ impl CompositorWindow {
     }
 
     /// Forwards queued keyboard and mouse messages from the compositor window to the
-    /// focused pane (or switches focus to the clicked pane first). Returns the newly
-    /// focused pane if a mouse click changed focus. While `overlay_open` or `kbm_off`,
-    /// only releases for already-held keys and buttons are delivered.
-    pub fn forward_input(&mut self, focus: usize, overlay_open: bool, kbm_off: bool, instances: &[InstanceConn]) -> Option<usize> {
+    /// focused pane (or switches focus to the clicked pane first, when `can_click_focus`
+    /// allows it). Returns the newly focused pane if a mouse click changed focus. While
+    /// `overlay_open` or `kbm_off`, only releases for already-held keys and buttons are
+    /// delivered.
+    pub fn forward_input(&mut self, focus: usize, overlay_open: bool, kbm_off: bool, can_click_focus: &[bool], instances: &[InstanceConn]) -> Option<usize> {
         #[cfg(windows)]
         if self.window.is_some() {
             let panes = self.display_panes();
             let zs: Vec<u8> = self.slots.iter().map(|s| s.z).collect();
             let w = self.window.as_mut().expect("checked");
-            return w.forward_input(focus, overlay_open || kbm_off, &panes, &zs, instances);
+            return w.forward_input(focus, overlay_open || kbm_off, &panes, &zs, can_click_focus, instances);
         }
         #[cfg(not(windows))]
-        let _ = (focus, overlay_open, kbm_off, instances);
+        let _ = (focus, overlay_open, kbm_off, can_click_focus, instances);
         None
     }
 
@@ -1645,7 +1646,7 @@ mod win {
 
         /// Drains keyboard/mouse messages received by the compositor window and forwards
         /// them to the focused pane's game window with mapped coordinates.
-        pub fn forward_input(&mut self, mut focus: usize, overlay_open: bool, panes: &[PaneRect], zs: &[u8], instances: &[InstanceConn]) -> Option<usize> {
+        pub fn forward_input(&mut self, mut focus: usize, overlay_open: bool, panes: &[PaneRect], zs: &[u8], can_click_focus: &[bool], instances: &[InstanceConn]) -> Option<usize> {
             let events: Vec<ForwardedInput> = match input_queue().lock() {
                 Ok(mut q) => std::mem::take(&mut *q),
                 Err(_) => return None,
@@ -1683,7 +1684,7 @@ mod win {
                     let (_, hwnd, lp) = self.pressed.swap_remove(i);
                     let here = self.shown.get(focus).and_then(|s| s.as_ref()).map(|s| s.source as isize);
                     // Let go where it went down: as any other message, where the mouse is now.
-                    if !overlay_open && here == Some(hwnd) && self.forward_one(ev, &mut focus, &mut switched, &pane_at, instances) {
+                    if !overlay_open && here == Some(hwnd) && self.forward_one(ev, &mut focus, &mut switched, &pane_at, can_click_focus, instances) {
                         continue;
                     }
                     let (msg, w, lp) = match ev {
@@ -1695,15 +1696,16 @@ mod win {
                     continue;
                 }
                 if !overlay_open {
-                    self.forward_one(ev, &mut focus, &mut switched, &pane_at, instances);
+                    self.forward_one(ev, &mut focus, &mut switched, &pane_at, can_click_focus, instances);
                 }
             }
             switched
         }
 
         /// Forwards `ev` to the focused pane's game window (a click on another pane
-        /// focuses it first: `focus`, `switched`). False when it went nowhere.
-        fn forward_one(&mut self, ev: ForwardedInput, focus: &mut usize, switched: &mut Option<usize>, pane_at: &dyn Fn(i32, i32) -> Option<usize>, instances: &[InstanceConn]) -> bool {
+        /// focuses it first when `can_click_focus` permits: `focus`, `switched`). False
+        /// when it went nowhere.
+        fn forward_one(&mut self, ev: ForwardedInput, focus: &mut usize, switched: &mut Option<usize>, pane_at: &dyn Fn(i32, i32) -> Option<usize>, can_click_focus: &[bool], instances: &[InstanceConn]) -> bool {
             match ev {
                 ForwardedInput::Mouse { msg, w, cx, cy, is_wheel, is_button_down } => {
                     if is_button_down
@@ -1711,6 +1713,7 @@ mod win {
                         && hit < instances.len()
                         && !instances[hit].gone
                         && hit != *focus
+                        && can_click_focus.get(hit).copied().unwrap_or(true)
                     {
                         *focus = hit;
                         *switched = Some(hit);
@@ -1879,8 +1882,16 @@ mod win {
                 let src = s.source as HWND;
                 if unsafe { IsWindow(src) } != 0 && unsafe { IsHungAppWindow(src) } == 0 {
                     unsafe {
+                        // `s.style.1` may already carry `WS_EX_TOOLWINDOW` from the hook's
+                        // `CreateWindowEx` containment: always clear it and toggle visibility
+                        // so Windows Shell restores the game's taskbar button.
+                        let want_ex = (s.style.1 & !(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) | WS_EX_APPWINDOW;
+                        let visible = IsWindowVisible(src) != 0;
+                        if visible {
+                            ShowWindowAsync(src, SW_HIDE);
+                        }
                         SetWindowLongW(src, GWL_STYLE, s.style.0 as i32);
-                        SetWindowLongW(src, GWL_EXSTYLE, s.style.1 as i32);
+                        SetWindowLongW(src, GWL_EXSTYLE, want_ex as i32);
                         SetWindowPos(src, std::ptr::null_mut(), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS);
                         ShowWindowAsync(src, SW_SHOWNOACTIVATE);
                     }

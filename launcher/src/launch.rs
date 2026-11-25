@@ -528,8 +528,15 @@ pub fn start(l: Launch) -> Result<Exited, LaunchError> {
 
     // Hosted, the logs go where the peerparty outside Proton keeps them.
     let outside = l.hosted.then(|| env.get(penv::LOG_DIR).map(PathBuf::from)).flatten();
+    let custom_log_dir = l.log_dir.is_some() || outside.is_some();
     let log_dir = l.log_dir.or(outside).unwrap_or_else(|| env::temp_dir().join("peerparty").join("logs"));
     fs::create_dir_all(&log_dir).map_err(|e| format!("{}: {e}", log_dir.display()))?;
+    if !custom_log_dir {
+        let removed = prune_logs(&log_dir, MAX_KEPT_LOGS);
+        if removed > 0 {
+            eprintln!("peerparty: pruned {removed} old log file(s) in {}", log_dir.display());
+        }
+    }
     // Where the game's saves with PeerParty's stand-ins go, when not the usual place.
     if let Some(line) = crate::portable::describe(&platform::data_dir()) {
         eprintln!("{line}");
@@ -748,6 +755,40 @@ fn copy_from_first(saves: &crate::saves::GameSaves, slot: u32, replace: bool, se
         ),
         Err(e) => eprintln!("peerparty: player 1's saves weren't copied to player {} ({e}); the game copies them as it opens them", slot + 1),
     }
+}
+
+/// Maximum number of `.log` files retained in the default `%TEMP%\peerparty\logs` folder.
+const MAX_KEPT_LOGS: usize = 30;
+
+/// Keeps the newest `keep` `.log` files in `dir` and removes older ones. Non-`.log` files,
+/// subdirectories, and files currently held open by a running game are left untouched.
+fn prune_logs(dir: &Path, keep: usize) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else { return 0 };
+    let mut logs: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if !ft.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if !path.extension().and_then(OsStr::to_str).is_some_and(|e| e.eq_ignore_ascii_case("log")) {
+            continue;
+        }
+        let modified = entry.metadata().and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        logs.push((path, modified));
+    }
+    if logs.len() <= keep {
+        return 0;
+    }
+    // Newest first; break timestamp ties deterministically by filename (which embeds YYYYMMDD-HHMMSS).
+    logs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+    let mut removed = 0;
+    for (path, _) in logs.into_iter().skip(keep) {
+        if fs::remove_file(path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// The hook's connection to `pipe`: ours is the only one the game gets (and
@@ -1174,6 +1215,28 @@ mod tests {
         assert_eq!(serde_json::from_str::<FpsCap>("60").unwrap(), FpsCap::Fixed(60));
         assert_eq!(serde_json::from_str::<FpsCap>("\"1/2\"").unwrap(), FpsCap::Divisor(2));
         assert_eq!(serde_json::from_str::<FpsCap>("\"1/3\"").unwrap(), FpsCap::Divisor(3));
+    }
+
+    #[test]
+    fn prune_logs_keeps_newest_and_leaves_other_files_alone() {
+        let dir = env::temp_dir().join(format!("peerparty-prune-logs-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("subdir")).unwrap();
+        // Write 5 log files with ascending names (and timestamps/tie-break order) plus a non-log file.
+        for i in 1..=5 {
+            fs::write(dir.join(format!("game-2026010{i}-000000-{i}.log")), b"log").unwrap();
+        }
+        fs::write(dir.join("keep.txt"), b"note").unwrap();
+        assert_eq!(prune_logs(&dir, 10), 0, "under cap removes nothing");
+        assert_eq!(prune_logs(&dir, 2), 3, "removes 3 oldest .log files");
+        let mut remaining: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        remaining.sort();
+        assert_eq!(remaining, vec!["game-20260104-000000-4.log", "game-20260105-000000-5.log", "keep.txt", "subdir"]);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

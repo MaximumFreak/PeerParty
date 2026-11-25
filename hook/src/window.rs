@@ -628,6 +628,41 @@ fn reposition_window(pane: PaneRect) {
     }
 }
 
+/// Restores a contained split-screen game window to the taskbar if the session's
+/// compositor process goes away while the game is still running (otherwise the game
+/// stays trapped as a `WS_EX_TOOLWINDOW` with no taskbar button or Alt+Tab entry).
+pub fn restore_from_compositor() {
+    if !VIEWPORT_ACTIVE.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    FOCUS_SPOOF.store(false, Ordering::Release);
+    let mut hwnd = live_primary() as usize;
+    if hwnd == 0 {
+        hwnd = find_own_window();
+    }
+    if hwnd == 0 {
+        return;
+    }
+    let h = hwnd as HWND;
+    unsafe {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SWP_ASYNCWINDOWPOS, SWP_NOMOVE, SWP_NOSIZE, ShowWindowAsync};
+        let ex = GetWindowLongW(h, GWL_EXSTYLE) as u32;
+        let want_ex = (ex & !(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) | WS_EX_APPWINDOW;
+        let toggle = IsWindowVisible(h) != 0 && ((ex & WS_EX_TOOLWINDOW) != 0 || (ex & WS_EX_APPWINDOW) == 0);
+        if toggle {
+            ShowWindowAsync(h, SW_HIDE);
+        }
+        if want_ex != ex {
+            SetWindowLongW(h, GWL_EXSTYLE, want_ex as i32);
+        }
+        SetWindowPos(h, std::ptr::null_mut(), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS);
+        if toggle {
+            ShowWindowAsync(h, SW_SHOWNOACTIVATE);
+        }
+    }
+    log!("window: the session's window went away: restored taskbar visibility for game window 0x{hwnd:x}");
+}
+
 fn put_in_pane(pane: PaneRect) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{HWND_NOTOPMOST, SWP_ASYNCWINDOWPOS, SWP_NOMOVE, SWP_NOSIZE, ShowWindowAsync, WS_EX_TOPMOST};
     let mut hwnd = live_primary() as usize;

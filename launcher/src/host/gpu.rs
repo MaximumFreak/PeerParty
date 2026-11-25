@@ -584,6 +584,12 @@ struct Renderer {
     cb: usize,
     params: Option<PaneParams>,
     sampler: usize,
+    /// Explicit pipeline states bound on every draw so injected overlays (such as RTSS)
+    /// that leave D3D11 blend, rasterizer, scissor, depth, or shader state dirty cannot
+    /// cull or black out the compositor's frames.
+    blend: usize,
+    raster: usize,
+    depth: usize,
     /// The window's monitor as last looked at (the swap chain's format follows it), and
     /// what the probe thread last found it shows.
     display: Display,
@@ -651,6 +657,9 @@ impl Drop for Renderer {
             self.dcomp_dev,
             self.rtv,
             self.swap,
+            self.depth,
+            self.raster,
+            self.blend,
             self.sampler,
             self.cb,
             self.ps,
@@ -886,6 +895,9 @@ impl Renderer {
             cb: 0,
             params: None,
             sampler: 0,
+            blend: 0,
+            raster: 0,
+            depth: 0,
             display: Display::SDR,
             monitor: monitor_of(hwnd),
             probe: DisplayProbe::start(monitor_of(hwnd)),
@@ -921,6 +933,20 @@ impl Renderer {
         {
             return false;
         }
+        // D3D11_BLEND_DESC: opaque overwrite on render target 0, all colour channels on.
+        let mut blend = [0u32; 2 + 8 * 8];
+        blend[2] = 0; // BlendEnable = FALSE
+        blend[3] = 2; // SrcBlend ONE
+        blend[4] = 1; // DestBlend ZERO
+        blend[5] = 1; // BlendOp ADD
+        blend[6] = 2; // SrcBlendAlpha ONE
+        blend[7] = 1; // DestBlendAlpha ZERO
+        blend[8] = 1; // BlendOpAlpha ADD
+        blend[9] = 0xf; // RenderTargetWriteMask ALL
+        // D3D11_RASTERIZER_DESC: solid, no culling, depth clip on, scissor off.
+        let raster: [u32; 10] = [3, 1, 0, 0, 0, 0, 1, 0, 0, 0];
+        // D3D11_DEPTH_STENCIL_DESC: depth and stencil off (valid comparison functions).
+        let depth: [u32; 13] = [0, 0, 8, 0, 0xffff, 1, 1, 1, 8, 1, 1, 1, 8];
         // D3D11_SAMPLER_DESC: bilinear, clamped.
         let mut sampler = [0u32; 13];
         sampler[0] = 0x15;
@@ -930,9 +956,14 @@ impl Renderer {
         sampler[5] = 1;
         sampler[6] = 1;
         sampler[12] = f32::MAX.to_bits();
-        if !ok(vcall!(self.dev, 23, fn(*const u32, *mut usize) -> i32, sampler.as_ptr(), &mut self.sampler)) {
+        if !ok(vcall!(self.dev, 20, fn(*const u32, *mut usize) -> i32, blend.as_ptr(), &mut self.blend))
+            || !ok(vcall!(self.dev, 21, fn(*const u32, *mut usize) -> i32, depth.as_ptr(), &mut self.depth))
+            || !ok(vcall!(self.dev, 22, fn(*const u32, *mut usize) -> i32, raster.as_ptr(), &mut self.raster))
+            || !ok(vcall!(self.dev, 23, fn(*const u32, *mut usize) -> i32, sampler.as_ptr(), &mut self.sampler))
+        {
             return false;
         }
+        note_external_osd();
         let (w, h) = client_size(self.hwnd);
         self.fence_event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
         let (format, space) = self.display.swap_format();
@@ -1127,10 +1158,20 @@ impl Renderer {
         let clear = if self.dcomp_dev != 0 { [0.0f32, 0.0, 0.0, 0.0] } else { [0.0f32, 0.0, 0.0, 1.0] };
         vcall!(ctx, 50, fn(usize, *const f32) -> (), rtv, clear.as_ptr());
         vcall!(ctx, 33, fn(u32, *const usize, usize) -> (), 1, &rtv, 0);
+        // Bind our own blend, depth-stencil, rasterizer, scissor and empty GS/HS/DS on
+        // every draw so injected OSD hooks (such as RTSS) that leave D3D11 state dirty
+        // after Present cannot cull, scissor, or mask out the panes.
+        vcall!(ctx, 35, fn(usize, *const f32, u32) -> (), self.blend, [0f32; 4].as_ptr(), 0xffff_ffff);
+        vcall!(ctx, 36, fn(usize, u32) -> (), self.depth, 0);
+        vcall!(ctx, 43, fn(usize) -> (), self.raster);
+        vcall!(ctx, 45, fn(u32, usize) -> (), 0, 0); // RSSetScissorRects
         vcall!(ctx, 17, fn(usize) -> (), 0); // IASetInputLayout
         vcall!(ctx, 24, fn(u32) -> (), 5); // TRIANGLESTRIP
         vcall!(ctx, 11, fn(usize, usize, u32) -> (), self.vs, 0, 0);
         vcall!(ctx, 9, fn(usize, usize, u32) -> (), self.ps, 0, 0);
+        vcall!(ctx, 23, fn(usize, usize, u32) -> (), 0, 0, 0); // GSSetShader
+        vcall!(ctx, 60, fn(usize, usize, u32) -> (), 0, 0, 0); // HSSetShader
+        vcall!(ctx, 64, fn(usize, usize, u32) -> (), 0, 0, 0); // DSSetShader
         vcall!(ctx, 16, fn(u32, u32, *const usize) -> (), 0, 1, &self.cb); // PSSetConstantBuffers
         vcall!(ctx, 10, fn(u32, u32, *const usize) -> (), 0, 1, &self.sampler);
         let mut order: Vec<usize> = (0..panes.len()).collect();
@@ -1229,6 +1270,26 @@ fn client_size(hwnd: HWND) -> (u32, u32) {
         return (0, 0);
     }
     ((r.right - r.left).max(0) as u32, (r.bottom - r.top).max(0) as u32)
+}
+
+/// Notes once when an external OSD hook DLL (such as RTSS) is loaded in the compositor
+/// process so diagnostics immediately show it.
+fn note_external_osd() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    static NOTED: AtomicBool = AtomicBool::new(false);
+    if NOTED.load(Ordering::Relaxed) {
+        return;
+    }
+    for dll in ["RTSSHooks64.dll", "RTSSHooks.dll"] {
+        let w = wide(dll);
+        if !unsafe { GetModuleHandleW(w.as_ptr()) }.is_null() {
+            if !NOTED.swap(true, Ordering::Relaxed) {
+                eprintln!("peerparty: session: {dll} is loaded in the compositor process; pipeline state is rebound every frame");
+            }
+            return;
+        }
+    }
 }
 
 /// A pane on the drawing thread.
@@ -2198,8 +2259,23 @@ mod tests {
         assert!(vcall!(r.dev, 5, fn(*const TexDesc, usize, *mut usize) -> i32, &desc, 0, &mut t) >= 0);
         let mut rtv = 0usize;
         assert!(vcall!(r.dev, 9, fn(usize, usize, *mut usize) -> i32, t, 0, &mut rtv) >= 0);
+        // Simulate an injected OSD (such as RTSS) leaving scissor + cull + zero write mask
+        // dirty on the D3D11 context before `draw`: `draw` must rebind its own state.
+        let mut bad_blend_desc = [0u32; 2 + 8 * 8];
+        bad_blend_desc[9] = 0; // RenderTargetWriteMask = 0 (blocks all writes)
+        let bad_raster_desc: [u32; 10] = [3, 3, 0, 0, 0, 0, 1, 1, 0, 0]; // CULL_BACK + ScissorEnable = TRUE
+        let (mut bad_blend, mut bad_raster) = (0usize, 0usize);
+        assert!(vcall!(r.dev, 20, fn(*const u32, *mut usize) -> i32, bad_blend_desc.as_ptr(), &mut bad_blend) >= 0);
+        assert!(vcall!(r.dev, 22, fn(*const u32, *mut usize) -> i32, bad_raster_desc.as_ptr(), &mut bad_raster) >= 0);
+        let empty_scissor = [0i32; 4];
+        vcall!(r.ctx, 35, fn(usize, *const f32, u32) -> (), bad_blend, [0f32; 4].as_ptr(), 0);
+        vcall!(r.ctx, 43, fn(usize) -> (), bad_raster);
+        vcall!(r.ctx, 45, fn(u32, *const [i32; 4]) -> (), 1, &empty_scissor);
+
         assert_eq!(r.draw(rtv, std::slice::from_ref(&pane), &[Some((1, 0))]), vec![(0, 1)]);
-        assert_eq!(read(&r, t, 16, 16)[8 * 16 + 8] & 0x00ff_ffff, 0xff0000, "red from slot 1");
+        assert_eq!(read(&r, t, 16, 16)[8 * 16 + 8] & 0x00ff_ffff, 0xff0000, "red from slot 1 even after dirty D3D11 state");
+        release(bad_raster);
+        release(bad_blend);
         release(rtv);
         release(t);
         drop(pane);

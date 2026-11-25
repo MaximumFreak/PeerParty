@@ -100,7 +100,9 @@ pub fn patch_get_proc_imports() {
         let system = (lower.starts_with(windows.as_str()) && !lower.contains(r"\microsoft.net\"))
             || lower.contains(r"\microsoft\windows defender\")
             || lower.contains(r"\windows defender\");
-        if system || file.starts_with("peerparty_hook") {
+        // Skip PeerParty's own hook DLL and external OSD hook DLLs (such as RTSS) whose
+        // own GetProcAddress lookups shouldn't be routed through PeerParty.
+        if system || file.starts_with("peerparty_hook") || file.starts_with("rtsshooks") {
             continue;
         }
         let imports = unsafe { crate::sys::pe::imports(base as *const u8) };

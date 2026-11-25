@@ -1100,10 +1100,12 @@ impl SessionHost {
     fn set_inputs(&mut self, inputs: Vec<SlotInput>) {
         self.inputs = inputs;
         self.inputs.resize(self.instances.len(), SlotInput::Auto);
+        let has_kbm = self.inputs.contains(&SlotInput::KeyboardMouse);
         for k in 0..self.instances.len() {
             let what = match self.inputs[k] {
                 SlotInput::Auto => "a controller (the first one used that no other player has), and the keyboard and mouse while their pane has the focus",
                 SlotInput::KeyboardMouse => "the keyboard and mouse, never a controller",
+                SlotInput::Controller if has_kbm => "a controller (clicking their pane won't pull the keyboard and mouse onto it; Ctrl+Alt+1-4 still can)",
                 SlotInput::Controller => "a controller; the keyboard and mouse only while their pane has the focus",
             };
             self.instances[k].send(&HostMsg::Note { text: format!("input: player {} plays with {what}", k + 1) });
@@ -1112,6 +1114,13 @@ impl SessionHost {
             self.instances[k].send(&HostMsg::Note { text: format!("input: the session starts with player {}'s pane focused: theirs are the keyboard and mouse", k + 1) });
             self.set_focus(k);
         }
+    }
+
+    /// Whether a mouse click on pane `i` may switch keyboard-and-mouse focus to it.
+    /// When a player explicitly chose keyboard and mouse, clicking an explicit
+    /// controller player's pane won't steal focus onto it (Ctrl+Alt+1-4 still can).
+    fn click_can_focus(&self, i: usize) -> bool {
+        !(self.inputs.contains(&SlotInput::KeyboardMouse) && self.inputs.get(i) == Some(&SlotInput::Controller))
     }
 
     /// Whether a split-screen session's seat `k` may take a controller now (`Pads::set_open`);
@@ -1504,7 +1513,9 @@ impl SessionHost {
             c.terminate_instances(&self.instances, &format!("still running {} s after being asked to close", CLOSE_WAIT.as_secs()));
         }
         let click = c.take_click();
-        let mut focus = if self.kbm_off || self.layout_studio.active { None } else { click.and_then(|(x, y)| c.pane_at(x, y)) };
+        let clicked_pane = if self.kbm_off || self.layout_studio.active { None } else { click.and_then(|(x, y)| c.pane_at(x, y)) };
+        let has_kbm = self.inputs.contains(&SlotInput::KeyboardMouse);
+        let mut focus = clicked_pane.filter(|&i| !(has_kbm && self.inputs.get(i) == Some(&SlotInput::Controller)));
         // A focus asked for by Ctrl+Alt+1–4: said in that pane (outside a zoom nothing on
         // screen changes, so the keys seemed to do nothing).
         let mut keyed: Option<usize> = None;
@@ -1586,6 +1597,7 @@ impl SessionHost {
             }
         }
         let overlay_open = self.panes[self.focus].visible || self.layout_studio.active;
+        let can_click: Vec<bool> = (0..self.instances.len()).map(|i| self.click_can_focus(i)).collect();
         let clicked_focus = if let Some(c) = self.compositor.as_mut() {
             c.maintain(&self.instances);
             // What changed in the panes, into each copy's log.
@@ -1594,7 +1606,7 @@ impl SessionHost {
                     crate::launch::note(inst.pid, &line);
                 }
             }
-            c.forward_input(self.focus, overlay_open, self.kbm_off, &self.instances)
+            c.forward_input(self.focus, overlay_open, self.kbm_off, &can_click, &self.instances)
         } else {
             None
         };
@@ -2831,5 +2843,13 @@ mod tests {
         assert_eq!(host.seats(0).unwrap().keyboard, None);
         host.keyboard_step(1);
         assert_eq!((host.focus, host.kbm_off), (0, false), "wraps past the one that ended");
+        // With an explicit KBM player, clicking an explicit Controller pane doesn't pull
+        // KBM focus onto it; Auto panes and KBM panes still allow click-focus.
+        assert!(host.click_can_focus(0), "Auto pane accepts click focus");
+        assert!(host.click_can_focus(1), "KBM pane accepts click focus");
+        assert!(!host.click_can_focus(2), "Controller pane resists click focus when a KBM player exists");
+        // Without an explicit KBM player, any pane can be click-focused.
+        host.set_inputs(vec![SlotInput::Auto, SlotInput::Controller, SlotInput::Controller]);
+        assert!(host.click_can_focus(0) && host.click_can_focus(1) && host.click_can_focus(2));
     }
 }

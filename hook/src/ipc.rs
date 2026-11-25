@@ -281,6 +281,7 @@ fn serve(up: Up, down: impl Read) {
     *crate::sys::lock(&OUT) = None;
     crate::overlay::set_visible(false);
     crate::overlay::pads_released();
+    crate::window::restore_from_compositor();
 }
 
 fn writer(mut up: Up, rx: Receiver<String>) {
