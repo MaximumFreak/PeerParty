@@ -2150,6 +2150,61 @@ mod tests {
         assert!(app.snack.is_none(), "a click dismisses it");
     }
 
+    /// Every card in the grid answers the pointer: hovered and clicked at its middle, it's
+    /// the one selected, with no game selected yet and with one (its page open) beside.
+    #[test]
+    fn every_card_in_the_grid_takes_a_click() {
+        crate::i18n::set("en");
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let mut app = App::with(ctx.clone(), Settings { onboarded: true, ..Settings::default() }, false);
+        let names = ["Lantern Keep", "Orbit Couriers", "Moss and Mortar", "Tidewatch", "Paper Comets", "Glasshouse Derby", "Night Market Heist", "Cinder Valley", "Quiet Harbor", "Starfall Arcade", "Foxglove Rally", "Copper Lagoon", "Hollow Pines", "Sundial Run", "Velvet Circuit"];
+        app.lib.scanned = names.iter().map(|n| game(n, Source::Steam)).collect();
+        app.lib.scanning = false;
+        app.rebuild();
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut t = 0.0;
+        for size in [vec2(1280.0, 800.0), vec2(2048.0, 1100.0)] {
+            for start_selected in [false, true] {
+                app.lib.selected = start_selected.then(|| store::key_of(&app.lib.scanned[0].exe));
+                let mut run = |app: &mut App, events: Vec<egui::Event>| {
+                    t += 0.2;
+                    let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)), time: Some(t), events, ..Default::default() };
+                    let mut out = ctx.run_ui(input, |ui| {
+                        eframe::App::logic(app, &ui.ctx().clone(), &mut frame);
+                        eframe::App::ui(app, ui, &mut frame);
+                    });
+                    out.textures_delta.clear();
+                };
+                for _ in 0..3 {
+                    run(&mut app, vec![]);
+                }
+                let mut missed = Vec::new();
+                for g in app.lib.scanned.clone() {
+                    let key = store::key_of(&g.exe);
+                    // Where it is now: a card not drawn this frame keeps an old place.
+                    let id = egui::Id::unique(("card-rect", key.as_str()));
+                    ctx.data_mut(|d| d.remove::<Rect>(id));
+                    run(&mut app, vec![]);
+                    let Some(rect) = ctx.data(|d| d.get_temp::<Rect>(id)) else { continue };
+                    if rect.bottom() > size.y - 60.0 {
+                        continue;
+                    }
+                    let at = rect.center();
+                    let click = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+                    run(&mut app, vec![egui::Event::PointerMoved(at)]);
+                    run(&mut app, vec![click(true)]);
+                    run(&mut app, vec![click(false)]);
+                    run(&mut app, vec![egui::Event::PointerMoved(pos2(1.0, size.y - 1.0))]);
+                    if app.lib.selected.as_deref() != Some(key.as_str()) {
+                        missed.push(format!("{} at {:?}", g.name, rect));
+                    }
+                }
+                assert!(missed.is_empty(), "{size:?}, selected first {start_selected}: no answer from {missed:#?}");
+            }
+        }
+    }
+
     /// Play's plan: with a copy running, exactly one copy more, with --multi-instance;
     /// with nothing running and two players, the second copy later. The command a .bat
     /// or the game's page shows has no --copy-saves.

@@ -241,6 +241,8 @@ impl App {
         if !ui.is_rect_visible(rect) {
             return;
         }
+        #[cfg(test)]
+        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique(("card-rect", key.as_str())), rect));
         if g.cover.is_none() && !self.icons.icons.contains_key(&key) {
             need.push(key.clone());
         }
