@@ -66,14 +66,23 @@ pub fn run(after_update: bool, moved: bool) -> eframe::Result {
     let settings = Settings::load();
     crate::i18n::set(&settings.prefs.language);
     theme::set_effects(settings.prefs.effects);
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("PeerParty")
-            .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([900.0, 560.0])
-            .with_icon(window_icon()),
-        ..Default::default()
-    };
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("PeerParty")
+        .with_inner_size([1280.0, 800.0])
+        .with_min_inner_size([900.0, 560.0])
+        .with_icon(window_icon());
+    let mut centered = true;
+    if let Some(w) = settings.window {
+        viewport = viewport.with_inner_size([w.w.max(900.0), w.h.max(560.0)]).with_maximized(w.maximized);
+        // Its title bar has to be reachable: a monitor it was on may be gone.
+        if platform::on_screen(w.x + w.w / 2.0, w.y + 12.0) {
+            viewport = viewport.with_position([w.x, w.y]);
+            centered = false;
+        } else {
+            eprintln!("peerparty: window: its last place ({}, {}) isn't on a screen now: centred", w.x, w.y);
+        }
+    }
+    let options = eframe::NativeOptions { viewport, centered, ..Default::default() };
     eframe::run_native(
         "peerparty",
         options,
@@ -560,9 +569,48 @@ struct App {
     settings_tab: settings::Tab,
     /// The Saves card's state.
     saves_view: saves::SavesView,
+    /// The window's new place and since when it's been there, saved once it settles
+    /// (not on every step of a drag).
+    window_settling: Option<(store::WindowPlace, Instant)>,
+}
+
+/// The window's place to remember now, from its viewport: None while minimized or not
+/// yet known. Maximized, it keeps the place it had before (`saved`), to go back to.
+fn window_place(saved: Option<store::WindowPlace>, info: &egui::ViewportInfo) -> Option<store::WindowPlace> {
+    if info.minimized == Some(true) {
+        return None;
+    }
+    let outer = info.outer_rect?;
+    if info.maximized == Some(true) {
+        let before = saved.unwrap_or(store::WindowPlace { x: outer.min.x, y: outer.min.y, w: 1280.0, h: 800.0, maximized: false });
+        return Some(store::WindowPlace { maximized: true, ..before });
+    }
+    let inner = info.inner_rect?;
+    Some(store::WindowPlace { x: outer.min.x.round(), y: outer.min.y.round(), w: inner.width().round(), h: inner.height().round(), maximized: false })
 }
 
 impl App {
+    /// Saves where the window is once it has stayed there a moment.
+    fn remember_window(&mut self, ctx: &egui::Context) {
+        let Some(now) = ctx.input(|i| window_place(self.settings.window, i.viewport())) else { return };
+        if Some(now) == self.settings.window {
+            self.window_settling = None;
+            return;
+        }
+        match self.window_settling {
+            Some((place, since)) if place == now && since.elapsed() >= Duration::from_millis(600) => {
+                self.window_settling = None;
+                self.settings.window = Some(now);
+                self.save_settings();
+            }
+            Some((place, _)) if place == now => ctx.request_repaint_after(Duration::from_millis(200)),
+            _ => {
+                self.window_settling = Some((now, Instant::now()));
+                ctx.request_repaint_after(Duration::from_millis(700));
+            }
+        }
+    }
+
     fn new(ctx: egui::Context, settings: Settings) -> App {
         Self::with(ctx, settings, true)
     }
@@ -589,6 +637,7 @@ impl App {
             together: together::State::default(),
             settings_tab: settings::Tab::General,
             saves_view: saves::SavesView::default(),
+            window_settling: None,
         };
         app.rebuild();
         app
@@ -1742,6 +1791,7 @@ impl eframe::App for App {
         self.icons.poll(ctx);
         self.updates_tick(ctx);
         self.tick();
+        self.remember_window(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -1864,6 +1914,24 @@ mod tests {
     fn game(name: &str, source: Source) -> Game {
         let exe = PathBuf::from(format!(r"C:\Games\{name}\{}.exe", name.replace(' ', "")));
         Game { name: name.into(), dir: exe.parent().unwrap().to_path_buf(), exe, source, cover: None, art: None }
+    }
+
+    #[test]
+    fn the_window_remembers_its_place_and_keeps_it_through_maximize_and_minimize() {
+        let mut info = egui::ViewportInfo::default();
+        assert_eq!(window_place(None, &info), None, "not known yet");
+        info.outer_rect = Some(Rect::from_min_size(pos2(100.4, 50.0), vec2(1408.0, 900.0)));
+        info.inner_rect = Some(Rect::from_min_size(pos2(108.0, 81.0), vec2(1392.0, 861.0)));
+        info.maximized = Some(false);
+        let placed = window_place(None, &info).unwrap();
+        assert_eq!(placed, store::WindowPlace { x: 100.0, y: 50.0, w: 1392.0, h: 861.0, maximized: false });
+
+        info.maximized = Some(true);
+        info.outer_rect = Some(Rect::from_min_size(pos2(-8.0, -8.0), vec2(2768.0, 1120.0)));
+        assert_eq!(window_place(Some(placed), &info), Some(store::WindowPlace { maximized: true, ..placed }), "the size to go back to stays");
+
+        info.minimized = Some(true);
+        assert_eq!(window_place(Some(placed), &info), None, "a minimized window's place says nothing");
     }
 
     #[test]

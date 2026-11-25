@@ -98,6 +98,12 @@ pub fn animations_enabled() -> bool {
 /// again without privileges): nothing changes.
 pub fn background(_on: bool) {}
 
+/// Whether a point (egui points) is on a screen. The window system keeps a window
+/// on screen itself here.
+pub fn on_screen(_x: f32, _y: f32) -> bool {
+    true
+}
+
 /// The name the user logs in with.
 pub fn user_name() -> String {
     std::env::var("USER").or_else(|_| std::env::var("LOGNAME")).unwrap_or_default()

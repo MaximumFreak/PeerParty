@@ -382,11 +382,27 @@ pub struct Settings {
     /// When it last asked (seconds since 1970).
     pub update_checked: u64,
     pub prefs: Prefs,
+    /// Where the window was and its size, the last time it settled (moved, resized,
+    /// maximized). None: centred at its first size.
+    pub window: Option<WindowPlace>,
     /// The file is there and couldn't be read (another program had it, say): these are
     /// defaults standing in, and saving them would put defaults over the player's real
     /// settings. Nothing is saved until a read works.
     #[serde(skip)]
     pub unread: bool,
+}
+
+/// The launcher window's place, in egui points: the outer top-left corner and the
+/// inside's size (what the viewport builder takes back). A maximized window keeps the
+/// size it had before, for when it's restored.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WindowPlace {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub maximized: bool,
 }
 
 /// `Settings::ui_version` now. 3: voice with strangers became off unless turned on; a
@@ -411,6 +427,7 @@ impl Default for Settings {
             check_updates: true,
             update_checked: 0,
             prefs: Prefs::default(),
+            window: None,
             unread: false,
         }
     }

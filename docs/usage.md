@@ -16,7 +16,9 @@ one a game needs to `%LOCALAPPDATA%\peerparty\hooks\<hash>\` on first use.
 ### The launcher window
 
 Double-click `peerparty.exe` (no arguments) for a window to pick a game and start it
-through PeerParty. It finds what's installed on any PC:
+through PeerParty. It opens where it was last left, at the size it had (maximized if it
+was), or centred the first time and when that place is on a monitor no longer
+connected. It finds what's installed on any PC:
 
 - **Steam**: every library in `libraryfolders.vdf`, with Steam's cached box art.
 - **Epic**: the launcher's install manifests (`Data\Manifests\*.item`).

@@ -379,6 +379,17 @@ pub fn background(on: bool) {
     unsafe { SetPriorityClass(GetCurrentProcess(), if on { PROCESS_MODE_BACKGROUND_BEGIN } else { PROCESS_MODE_BACKGROUND_END }) };
 }
 
+/// Whether a point (egui points, at the system's scale) is on a monitor connected now:
+/// a window put back where it was on a monitor since unplugged would be out of reach.
+pub fn on_screen(x: f32, y: f32) -> bool {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromPoint};
+    use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
+    let scale = unsafe { GetDpiForSystem() } as f32 / 96.0;
+    let p = POINT { x: (x * scale).round() as i32, y: (y * scale).round() as i32 };
+    !unsafe { MonitorFromPoint(p, MONITOR_DEFAULTTONULL) }.is_null()
+}
+
 /// The name the user signs in to this PC with.
 pub fn user_name() -> String {
     std::env::var("USERNAME").unwrap_or_default()
