@@ -205,9 +205,10 @@ pub fn inject_server(id: i32, data: Vec<u8>) {
 
 /// `inject_server` for a callback meant for the game server, else `inject`. A game
 /// server with no dispatch of its own to deliver it (manual dispatch on the game's one
-/// pipe) gets it through the game's.
+/// pipe, never run as the server's: `gs::server_dispatch`) gets it through the game's.
 pub fn inject_to(server: bool, id: i32, data: Vec<u8>) {
-    let server = server && (!MANUAL.load(Ordering::Relaxed) || crate::steam::gs::server_pipe().is_some());
+    let server = server
+        && (!MANUAL.load(Ordering::Relaxed) || crate::steam::gs::server_pipe().is_some() || crate::steam::gs::shared_server_dispatch_seen());
     push(0, id, data, server);
 }
 
@@ -811,8 +812,8 @@ unsafe extern "C" fn detour_next(pipe: i32, msg: *mut CallbackMsg) -> bool {
         dispatched();
         let mut out = crate::sys::lock(&OUTSTANDING);
         if !out.contains_key(&pipe) {
-            // The game server's pipe gets its callbacks; every other pipe the rest.
-            let server = crate::steam::gs::server_pipe() == Some(pipe);
+            // The game server's dispatch gets its callbacks; every other one the rest.
+            let server = crate::steam::gs::server_dispatch(pipe);
             let next = {
                 let mut q = crate::sys::lock(&INJECT);
                 q.iter().position(|p| p.server == server).and_then(|i| q.remove(i))
@@ -852,6 +853,9 @@ unsafe extern "C" fn detour_next(pipe: i32, msg: *mut CallbackMsg) -> bool {
         }
     }
     let ok = unsafe { hook.call(pipe, msg) };
+    if !ok {
+        crate::steam::gs::dispatch_done();
+    }
     if ok && !msg.is_null() {
         unsafe { crate::steam::own::rewrite_raw((*msg).param, (*msg).param_size.max(0) as usize) };
         let id = unsafe { (*msg).callback };
@@ -963,14 +967,33 @@ fn polled(call: u64) -> bool {
 /// `ESteamAPICallFailure`: none.
 const CALL_FAILURE_NONE: i32 = -1;
 
-/// ISteamUtils's methods PeerParty answers for its own calls (steamobj.rs stand-ins);
-/// everything else, and every call of Steam's, stays with Steam.
+/// ISteamUtils's methods PeerParty answers for its own calls (steamobj.rs stand-ins),
+/// and whether there's an overlay; everything else, and every call of Steam's, stays
+/// with Steam.
 pub fn utils() -> Vec<(&'static str, usize)> {
     vec![
         ("IsAPICallCompleted", utils_completed as *const () as usize),
         ("GetAPICallFailureReason", utils_failure as *const () as usize),
         ("GetAPICallResult", utils_result as *const () as usize),
+        ("IsOverlayEnabled", utils_overlay_enabled as *const () as usize),
     ]
+}
+
+crate::sys::vtable::vmethod! {
+    /// A game that checks for Steam's overlay before its invite button or friends list
+    /// sees PeerParty's, which answers those (lan.rs `invite_dialog`, `activate_overlay`).
+    fn utils_overlay_enabled(this: usize) -> bool {
+        let ours = crate::steam::lan::on() && crate::ipc::connected();
+        let steams = !ours && crate::steam::obj::call_real!(this, "IsOverlayEnabled", fn() -> bool, false);
+        log::throttled(&format!("steam-lan IsOverlayEnabled {ours} {steams}"), 1, |_| {
+            if ours {
+                log!("steam-lan IsOverlayEnabled: yes (PeerParty's overlay answers the game's overlay calls)");
+            } else {
+                log!("steam-lan IsOverlayEnabled: {steams} (Steam's answer: PeerParty's overlay isn't connected)");
+            }
+        });
+        ours || steams
+    }
 }
 
 crate::sys::vtable::vmethod! {

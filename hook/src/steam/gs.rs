@@ -246,6 +246,32 @@ static GET_CLIENT_PIPE: AtomicUsize = AtomicUsize::new(0);
 static SERVER_STARTED: AtomicBool = AtomicBool::new(false);
 /// Which pipe states have been logged (bit 0 without a game server, bit 1 with one).
 static PIPES_LOGGED: AtomicU8 = AtomicU8::new(0);
+/// The game ran its game server's dispatch on its own pipe at least once (`server_dispatch`).
+static SHARED_SERVER_DISPATCH: AtomicBool = AtomicBool::new(false);
+
+/// Which pipe getter this thread called last, until its dispatch loop ends: a game whose
+/// game server shares its own pipe (manual dispatch: Steamworks.NET's
+/// `RunFrame(isGameServer)`) asks for the server's pipe, then fetches the server's
+/// callbacks, so that getter tells the two dispatches apart.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Asked {
+    None,
+    Client,
+    Server,
+}
+
+thread_local! {
+    static ASKED: std::cell::Cell<Asked> = const { std::cell::Cell::new(Asked::None) };
+    /// Set while PeerParty itself calls a getter (`call_pipe`): that isn't the game asking.
+    static OWN_ASK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The game asked for a pipe (the getters' hooks).
+fn asked(which: Asked) {
+    if !OWN_ASK.with(|o| o.get()) {
+        ASKED.with(|a| a.set(which));
+    }
+}
 
 fn lan() -> Option<&'static Lan> {
     net::lan()
@@ -328,7 +354,7 @@ pub fn server_pipe() -> Option<i32> {
         let verdict = match (started, pick) {
             (_, Some(_)) => "the game server's dispatch",
             (false, None) => "no game server started, so all callbacks go to the game",
-            (true, None) => "not a separate pipe, so all callbacks go to the game",
+            (true, None) => "not a separate pipe: the game server's callbacks go to a dispatch that asked for the server's pipe first, the rest to the game",
         };
         log!("steam-lan pipes: game {client}, game server {server} ({verdict})");
     }
@@ -344,13 +370,72 @@ fn pick_server_pipe(started: bool, server: i32, client: i32) -> Option<i32> {
     Some(server)
 }
 
+/// Whether a manual dispatch fetching from `pipe` is the game server's: its own pipe,
+/// or the game's when the two are one and this thread asked for the server's last.
+pub fn server_dispatch(pipe: i32) -> bool {
+    if server_pipe() == Some(pipe) {
+        return true;
+    }
+    let shared = SERVER_STARTED.load(Ordering::Relaxed) && call_pipe(&GET_PIPE) == pipe;
+    if !shared_server_dispatch(shared, ASKED.with(|a| a.get())) {
+        return false;
+    }
+    if !SHARED_SERVER_DISPATCH.swap(true, Ordering::Relaxed) {
+        log!("steam-lan the game dispatches its game server's callbacks on its own pipe ({pipe}): they go to the dispatch that asks for the server's pipe first");
+    }
+    true
+}
+
+/// `server_dispatch` on the game's own pipe: a started server sharing it, and the last
+/// pipe this thread asked for was the server's.
+fn shared_server_dispatch(shared: bool, asked: Asked) -> bool {
+    shared && asked == Asked::Server
+}
+
+/// A manual dispatch loop ran dry: the next one says again whose it is (a game that
+/// asked for the server's pipe once, at start, doesn't make every later one the server's).
+pub fn dispatch_done() {
+    ASKED.with(|a| a.set(Asked::None));
+}
+
+/// Whether the game has run its game server's dispatch on its own pipe, so a callback
+/// for the server can wait for it there.
+pub fn shared_server_dispatch_seen() -> bool {
+    SHARED_SERVER_DISPATCH.load(Ordering::Relaxed)
+}
+
+type PipeFn = unsafe extern "C" fn() -> i32;
+
+static SERVER_PIPE_HOOK: OnceLock<GenericDetour<PipeFn>> = OnceLock::new();
+static CLIENT_PIPE_HOOK: OnceLock<GenericDetour<PipeFn>> = OnceLock::new();
+static CLIENT_PIPE_HOOK_OLD: OnceLock<GenericDetour<PipeFn>> = OnceLock::new();
+
+unsafe extern "C" fn detour_server_pipe() -> i32 {
+    asked(Asked::Server);
+    SERVER_PIPE_HOOK.get().map_or(0, |h| unsafe { h.call() })
+}
+
+unsafe extern "C" fn detour_client_pipe() -> i32 {
+    asked(Asked::Client);
+    CLIENT_PIPE_HOOK.get().map_or(0, |h| unsafe { h.call() })
+}
+
+unsafe extern "C" fn detour_client_pipe_old() -> i32 {
+    asked(Asked::Client);
+    CLIENT_PIPE_HOOK_OLD.get().map_or(0, |h| unsafe { h.call() })
+}
+
+/// Calls a pipe getter; PeerParty's own asking doesn't count as the game's (`asked`).
 fn call_pipe(slot: &AtomicUsize) -> i32 {
     let f = slot.load(Ordering::Relaxed);
     if f == 0 {
         return 0;
     }
     let f: unsafe extern "C" fn() -> i32 = unsafe { std::mem::transmute(f) };
-    unsafe { f() }
+    let was = OWN_ASK.with(|o| o.replace(true));
+    let pipe = unsafe { f() };
+    OWN_ASK.with(|o| o.set(was));
+    pipe
 }
 
 /// The game server SteamID `host`'s servers go by: worked out from its player id, so
@@ -448,7 +533,8 @@ fn publish(s: &Server, listed: bool) {
 
 /// The overlay's Join on a player who hosts a game server: the game is handed Steam's
 /// "join this server" request with the server's address, as Steam's friends list
-/// would. False when the game doesn't use Steam or the peer hosts no server.
+/// would. False when the game doesn't use Steam, the peer hosts no server, or it is
+/// joined through its lobby or rich presence (the invite path takes it then).
 pub fn join_server(peer: PeerId) -> bool {
     if !net::fronts().contains(&net::Front::Steam) {
         return false;
@@ -459,6 +545,12 @@ pub fn join_server(peer: PeerId) -> bool {
     let (Some(_), Some(port)) = (get(KEY_GS), get(KEY_GS_PORT).and_then(|p| p.parse::<u16>().ok())) else {
         return false;
     };
+    // A listen server's game lets friends in through its lobby (or rich presence): a
+    // "join this server" request to it may take the dedicated-server path instead.
+    if crate::steam::lan::joined_by_lobby_or_connect(&presence) {
+        log!("steam-lan join: {peer} hosts a game server but is in a Steam lobby or gives a connect: asking them to invite us there instead");
+        return false;
+    }
     let address = if get(KEY_GS_LISTED).as_deref() == Some("1") {
         match lan.game_address(peer) {
             Some(std::net::IpAddr::V4(v4)) => format!("{v4}:{port}"),
@@ -1230,13 +1322,33 @@ where
 /// Hooks steam_api's game server exports. Returns the addresses it patched.
 pub fn attach(exports: &[Export]) -> Vec<usize> {
     let find = |n: &str| exports.iter().find(|e| e.name == n).map(|e| e.addr as usize);
-    if let Some(a) = find("SteamGameServer_GetHSteamPipe") {
-        GET_PIPE.store(a, Ordering::Relaxed);
-    }
-    if let Some(a) = find("SteamAPI_GetHSteamPipe").or_else(|| find("GetHSteamPipe")) {
-        GET_CLIENT_PIPE.store(a, Ordering::Relaxed);
-    }
     let mut patched = Vec::new();
+    // The getters are hooked to see which pipe a dispatch asked for (`server_dispatch`).
+    if let Some(a) = find("SteamGameServer_GetHSteamPipe") {
+        let hooked = arm(&SERVER_PIPE_HOOK, a, detour_server_pipe as PipeFn);
+        GET_PIPE.store(a, Ordering::Relaxed);
+        if hooked {
+            patched.push(a);
+        }
+    }
+    let client = find("SteamAPI_GetHSteamPipe");
+    let old = find("GetHSteamPipe").filter(|a| Some(*a) != client);
+    if let Some(a) = client {
+        let hooked = arm(&CLIENT_PIPE_HOOK, a, detour_client_pipe as PipeFn);
+        GET_CLIENT_PIPE.store(a, Ordering::Relaxed);
+        if hooked {
+            patched.push(a);
+        }
+    }
+    if let Some(a) = old {
+        let hooked = arm(&CLIENT_PIPE_HOOK_OLD, a, detour_client_pipe_old as PipeFn);
+        if client.is_none() {
+            GET_CLIENT_PIPE.store(a, Ordering::Relaxed);
+        }
+        if hooked {
+            patched.push(a);
+        }
+    }
     let mut try_arm = |name: &str, ok: &dyn Fn(usize) -> bool| {
         if let Some(a) = find(name) {
             if ok(a) {
@@ -1672,6 +1784,25 @@ mod tests {
         assert_eq!(pick_server_pipe(true, 2, 1), Some(2));
         // The game's pipe unknown (no getter export): the server pipe still counts.
         assert_eq!(pick_server_pipe(true, 2, 0), Some(2));
+    }
+
+    #[test]
+    fn a_shared_pipe_is_the_servers_after_its_getter() {
+        // A game server on the game's own pipe (Steamworks.NET's RunFrame(true) asks
+        // SteamGameServer_GetHSteamPipe, then fetches): that dispatch is the server's.
+        assert!(shared_server_dispatch(true, Asked::Server));
+        // The game's own dispatch, or one that asked for no pipe since the last ran dry.
+        assert!(!shared_server_dispatch(true, Asked::Client));
+        assert!(!shared_server_dispatch(true, Asked::None));
+        // No server started, or a pipe that isn't the shared one: never.
+        assert!(!shared_server_dispatch(false, Asked::Server));
+    }
+
+    #[test]
+    fn a_dispatch_loop_running_dry_forgets_whose_it_was() {
+        ASKED.with(|a| a.set(Asked::Server));
+        dispatch_done();
+        assert_eq!(ASKED.with(|a| a.get()), Asked::None);
     }
 
     #[test]

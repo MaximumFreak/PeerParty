@@ -162,6 +162,13 @@ pub fn takes_joins() -> bool {
     ON.load(Ordering::Relaxed) && crate::steam::delivers(GAME_RICH_PRESENCE_JOIN_REQUESTED)
 }
 
+/// Whether a player's presence says they're in a Steam lobby or give a `connect` to join
+/// them by: a friend joins them that way, as Steam's friends list does, before their
+/// game server (gs.rs `join_server`).
+pub fn joined_by_lobby_or_connect(presence: &[(String, String)]) -> bool {
+    presence.iter().any(|(k, v)| (k == KEY_STEAM_LOBBY || k == "connect") && !v.is_empty())
+}
+
 /// Our rich presence `connect`: where a friend joining us should go.
 pub fn my_connect() -> String {
     MY_PRESENCE
@@ -1319,8 +1326,10 @@ unsafe extern "C" fn controller_analog(out: *mut u8, this: usize, input: u64, ac
 unsafe extern "C" fn invite_dialog(_this: usize, connect: *const c_char) {
     let connect = crate::sys::read::cstr(connect as usize).unwrap_or_default();
     if crate::overlay::invite_dialog(&connect, None) {
+        log!("steam-lan the game's invite dialog (connect {connect:?}): PeerParty's overlay opens on its invite page");
         return;
     }
+    log!("steam-lan the game's invite dialog (connect {connect:?}): no overlay, so every LAN friend is invited");
     crate::invite::send(None, &connect);
 }
 
@@ -1330,8 +1339,10 @@ unsafe extern "C" fn invite_dialog_lobby(_this: usize, lobby: u64) {
     match crate::steam::mm::lobby_for(lobby) {
         Some(l) => {
             if crate::overlay::invite_dialog(&my_connect(), Some(l.clone())) {
+                log!("steam-lan the game's invite dialog for lobby {lobby}: PeerParty's overlay opens on its invite page");
                 return;
             }
+            log!("steam-lan the game's invite dialog for lobby {lobby}: no overlay, so every LAN friend is invited");
             crate::invite::send_lobby(None, l);
         }
         None => log!("steam-lan invite dialog for lobby {lobby}, which isn't a LAN lobby"),
@@ -1343,8 +1354,10 @@ unsafe extern "C" fn invite_dialog_lobby(_this: usize, lobby: u64) {
 unsafe extern "C" fn activate_overlay(this: usize, dialog: *const c_char) {
     let d = crate::sys::read::cstr(dialog as usize).unwrap_or_default();
     if crate::overlay::steam_dialog(&d, None) {
+        log!("steam-lan ActivateGameOverlay({d:?}): PeerParty's overlay opens");
         return;
     }
+    log!("steam-lan ActivateGameOverlay({d:?}): no PeerParty overlay, so Steam's gets it");
     real_call!("SteamAPI_ISteamFriends_ActivateGameOverlay", fn(usize, *const c_char) -> (), (), this, dialog);
 }
 
@@ -1704,6 +1717,17 @@ pub fn pump() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A host in a Steam lobby, or with a rich presence `connect`, is joined that way;
+    /// one with only a game server through the server.
+    #[test]
+    fn a_lobby_or_connect_in_presence_is_joined_before_a_server() {
+        let kv = |v: &[(&str, &str)]| v.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
+        assert!(joined_by_lobby_or_connect(&kv(&[("peerparty:gs", "1"), (KEY_STEAM_LOBBY, "109775241000000001")])));
+        assert!(joined_by_lobby_or_connect(&kv(&[("connect", "+connect_lobby 1")])));
+        assert!(!joined_by_lobby_or_connect(&kv(&[("peerparty:gs", "1"), ("peerparty:gsport", "8766")])));
+        assert!(!joined_by_lobby_or_connect(&kv(&[("connect", "")])));
+    }
 
     #[test]
     fn reads_the_id_in_a_steam_appid_txt() {
