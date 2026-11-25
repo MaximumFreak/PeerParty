@@ -4,7 +4,8 @@
 //!
 //! The handlers don't know which function they stand in for, only its shape. On x86 an
 //! EOS function is stdcall, so the callee pops its arguments and each argument count
-//! needs its own handler; const generics give one per (class, slots).
+//! needs its own handler; const generics give one per (class, slots). On x64 the caller
+//! cleans up, so one ten-argument handler per class serves every count.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -57,6 +58,7 @@ fn client_data_slot(class: u8) -> usize {
     }
 }
 
+#[inline(never)]
 unsafe fn run(class: u8, a: &[usize]) -> usize {
     match class {
         ASYNC | ASYNC_AFTER_PTR | ASYNC_AFTER_U32 => {
@@ -74,6 +76,7 @@ unsafe fn run(class: u8, a: &[usize]) -> usize {
         ADD_NOTIFY => NEXT_NOTIFY.fetch_add(1, Ordering::Relaxed) as usize,
         RESULT => result::NO_CONNECTION as u32 as usize,
         ZERO | VOID => 0,
+        NOT_FOUND => result::NOT_FOUND as u32 as usize,
         c => {
             let out = a.get((c - COPY) as usize).copied().unwrap_or(0);
             if out != 0 {
@@ -91,6 +94,8 @@ const ZERO: u8 = 3;
 const VOID: u8 = 4;
 const ASYNC_AFTER_PTR: u8 = 5;
 const ASYNC_AFTER_U32: u8 = 6;
+/// A Copy whose out argument is past the function's last: EOS_NotFound, nothing written.
+const NOT_FOUND: u8 = 7;
 const COPY: u8 = 10;
 
 macro_rules! handlers {
@@ -106,6 +111,12 @@ macro_rules! handlers {
     };
 }
 
+#[cfg(target_arch = "x86_64")]
+handlers! {
+    h10(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9);
+}
+
+#[cfg(not(target_arch = "x86_64"))]
 handlers! {
     h0();
     h1(a0);
@@ -120,6 +131,14 @@ handlers! {
     h10(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9);
 }
 
+#[cfg(target_arch = "x86_64")]
+fn pick<const C: u8>(slots: u8) -> Option<usize> {
+    // Arguments past the real ones are read from registers and the caller's frame,
+    // which are there to read; `handler` never lets a class use one.
+    (slots <= 10).then_some(h10::<C> as *const () as usize)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
 fn pick<const C: u8>(slots: u8) -> Option<usize> {
     Some(match slots {
         0 => h0::<C> as *const () as usize,
@@ -151,6 +170,7 @@ pub fn handler(class: Class, slots: u8) -> Option<usize> {
         Class::Result => pick::<RESULT>(slots),
         Class::Zero => pick::<ZERO>(slots),
         Class::Void => pick::<VOID>(slots),
+        Class::Copy(i @ 1..=4) if i >= slots => pick::<NOT_FOUND>(slots),
         Class::Copy(1) => pick::<{ COPY + 1 }>(slots),
         Class::Copy(2) => pick::<{ COPY + 2 }>(slots),
         Class::Copy(3) => pick::<{ COPY + 3 }>(slots),

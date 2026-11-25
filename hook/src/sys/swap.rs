@@ -19,7 +19,7 @@
 //!   first used and then now and again, not as modules map.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 
 use retour::GenericDetour;
@@ -59,6 +59,20 @@ fn inline() -> bool {
     *INLINE.get_or_init(|| crate::config::HookConfig::global().swap_inline)
 }
 
+/// Bumped when a module loads or an SDK registers: the passes over every module's imports
+/// below walk the loader's list and read each import table, and one that finished with
+/// nothing left to retry needn't run again until something changed (EOS and Vivox ask
+/// for one every few hundred calls).
+static GEN: AtomicU64 = AtomicU64::new(1);
+/// The GEN the last full pass of each kind finished at with nothing left unbound.
+static GET_PROC_DONE: AtomicU64 = AtomicU64::new(0);
+static IMPORTS_DONE: AtomicU64 = AtomicU64::new(0);
+
+/// A module loaded (watch::consider): the next passes look at every module again.
+pub fn module_loaded() {
+    GEN.fetch_add(1, Ordering::AcqRel);
+}
+
 /// A packed module: its import table stays as the loader left it, for compatibility.
 pub fn leave_alone(base: usize) {
     crate::sys::lock(&LEAVE_ALONE).insert(base);
@@ -70,20 +84,23 @@ pub fn patch_get_proc_imports() {
     if inline() || REAL_GET_PROC.load(Ordering::Relaxed) == 0 {
         return;
     }
-    let windows = std::env::var("SystemRoot")
-        .unwrap_or_else(|_| r"C:\Windows".into())
-        .to_ascii_lowercase();
+    let generation = GEN.load(Ordering::Acquire);
+    if GET_PROC_DONE.load(Ordering::Acquire) == generation {
+        return;
+    }
+    static WINDOWS: OnceLock<String> = OnceLock::new();
+    let windows = WINDOWS.get_or_init(|| std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()).to_ascii_lowercase());
+    let mut pending = false;
     for (base, full) in crate::watch::modules_full() {
+        if crate::sys::lock(&IAT_DONE).contains(&base) || crate::sys::lock(&LEAVE_ALONE).contains(&base) {
+            continue;
+        }
         let lower = full.to_ascii_lowercase();
         let file = lower.rsplit(['\\', '/']).next().unwrap_or_default().to_string();
-        let system = (lower.starts_with(&windows) && !lower.contains(r"\microsoft.net\"))
+        let system = (lower.starts_with(windows.as_str()) && !lower.contains(r"\microsoft.net\"))
             || lower.contains(r"\microsoft\windows defender\")
             || lower.contains(r"\windows defender\");
-        if system
-            || file.starts_with("peerparty_hook")
-            || crate::sys::lock(&IAT_DONE).contains(&base)
-            || crate::sys::lock(&LEAVE_ALONE).contains(&base)
-        {
+        if system || file.starts_with("peerparty_hook") {
             continue;
         }
         let imports = unsafe { crate::sys::pe::imports(base as *const u8) };
@@ -123,6 +140,7 @@ pub fn patch_get_proc_imports() {
             }
         }
         if unbound {
+            pending = true;
             continue;
         }
         crate::sys::lock(&IAT_DONE).insert(base);
@@ -132,6 +150,9 @@ pub fn patch_get_proc_imports() {
         for by in chained {
             log!("swap {full}: GetProcAddress was already redirected to {by}; peerparty passes it what it doesn't answer");
         }
+    }
+    if !pending {
+        GET_PROC_DONE.store(generation, Ordering::Release);
     }
 }
 
@@ -190,6 +211,7 @@ fn is_loader_module(module: usize) -> bool {
 }
 
 pub fn register(base: usize, name: &str, resolve: Resolver) {
+    GEN.fetch_add(1, Ordering::AcqRel);
     {
         let mut m = crate::sys::lock(&MODULES);
         m.retain(|x| x.base != base);
@@ -345,6 +367,11 @@ pub fn importers_patched(base: usize) -> usize {
 /// (a DLL that imports the SDK is often still loading when the SDK is registered).
 pub fn patch_imports() {
     patch_get_proc_imports();
+    let generation = GEN.load(Ordering::Acquire);
+    if IMPORTS_DONE.load(Ordering::Acquire) == generation {
+        return;
+    }
+    let mut pending = false;
     let sdks: Vec<(usize, String, Resolver)> = MODULES
         .lock()
         .unwrap()
@@ -365,6 +392,7 @@ pub fn patch_imports() {
             let theirs: Vec<_> = imports.iter().filter(|i| i.dll.eq_ignore_ascii_case(sdk)).collect();
             if theirs.iter().any(|i| unsafe { i.slot.read() } == i.unbound) {
                 crate::sys::lock(&PATCHED).remove(&(module, *base));
+                pending = true;
                 continue;
             }
             if !theirs.is_empty() {
@@ -384,6 +412,9 @@ pub fn patch_imports() {
                 log!("swap patched {n} imports of {sdk} in module {module:#x}");
             }
         }
+    }
+    if !pending {
+        IMPORTS_DONE.store(generation, Ordering::Release);
     }
 }
 

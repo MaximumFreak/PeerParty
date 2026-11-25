@@ -751,7 +751,8 @@ mod win {
     use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant};
 
-    use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+    use windows_sys::core::BOOL;
     use windows_sys::Win32::Graphics::Gdi::{BLACK_BRUSH, ClientToScreen, GetStockObject, HBRUSH, ScreenToClient};
     use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_F4};

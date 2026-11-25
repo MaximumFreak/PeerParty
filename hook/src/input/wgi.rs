@@ -498,7 +498,8 @@ unsafe extern "system" fn raw_reading(
     if hr < 0 {
         return hr;
     }
-    if matches!(policy(), Policy::PassThrough) {
+    let p = policy();
+    if matches!(p, Policy::PassThrough) {
         if !axes.is_null()
             && n_axes > 0
             && n_axes <= 64
@@ -516,7 +517,7 @@ unsafe extern "system" fn raw_reading(
         }
         return hr;
     }
-    if let Policy::Virtual(snap) = policy() {
+    if let Policy::Virtual(snap) = p {
         super::first_use(&super::USED_WGI_RAW, "Windows.Gaming.Input raw controllers (its own reads as it is, the others at rest)");
         // Its own physical controller reads as it is: learnt as the one whose buttons
         // went down with the copy's controller's (as many of them).
@@ -538,9 +539,11 @@ unsafe extern "system" fn raw_reading(
     }
     if !axes.is_null() && n_axes > 0 && n_axes <= 64 {
         let now = unsafe { std::slice::from_raw_parts_mut(axes, n_axes as usize) };
+        // Both read under their locks (AXES, then REST) rather than copied out: a held
+        // controller is polled every frame.
         let mut held = AXES.lock().unwrap();
-        let at_open = match held.iter().find(|(c, _)| *c == this) {
-            Some((_, a)) if a.len() == now.len() => a.clone(),
+        let at = match held.iter().position(|(c, _)| *c == this) {
+            Some(i) if held[i].1.len() == now.len() => i,
             Some(_) => return hr,
             None => {
                 // A game that makes a new controller object for each read can't grow the
@@ -549,15 +552,14 @@ unsafe extern "system" fn raw_reading(
                     held.remove(0);
                 }
                 held.push((this, now.to_vec()));
-                now.to_vec()
+                held.len() - 1
             }
         };
-        drop(held);
+        let at_open = &held[at].1;
         let rest = REST.lock().unwrap();
-        let learnt = rest.iter().find(|(c, r)| *c == this && r.len() == now.len()).map(|(_, r)| r.clone());
-        drop(rest);
+        let learnt = rest.iter().find(|(c, r)| *c == this && r.len() == now.len()).map(|(_, r)| r);
         for (i, v) in now.iter_mut().enumerate() {
-            *v = held_axis(learnt.as_ref().and_then(|r| r[i].rest()), at_open[i]);
+            *v = held_axis(learnt.and_then(|r| r[i].rest()), at_open[i]);
         }
     }
     hr

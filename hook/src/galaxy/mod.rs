@@ -45,7 +45,7 @@ use crate::sys::hook::with_lock;
 use crate::log;
 use crate::net::{self, Front};
 use crate::sys::pe::Export;
-use crate::sys::vtable::vmethod;
+use crate::sys::vtable::{vmethod, Names};
 
 pub const NS: &str = "galaxy.lobby";
 const P2P: &str = "galaxy:p2p";
@@ -155,7 +155,12 @@ impl Iface {
         }
     }
 
-    fn table(self) -> &'static [&'static [&'static str]] {
+    /// The layout at `i` in this class's table.
+    fn layout_at(self, i: usize) -> Names {
+        Names::new(vt::NAMES, self.table()[i])
+    }
+
+    fn table(self) -> &'static [&'static [u16]] {
         match self {
             Iface::Registrar => vt::ILISTENERREGISTRAR,
             Iface::User => vt::IUSER,
@@ -176,7 +181,7 @@ impl Iface {
 
 /// The layout this DLL has for an interface, and how many of its slots are certain.
 struct Layout {
-    names: &'static [&'static str],
+    names: Names,
     certain: usize,
     /// The DLL's own slot count (its RTTI), when it has more than `names`: a stand-in's
     /// vtable has that many, the ones past `names` forwarding to the real object.
@@ -319,7 +324,7 @@ fn rtti_slots(base: usize, class: &str) -> Option<usize> {
     None
 }
 
-fn layout(iface: Iface) -> Option<(&'static [&'static str], usize, usize)> {
+fn layout(iface: Iface) -> Option<(Names, usize, usize)> {
     let mut layouts = crate::sys::lock(&LAYOUTS);
     let got = layouts.entry(iface).or_insert_with(|| {
         let r = row()?;
@@ -328,7 +333,7 @@ fn layout(iface: Iface) -> Option<(&'static [&'static str], usize, usize)> {
         if index < 0 {
             return None;
         }
-        let names = iface.table()[index as usize];
+        let names = iface.layout_at(index as usize);
         let base = MODULE.load(Ordering::Relaxed);
         match rtti_slots(base, iface.class()) {
             Some(n) if n == names.len() => Some(Layout { certain: n, names, slots: n }),
@@ -360,7 +365,7 @@ fn layout(iface: Iface) -> Option<(&'static [&'static str], usize, usize)> {
 /// A DLL between two SDKs whose headers PeerParty has (1.152.10, between 1.152.9 and
 /// 1.152.11) can have a class as the next one has it: the layout with the DLL's own slot
 /// count from the same x.y series, newer versions first, then older.
-fn nearby_layout(row: usize, at: usize, table: &'static [&'static [&'static str]], slots: usize) -> Option<&'static [&'static str]> {
+fn nearby_layout(row: usize, at: usize, table: &'static [&'static [u16]], slots: usize) -> Option<Names> {
     let (series, ..) = vt::VERSIONS[row];
     let same = |r: &usize| {
         let (v, ..) = vt::VERSIONS[*r];
@@ -372,7 +377,7 @@ fn nearby_layout(row: usize, at: usize, table: &'static [&'static [&'static str]
         .chain(older)
         .map(|r| vt::VERSIONS[r].1[at])
         .filter(|i| *i >= 0)
-        .map(|i| table[i as usize])
+        .map(|i| Names::new(vt::NAMES, table[i as usize]))
         .find(|names| names.len() == slots)
 }
 
@@ -2573,12 +2578,12 @@ mod tests {
     }
 
     /// The layouts the SDK's headers give a version, by class.
-    fn layouts_of(v: (u32, u32, u32)) -> Vec<&'static [&'static str]> {
+    fn layouts_of(v: (u32, u32, u32)) -> Vec<Names> {
         let r = row_for(v).unwrap();
         [Iface::Registrar, Iface::User, Iface::Friends, Iface::Matchmaking, Iface::Networking]
             .iter()
             .enumerate()
-            .map(|(i, c)| c.table()[vt::VERSIONS[r].1[i] as usize])
+            .map(|(i, c)| c.layout_at(vt::VERSIONS[r].1[i] as usize))
             .collect()
     }
 
@@ -2604,9 +2609,9 @@ mod tests {
     fn a_slot_count_between_two_sdks_takes_the_nearby_layout() {
         // Galaxy 1.152.10's IStats has 1.152.11's 38 slots, not 1.152.9's 35.
         let at = vt::CLASSES.iter().position(|c| *c == "IStats").unwrap();
-        let newest = vt::ISTATS[vt::VERSIONS[row_for((1, 152, 11)).unwrap()].1[at] as usize];
+        let newest = Iface::Stats.layout_at(vt::VERSIONS[row_for((1, 152, 11)).unwrap()].1[at] as usize);
         let r = row_for((1, 152, 10)).unwrap();
-        assert_ne!(vt::ISTATS[vt::VERSIONS[r].1[at] as usize].len(), newest.len());
+        assert_ne!(Iface::Stats.layout_at(vt::VERSIONS[r].1[at] as usize).len(), newest.len());
         assert_eq!(nearby_layout(r, at, vt::ISTATS, newest.len()), Some(newest));
         // No layout in the series has 99 slots.
         assert_eq!(nearby_layout(r, at, vt::ISTATS, 99), None);
@@ -2623,11 +2628,11 @@ mod tests {
         let r = vt::VERSIONS.len() - 1;
         for iface in [Iface::User, Iface::Friends, Iface::Stats, Iface::Utils, Iface::Apps, Iface::Storage, Iface::CloudStorage, Iface::Telemetry, Iface::Chat, Iface::CustomNetworking] {
             let at = vt::CLASSES.iter().position(|c| *c == iface.class()).unwrap();
-            let names = iface.table()[vt::VERSIONS[r].1[at] as usize];
+            let names = iface.layout_at(vt::VERSIONS[r].1[at] as usize);
             let mine = overrides(iface);
             for (n, _) in &mine {
                 // An older SDK's shape (`name~args`) is in that SDK's layout.
-                let known = if n.contains('~') { iface.table().iter().any(|row| row.contains(n)) } else { names.contains(n) };
+                let known = if n.contains('~') { (0..iface.table().len()).any(|i| iface.layout_at(i).contains(n)) } else { names.contains(n) };
                 assert!(known, "{} {n}", iface.class());
             }
             // Every slot of the newest SDK is PeerParty's, except IApps' local ones and
@@ -2656,7 +2661,7 @@ mod tests {
         let r = row_for((1, 152, 11)).unwrap();
         for iface in [Iface::Stats, Iface::Utils, Iface::Apps, Iface::Storage, Iface::CloudStorage, Iface::Telemetry, Iface::Chat, Iface::CustomNetworking] {
             let at = vt::CLASSES.iter().position(|c| *c == iface.class()).unwrap();
-            let names = iface.table()[vt::VERSIONS[r].1[at] as usize];
+            let names = iface.layout_at(vt::VERSIONS[r].1[at] as usize);
             assert_eq!(rtti_slots(base, iface.class()), Some(names.len()), "{}", iface.class());
         }
     }

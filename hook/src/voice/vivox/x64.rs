@@ -1413,18 +1413,17 @@ fn pump(s: &mut State) {
         log!("vivox: sound devices changed; the game is told");
         s.queue.push_back(Out::event(evt::AUDIO_DEVICE_HOT_SWAP));
     }
-    let handles: Vec<String> = s.sessions.keys().cloned().collect();
+    // Borrowed, not copied: this runs every time the game polls for a message.
+    let (sessions, accounts, blocked) = (&mut s.sessions, &s.accounts, &s.blocked);
     let mut outs = Vec::new();
-    for h in handles {
-        let blocked = s.blocked.clone();
-        let Some(acct) = s.sessions.get(&h).and_then(|x| s.accounts.get(&x.account)).map(|a| (a.name.clone(), a.display.clone())) else {
+    for (h, sess) in sessions.iter_mut() {
+        let Some(acct) = accounts.get(&sess.account).map(|a| (a.name.as_str(), a.display.as_str())) else {
             continue;
         };
-        let Some(sess) = s.sessions.get_mut(&h) else { continue };
         for ev in voice::take(&sess.room) {
             match ev {
                 RoomEvent::Joined(p) => {
-                    greet(lan, sess, p, &acct);
+                    greet(lan, sess, p, acct);
                 }
                 RoomEvent::Left(p) => {
                     sess.greeted.remove(&p);
@@ -1436,7 +1435,7 @@ fn pump(s: &mut State) {
                 RoomEvent::Data(p, bytes) => {
                     if let Some((name, display)) = parse_hello(&bytes) {
                         if !sess.greeted.contains(&p) {
-                            greet(lan, sess, p, &acct);
+                            greet(lan, sess, p, acct);
                         }
                         if sess.remotes.contains_key(&p) {
                             continue;
@@ -1445,7 +1444,7 @@ fn pump(s: &mut State) {
                         log!("vivox: {uri} ({display}) is in channel {}", sess.uri);
                         let mut e = Out::event(evt::PARTICIPANT_ADDED);
                         e.str(EVT_GROUP, &sess.group)
-                            .str(EVT_SESSION, &h)
+                            .str(EVT_SESSION, h)
                             .str(PART_URI, &uri)
                             .str(PART_ADDED_ACCOUNT, &name)
                             .str(PART_ADDED_DISPLAY_NAME, &display)
@@ -1499,8 +1498,8 @@ fn pump(s: &mut State) {
 }
 
 /// Tells a room member who we are, and where.
-fn greet(lan: &Lan, sess: &mut Session, peer: PeerId, acct: &(String, String)) {
-    voice::send_data_to(lan, &sess.room, &[peer], &hello(&acct.0, &acct.1));
+fn greet(lan: &Lan, sess: &mut Session, peer: PeerId, acct: (&str, &str)) {
+    voice::send_data_to(lan, &sess.room, &[peer], &hello(acct.0, acct.1));
     if let Some(pos) = sess.speaker {
         voice::send_data_to(lan, &sess.room, &[peer], &position_msg(pos));
     }

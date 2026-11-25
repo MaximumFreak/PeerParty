@@ -300,7 +300,7 @@ fn make_cert() -> Result<Cert, String> {
     let mut config: CERT_CHAIN_ENGINE_CONFIG = unsafe { std::mem::zeroed() };
     config.cbSize = std::mem::size_of::<CERT_CHAIN_ENGINE_CONFIG>() as u32;
     config.hExclusiveRoot = store;
-    let mut engine = 0isize;
+    let mut engine = ptr::null_mut();
     if unsafe { CertCreateCertificateChainEngine(&config, &mut engine) } == 0 {
         return Err(os_error("CertCreateCertificateChainEngine"));
     }
@@ -335,7 +335,7 @@ fn make_cert() -> Result<Cert, String> {
     Ok(Cert {
         context,
         encoded,
-        engine,
+        engine: engine as isize,
         credentials,
     })
 }
@@ -775,20 +775,27 @@ impl TlsStream {
             let rc = unsafe { DecryptMessage(&self.ctx, &d, 0, ptr::null_mut()) };
             match rc {
                 SEC_E_OK => {
-                    let mut extra = Vec::new();
+                    // The next record's bytes (EXTRA) are moved to the front of the same
+                    // buffer: one allocation for the connection, not one a record.
+                    let mut extra = None;
                     for b in &bufs {
                         if b.BufferType == SECBUFFER_DATA && b.cbBuffer > 0 {
                             self.plain.extend_from_slice(unsafe {
                                 std::slice::from_raw_parts(b.pvBuffer as *const u8, b.cbBuffer as usize)
                             });
                         } else if b.BufferType == SECBUFFER_EXTRA && b.cbBuffer > 0 {
-                            extra = unsafe {
-                                std::slice::from_raw_parts(b.pvBuffer as *const u8, b.cbBuffer as usize)
-                            }
-                            .to_vec();
+                            extra = Some((b.pvBuffer as usize, b.cbBuffer as usize));
                         }
                     }
-                    self.incoming = extra;
+                    let base = self.incoming.as_ptr() as usize;
+                    match extra {
+                        Some((at, n)) if at >= base && at - base + n <= self.incoming.len() => {
+                            self.incoming.copy_within(at - base..at - base + n, 0);
+                            self.incoming.truncate(n);
+                        }
+                        Some((at, n)) => self.incoming = unsafe { std::slice::from_raw_parts(at as *const u8, n) }.to_vec(),
+                        None => self.incoming.clear(),
+                    }
                 }
                 SEC_E_INCOMPLETE_MESSAGE => match read_more(&mut self.sock, &mut self.incoming) {
                     Ok(()) => {}
@@ -898,7 +905,7 @@ mod tests {
         para.cbSize = std::mem::size_of::<CERT_CHAIN_PARA>() as u32;
         let mut chain = ptr::null_mut();
         let built = unsafe {
-            CertGetCertificateChain(0, cert.context, ptr::null(), ptr::null_mut(), &para, 0, ptr::null(), &mut chain)
+            CertGetCertificateChain(ptr::null_mut(), cert.context, ptr::null(), ptr::null_mut(), &para, 0, ptr::null(), &mut chain)
         };
         assert_ne!(built, 0, "{}", io::Error::last_os_error());
         let name = wide(host);

@@ -23,7 +23,7 @@ pub(crate) mod web;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 
 use retour::GenericDetour;
@@ -144,7 +144,7 @@ fn watch_undelivered() {
                 if age < UNDELIVERED_AFTER {
                     continue;
                 }
-                let how = match (*crate::sys::lock(&DISPATCH_SEEN), MANUAL.load(Ordering::Relaxed)) {
+                let how = match (dispatch_seen(), MANUAL.load(Ordering::Relaxed)) {
                     (None, _) => "the game hasn't run SteamAPI_RunCallbacks or asked for a callback since PeerParty hooked steam_api".to_string(),
                     (Some(t), true) => format!("the game dispatches manually; it last asked {}s ago", t.elapsed().as_secs()),
                     (Some(t), false) => format!("the game's SteamAPI_RunCallbacks last ran {}s ago", t.elapsed().as_secs()),
@@ -184,6 +184,8 @@ struct CallCompleted {
 /// FreeLastCallback (a game dispatching the client's and the server's pipes in turn can
 /// hold one of the SDK's on one while ours is out on the other).
 static OUTSTANDING: LazyLock<Mutex<HashMap<i32, Vec<u8>>>> = LazyLock::new(Mutex::default);
+/// OUTSTANDING's length.
+static OUTSTANDING_N: AtomicUsize = AtomicUsize::new(0);
 /// The game dispatches manually (it called SteamAPI_ManualDispatch_RunFrame).
 static MANUAL: AtomicBool = AtomicBool::new(false);
 /// Callback id -> CCallbackBase objects the game registered (classic dispatch), each
@@ -501,8 +503,10 @@ fn try_typed<T>(
 }
 
 unsafe extern "C" fn detour_free_last(pipe: i32) {
-    // Our injected callback isn't the SDK's to free.
-    if crate::sys::lock(&OUTSTANDING).remove(&pipe).is_some() {
+    // Our injected callback isn't the SDK's to free. (A game frees every callback it
+    // takes: the lock only when one of ours is out.)
+    if OUTSTANDING_N.load(Ordering::Acquire) > 0 && crate::sys::lock(&OUTSTANDING).remove(&pipe).is_some() {
+        OUTSTANDING_N.fetch_sub(1, Ordering::AcqRel);
         return;
     }
     if let Some(hook) = FREE_LAST.get() {
@@ -521,11 +525,22 @@ fn in_run_callbacks() -> bool {
     IN_RUN_CALLBACKS.with(|c| c.get())
 }
 
-/// How the game takes Steam's callbacks, for the log and the undelivered-callback watch.
-static DISPATCH_SEEN: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+/// How the game takes Steam's callbacks, for the log and the undelivered-callback watch:
+/// when it last dispatched, in milliseconds from `DISPATCH_EPOCH` plus one (0: never).
+/// Set every frame, so not behind a lock.
+static DISPATCH_SEEN: AtomicU64 = AtomicU64::new(0);
+static DISPATCH_EPOCH: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
 
 fn dispatched() {
-    *crate::sys::lock(&DISPATCH_SEEN) = Some(std::time::Instant::now());
+    DISPATCH_SEEN.store(DISPATCH_EPOCH.elapsed().as_millis() as u64 + 1, Ordering::Relaxed);
+}
+
+/// When the game last dispatched, if it has.
+fn dispatch_seen() -> Option<std::time::Instant> {
+    match DISPATCH_SEEN.load(Ordering::Relaxed) {
+        0 => None,
+        ms => Some(*DISPATCH_EPOCH + std::time::Duration::from_millis(ms - 1)),
+    }
 }
 
 unsafe extern "C" fn detour_run_frame(pipe: i32) {
@@ -626,6 +641,10 @@ unsafe extern "C" fn detour_unregister(obj: usize) {
 fn deliver_registered(server: bool) {
     let batch: Vec<Pending> = {
         let mut q = crate::sys::lock(&INJECT);
+        // Run every frame; usually nothing waits.
+        if !q.iter().any(|p| p.server == server) {
+            return;
+        }
         let (mine, rest): (VecDeque<Pending>, VecDeque<Pending>) = q.drain(..).partition(|p| p.server == server);
         *q = rest;
         mine.into_iter().collect()
@@ -825,7 +844,9 @@ unsafe extern "C" fn detour_next(pipe: i32, msg: *mut CallbackMsg) -> bool {
                 log::throttled(&format!("steam-lan manual {id}"), 8, |n| {
                     log!("steam-lan delivered callback {id} ({} bytes, n={n})", data.len())
                 });
-                out.insert(pipe, data);
+                if out.insert(pipe, data).is_none() {
+                    OUTSTANDING_N.fetch_add(1, Ordering::AcqRel);
+                }
                 return true;
             }
         }

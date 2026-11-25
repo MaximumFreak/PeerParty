@@ -160,7 +160,7 @@ fn ssl_policy(cert: *const CERT_CONTEXT, host: &str) -> io::Result<()> {
     let mut para: CERT_CHAIN_PARA = unsafe { std::mem::zeroed() };
     para.cbSize = std::mem::size_of::<CERT_CHAIN_PARA>() as u32;
     let mut chain = ptr::null_mut();
-    let built = unsafe { CertGetCertificateChain(0, cert, ptr::null(), ptr::null_mut(), &para, 0, ptr::null(), &mut chain) };
+    let built = unsafe { CertGetCertificateChain(ptr::null_mut(), cert, ptr::null(), ptr::null_mut(), &para, 0, ptr::null(), &mut chain) };
     if built == 0 {
         return Err(io::Error::other(os_error("CertGetCertificateChain")));
     }

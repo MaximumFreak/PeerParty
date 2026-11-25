@@ -712,12 +712,12 @@ impl Server {
                 return;
             }
             match c.fragments.take() {
-                Some((seq, _, buf)) if seq == h.seq => buf,
+                Some((seq, _, buf)) if seq == h.seq => std::borrow::Cow::Owned(buf),
                 _ => return,
             }
         } else {
             c.fragments = None;
-            data.to_vec()
+            std::borrow::Cow::Borrowed(data)
         };
         c.recv_seq = h.seq;
         c.recv_mask = if d >= 64 { 1 } else { (c.recv_mask << d) | 1 };

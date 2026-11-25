@@ -206,6 +206,7 @@ fn consider(m: Mod) {
         }
     }
     // Modules loaded before this one have bound their imports by now.
+    crate::sys::swap::module_loaded();
     crate::sys::swap::patch_get_proc_imports();
     let table = match unsafe { pe::exports(m.base.cast()) } {
         Ok(t) => t,

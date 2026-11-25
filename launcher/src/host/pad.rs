@@ -1196,7 +1196,7 @@ fn open_hid(list: &Arc<Mutex<Vec<Hid>>>, threads: &Arc<Threads>, path: String) {
     let mut attr: HIDD_ATTRIBUTES = unsafe { std::mem::zeroed() };
     attr.Size = size_of::<HIDD_ATTRIBUTES>() as u32;
     let mut pre = 0isize;
-    if unsafe { HidD_GetAttributes(h, &mut attr) } == 0 || unsafe { HidD_GetPreparsedData(h, &mut pre) } == 0 {
+    if !unsafe { HidD_GetAttributes(h, &mut attr) } || !unsafe { HidD_GetPreparsedData(h, &mut pre) } {
         close();
         return;
     }
@@ -1278,7 +1278,7 @@ fn open_hid(list: &Arc<Mutex<Vec<Hid>>>, threads: &Arc<Threads>, path: String) {
 fn serial_of(h: windows_sys::Win32::Foundation::HANDLE) -> String {
     let mut buf = [0u16; 128];
     let ok = unsafe { windows_sys::Win32::Devices::HumanInterfaceDevice::HidD_GetSerialNumberString(h, buf.as_mut_ptr().cast(), (buf.len() * 2) as u32) };
-    if ok == 0 {
+    if !ok {
         return String::new();
     }
     let n = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());

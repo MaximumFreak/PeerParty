@@ -25,6 +25,7 @@ mod lobby;
 mod mesh;
 pub mod own;
 pub mod redact;
+pub mod sha1;
 mod sys;
 #[cfg(any(test, feature = "test-util"))]
 #[doc(hidden)]

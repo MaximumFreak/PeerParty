@@ -34,8 +34,7 @@ use retour::GenericDetour;
 use crate::sys::hook::with_lock;
 use crate::log;
 use crate::sys::pe::Export;
-use crate::steam::vt::TABLES;
-use crate::sys::vtable::{self, exec_block, vmethod};
+use crate::sys::vtable::{self, exec_block, vmethod, Names};
 
 /// Calls the real object's method `name` for a stand-in `this`, or gives `default`
 /// when this version has no such method.
@@ -82,11 +81,13 @@ fn family(version: &str) -> &str {
     version.trim_end_matches(|c: char| c.is_ascii_digit())
 }
 
-pub(crate) fn layout(version: &str) -> Option<(&'static str, &'static [&'static str])> {
-    TABLES
-        .iter()
-        .find(|(v, _)| *v == version)
-        .map(|(v, names)| (*v, *names))
+/// Every version PeerParty has a layout for.
+pub(crate) fn tables() -> impl Iterator<Item = (&'static str, Names)> {
+    crate::steam::vt::TABLES.iter().map(|(v, ix)| (*v, Names::new(crate::steam::vt::NAMES, ix)))
+}
+
+pub(crate) fn layout(version: &str) -> Option<(&'static str, Names)> {
+    tables().find(|(v, _)| *v == version)
 }
 
 /// The slot of `name` in `version`, when it has the newest signature. An overloaded
@@ -161,7 +162,7 @@ pub fn wrap_as(real: usize, version: &str, server: bool) -> usize {
     // How many slots of each name came before: an overload's `name@N` (see `slot`).
     let mut before: HashMap<&str, usize> = HashMap::new();
     let Some((vtable, ours)) = vtable::build(names.len(), |i| {
-        let n = names[i];
+        let n = *names.get(i)?;
         let k = before.entry(n).or_insert(0);
         let nth = format!("{n}@{k}");
         *k += 1;
@@ -241,7 +242,7 @@ pub unsafe fn real_method(this: usize, name: &str) -> Option<(usize, usize)> {
         return None;
     }
     let proxy = unsafe { &*(this as *const Proxy) };
-    let i = slot(proxy.version, name)?;
+    let i = stand_in_slot(proxy.version, name)?;
     let vtable = unsafe { *(proxy.real as *const *const usize) };
     Some((proxy.real, unsafe { *vtable.add(i) }))
 }
@@ -581,8 +582,21 @@ unsafe fn member(this: usize, name: &str) -> Option<usize> {
         return None;
     }
     let proxy = unsafe { &*(this as *const Proxy) };
-    let i = slot(proxy.version, name)?;
+    let i = stand_in_slot(proxy.version, name)?;
     Some(unsafe { *proxy.vtable.add(i) })
+}
+
+/// `slot` for a stand-in's version (one of vt.rs's own strings), remembered: every flat
+/// API call through a stand-in asks, and `slot` searches the tables by name.
+fn stand_in_slot(version: &'static str, name: &str) -> Option<usize> {
+    static SLOTS: LazyLock<RwLock<HashMap<usize, HashMap<String, Option<usize>>>>> = LazyLock::new(RwLock::default);
+    let key = version.as_ptr() as usize;
+    if let Some(&i) = SLOTS.read().unwrap_or_else(|e| e.into_inner()).get(&key).and_then(|m| m.get(name)) {
+        return i;
+    }
+    let i = slot(version, name);
+    SLOTS.write().unwrap_or_else(|e| e.into_inner()).entry(key).or_default().insert(name.to_string(), i);
+    i
 }
 
 /// Where flat method `i` goes for `self`: the stand-in's own method, as Valve's flat
@@ -1223,7 +1237,7 @@ fn flat_iface(family: &str) -> Option<&'static str> {
 fn version_from_vtable(family: &str, flat: &HashMap<String, usize>, slot: impl Fn(usize) -> Option<usize>) -> Option<&'static str> {
     let iface = flat_iface(family)?;
     let mut best: Option<(i64, &'static str)> = None;
-    for (v, names) in TABLES.iter().filter(|(v, _)| self::family(v) == family) {
+    for (v, names) in tables().filter(|(v, _)| self::family(v) == family) {
         let (mut hit, mut miss) = (0i64, 0i64);
         for (i, n) in names.iter().enumerate() {
             let method = n.split('~').next().unwrap_or(n);
@@ -1237,7 +1251,7 @@ fn version_from_vtable(family: &str, flat: &HashMap<String, usize>, slot: impl F
             }
         }
         if hit >= 3 && hit > miss && best.is_none_or(|(s, _)| hit - miss > s) {
-            best = Some((hit - miss, *v));
+            best = Some((hit - miss, v));
         }
     }
     best.map(|(_, v)| v)
@@ -1299,13 +1313,13 @@ mod tests {
 
     #[test]
     fn an_unnamed_version_is_told_from_the_vtable() {
-        let all: Vec<&str> = TABLES.iter().map(|(v, _)| *v).filter(|v| family(v) == "SteamMatchMaking").collect();
+        let all: Vec<&str> = tables().map(|(v, _)| v).filter(|v| family(v) == "SteamMatchMaking").collect();
         let flat = flat_for("ISteamMatchmaking", &all);
         for v in ["SteamMatchMaking009", "SteamMatchMaking008", "SteamMatchMaking006"] {
             let vt = vtable_of(v, "ISteamMatchmaking", &flat);
             assert_eq!(version_from_vtable("SteamMatchMaking", &flat, |i| vt.get(i).copied()), Some(v), "{v}");
         }
-        let users: Vec<&str> = TABLES.iter().map(|(v, _)| *v).filter(|v| family(v) == "SteamUser").collect();
+        let users: Vec<&str> = tables().map(|(v, _)| v).filter(|v| family(v) == "SteamUser").collect();
         let flat = flat_for("ISteamUser", &users);
         let vt = vtable_of("SteamUser019", "ISteamUser", &flat);
         let got = version_from_vtable("SteamUser", &flat, |i| vt.get(i).copied()).unwrap();
@@ -1361,7 +1375,7 @@ mod tests {
         assert_eq!(slot("SteamUtils011", "IsAPICallCompleted"), Some(10));
         assert_eq!(slot("SteamClient010", "GetISteamUtils"), Some(9));
         assert!(slot("SteamNetworkingSockets004", "ConnectP2P~2").is_some());
-        assert!(TABLES.iter().all(|(_, n)| n.len() <= vtable::MAX_SLOTS));
+        assert!(tables().all(|(_, n)| n.len() <= vtable::MAX_SLOTS));
         // The C++ interfaces steamown and Steam Input's gating stand in front of.
         for v in ["SteamInput001", "SteamInput006", "SteamController003", "SteamController008"] {
             assert!(slot(v, "GetDigitalActionData").is_some() && slot(v, "GetAnalogActionData").is_some(), "{v}");
@@ -1416,7 +1430,7 @@ mod tests {
     #[test]
     fn every_steam_user_version_has_its_ticket_answered() {
         let mine = crate::steam::p2p::user();
-        for (version, names) in crate::steam::vt::TABLES.iter().filter(|(v, _)| v.starts_with("SteamUser")) {
+        for (version, names) in tables().filter(|(v, _)| v.starts_with("SteamUser")) {
             let ticket = names.iter().find(|n| n.starts_with("GetAuthSessionTicket"));
             if let Some(ticket) = ticket {
                 assert!(mine.iter().any(|(m, _)| m == ticket), "{version}'s {ticket} isn't answered");

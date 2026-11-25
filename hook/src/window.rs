@@ -1023,7 +1023,16 @@ unsafe extern "system" fn detour_get_system_metrics(index: i32) -> i32 {
         Some(h) => unsafe { h.call(index) },
         None => 0,
     };
+    if !spoofed_metric(index) {
+        return real;
+    }
     spoof_system_metric(index, real, virtual_size())
+}
+
+/// Whether `spoof_system_metric` changes metric `index`: the rest skip the session's
+/// lock (a game asks for metrics often, most of them not these).
+fn spoofed_metric(index: i32) -> bool {
+    matches!(index, SM_CXSCREEN | SM_CXFULLSCREEN | SM_CXVIRTUALSCREEN | SM_CYSCREEN | SM_CYFULLSCREEN | SM_CYVIRTUALSCREEN)
 }
 
 unsafe extern "system" fn detour_get_monitor_info_w(mon: isize, mi: *mut MonitorInfo) -> i32 {
@@ -1065,7 +1074,8 @@ unsafe extern "system" fn detour_enum_display_a(dev: *const u8, mode: u32, dm: *
 unsafe extern "system" fn detour_get_foreground() -> isize {
     let real = GET_FOREGROUND.get().map_or(0, |h| unsafe { h.call() });
     let spoof = FOCUS_SPOOF.load(Ordering::Relaxed);
-    if !spoof {
+    // The game's own window (the usual answer) is ours: no lookups.
+    if !spoof || (real != 0 && real as usize == PRIMARY_HWND.load(Ordering::Relaxed)) {
         return real;
     }
     spoof_focus_hwnd(real, is_our_window(real), live_primary(), true)
@@ -1074,7 +1084,8 @@ unsafe extern "system" fn detour_get_foreground() -> isize {
 unsafe extern "system" fn detour_get_active() -> isize {
     let real = GET_ACTIVE.get().map_or(0, |h| unsafe { h.call() });
     let spoof = FOCUS_SPOOF.load(Ordering::Relaxed);
-    if !spoof {
+    // The game's own window (the usual answer) is ours: no lookups.
+    if !spoof || (real != 0 && real as usize == PRIMARY_HWND.load(Ordering::Relaxed)) {
         return real;
     }
     spoof_focus_hwnd(real, is_our_window(real), live_primary(), true)
@@ -1083,7 +1094,8 @@ unsafe extern "system" fn detour_get_active() -> isize {
 unsafe extern "system" fn detour_get_focus() -> isize {
     let real = GET_FOCUS.get().map_or(0, |h| unsafe { h.call() });
     let spoof = FOCUS_SPOOF.load(Ordering::Relaxed);
-    if !spoof {
+    // The game's own window (the usual answer) is ours: no lookups.
+    if !spoof || (real != 0 && real as usize == PRIMARY_HWND.load(Ordering::Relaxed)) {
         return real;
     }
     spoof_focus_hwnd(real, is_our_window(real), live_primary(), true)
@@ -1326,6 +1338,9 @@ unsafe extern "system" fn detour_enum_display_ex_a(dev: *const u8, mode: u32, dm
 
 unsafe extern "system" fn detour_get_system_metrics_for_dpi(index: i32, dpi: u32) -> i32 {
     let real = GET_METRICS_DPI.get().map_or(0, |h| unsafe { h.call(index, dpi) });
+    if !spoofed_metric(index) {
+        return real;
+    }
     spoof_system_metric(index, real, virtual_size())
 }
 
@@ -1386,6 +1401,12 @@ mod tests {
         assert_eq!(spoof_system_metric(SM_CYVIRTUALSCREEN, 1440, Some((960, 540))), 540);
         assert_eq!(spoof_system_metric(5, 1, Some((960, 540))), 1, "unrelated metrics stay real");
         assert_eq!(spoof_system_metric(SM_CXSCREEN, 2560, None), 2560);
+        // The detours' quick check passes every metric the helper changes.
+        for i in 0..200 {
+            if spoof_system_metric(i, -7, Some((960, 540))) != -7 {
+                assert!(spoofed_metric(i), "metric {i}");
+            }
+        }
     }
 
     #[test]

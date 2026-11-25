@@ -10,7 +10,6 @@
 use std::fmt;
 
 use hkdf::Hkdf;
-use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
 const SECRET_LEN: usize = 15;
@@ -193,14 +192,13 @@ impl RoomCode {
     /// The DHT info-hash a room's copies of `game` meet on in hour `slot`. Only someone
     /// with the code can work it out, and it changes every hour.
     pub fn topic(&self, game: &str, slot: u64) -> [u8; 20] {
-        let mut h = Sha1::new();
-        h.update(b"peerparty/1/room/");
-        h.update(self.key(b"topic"));
-        h.update([0]);
-        h.update(game.as_bytes());
-        h.update([0]);
-        h.update(slot.to_be_bytes());
-        h.finalize().into()
+        let mut m = b"peerparty/1/room/".to_vec();
+        m.extend_from_slice(&self.key(b"topic"));
+        m.push(0);
+        m.extend_from_slice(game.as_bytes());
+        m.push(0);
+        m.extend_from_slice(&slot.to_be_bytes());
+        crate::sha1::sha1(&m)
     }
 }
 

@@ -424,19 +424,14 @@ struct Network {
 /// plugin, PartyCSharpSDK.Interop, reads `PARTY_STATE_CHANGE_UNION`: 440 bytes on x64,
 /// PARTY_CREATE_NEW_NETWORK_COMPLETED_STATE_CHANGE). A change only its own size ends
 /// wherever the heap puts it, and a read past it that crosses into an unmapped page
-/// crashes the game (seen joining a network a second time).
-#[repr(C)]
-struct Padded<T> {
-    change: T,
-    _union_room: [u8; UNION_ROOM],
-}
-
-/// Bytes after every change: more than any wrapper's union needs past its struct.
+/// crashes the game (seen joining a network a second time). The change is kept as
+/// zeroed words with the struct at their start, so the queueing code isn't stamped out
+/// once per change type.
 const UNION_ROOM: usize = 1024;
 
 /// One queued state change: the struct, plus memory it points into.
 struct Change {
-    _data: Box<dyn std::any::Any + Send>,
+    _data: Box<[u64]>,
     ptr: usize,
     _bytes: Vec<u8>,
     _ptrs: Vec<usize>,
@@ -713,12 +708,19 @@ impl State {
         texts: Vec<CString>,
         fix: impl FnOnce(&mut T, usize, usize, &[usize]),
     ) {
-        let mut data = Box::new(Padded { change: c, _union_room: [0; UNION_ROOM] });
-        let b = bytes.as_ptr() as usize;
-        let p = ptrs.as_ptr() as usize;
+        // Changes are plain C structs: nothing to drop, nothing aligned past a word.
+        const { assert!(!std::mem::needs_drop::<T>() && std::mem::align_of::<T>() <= 8) };
+        let mut data = change_room(std::mem::size_of::<T>());
+        let at = data.as_mut_ptr() as *mut T;
+        unsafe { at.write(c) };
         let t: Vec<usize> = texts.iter().map(|t| t.as_ptr() as usize).collect();
-        fix(&mut data.change, b, p, &t);
-        let ptr = &data.change as *const T as usize;
+        fix(unsafe { &mut *at }, bytes.as_ptr() as usize, ptrs.as_ptr() as usize, &t);
+        self.queue_change(data, bytes, ptrs, texts);
+    }
+
+    #[inline(never)]
+    fn queue_change(&mut self, data: Box<[u64]>, bytes: Vec<u8>, ptrs: Vec<usize>, texts: Vec<CString>) {
+        let ptr = data.as_ptr() as usize;
         self.queue.push(Change {
             _data: data,
             ptr,
@@ -728,6 +730,15 @@ impl State {
         });
     }
 
+}
+
+/// Zeroed words for a change of `size` bytes and the union room after it.
+#[inline(never)]
+fn change_room(size: usize) -> Box<[u64]> {
+    vec![0u64; (size + UNION_ROOM).div_ceil(8)].into_boxed_slice()
+}
+
+impl State {
     /// An array for a Get* function to hand out, valid until the next
     /// PartyStartProcessingStateChanges (an earlier array stays valid when a later call
     /// of the same kind returns a different one). One with the same items is reused, so
@@ -2508,9 +2519,9 @@ mod tests {
         let mut s = State::default();
         s.push(7u32);
         let c = &s.queue[0];
-        let boxed: &Padded<u32> = c._data.downcast_ref().expect("padded");
-        assert_eq!(c.ptr, &boxed.change as *const u32 as usize);
-        assert!(std::mem::size_of::<Padded<u32>>() >= 440);
+        assert_eq!(c.ptr, c._data.as_ptr() as usize);
+        assert_eq!(unsafe { *(c.ptr as *const u32) }, 7);
+        assert!(c._data.len() * 8 >= 4 + 440);
     }
 
     #[test]

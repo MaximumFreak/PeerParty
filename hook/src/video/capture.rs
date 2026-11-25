@@ -305,10 +305,12 @@ pub fn pace() {
             // landing on a VBlank wakes this copy immediately rather than sleeping blindly.
             let max_slice = if hidden { 50 } else if sync { pace_timeout_ms(h.sync_divisor()) } else { 50 };
             let wait_ms = ((rem + 500) / 1000).clamp(1, u64::from(max_slice)) as u32;
-            if !link.pace.is_null() {
-                unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(link.pace, wait_ms) };
-            } else {
-                std::thread::sleep(std::time::Duration::from_millis(u64::from(wait_ms)));
+            if !wait_until(link.pace, rem.min(u64::from(max_slice) * 1000)) {
+                if !link.pace.is_null() {
+                    unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(link.pace, wait_ms) };
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(u64::from(wait_ms)));
+                }
             }
             // Bail out immediately if unzoomed or cap cleared while waiting.
             if hidden && !h.hidden() {
@@ -328,6 +330,45 @@ pub fn pace() {
     let next_base = if done.saturating_sub(target) > interval { done } else { target };
     NEXT_FRAME_US.store(next_base, Ordering::Release);
     LAST_PACED_PRESENT.store(h.presents.load(Ordering::Acquire), Ordering::Release);
+}
+
+/// Waits `us` microseconds, or until `pace` (when there is one) is signalled, on a
+/// high-resolution waitable timer: a plain timeout or sleep ends on the system timer's
+/// tick (15.6 ms unless the game asked for finer), which an FPS cap can't keep to.
+/// False when there's no such timer (before Windows 10 1803): the caller waits as before.
+fn wait_until(pace: HANDLE, us: u64) -> bool {
+    use windows_sys::Win32::System::Threading::{
+        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, SetWaitableTimer, TIMER_ALL_ACCESS, WaitForMultipleObjects,
+    };
+    thread_local! {
+        static TIMER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    }
+    // One a presenting thread, kept for its life.
+    let timer = TIMER.with(|t| match t.get() {
+        Some(h) => h,
+        None => {
+            let h = unsafe { CreateWaitableTimerExW(std::ptr::null(), std::ptr::null(), CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS) };
+            if h.is_null() {
+                log!("video: no high-resolution timer here: frame caps wait on the system timer's tick");
+            }
+            t.set(Some(h as usize));
+            h as usize
+        }
+    }) as HANDLE;
+    if timer.is_null() {
+        return false;
+    }
+    // Relative, in 100 ns units.
+    let due = -((us.max(1) * 10) as i64);
+    if unsafe { SetWaitableTimer(timer, &due, 0, None, std::ptr::null(), 0) } == 0 {
+        return false;
+    }
+    let handles = [timer, pace];
+    let n = if pace.is_null() { 1 } else { 2 };
+    // The timeout only guards against a timer that never fires.
+    let limit = (us / 1000 + 50) as u32;
+    unsafe { WaitForMultipleObjects(n, handles.as_ptr(), 0, limit) };
+    true
 }
 
 /// Where pixel files go: the ring file's directory, as the session names it (None when

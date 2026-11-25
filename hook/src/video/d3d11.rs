@@ -7,6 +7,8 @@
 //! Vtable slots are from d3d11.h: ID3D11Device and ID3D11DeviceContext in declaration
 //! order after IUnknown (and ID3D11DeviceChild for the context).
 
+use std::sync::OnceLock;
+
 use super::Frame;
 use super::com::{compile, release, vcall};
 
@@ -125,7 +127,8 @@ pub struct Renderer {
     ctx: usize,
     vs: usize,
     ps: usize,
-    /// The pixel shaders for linear targets (`Target::Srgb`, `Target::ScRgb`).
+    /// The pixel shaders for linear targets (`Target::Srgb`, `Target::ScRgb`) and HDR10,
+    /// made the first time a target needs one (0 until then).
     ps_srgb: usize,
     ps_scrgb: usize,
     ps_pq: usize,
@@ -159,19 +162,10 @@ impl Renderer {
         if vcall!(device, 37, fn() -> u32) >= 0xb100 {
             r.uav_slots = UAV_SLOTS_11_1;
         }
-        let hlsl = format!("#define SDR_WHITE {SDR_WHITE}\n{HLSL}");
-        let vs = compile(&hlsl, c"vs", c"vs_4_0")?;
-        let ps = compile(&hlsl, c"ps", c"ps_4_0")?;
-        let ps_srgb = compile(&hlsl, c"ps_srgb", c"ps_4_0")?;
-        let ps_scrgb = compile(&hlsl, c"ps_scrgb", c"ps_4_0")?;
-        let ps_pq = compile(&hlsl, c"ps_pq", c"ps_4_0")?;
+        let vs = shader_code(Shader::Vs)?;
         let ok = |hr: i32| hr >= 0;
-        let pixel = |code: &[u8], out: &mut usize| ok(vcall!(device, 15, fn(*const u8, usize, usize, *mut usize) -> i32, code.as_ptr(), code.len(), 0, out));
         if !ok(vcall!(device, 12, fn(*const u8, usize, usize, *mut usize) -> i32, vs.as_ptr(), vs.len(), 0, &mut r.vs))
-            || !pixel(&ps, &mut r.ps)
-            || !pixel(&ps_srgb, &mut r.ps_srgb)
-            || !pixel(&ps_scrgb, &mut r.ps_scrgb)
-            || !pixel(&ps_pq, &mut r.ps_pq)
+            || r.pixel_shader(Shader::Ps) == 0
         {
             return None;
         }
@@ -294,12 +288,15 @@ impl Renderer {
         // ID3D11RenderTargetView::GetDesc: the view's format says how to write to it.
         let mut view = RtvDesc { format: 0, dimension: 0, mip_slice: 0, pad: [0; 2] };
         vcall!(rtv, 8, fn(*mut RtvDesc) -> (), &mut view);
-        let shader = match target_of(view.format, self.hdr10) {
-            Target::Plain => self.ps,
-            Target::Srgb => self.ps_srgb,
-            Target::ScRgb => self.ps_scrgb,
-            Target::Pq => self.ps_pq,
-        };
+        let shader = self.pixel_shader(match target_of(view.format, self.hdr10) {
+            Target::Plain => Shader::Ps,
+            Target::Srgb => Shader::PsSrgb,
+            Target::ScRgb => Shader::PsScRgb,
+            Target::Pq => Shader::PsPq,
+        });
+        if shader == 0 {
+            return;
+        }
         // Save. With the RTVs the pixel shader's UAVs, which share their slots: setting
         // the render targets alone would unbind them.
         let mut rtvs = [0usize; 8];
@@ -382,6 +379,50 @@ impl Renderer {
     pub fn flush(&self) {
         vcall!(self.ctx, 111, fn() -> ());
     }
+
+    /// The pixel shader `which`, made now if it hasn't been (0 if it can't be).
+    fn pixel_shader(&mut self, which: Shader) -> usize {
+        let device = self.device;
+        let slot = match which {
+            Shader::Ps => &mut self.ps,
+            Shader::PsSrgb => &mut self.ps_srgb,
+            Shader::PsScRgb => &mut self.ps_scrgb,
+            Shader::PsPq => &mut self.ps_pq,
+            Shader::Vs => return self.vs,
+        };
+        if *slot == 0
+            && let Some(code) = shader_code(which)
+            && vcall!(device, 15, fn(*const u8, usize, usize, *mut usize) -> i32, code.as_ptr(), code.len(), 0, slot) < 0
+        {
+            *slot = 0;
+        }
+        *slot
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Shader {
+    Vs,
+    Ps,
+    PsSrgb,
+    PsScRgb,
+    PsPq,
+}
+
+/// A shader's bytecode, compiled once a process: a renderer is made again for each new
+/// device or swap chain, and compiling is what made the overlay's first frame slow.
+fn shader_code(which: Shader) -> Option<&'static [u8]> {
+    static CODE: [OnceLock<Option<Vec<u8>>>; 5] = [const { OnceLock::new() }; 5];
+    let (i, entry, target) = match which {
+        Shader::Vs => (0, c"vs", c"vs_4_0"),
+        Shader::Ps => (1, c"ps", c"ps_4_0"),
+        Shader::PsSrgb => (2, c"ps_srgb", c"ps_4_0"),
+        Shader::PsScRgb => (3, c"ps_scrgb", c"ps_4_0"),
+        Shader::PsPq => (4, c"ps_pq", c"ps_4_0"),
+    };
+    CODE[i]
+        .get_or_init(|| compile(&format!("#define SDR_WHITE {SDR_WHITE}\n{HLSL}"), entry, target))
+        .as_deref()
 }
 
 impl Drop for Renderer {

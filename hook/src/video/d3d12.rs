@@ -8,6 +8,7 @@
 //! and acquired / released around the draw; `release_buffers` lets them go before the
 //! game resizes its swap chain.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use retour::GenericDetour;
@@ -75,14 +76,13 @@ unsafe extern "system" fn execute_hook(queue: usize, n: u32, lists: *const usize
 /// it remakes its device).
 const MAX_QUEUES: usize = 8;
 
+/// QUEUES' queues, read without its lock: a game submits many times a frame, compute
+/// and copy queues too. A queue in QUEUES is AddRef'd, so its address isn't reused.
+static DIRECT: [AtomicUsize; MAX_QUEUES] = [const { AtomicUsize::new(0) }; MAX_QUEUES];
+
 fn note_queue(queue: usize) {
-    let mut q = crate::sys::lock(&QUEUES);
-    if q.iter().any(|(x, _)| *x == queue) {
+    if DIRECT.iter().any(|d| d.load(Ordering::Relaxed) == queue) {
         return;
-    }
-    if q.len() >= MAX_QUEUES {
-        let (old, _) = q.remove(0);
-        release(old);
     }
     // ID3D12CommandQueue::GetDesc (slot 18) returns its struct through a hidden pointer.
     let mut desc = [0u32; 4];
@@ -90,14 +90,25 @@ fn note_queue(queue: usize) {
     if desc[0] != 0 {
         return; // not a direct queue
     }
+    let mut q = crate::sys::lock(&QUEUES);
+    if q.iter().any(|(x, _)| *x == queue) {
+        return;
+    }
     let mut dev = 0usize;
     // ID3D12DeviceChild::GetDevice is slot 7.
     if vcall!(queue, 7, fn(*const Guid, *mut usize) -> i32, &IID_ID3D12DEVICE, &mut dev) < 0 {
         return;
     }
+    let old = (q.len() >= MAX_QUEUES).then(|| q.remove(0).0);
     vcall!(queue, 1, fn() -> u32);
     q.push((queue, dev));
     release(dev);
+    for (i, d) in DIRECT.iter().enumerate() {
+        d.store(q.get(i).map_or(0, |(x, _)| *x), Ordering::Relaxed);
+    }
+    if let Some(old) = old {
+        release(old);
+    }
 }
 
 /// Swap chains and the queue each was made on (AddRef'd, kept).

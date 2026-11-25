@@ -961,7 +961,9 @@ mod reg {
     use windows_sys::Win32::System::Registry::*;
 
     /// How deep a key's subkeys are followed, and how many keys at most.
+    #[cfg(windows)]
     const MAX_DEPTH: usize = 16;
+    #[cfg(windows)]
     const MAX_KEYS: usize = 20_000;
 
     #[cfg(windows)]
@@ -1334,6 +1336,7 @@ mod tests {
 
     /// A junction inside a save isn't followed (one back up to the save would never end).
     #[test]
+    #[cfg(windows)]
     fn links_inside_saves_are_left_out() {
         use std::os::windows::process::CommandExt;
         let b = base("links");

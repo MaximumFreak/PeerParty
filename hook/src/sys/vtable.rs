@@ -23,6 +23,60 @@ macro_rules! vmethod {
 }
 pub(crate) use vmethod;
 
+/// A layout's method names in vtable order. The generated tables (steam/vt.rs,
+/// galaxy/vt.rs) keep each name once in a pool and a layout as indices into it: a table
+/// of `&str`s costs 16 bytes a slot on x64 and a relocation each on x86.
+#[derive(Clone, Copy)]
+pub struct Names {
+    pool: &'static [&'static str],
+    ix: &'static [u16],
+}
+
+impl Names {
+    pub const fn new(pool: &'static [&'static str], ix: &'static [u16]) -> Self {
+        Names { pool, ix }
+    }
+
+    pub fn len(self) -> usize {
+        self.ix.len()
+    }
+
+    pub fn get(self, i: usize) -> Option<&'static &'static str> {
+        self.pool.get(*self.ix.get(i)? as usize)
+    }
+
+    pub fn iter(self) -> NamesIter {
+        self.into_iter()
+    }
+
+    pub fn contains(self, name: &str) -> bool {
+        self.iter().any(|n| *n == name)
+    }
+}
+
+pub type NamesIter = std::iter::Map<std::iter::Zip<std::slice::Iter<'static, u16>, std::iter::Repeat<&'static [&'static str]>>, fn((&'static u16, &'static [&'static str])) -> &'static &'static str>;
+
+impl IntoIterator for Names {
+    type Item = &'static &'static str;
+    type IntoIter = NamesIter;
+
+    fn into_iter(self) -> NamesIter {
+        self.ix.iter().zip(std::iter::repeat(self.pool)).map(|(&i, pool)| &pool[i as usize])
+    }
+}
+
+impl PartialEq for Names {
+    fn eq(&self, other: &Names) -> bool {
+        self.iter().eq(other.iter())
+    }
+}
+
+impl std::fmt::Debug for Names {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
 /// The most slots a stand-in's vtable forwards.
 pub const MAX_SLOTS: usize = 128;
 const STUB: usize = 16;

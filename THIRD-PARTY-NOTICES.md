@@ -80,7 +80,7 @@ SOFTWARE.
 
 ## Rust crates linked into the program
 
-177 crates: the ones linked into the Windows x64 and x86 builds (Cargo.lock
+175 crates: the ones linked into the Windows x64 and x86 builds (Cargo.lock
 also lists crates for other platforms and build-time tools, which aren't shipped).
 Where several crates share a licence text, they are listed
 together above it. `vendor/retour` (retour with local fixes) is among them.
@@ -467,7 +467,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### aead 0.5.2, base64ct 1.8.3, block-buffer 0.10.4, chacha20 0.9.1, chacha20poly1305 0.10.1, cipher 0.4.4 and 16 more
+### aead 0.5.2, base64ct 1.8.3, block-buffer 0.10.4, chacha20 0.9.1, chacha20poly1305 0.10.1, cipher 0.4.4 and 15 more
 
 - aead 0.5.2 (MIT OR Apache-2.0), https://github.com/RustCrypto/traits
 - base64ct 1.8.3 (Apache-2.0 OR MIT), https://github.com/RustCrypto/formats
@@ -486,7 +486,6 @@ DEALINGS IN THE SOFTWARE.
 - opaque-debug 0.3.1 (MIT OR Apache-2.0), https://github.com/RustCrypto/utils
 - pkcs8 0.10.2 (Apache-2.0 OR MIT), https://github.com/RustCrypto/formats/tree/master/pkcs8
 - poly1305 0.8.0 (Apache-2.0 OR MIT), https://github.com/RustCrypto/universal-hashes
-- sha1 0.10.7 (MIT OR Apache-2.0), https://github.com/RustCrypto/hashes
 - sha2 0.10.9 (MIT OR Apache-2.0), https://github.com/RustCrypto/hashes
 - signature 2.2.0 (Apache-2.0 OR MIT), https://github.com/RustCrypto/traits/tree/master/signature
 - spki 0.7.3 (Apache-2.0 OR MIT), https://github.com/RustCrypto/formats/tree/master/spki
@@ -6733,9 +6732,8 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### sha1 0.10.7, sha2 0.10.9
+### sha2 0.10.9
 
-- sha1 0.10.7 (MIT OR Apache-2.0), https://github.com/RustCrypto/hashes
 - sha2 0.10.9 (MIT OR Apache-2.0), https://github.com/RustCrypto/hashes
 
 ```text
@@ -8228,11 +8226,10 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### windows-link 0.2.1, windows-sys 0.52.0, windows-sys 0.59.0, windows-sys 0.61.2, windows-targets 0.52.6, windows_i686_msvc 0.52.6 and 1 more
+### windows-link 0.2.1, windows-sys 0.52.0, windows-sys 0.61.2, windows-targets 0.52.6, windows_i686_msvc 0.52.6, windows_x86_64_msvc 0.52.6
 
 - windows-link 0.2.1 (MIT OR Apache-2.0), https://github.com/microsoft/windows-rs
 - windows-sys 0.52.0 (MIT OR Apache-2.0), https://github.com/microsoft/windows-rs
-- windows-sys 0.59.0 (MIT OR Apache-2.0), https://github.com/microsoft/windows-rs
 - windows-sys 0.61.2 (MIT OR Apache-2.0), https://github.com/microsoft/windows-rs
 - windows-targets 0.52.6 (MIT OR Apache-2.0), https://github.com/microsoft/windows-rs
 - windows_i686_msvc 0.52.6 (MIT OR Apache-2.0), https://github.com/microsoft/windows-rs
@@ -8262,11 +8259,10 @@ SOFTWARE.
     SOFTWARE
 ```
 
-### windows-link 0.2.1, windows-sys 0.52.0, windows-sys 0.59.0, windows-sys 0.61.2, windows-targets 0.52.6, windows_i686_msvc 0.52.6 and 1 more
+### windows-link 0.2.1, windows-sys 0.52.0, windows-sys 0.61.2, windows-targets 0.52.6, windows_i686_msvc 0.52.6, windows_x86_64_msvc 0.52.6
 
 - windows-link 0.2.1 (MIT OR Apache-2.0), https://github.com/microsoft/windows-rs
 - windows-sys 0.52.0 (MIT OR Apache-2.0), https://github.com/microsoft/windows-rs
-- windows-sys 0.59.0 (MIT OR Apache-2.0), https://github.com/microsoft/windows-rs
 - windows-sys 0.61.2 (MIT OR Apache-2.0), https://github.com/microsoft/windows-rs
 - windows-targets 0.52.6 (MIT OR Apache-2.0), https://github.com/microsoft/windows-rs
 - windows_i686_msvc 0.52.6 (MIT OR Apache-2.0), https://github.com/microsoft/windows-rs

@@ -26,8 +26,8 @@
 //! a device whose format was set before the hooks is taken as the standard joystick
 //! format of its size.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use peerparty_protocol::input_shm::{InputSnapshot, VirtualKeyboard, VirtualPad};
 use retour::GenericDetour;
@@ -219,7 +219,8 @@ struct Format {
     objs: Vec<Obj>,
 }
 
-/// One device, as asked once (and its format as the game set it).
+/// One device, as asked once (and its format as the game set it). Copied out of DEVS on
+/// every read, so what's big is shared.
 #[derive(Clone)]
 struct Dev {
     this: usize,
@@ -227,11 +228,11 @@ struct Dev {
     hid: Option<device::Hid>,
     /// An XInput controller's HID side (`&IG_` in its path): XInput's routing decides.
     xinput_side: bool,
-    format: Option<Format>,
+    format: Option<Arc<Format>>,
     /// Each format object's range (`DIPROP_RANGE`), asked at the first read.
-    ranges: Option<Vec<Option<(i32, i32)>>>,
+    ranges: Option<Arc<[Option<(i32, i32)>]>>,
     /// The last state its buffered reads handed out (a joystick carrying the virtual pad).
-    last: Option<Vec<u8>>,
+    last: Option<Arc<[u8]>>,
 }
 
 static DEVS: Mutex<Vec<Dev>> = Mutex::new(Vec::new());
@@ -395,16 +396,22 @@ fn parse_format(f: &DataFormat) -> Option<Format> {
 
 /// DirectInput's standard joystick format of `size` bytes (`DIJOYSTATE`, 80, or
 /// `DIJOYSTATE2`, 272): eight axes, four hats, then 32 or 128 buttons.
-fn standard_joystick(size: u32) -> Option<Format> {
-    let buttons = match size {
-        80 => 32,
-        272 => 128,
+fn standard_joystick(size: u32) -> Option<Arc<Format>> {
+    static SMALL: OnceLock<Arc<Format>> = OnceLock::new();
+    static LARGE: OnceLock<Arc<Format>> = OnceLock::new();
+    let (cell, buttons) = match size {
+        80 => (&SMALL, 32),
+        272 => (&LARGE, 128),
         _ => return None,
     };
+    Some(cell.get_or_init(|| Arc::new(build_standard_joystick(size, buttons))).clone())
+}
+
+fn build_standard_joystick(size: u32, buttons: u32) -> Format {
     let mut objs: Vec<Obj> = (0..8).map(|i| Obj { ofs: i * 4, what: What::Axis(i as u8) }).collect();
     objs.extend((0..4).map(|i| Obj { ofs: 32 + i * 4, what: What::Pov(i as u8) }));
     objs.extend((0..buttons).map(|i| Obj { ofs: 48 + i, what: What::Button(i as u8) }));
-    Some(Format { size, objs })
+    Format { size, objs }
 }
 
 /// Each axis's `(min, max)` (`DIPROP_RANGE`, by offset), None for the rest.
@@ -534,9 +541,27 @@ const EXTENDED: [(u8, usize); 19] = [
 /// divide) is its scan code with 0x80, as DirectInput numbers it; the rest are the
 /// keyboard layout's scan codes.
 pub(crate) fn pack_keyboard(out: &mut [u8], kb: &VirtualKeyboard) {
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VK_TO_VSC_EX, MapVirtualKeyW};
+    let map = dik_map();
     for vk in 1u8..=254 {
         if kb.is_down(vk) {
+            let sc = map[vk as usize].load(Ordering::Relaxed) as usize;
+            if sc > 0 && sc < out.len() {
+                out[sc] = 0x80;
+            }
+        }
+    }
+}
+
+/// Each virtual key's `DIK_*` code (0: none) for the thread's keyboard layout, worked out
+/// again only when the layout changes: a game polls the keyboard every frame.
+fn dik_map() -> &'static [AtomicU8; 256] {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardLayout, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW};
+    static MAP: [AtomicU8; 256] = [const { AtomicU8::new(0) }; 256];
+    // The layout it was made for, plus one (0: not made yet).
+    static FOR: AtomicUsize = AtomicUsize::new(0);
+    let layout = (unsafe { GetKeyboardLayout(0) } as usize).wrapping_add(1);
+    if FOR.load(Ordering::Acquire) != layout {
+        for vk in 1u8..=254 {
             let sc = match EXTENDED.iter().find(|(v, _)| *v == vk) {
                 Some(&(_, dik)) => dik,
                 None => {
@@ -545,11 +570,11 @@ pub(crate) fn pack_keyboard(out: &mut [u8], kb: &VirtualKeyboard) {
                     if low == 0 { 0 } else if ex & 0xFF00 == 0xE000 { low | 0x80 } else { low }
                 }
             };
-            if sc > 0 && sc < out.len() {
-                out[sc] = 0x80;
-            }
+            MAP[vk as usize].store(sc.min(255) as u8, Ordering::Relaxed);
         }
+        FOR.store(layout, Ordering::Release);
     }
+    &MAP
 }
 
 /// The seat the virtual pad's joystick was chosen for (`super::seat_stamp`), the
@@ -614,15 +639,15 @@ fn joystick(d: &Dev, snap: &InputSnapshot, real_down: u32) -> Joy {
     if bound(d.this, own_down, real_down) { Joy::Pad(pad) } else { Joy::Rest }
 }
 
-fn format_of(d: &Dev, size: u32) -> Option<Format> {
+fn format_of(d: &Dev, size: u32) -> Option<Arc<Format>> {
     d.format.clone().filter(|f| f.size == size).or_else(|| standard_joystick(size))
 }
 
-fn ranges_for(d: &Dev, f: &Format) -> Vec<Option<(i32, i32)>> {
+fn ranges_for(d: &Dev, f: &Format) -> Arc<[Option<(i32, i32)>]> {
     if let Some(r) = d.ranges.as_ref().filter(|r| r.len() == f.objs.len()) {
         return r.clone();
     }
-    let r = ranges_of(d.this, f);
+    let r: Arc<[Option<(i32, i32)>]> = ranges_of(d.this, f).into();
     update(d.this, |k| k.ranges = Some(r.clone()));
     r
 }
@@ -747,9 +772,9 @@ fn dev_data(i: usize, this: usize, size: u32, data: *mut u8, count: *mut u32, fl
                     let before = d.last.clone().filter(|l| l.len() == now.len()).unwrap_or_else(|| {
                         let mut rest = vec![0u8; f.size as usize];
                         pack(&f, &r, &mut rest, None);
-                        rest
+                        rest.into()
                     });
-                    let mut given = before.clone();
+                    let mut given = before.to_vec();
                     let mut w = 0u32;
                     let at = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount() };
                     for o in &f.objs {
@@ -774,7 +799,7 @@ fn dev_data(i: usize, this: usize, size: u32, data: *mut u8, count: *mut u32, fl
                     }
                     unsafe { *count = w };
                     if flags & DIGDD_PEEK == 0 {
-                        update(this, |k| k.last = Some(given));
+                        update(this, |k| k.last = Some(given.into()));
                     }
                 }
             }
@@ -889,10 +914,11 @@ fn set_data_format(i: usize, this: usize, format: *const DataFormat) -> i32 {
         let d = dev(this);
         if d.kind == Kind::Joystick
             && let Some(f) = &f
-            && standard_joystick(f.size).as_ref() != Some(f)
+            && standard_joystick(f.size).as_deref() != Some(f)
         {
             log!("input: DirectInput joystick {this:#x} reads a format of its own ({} bytes, {} objects)", f.size, f.objs.len());
         }
+        let f = f.map(Arc::new);
         update(this, |d| {
             d.format = f;
             d.ranges = None;

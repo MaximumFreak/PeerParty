@@ -64,7 +64,8 @@ pub fn process_exe(pid: u32) -> Option<String> {
 
 /// Whether the process has a visible top-level window.
 pub fn has_visible_window(pid: u32) -> bool {
-    use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
+    use windows_sys::core::BOOL;
     use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId, IsWindowVisible};
     struct Find {
         pid: u32,
