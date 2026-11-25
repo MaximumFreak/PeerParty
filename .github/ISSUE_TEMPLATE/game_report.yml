@@ -7,13 +7,13 @@ body:
       value: |
         Thanks for reporting. Every game started through PeerParty writes a log of what PeerParty did in it, and a report can't be looked into without it.
 
-        **Getting the log:** in the launcher, open **Settings** and press **Open logs**, or paste `%TEMP%\peerparty\logs` into File Explorer's address bar. There is one file per run, named after the game's exe and the time it started (for example `game-20261109-183005-4242.log`). Attach the newest one for the game, **from each PC that played**.
+        **Getting the log:** in the launcher, open **Settings** and press **Open logs**, or paste `%TEMP%\peerparty\logs` into File Explorer's address bar. There is one file per run, named after the game's exe and the time it started (for example `game-20261109-183005-4242.log`). Attach the newest one for the game **from each PC that played**. In split screen or with two copies on one PC, each copy writes its own log: attach one per copy.
   - type: input
     id: version
     attributes:
       label: PeerParty version
       description: Shown in the launcher's Settings.
-      placeholder: "0.4.0"
+      placeholder: "0.5.2"
     validations:
       required: true
   - type: input
@@ -39,18 +39,22 @@ body:
     id: network
     attributes:
       label: How you played
+      description: Pick every one that applies (for example split screen on one PC with a friend joining over LAN).
+      multiple: true
       options:
-        - LAN (same network)
-        - Internet (room code or friends)
+        - Split screen on one PC (one window, 2–4 players)
+        - Two copies on one PC (separate windows)
+        - LAN (PCs on the same network)
+        - Internet with a room code
         - Public sessions
-        - Only one PC so far
+        - One player only so far
     validations:
       required: true
   - type: textarea
     id: what
     attributes:
       label: What happens
-      description: How many PCs played, what you tried (host, join, invite), what you expected, and what happened instead.
+      description: How many PCs and players took part, what you tried (host, join, invite), what you expected, and what happened instead. For split screen, also say the layout, how many players, and which controllers or keyboard and mouse each one used.
       placeholder: |
         1. Two PCs on the same network, both started the game through PeerParty
         2. PC 1 hosted a lobby
@@ -61,7 +65,7 @@ body:
     id: logs
     attributes:
       label: Logs
-      description: In the launcher, **Settings → Open logs** (or `%TEMP%\peerparty\logs`). Drag the newest log for the game from each PC into this box. Please attach the files rather than pasting them.
+      description: In the launcher, **Settings → Open logs** (or `%TEMP%\peerparty\logs`). Drag the newest log for the game from each PC (in split screen, one per copy) into this box. Please attach the files rather than pasting them.
       placeholder: Drop the .log files here
     validations:
       required: true
