@@ -144,6 +144,44 @@ pub fn swap_queue(swap: usize) -> Option<usize> {
     crate::sys::lock(&SWAP_QUEUES).iter().find(|(s, _)| *s == swap).map(|(_, q)| *q)
 }
 
+/// Drops `swap`'s held command-queue reference (when its window is destroyed).
+pub fn forget_swap(swap: usize) {
+    let old = {
+        let mut q = crate::sys::lock(&SWAP_QUEUES);
+        q.iter().position(|(s, _)| *s == swap).map(|i| q.remove(i).1)
+    };
+    if let Some(queue) = old {
+        release(queue);
+    }
+}
+
+/// Drops all held direct-queue references for `device` (when the last swap chain on it
+/// goes away), so PeerParty never keeps the game's Direct3D 12 device alive past shutdown.
+pub fn forget_device(device: usize) {
+    if device == 0 {
+        return;
+    }
+    let removed: Vec<usize> = {
+        let mut q = crate::sys::lock(&QUEUES);
+        let mut out = Vec::new();
+        q.retain(|&(queue, dev)| {
+            if dev == device {
+                out.push(queue);
+                false
+            } else {
+                true
+            }
+        });
+        for (i, d) in DIRECT.iter().enumerate() {
+            d.store(q.get(i).map_or(0, |(x, _)| *x), Ordering::Relaxed);
+        }
+        out
+    };
+    for queue in removed {
+        release(queue);
+    }
+}
+
 /// The first direct queue of `device` the game submitted on (not AddRef'd: kept alive
 /// by `QUEUES`).
 pub fn queue_of(device: usize) -> Option<usize> {

@@ -561,6 +561,9 @@ pub enum HookMsg {
     /// the release fence, their size and format (a `DXGI_FORMAT`), and the graphics API
     /// they come from.
     Surface(SurfaceMsg),
+    /// The copy let go of its active capture surface (e.g. its window was destroyed): the
+    /// compositor should drop its opened handles to that set right away.
+    SurfaceCleared,
 }
 
 impl HookMsg {
@@ -602,6 +605,7 @@ impl HookMsg {
                 ("pixels", opt_str(&m.pixels)),
                 ("stride", Json::u64(m.stride.into())),
             ]),
+            HookMsg::SurfaceCleared => Json::obj(vec![("t", Json::str("surface_cleared"))]),
         }
     }
 
@@ -626,6 +630,7 @@ impl HookMsg {
                 api: text(v, "api").unwrap_or_default(),
             },
             "surface" => HookMsg::Surface(SurfaceMsg::from_json(v)?),
+            "surface_cleared" => HookMsg::SurfaceCleared,
             _ => return None,
         })
     }
@@ -860,6 +865,7 @@ mod tests {
                 stride: 1920 * 4,
                 ..surface()
             }),
+            HookMsg::SurfaceCleared,
         ] {
             let line = m.to_line();
             assert_eq!(HookMsg::from_line(&line), Some(m), "{line}");

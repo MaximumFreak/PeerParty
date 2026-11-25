@@ -428,6 +428,17 @@ pub(super) fn send_surface(m: SurfaceMsg) {
     }
 }
 
+/// Tells the session that this copy's active capture surface is gone (its window is being
+/// destroyed), so the compositor releases its duplicated handles before teardown finishes.
+pub(super) fn clear_surface() {
+    let had = CURRENT.swap(0, Ordering::AcqRel);
+    CURRENT_AT.store(0, Ordering::Release);
+    crate::sys::lock(&REPORTED).clear();
+    if had != 0 && crate::ipc::connected() {
+        crate::ipc::send(HookMsg::SurfaceCleared);
+    }
+}
+
 /// Whether a frame of `generation` goes to the session. A game with two swap chains (one
 /// made for a fullscreen switch, say) can go back to presenting the first, whose set was
 /// reported before the other's and isn't made again: the session draws only the set

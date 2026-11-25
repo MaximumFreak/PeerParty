@@ -1722,6 +1722,12 @@ impl SessionHost {
                 }
                 self.instances[i].surface = Some(s);
             }
+            HookMsg::SurfaceCleared => {
+                if let Some(c) = self.compositor.as_mut() {
+                    c.clear_frames(i);
+                }
+                self.instances[i].surface = None;
+            }
         }
     }
 
@@ -2701,6 +2707,8 @@ mod tests {
         let m = peerparty_protocol::SurfaceMsg { pid: 0, generation: 2, textures: vec![4, 8, 12], content: 16, release: 20, width: 1920, height: 1080, format: 90, api: "d3d11".into(), color_space: 0, pixels: None, stride: 0 };
         host.message(1, HookMsg::Surface(m));
         assert_eq!(host.instances[1].surface, Some(Surface { generation: 2, width: 1920, height: 1080, format: 90, api: "d3d11".into() }));
+        host.message(1, HookMsg::SurfaceCleared);
+        assert_eq!(host.instances[1].surface, None);
         let state = |s: &str| Json::parse(s).unwrap();
         host.message(0, HookMsg::State(state(r#"{"t":"state","prefer_ingame":true,"me":{"name":"Sam"},"present":""}"#)));
         assert!(host.instances[0].prefer_ingame && !host.instances[0].ingame);

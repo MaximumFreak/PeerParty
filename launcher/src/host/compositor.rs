@@ -499,6 +499,20 @@ impl CompositorWindow {
         true
     }
 
+    /// Drops copy `i`'s shared frame surface (its window was destroyed or stopped sharing).
+    pub fn clear_frames(&mut self, i: usize) {
+        #[cfg(windows)]
+        if let Some(w) = self.window.as_mut() {
+            w.set_surface(i, None, None);
+        }
+        #[cfg(unix)]
+        if let Some(w) = self.window.as_mut() {
+            w.set_pixels(i, None, None);
+        }
+        #[cfg(not(any(windows, unix)))]
+        let _ = i;
+    }
+
     /// The name of the event the copies' hooks set after each frame (None: no window
     /// drawing them, or one that looks at their rings once a refresh instead).
     pub fn frame_event(&self) -> Option<String> {
@@ -1435,22 +1449,24 @@ mod win {
                 if !contain_window(self.hwnd, src, layout_pane, bounds, minimized) {
                     self.notes.push((i, format!("session: the game's window 0x{source:x} isn't answering (busy or hung): put in its pane once it does")));
                 }
-                // The thumbnail is only the fallback for frames the window can't draw
-                // itself: without one, the pane and its input still work.
-                let mut thumbnail: Thumbnail = 0;
-                match dwm() {
-                    Some(dwm) if unsafe { (dwm.register)(self.hwnd, src, &mut thumbnail) } >= 0 => {}
-                    _ => {
-                        thumbnail = 0;
-                        self.notes.push((i, format!("session: no DWM thumbnail of the game's window 0x{source:x}: its pane shows only the frames it hands over")));
-                    }
-                }
                 // A copy that made a new window (a mode switch, a device reset) may still
-                // be handing over frames this window draws: its new thumbnail starts
-                // hidden, or it would cover them until `push_panes` saw it.
+                // be handing over frames this window draws: skip registering a thumbnail
+                // while GPU capture is already live so no hidden DWM thumbnail sits on
+                // the compositor HWND.
                 let drawn = self.gpu.as_ref().is_some_and(|g| g.live(i));
+                let mut thumbnail: Thumbnail = 0;
                 if drawn {
                     self.notes.push((i, format!("session: the game's window is now 0x{source:x}; its pane keeps drawing the frames it hands over")));
+                } else {
+                    // The thumbnail is only the fallback for frames the window can't draw
+                    // itself: without one, the pane and its input still work.
+                    match dwm() {
+                        Some(dwm) if unsafe { (dwm.register)(self.hwnd, src, &mut thumbnail) } >= 0 => {}
+                        _ => {
+                            thumbnail = 0;
+                            self.notes.push((i, format!("session: no DWM thumbnail of the game's window 0x{source:x}: its pane shows only the frames it hands over")));
+                        }
+                    }
                 }
                 self.shown[i] = Some(Shown {
                     source,
@@ -1760,13 +1776,34 @@ mod win {
             s.dest = dest;
             s.uv = uv;
             s.src_size = src_size;
+            // Unregister DWM thumbnails once GPU capture is live so hidden thumbnails
+            // aren't left attached to the compositor HWND; re-register only if this pane
+            // falls back to thumbnail mode.
+            if s.drawn {
+                if s.thumbnail != 0 {
+                    if let Some(dwm) = dwm {
+                        unsafe { (dwm.unregister)(s.thumbnail) };
+                    }
+                    s.thumbnail = 0;
+                }
+                return;
+            }
+            let visible = dest.width > 0 && dest.height > 0;
+            if visible && s.thumbnail == 0
+                && let Some(dwm) = dwm
+            {
+                let mut thumb: Thumbnail = 0;
+                if unsafe { (dwm.register)(self.hwnd, s.source as HWND, &mut thumb) } >= 0 {
+                    s.thumbnail = thumb;
+                }
+            }
             let (w, h) = (i32::try_from(dest.width).unwrap_or(i32::MAX), i32::try_from(dest.height).unwrap_or(i32::MAX));
             let props = ThumbnailProperties {
                 flags: DWM_TNP_RECTDESTINATION | DWM_TNP_OPACITY | DWM_TNP_VISIBLE | DWM_TNP_SOURCECLIENTAREAONLY,
                 destination: RECT { left: dest.x, top: dest.y, right: dest.x.saturating_add(w), bottom: dest.y.saturating_add(h) },
                 source: RECT { left: 0, top: 0, right: 0, bottom: 0 },
                 opacity: 255,
-                visible: BOOL::from(dest.width > 0 && dest.height > 0 && !s.drawn),
+                visible: BOOL::from(visible),
                 client_area_only: 1,
             };
             if let Some(dwm) = dwm.filter(|_| s.thumbnail != 0) {

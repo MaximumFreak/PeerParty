@@ -301,6 +301,13 @@ pub fn set_capture(enabled: bool, ring: Option<&str>, event: Option<&str>, pace:
     }
 }
 
+/// Drops any DXGI capture/drawer state bound to `hwnd` when that window is destroyed.
+pub(crate) fn window_destroyed(hwnd: usize) {
+    if !skipped() {
+        let _ = dxgi::window_destroyed(hwnd);
+    }
+}
+
 /// Ensures graphics present/resize hooks are installed so a split-screen session receives
 /// exact backbuffer dimensions (`HookMsg::Viewport`) on startup and resolution changes.
 pub fn ensure_viewport_hooks() {

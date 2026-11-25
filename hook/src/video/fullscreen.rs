@@ -169,6 +169,20 @@ unsafe extern "system" fn make_window_association(factory: usize, hwnd: usize, f
     unsafe { real.call(factory, hwnd, flags | NO_ALT_ENTER) }
 }
 
+/// `DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH`.
+const ALLOW_MODE_SWITCH: u32 = 0x2;
+
+/// Strips `DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH` while the copy is kept windowed so
+/// DXGI cannot change the display mode on a swap chain create or resize.
+pub(super) fn keep_flags(flags: u32, windowed: bool) -> u32 {
+    if windowed { flags & !ALLOW_MODE_SWITCH } else { flags }
+}
+
+/// Drops any remembered fullscreen wish for `swap` (when its window is destroyed).
+pub(super) fn forget_swap(swap: usize) {
+    wanted(swap, false);
+}
+
 /// A swap chain was made: what's known of the one before at its address goes (a
 /// fullscreen one's wish too: a windowed one made at the same address isn't it).
 fn made_swap(swap: usize, device: usize) {
@@ -177,29 +191,47 @@ fn made_swap(swap: usize, device: usize) {
     super::d3d12::note_swap(swap, device);
 }
 
-unsafe extern "system" fn create_swap_chain(factory: usize, device: usize, desc: *mut SwapChainDesc, out: *mut usize) -> i32 {
+/// Records a newly created swap chain, clearing stale state for its address before
+/// recording whether the game asked for fullscreen so `made_swap` never wipes `want_fs`.
+fn finish_create(swap: usize, device: usize, want_fs: bool) {
+    made_swap(swap, device);
+    if want_fs {
+        wanted(swap, true);
+    }
+}
 
+unsafe extern "system" fn create_swap_chain(factory: usize, device: usize, desc: *mut SwapChainDesc, out: *mut usize) -> i32 {
     let real = CREATE_SWAP_CHAIN.get().unwrap();
-    let made = |hr: i32| {
-        if hr >= 0 && !out.is_null() {
-            made_swap(unsafe { out.read() }, device);
-        }
-        hr
-    };
     if !keep_windowed() || desc.is_null() {
-        return made(unsafe { real.call(factory, device, desc, out) });
+        let hr = unsafe { real.call(factory, device, desc, out) };
+        if hr >= 0 && !out.is_null() {
+            finish_create(unsafe { out.read() }, device, false);
+        }
+        return hr;
     }
-    let windowed = unsafe { &raw mut (*desc).windowed };
-    if unsafe { windowed.read() } != 0 {
-        return made(unsafe { real.call(factory, device, desc, out) });
+    let windowed_ptr = unsafe { &raw mut (*desc).windowed };
+    let flags_ptr = unsafe { &raw mut (*desc).flags };
+    let orig_windowed = unsafe { windowed_ptr.read() };
+    let orig_flags = unsafe { flags_ptr.read() };
+    let want_fs = orig_windowed == 0;
+    let new_flags = keep_flags(orig_flags, true);
+    if want_fs {
+        told("a fullscreen swap chain");
+        // The game's own description, windowed for the call and put back after.
+        unsafe { windowed_ptr.write(1) };
     }
-    told("a fullscreen swap chain");
-    // The game's own description, windowed for the call and put back after.
-    unsafe { windowed.write(1) };
-    let hr = made(unsafe { real.call(factory, device, desc, out) });
-    unsafe { windowed.write(0) };
+    if new_flags != orig_flags {
+        unsafe { flags_ptr.write(new_flags) };
+    }
+    let hr = unsafe { real.call(factory, device, desc, out) };
+    if want_fs {
+        unsafe { windowed_ptr.write(orig_windowed) };
+    }
+    if new_flags != orig_flags {
+        unsafe { flags_ptr.write(orig_flags) };
+    }
     if hr >= 0 && !out.is_null() {
-        wanted(unsafe { out.read() }, true);
+        finish_create(unsafe { out.read() }, device, want_fs);
     }
     hr
 }
@@ -214,21 +246,62 @@ unsafe extern "system" fn create_for_hwnd(
     out: *mut usize,
 ) -> i32 {
     let real = CREATE_FOR_HWND.get().unwrap();
-    if !keep_windowed() || fs.is_null() || unsafe { (*fs).windowed } != 0 {
+    if !keep_windowed() {
         let hr = unsafe { real.call(factory, device, hwnd, desc, fs, output, out) };
         if hr >= 0 && !out.is_null() {
-            wanted(unsafe { out.read() }, false);
-            made_swap(unsafe { out.read() }, device);
+            finish_create(unsafe { out.read() }, device, false);
         }
         return hr;
     }
-    told("a fullscreen swap chain");
-    let mut windowed = unsafe { *fs };
-    windowed.windowed = 1;
-    let hr = unsafe { real.call(factory, device, hwnd, desc, &windowed, output, out) };
+    // Copy DXGI_SWAP_CHAIN_DESC1 (12 u32s, Flags at index 11) so we can strip mode switch
+    // without mutating the caller's const struct.
+    let desc1 = (desc != 0).then(|| {
+        let mut d = unsafe { *(desc as *const [u32; 12]) };
+        d[11] = keep_flags(d[11], true);
+        d
+    });
+    let desc_arg = desc1.as_ref().map_or(0, |d| d.as_ptr() as usize);
+    let want_fs = !fs.is_null() && unsafe { (*fs).windowed } == 0;
+    let windowed = if want_fs {
+        told("a fullscreen swap chain");
+        let mut w = unsafe { *fs };
+        w.windowed = 1;
+        w
+    } else {
+        FullscreenDesc { refresh_num: 0, refresh_den: 0, scanline: 0, scaling: 0, windowed: 1 }
+    };
+    let fs_arg = if want_fs { &raw const windowed } else { fs };
+    let hr = unsafe { real.call(factory, device, hwnd, desc_arg, fs_arg, output, out) };
     if hr >= 0 && !out.is_null() {
-        wanted(unsafe { out.read() }, true);
-        made_swap(unsafe { out.read() }, device);
+        finish_create(unsafe { out.read() }, device, want_fs);
     }
     hr
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_for_hwnd_keeps_fullscreen_wish_after_made_swap() {
+        let swap = 0x5555_1230usize;
+        // Creating a fullscreen swap chain must record it as wanted after clearing stale
+        // state for that address (not wipe the wish immediately after setting it).
+        finish_create(swap, 0, true);
+        assert!(crate::sys::lock(&WANTED).contains(&swap), "fullscreen wish stays recorded");
+        // A later windowed swap chain at the same address clears the old wish.
+        finish_create(swap, 0, false);
+        assert!(!crate::sys::lock(&WANTED).contains(&swap), "windowed swap chain clears stale wish");
+        // Explicit cleanup on window destroy also removes the entry.
+        finish_create(swap, 0, true);
+        forget_swap(swap);
+        assert!(!crate::sys::lock(&WANTED).contains(&swap));
+    }
+
+    #[test]
+    fn allow_mode_switch_is_stripped_only_when_kept_windowed() {
+        let flags = ALLOW_MODE_SWITCH | 0x40 | 0x800;
+        assert_eq!(keep_flags(flags, true), 0x40 | 0x800);
+        assert_eq!(keep_flags(flags, false), flags);
+    }
 }

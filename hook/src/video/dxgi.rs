@@ -110,6 +110,7 @@ impl Drop for Held {
 /// that's gone: the device is compared too.
 struct State {
     swap: usize,
+    window: usize,
     kind: Kind,
     /// Made the first time the overlay is drawn.
     drawer: Option<Drawer>,
@@ -123,6 +124,58 @@ struct State {
 /// few kept so two presenting in turn don't rebuild each other's every frame).
 static STATES: Mutex<Vec<State>> = Mutex::new(Vec::new());
 const MAX_STATES: usize = 4;
+
+/// Releases all swap chain states, capture rings, overlay drawers and D3D12 queue refs
+/// owned by `hwnd` when that window is destroyed, so PeerParty drops its COM refs before
+/// the game tears down its device and the compositor stops waiting on its shared fences.
+pub(super) fn window_destroyed(hwnd: usize) -> bool {
+    if hwnd == 0 {
+        return false;
+    }
+    let (removed, dead_d3d12_devs) = {
+        let mut st = crate::sys::lock(&STATES);
+        let mut removed = Vec::new();
+        let mut i = 0;
+        while i < st.len() {
+            if st[i].window == hwnd {
+                removed.push(st.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        if removed.is_empty() {
+            return false;
+        }
+        let mut dead_devs = Vec::new();
+        for s in &removed {
+            if let Kind::D3d12(dev) = s.kind
+                && !dead_devs.contains(&dev)
+                && !st.iter().any(|other| other.kind == Kind::D3d12(dev))
+            {
+                dead_devs.push(dev);
+            }
+        }
+        (removed, dead_devs)
+    };
+    // Tell the host before draining/releasing locally so the compositor starts dropping
+    // its opened handles to this copy's shared textures and fences right away.
+    capture::clear_surface();
+    let count = removed.len();
+    let swaps: Vec<usize> = removed.iter().map(|s| s.swap).collect();
+    // Drop outside STATES: D3d12Capture::drop waits briefly for its last copy fence and
+    // releases COM objects.
+    drop(removed);
+    for swap in swaps {
+        forget(swap);
+        super::fullscreen::forget_swap(swap);
+        d3d12::forget_swap(swap);
+    }
+    for dev in dead_d3d12_devs {
+        d3d12::forget_device(dev);
+    }
+    log!("video: window 0x{hwnd:x} destroyed: released {count} swap chain state(s)");
+    true
+}
 
 #[repr(C)]
 pub(super) struct SwapChainDesc {
@@ -140,7 +193,7 @@ pub(super) struct SwapChainDesc {
     window: usize,
     pub(super) windowed: i32,
     effect: u32,
-    flags: u32,
+    pub(super) flags: u32,
 }
 
 pub fn install() -> bool {
@@ -249,11 +302,14 @@ fn kind_of(swap: usize) -> (Kind, Held) {
 }
 
 /// `swap`'s state (made, or moved to the back as the most recently used).
-fn state_for(st: &mut Vec<State>, swap: usize) -> &mut State {
+fn state_for(st: &mut Vec<State>, swap: usize, window: usize) -> &mut State {
     let (kind, held) = kind_of(swap);
     if let Some(i) = st.iter().position(|s| s.swap == swap) {
-        let s = st.remove(i);
+        let mut s = st.remove(i);
         if s.kind == kind {
+            if window != 0 {
+                s.window = window;
+            }
             st.push(s);
             return st.last_mut().unwrap();
         }
@@ -262,7 +318,7 @@ fn state_for(st: &mut Vec<State>, swap: usize) -> &mut State {
     if st.len() >= MAX_STATES {
         st.remove(0);
     }
-    st.push(State { swap, kind, drawer: None, capture11: D3d11Capture::default(), capture12: D3d12Frames::default(), _device: held });
+    st.push(State { swap, window, kind, drawer: None, capture11: D3d11Capture::default(), capture12: D3d12Frames::default(), _device: held });
     if st.len() == 2 {
         log!("video: the game presents more than one swap chain; each keeps its own drawing and copying");
     }
@@ -334,7 +390,7 @@ fn on_present(swap: usize) {
     }
 
     let mut st = crate::sys::lock(&STATES);
-    let s = state_for(&mut st, swap);
+    let s = state_for(&mut st, swap, desc.window);
     let space = color_space(swap, desc.format);
     let hdr10 = space == peerparty_protocol::frame_ring::COLOR_SPACE_HDR10;
     match s.kind {
@@ -461,6 +517,7 @@ unsafe extern "system" fn present1_hook(swap: usize, sync: u32, flags: u32, para
 
 unsafe extern "system" fn resize_hook(swap: usize, n: u32, w: u32, h: u32, fmt: u32, flags: u32) -> i32 {
     let _ = std::panic::catch_unwind(|| before_resize(swap, w, h));
+    let flags = super::fullscreen::keep_flags(flags, super::fullscreen::keep_windowed());
     unsafe { RESIZE.get().unwrap().call(swap, n, w, h, fmt, flags) }
 }
 
@@ -479,6 +536,7 @@ unsafe extern "system" fn set_color_space_hook(swap: usize, space: u32) -> i32 {
 
 unsafe extern "system" fn resize1_hook(swap: usize, n: u32, w: u32, h: u32, fmt: u32, flags: u32, mask: *const u32, queues: *const usize) -> i32 {
     let _ = std::panic::catch_unwind(|| before_resize(swap, w, h));
+    let flags = super::fullscreen::keep_flags(flags, super::fullscreen::keep_windowed());
     let hr = unsafe { RESIZE1.get().unwrap().call(swap, n, w, h, fmt, flags, mask, queues) };
     // A Direct3D 12 swap chain may present on another queue from here on (the first
     // buffer's): the overlay and the copies follow it.
@@ -627,6 +685,57 @@ mod tests {
         capture::configure(false, None, None);
         // The swap chain's state goes with it.
         crate::sys::lock(&STATES).retain(|s| s.swap != swap);
+        for o in [swap, queue, dev, adapter, f4, f2, factory] {
+            release(o);
+        }
+    }
+
+    /// Destroying a wrapped game window (`WM_DESTROY`/`WM_NCDESTROY`) releases its swap
+    /// chain state and Direct3D 12 command-queue refs before the game tears down its device.
+    #[test]
+    fn wm_ncdestroy_releases_d3d12_swap_chain_state() {
+        const IID_IDXGIFACTORY2: Guid = Guid(0x50c83a1c, 0xe072, 0x4c48, [0x87, 0xb0, 0x36, 0x30, 0xfa, 0x36, 0xa6, 0xd0]);
+        const IID_IDXGIFACTORY4: Guid = Guid(0x1bc6ea02, 0xef36, 0x464f, [0xbf, 0x0c, 0x21, 0xca, 0x39, 0xe5, 0x16, 0x8a]);
+        const IID_IDXGIADAPTER: Guid = Guid(0x2411e7e1, 0x12ac, 0x4ccf, [0xbd, 0x14, 0x97, 0x98, 0xe8, 0x53, 0x4d, 0xc0]);
+        let _turn = crate::sys::lock(&capture::tests::SERIAL);
+        let _ = com::load("d3d11.dll");
+        let (_map, name) = capture::tests::session_ring();
+        capture::configure(true, Some(&name), None);
+
+        type CreateFactory = unsafe extern "system" fn(*const Guid, *mut usize) -> i32;
+        let cf: CreateFactory = unsafe { std::mem::transmute(com::proc(com::load("dxgi.dll"), c"CreateDXGIFactory1").unwrap()) };
+        let mut factory = 0usize;
+        assert!(unsafe { cf(&com::IID_IDXGIFACTORY1, &mut factory) } >= 0);
+        let (f2, f4) = (com::query(factory, &IID_IDXGIFACTORY2), com::query(factory, &IID_IDXGIFACTORY4));
+        let mut adapter = 0usize;
+        assert!(vcall!(f4, 27, fn(*const Guid, *mut usize) -> i32, &IID_IDXGIADAPTER, &mut adapter) >= 0);
+        type Create12 = unsafe extern "system" fn(usize, u32, *const Guid, *mut usize) -> i32;
+        let c12: Create12 = unsafe { std::mem::transmute(com::proc(com::load("d3d12.dll"), c"D3D12CreateDevice").unwrap()) };
+        let mut dev = 0usize;
+        assert!(unsafe { c12(adapter, 0xb000, &IID_ID3D12DEVICE, &mut dev) } >= 0);
+        let mut queue = 0usize;
+        assert!(vcall!(dev, 8, fn(*const u32, *const Guid, *mut usize) -> i32, [0u32; 4].as_ptr(), &com::IID_ID3D12COMMANDQUEUE, &mut queue) >= 0);
+        let win = HiddenWindow::new().unwrap();
+        let hwnd = win.0 as usize;
+        crate::window::wrap_window_for_test(hwnd);
+        assert!(crate::window::is_wrapped_for_test(hwnd));
+
+        let desc: [u32; 12] = [64, 32, 87, 0, 1, 0, 0x20, 2, 0, 4, 0, 0];
+        let mut swap = 0usize;
+        let hr = vcall!(f2, 15, fn(usize, usize, *const u32, usize, usize, *mut usize) -> i32, queue, hwnd, desc.as_ptr(), 0, 0, &mut swap);
+        assert!(hr >= 0 && swap != 0, "CreateSwapChainForHwnd {hr:#x}");
+        d3d12::note_swap(swap, queue);
+        on_present(swap);
+        assert!(crate::sys::lock(&STATES).iter().any(|s| s.swap == swap && s.window == hwnd));
+        assert_eq!(d3d12::swap_queue(swap), Some(queue));
+
+        // Dropping the window calls DestroyWindow -> WM_DESTROY / WM_NCDESTROY.
+        drop(win);
+        assert!(!crate::window::is_wrapped_for_test(hwnd), "window unwrapped on WM_NCDESTROY");
+        assert!(!crate::sys::lock(&STATES).iter().any(|s| s.swap == swap), "swap chain state released");
+        assert_eq!(d3d12::swap_queue(swap), None, "D3D12 swap queue released");
+
+        capture::configure(false, None, None);
         for o in [swap, queue, dev, adapter, f4, f2, factory] {
             release(o);
         }

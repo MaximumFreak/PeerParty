@@ -327,7 +327,18 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrA as get_windo
 #[cfg(target_pointer_width = "32")]
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongA as get_window_long_ptr_a, GetWindowLongW as get_window_long_ptr_w, SetWindowLongA as set_window_long_ptr_a, SetWindowLongW as set_window_long_ptr_w};
 
+const WM_DESTROY: u32 = 0x0002;
 const WM_NCDESTROY: u32 = 0x0082;
+
+#[cfg(test)]
+pub(crate) fn wrap_window_for_test(hwnd: usize) {
+    keep_focus(hwnd);
+}
+
+#[cfg(test)]
+pub(crate) fn is_wrapped_for_test(hwnd: usize) -> bool {
+    crate::sys::lock(&WRAPPED).iter().any(|x| x.hwnd == hwnd)
+}
 
 unsafe extern "system" fn focus_proc(h: HWND, m: u32, w: usize, l: isize) -> isize {
     use windows_sys::Win32::UI::WindowsAndMessaging::{CallWindowProcA, CallWindowProcW, DefWindowProcA, DefWindowProcW, WNDPROC};
@@ -358,11 +369,17 @@ unsafe extern "system" fn focus_proc(h: HWND, m: u32, w: usize, l: isize) -> isi
         }
         return rc;
     }
+    if m == WM_DESTROY || m == WM_NCDESTROY {
+        // Release PeerParty's swap chain COM refs before the game's destroy handler tears
+        // down its graphics device.
+        crate::video::window_destroyed(h as usize);
+    }
     let rc = call(m, w, l);
     if m == WM_NCDESTROY {
         // The window's last message: its entry goes (a later window may get its handle).
         crate::sys::lock(&WRAPPED).retain(|x| x.hwnd != h as usize);
         let _ = PRIMARY_HWND.compare_exchange(h as usize, 0, Ordering::Relaxed, Ordering::Relaxed);
+        crate::video::window_destroyed(h as usize);
     }
     rc
 }

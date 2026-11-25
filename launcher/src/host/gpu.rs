@@ -33,7 +33,7 @@ use peerparty_protocol::frame_ring::{FLAG_COMPOSITOR_LIVE, FLAG_HIDDEN, SLOTS};
 use peerparty_protocol::ipc::SurfaceMsg;
 use peerparty_protocol::session::PaneRect;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND};
-use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects, WaitForSingleObjectEx};
+use windows_sys::Win32::System::Threading::{CreateEventW, ResetEvent, SetEvent, WaitForMultipleObjects, WaitForSingleObject, WaitForSingleObjectEx};
 
 /// Calls method `slot` of COM object `obj` (stdcall, `this` first).
 macro_rules! vcall {
@@ -59,6 +59,8 @@ const IID_ID3D11DEVICE5: Guid = Guid(0x8ffde202, 0xa0e7, 0x45df, [0x9e, 0x01, 0x
 const IID_ID3D11DEVICECONTEXT4: Guid = Guid(0x917600da, 0xf58c, 0x4c33, [0x98, 0xd8, 0x3e, 0x15, 0xb3, 0x90, 0xfa, 0x24]);
 const IID_ID3D11FENCE: Guid = Guid(0xaffde9d1, 0x1df7, 0x4bb7, [0x8a, 0x34, 0x0f, 0x46, 0x25, 0x1d, 0xab, 0x80]);
 const IID_ID3D11TEXTURE2D: Guid = Guid(0x6f15aaf2, 0xd208, 0x4e89, [0x9a, 0xb4, 0x48, 0x95, 0x35, 0xd3, 0x4f, 0x9c]);
+const IID_IDXGIDEVICE: Guid = Guid(0x54ec77fa, 0x1377, 0x44e6, [0x8c, 0x32, 0x88, 0xfd, 0x5f, 0x44, 0xc8, 0x4c]);
+const IID_IDCOMPOSITIONDEVICE: Guid = Guid(0xc37ea93a, 0xe7aa, 0x450d, [0xb1, 0x6f, 0x97, 0x46, 0xcb, 0x04, 0x07, 0xf3]);
 
 fn release(obj: usize) {
     if obj != 0 {
@@ -372,6 +374,15 @@ const DXGI_STATUS_OCCLUDED: i32 = 0x087A_0001;
 const DXGI_PRESENT_TEST: u32 = 1;
 /// How often an occluded window is asked whether it can be seen again.
 const OCCLUDED_RETRY: std::time::Duration = std::time::Duration::from_millis(250);
+/// Win32 `WAIT_OBJECT_0`.
+const WAIT_OBJECT_0: u32 = 0;
+/// Maximum CPU wait per pane for a copy's content fence before redrawing its last
+/// completed frame instead of blocking the compositor's GPU queue on a dying/hung copy.
+const CONTENT_WAIT_MS: u32 = 4;
+/// Consecutive frame-latency waitable timeouts before resetting the swap chain/device.
+const MAX_WAIT_TIMEOUTS: u32 = 5;
+/// Present duration above which a stall is logged to the session's hook logs.
+const PRESENT_STALL_MS: u128 = 200;
 
 const HLSL: &str = r#"
 struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
@@ -560,7 +571,11 @@ struct Renderer {
     ctx: usize,
     ctx4: usize,
     swap: usize,
+    dcomp_dev: usize,
+    dcomp_target: usize,
+    dcomp_visual: usize,
     waitable: HANDLE,
+    fence_event: HANDLE,
     rtv: usize,
     size: (u32, u32),
     vs: usize,
@@ -583,11 +598,38 @@ impl Drop for Renderer {
         if !self.waitable.is_null() {
             unsafe { CloseHandle(self.waitable) };
         }
+        if !self.fence_event.is_null() {
+            unsafe { CloseHandle(self.fence_event) };
+        }
+        if self.dcomp_visual != 0 {
+            vcall!(self.dcomp_visual, 15, fn(usize) -> i32, 0); // SetContent(NULL)
+        }
+        if self.dcomp_target != 0 {
+            vcall!(self.dcomp_target, 3, fn(usize) -> i32, 0); // SetRoot(NULL)
+        }
+        if self.dcomp_dev != 0 {
+            vcall!(self.dcomp_dev, 3, fn() -> i32); // Commit
+        }
         if self.ctx != 0 {
             vcall!(self.ctx, 110, fn() -> ()); // ClearState
             vcall!(self.ctx, 111, fn() -> ()); // Flush
         }
-        for o in [self.rtv, self.swap, self.sampler, self.cb, self.ps, self.vs, self.ctx4, self.ctx, self.dev5, self.dev1, self.dev] {
+        for o in [
+            self.dcomp_visual,
+            self.dcomp_target,
+            self.dcomp_dev,
+            self.rtv,
+            self.swap,
+            self.sampler,
+            self.cb,
+            self.ps,
+            self.vs,
+            self.ctx4,
+            self.ctx,
+            self.dev5,
+            self.dev1,
+            self.dev,
+        ] {
             release(o);
         }
     }
@@ -801,7 +843,11 @@ impl Renderer {
             ctx: 0,
             ctx4: 0,
             swap: 0,
+            dcomp_dev: 0,
+            dcomp_target: 0,
+            dcomp_visual: 0,
             waitable: std::ptr::null_mut(),
+            fence_event: std::ptr::null_mut(),
             rtv: 0,
             size: (0, 0),
             vs: 0,
@@ -857,13 +903,21 @@ impl Renderer {
             return false;
         }
         let (w, h) = client_size(self.hwnd);
-        // DXGI_SWAP_CHAIN_DESC1: the display's format, 2 buffers, flip-discard, its
-        // latency waitable.
+        self.fence_event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
         let (format, space) = self.display.swap_format();
-        let desc: [u32; 12] = [w.max(1), h.max(1), format, 0, 1, 0, 0x20, 2, 0, 4, 0, 0x40];
-        // IDXGIFactory2::CreateSwapChainForHwnd is slot 15.
-        if !ok(vcall!(f2, 15, fn(usize, HWND, *const u32, usize, usize, *mut usize) -> i32, self.dev, self.hwnd, desc.as_ptr(), 0, 0, &mut self.swap)) {
-            return false;
+        // Prefer a premultiplied DirectComposition flip swap chain (3 buffers) so the
+        // full-monitor borderless compositor window stays cleanly DWM-composed without
+        // Direct Flip / MPO transitions (which can stall Present or flash the desktop on
+        // close). Fall back to an HWND flip swap chain (3 buffers) where dcomp.dll is
+        // unavailable.
+        if !self.setup_composition(f2, w.max(1), h.max(1), format) {
+            // DXGI_SWAP_CHAIN_DESC1: the display's format, 3 buffers, flip-discard, its
+            // latency waitable.
+            let desc: [u32; 12] = [w.max(1), h.max(1), format, 0, 1, 0, 0x20, 3, 0, 4, 0, 0x40];
+            // IDXGIFactory2::CreateSwapChainForHwnd is slot 15.
+            if !ok(vcall!(f2, 15, fn(usize, HWND, *const u32, usize, usize, *mut usize) -> i32, self.dev, self.hwnd, desc.as_ptr(), 0, 0, &mut self.swap)) {
+                return false;
+            }
         }
         self.set_color_space(space);
         if self.display.hdr {
@@ -879,6 +933,88 @@ impl Renderer {
         }
         self.size = (w.max(1), h.max(1));
         true
+    }
+
+    /// Creates a premultiplied DirectComposition flip-discard swap chain (3 buffers) and
+    /// binds it to `self.hwnd` via `dcomp.dll` from System32.
+    fn setup_composition(&mut self, f2: usize, w: u32, h: u32, format: u32) -> bool {
+        type CreateDComp = unsafe extern "system" fn(usize, *const Guid, *mut usize) -> i32;
+        let Some(create_fn) = system_proc("dcomp.dll", c"DCompositionCreateDevice") else { return false };
+        let create: CreateDComp = unsafe { std::mem::transmute(create_fn) };
+        let dxgi_dev = query(self.dev, &IID_IDXGIDEVICE);
+        if dxgi_dev == 0 {
+            return false;
+        }
+        let mut dcomp_dev = 0usize;
+        let hr = unsafe { create(dxgi_dev, &IID_IDCOMPOSITIONDEVICE, &mut dcomp_dev) };
+        release(dxgi_dev);
+        if hr < 0 || dcomp_dev == 0 {
+            return false;
+        }
+        // DXGI_SWAP_CHAIN_DESC1: 3 buffers, DXGI_SCALING_STRETCH (0),
+        // DXGI_SWAP_EFFECT_FLIP_DISCARD (4), DXGI_ALPHA_MODE_PREMULTIPLIED (1),
+        // DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT (0x40).
+        let desc: [u32; 12] = [w, h, format, 0, 1, 0, 0x20, 3, 0, 4, 1, 0x40];
+        let mut swap = 0usize;
+        let mut target = 0usize;
+        let mut visual = 0usize;
+        // IDXGIFactory2::CreateSwapChainForComposition (24),
+        // IDCompositionDevice::CreateTargetForHwnd (6, topmost=TRUE) & CreateVisual (7),
+        // IDCompositionVisual::SetContent (15), IDCompositionTarget::SetRoot (3),
+        // IDCompositionDevice::Commit (3).
+        let ok = vcall!(f2, 24, fn(usize, *const u32, usize, *mut usize) -> i32, self.dev, desc.as_ptr(), 0, &mut swap) >= 0
+            && swap != 0
+            && vcall!(dcomp_dev, 6, fn(HWND, i32, *mut usize) -> i32, self.hwnd, 1, &mut target) >= 0
+            && target != 0
+            && vcall!(dcomp_dev, 7, fn(*mut usize) -> i32, &mut visual) >= 0
+            && visual != 0
+            && vcall!(visual, 15, fn(usize) -> i32, swap) >= 0
+            && vcall!(target, 3, fn(usize) -> i32, visual) >= 0
+            && vcall!(dcomp_dev, 3, fn() -> i32) >= 0;
+        if !ok {
+            if visual != 0 {
+                vcall!(visual, 15, fn(usize) -> i32, 0);
+            }
+            if target != 0 {
+                vcall!(target, 3, fn(usize) -> i32, 0);
+            }
+            vcall!(dcomp_dev, 3, fn() -> i32);
+            for o in [visual, target, swap, dcomp_dev] {
+                release(o);
+            }
+            return false;
+        }
+        self.swap = swap;
+        self.dcomp_dev = dcomp_dev;
+        self.dcomp_target = target;
+        self.dcomp_visual = visual;
+        true
+    }
+
+    /// Checks on the CPU whether shared content `fence` has reached `target`, waiting up
+    /// to `timeout_ms` ms via `SetEventOnCompletion` so a dying or stalled producer never
+    /// hangs the compositor's GPU queue.
+    fn content_ready(&self, fence: usize, target: u64, timeout_ms: u32) -> bool {
+        if fence == 0 {
+            return target == 0;
+        }
+        let ev = self.fence_event;
+        wait_fence_ready(
+            target,
+            || vcall!(fence, 8, fn() -> u64), // ID3D11Fence::GetCompletedValue
+            |val, rem| {
+                if ev.is_null() {
+                    return false;
+                }
+                unsafe { ResetEvent(ev) };
+                // ID3D11Fence::SetEventOnCompletion is slot 9.
+                if vcall!(fence, 9, fn(u64, HANDLE) -> i32, val, ev) < 0 {
+                    return false;
+                }
+                unsafe { WaitForSingleObject(ev, rem) == WAIT_OBJECT_0 }
+            },
+            timeout_ms,
+        )
     }
 
     /// IDXGISwapChain3::SetColorSpace1 (38), where the swap chain has it.
@@ -929,6 +1065,9 @@ impl Renderer {
                 return None;
             }
             self.set_color_space(space);
+            if self.dcomp_dev != 0 {
+                vcall!(self.dcomp_dev, 3, fn() -> i32); // Commit
+            }
             self.size = (w, h);
         }
         if self.rtv == 0 {
@@ -947,7 +1086,11 @@ impl Renderer {
     /// their slots.
     fn draw(&mut self, rtv: usize, panes: &[Pane], take: &[Option<(usize, u64)>]) -> Vec<(usize, usize)> {
         let ctx = self.ctx;
-        vcall!(ctx, 50, fn(usize, *const f32) -> (), rtv, [0.0f32, 0.0, 0.0, 1.0].as_ptr());
+        // DirectComposition sits above the window's black GDI background and any fallback
+        // DWM thumbnails: clear transparent outside drawn GPU panes so thumbnails show
+        // through while drawn panes output opaque alpha = 1.0.
+        let clear = if self.dcomp_dev != 0 { [0.0f32, 0.0, 0.0, 0.0] } else { [0.0f32, 0.0, 0.0, 1.0] };
+        vcall!(ctx, 50, fn(usize, *const f32) -> (), rtv, clear.as_ptr());
         vcall!(ctx, 33, fn(u32, *const usize, usize) -> (), 1, &rtv, 0);
         vcall!(ctx, 17, fn(usize) -> (), 0); // IASetInputLayout
         vcall!(ctx, 24, fn(u32) -> (), 5); // TRIANGLESTRIP
@@ -1178,6 +1321,56 @@ fn any_fresh(panes: &[Pane]) -> bool {
     })
 }
 
+/// Returns true once `completed()` reaches `target`, waiting in bounded steps via
+/// `wait_step(target, remaining_ms)` up to `timeout_ms` ms. Returns false immediately if
+/// `completed()` reports device-removed (`u64::MAX`) or `wait_step` fails / times out.
+fn wait_fence_ready(target: u64, mut completed: impl FnMut() -> u64, mut wait_step: impl FnMut(u64, u32) -> bool, timeout_ms: u32) -> bool {
+    if target == 0 {
+        return true;
+    }
+    let done = completed();
+    if done == u64::MAX {
+        return false;
+    }
+    if done >= target {
+        return true;
+    }
+    if timeout_ms == 0 {
+        return false;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(u64::from(timeout_ms));
+    loop {
+        let rem = deadline.saturating_duration_since(std::time::Instant::now()).as_millis() as u32;
+        if rem == 0 {
+            let done = completed();
+            return done != u64::MAX && done >= target;
+        }
+        if !wait_step(target, rem) {
+            let done = completed();
+            return done != u64::MAX && done >= target;
+        }
+        let done = completed();
+        if done == u64::MAX {
+            return false;
+        }
+        if done >= target {
+            return true;
+        }
+    }
+}
+
+/// Writes `line` into every active copy's hook log (once per unique PID).
+fn note_all(panes: &[Pane], line: &str) {
+    let mut seen = Vec::new();
+    for p in panes {
+        let pid = p.opened.as_ref().map(|o| o.surface.pid).or_else(|| p.draw.surface.as_ref().map(|s| s.pid)).unwrap_or(0);
+        if pid != 0 && !seen.contains(&pid) {
+            seen.push(pid);
+            crate::launch::note(pid, line);
+        }
+    }
+}
+
 fn take_frames(r: &mut Renderer, panes: &mut [Pane], dirty: &mut bool) -> (bool, Vec<Option<(usize, u64)>>, Vec<bool>) {
     let mut fresh = false;
     let mut take: Vec<Option<(usize, u64)>> = Vec::with_capacity(panes.len());
@@ -1187,20 +1380,66 @@ fn take_frames(r: &mut Renderer, panes: &mut [Pane], dirty: &mut bool) -> (bool,
         let mut now = false;
         let visible = p.draw.dest.width > 0 && p.draw.dest.height > 0;
         if let (Some(o), Some(ring), true) = (p.opened.as_mut(), p.draw.ring.as_ref(), visible) {
-            match ring.header().take(o.surface.generation) {
-                Some(f) => {
-                    if o.last != Some((f.slot, f.seq)) {
-                        fresh = true;
+            if o.pixels {
+                match ring.header().take(o.surface.generation) {
+                    Some(f) => {
+                        if o.last != Some((f.slot, f.seq)) {
+                            fresh = true;
+                        }
+                        o.last = Some((f.slot, f.seq));
+                        t = Some((f.slot, 0));
+                        now = true;
+                        // Pixels are copied out now: the hook may write the slot once
+                        // it's no longer the one taken.
+                        r.upload(o, f.slot, f.seq);
                     }
-                    o.last = Some((f.slot, f.seq));
-                    t = Some((f.slot, f.ready));
-                    now = true;
-                    // Pixels are copied out now: the hook may write the slot once
-                    // it's no longer the one taken.
-                    r.upload(o, f.slot, f.seq);
+                    // A newer generation's surface hasn't come yet: the last frame again.
+                    None => t = o.last.map(|(slot, _)| (slot, 0)),
                 }
-                // A newer generation's surface hasn't come yet: the last frame again.
-                None => t = o.last.map(|(slot, _)| (slot, 0)),
+            } else {
+                let generation = o.surface.generation;
+                match ring.header().published().filter(|f| f.generation == generation) {
+                    Some(pub_f) if o.last == Some((pub_f.slot, pub_f.seq)) => {
+                        // Same frame already verified ready: keep `reading` pinned without
+                        // issuing a GPU-side content-fence wait.
+                        if vcall!(o.content, 8, fn() -> u64) != u64::MAX
+                            && let Some(f) = ring.header().take(generation)
+                        {
+                            if f.slot == pub_f.slot && f.seq == pub_f.seq {
+                                t = Some((f.slot, 0));
+                                now = true;
+                            } else if r.content_ready(o.content, f.ready, CONTENT_WAIT_MS) {
+                                fresh = true;
+                                o.last = Some((f.slot, f.seq));
+                                t = Some((f.slot, 0));
+                                now = true;
+                            }
+                        }
+                    }
+                    Some(pub_f) => {
+                        // Verify CPU fence completion before moving `reading` so an
+                        // unready or dying producer never stalls the compositor's GPU
+                        // queue or unpins the previously completed slot.
+                        if r.content_ready(o.content, pub_f.ready, CONTENT_WAIT_MS) {
+                            if let Some(f) = ring.header().take(generation)
+                                && (f.ready <= pub_f.ready || r.content_ready(o.content, f.ready, CONTENT_WAIT_MS))
+                            {
+                                fresh = true;
+                                o.last = Some((f.slot, f.seq));
+                                t = Some((f.slot, 0));
+                                now = true;
+                            }
+                        } else if vcall!(o.content, 8, fn() -> u64) != u64::MAX {
+                            t = o.last.map(|(slot, _)| (slot, 0));
+                        }
+                    }
+                    // A newer generation's surface hasn't come yet: the last frame again.
+                    None => {
+                        if vcall!(o.content, 8, fn() -> u64) != u64::MAX {
+                            t = o.last.map(|(slot, _)| (slot, 0));
+                        }
+                    }
+                }
             }
             if o.last.is_some() && p.previous.take().is_some() {
                 *dirty = true;
@@ -1229,6 +1468,8 @@ fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE, pause_on_occl
     let mut prefer: Option<Luid> = None;
     // How many times the device was given up (logged the first few).
     let mut lost = 0u32;
+    let mut wait_timeouts = 0u32;
+    let mut stall_logs = 0u32;
     let mut dirty = true;
     // Since when Present has said the window can't be seen (DXGI_STATUS_OCCLUDED: the
     // screen locked, another window full screen over it): nothing is drawn meanwhile,
@@ -1281,7 +1522,11 @@ fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE, pause_on_occl
             && failed_luid != Some(luid)
         {
             gpu = Renderer::new(hwnd, luid);
-            if gpu.is_none() {
+            wait_timeouts = 0;
+            if let Some(r) = &gpu {
+                let mode = if r.dcomp_dev != 0 { "DirectComposition" } else { "HWND" };
+                note_all(&panes, &format!("session: compositor swap chain ready ({mode}, 3 buffers, {})", if r.display.hdr { "HDR scRGB" } else { "SDR" }));
+            } else {
                 failed_luid = Some(luid);
             }
             dirty = true;
@@ -1351,6 +1596,7 @@ fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE, pause_on_occl
                 continue;
             }
             eprintln!("peerparty: session: the window can be seen again; drawing resumes");
+            note_all(&panes, "session: the window can be seen again; drawing resumes");
             occluded = None;
             dirty = true;
         }
@@ -1361,7 +1607,26 @@ fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE, pause_on_occl
         }
         let sync_interval = shared.sync_interval.load(Ordering::Acquire).clamp(1, 4);
         if !r.waitable.is_null() {
-            unsafe { WaitForSingleObjectEx(r.waitable, 100 * sync_interval, 1) };
+            let rc = unsafe { WaitForSingleObjectEx(r.waitable, 100 * sync_interval, 1) };
+            if rc != WAIT_OBJECT_0 {
+                wait_timeouts += 1;
+                // Release frame pacing right away so copies aren't throttled while the
+                // swap chain isn't signalling its latency waitable.
+                set_live(shared, &panes, false);
+                if wait_timeouts == 1 || wait_timeouts == MAX_WAIT_TIMEOUTS {
+                    let msg = format!("session: compositor frame waitable timed out (rc={rc:#x}, count={wait_timeouts})");
+                    eprintln!("peerparty: {msg}");
+                    note_all(&panes, &msg);
+                }
+                if wait_timeouts >= MAX_WAIT_TIMEOUTS {
+                    reset_gpu(&mut panes);
+                    gpu = None;
+                    failed_luid = None;
+                    wait_timeouts = 0;
+                }
+                continue;
+            }
+            wait_timeouts = 0;
         }
         // Taken once there's room (only looked at before the wait): the frame event woke
         // this for one copy's frame, and another copy's of this same refresh, published
@@ -1372,8 +1637,11 @@ fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE, pause_on_occl
         let Some(rtv) = r.target() else {
             lost += 1;
             if lost <= 5 {
-                eprintln!("peerparty: session: the window's swap chain couldn't be resized; making a new device (time {lost})");
+                let msg = format!("session: the window's swap chain couldn't be resized; making a new device (time {lost})");
+                eprintln!("peerparty: {msg}");
+                note_all(&panes, &msg);
             }
+            set_live(shared, &panes, false);
             reset_gpu(&mut panes);
             gpu = None;
             failed_luid = None;
@@ -1381,9 +1649,24 @@ fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE, pause_on_occl
         };
         let drawn = r.draw(rtv, &panes, &take);
         // IDXGISwapChain::Present (8): vsync (1 = full, 2 = 1/2, 3 = 1/3 display refresh).
+        let present_at = std::time::Instant::now();
         let hr = vcall!(r.swap, 8, fn(u32, u32) -> i32, sync_interval, 0);
+        let present_ms = present_at.elapsed().as_millis();
+        if present_ms >= PRESENT_STALL_MS {
+            stall_logs += 1;
+            if stall_logs <= 5 {
+                let msg = format!("session: compositor Present stalled for {present_ms} ms (hr={hr:#x})");
+                eprintln!("peerparty: {msg}");
+                note_all(&panes, &msg);
+            }
+        }
+        if hr < 0 {
+            set_live(shared, &panes, false);
+        }
         if pause_on_occluded && hr == DXGI_STATUS_OCCLUDED && occluded.is_none() {
-            eprintln!("peerparty: session: the window can't be seen (the screen is locked, or a full-screen window covers it); nothing is drawn until it can");
+            let msg = "session: the window can't be seen (the screen is locked, or a full-screen window covers it); nothing is drawn until it can";
+            eprintln!("peerparty: {msg}");
+            note_all(&panes, msg);
             occluded = Some(std::time::Instant::now());
             set_live(shared, &panes, false);
         }
@@ -1412,7 +1695,9 @@ fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE, pause_on_occl
         }
         // DXGI_ERROR_DEVICE_REMOVED / DEVICE_RESET: start over on a new device.
         if hr == 0x887A_0005_u32 as i32 || hr == 0x887A_0007_u32 as i32 {
-            eprintln!("peerparty: session: the window's graphics device was lost ({hr:#x}); making a new one");
+            let msg = format!("session: the window's graphics device was lost ({hr:#x}); making a new one");
+            eprintln!("peerparty: {msg}");
+            note_all(&panes, &msg);
             set_live(shared, &panes, false);
             reset_gpu(&mut panes);
             gpu = None;
@@ -1987,6 +2272,121 @@ mod tests {
         drop(s);
         unsafe { DestroyWindow(hwnd) };
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wait_fence_ready_handles_completed_removed_and_timed_out_fences() {
+        use std::cell::Cell;
+        // Target 0 is always ready without even polling.
+        assert!(wait_fence_ready(0, || panic!("not polled"), |_, _| panic!("not waited"), 10));
+        // Already completed skips waiting.
+        let waits = Cell::new(0u32);
+        assert!(wait_fence_ready(5, || 5, |_, _| { waits.set(waits.get() + 1); true }, 10));
+        assert_eq!(waits.get(), 0);
+        // Device-removed sentinel (`u64::MAX`) fails immediately without waiting.
+        assert!(!wait_fence_ready(5, || u64::MAX, |_, _| { waits.set(waits.get() + 1); true }, 10));
+        assert_eq!(waits.get(), 0);
+        // Completes after one wait step (including surviving a spurious wakeup first).
+        let val = Cell::new(3u64);
+        let step = Cell::new(0u32);
+        assert!(wait_fence_ready(
+            5,
+            || val.get(),
+            |_, _| {
+                let s = step.get() + 1;
+                step.set(s);
+                if s == 2 {
+                    val.set(5);
+                }
+                true
+            },
+            50,
+        ));
+        assert_eq!(step.get(), 2);
+        // Timed-out / failed wait returns false cleanly without looping forever.
+        let step = Cell::new(0u32);
+        assert!(!wait_fence_ready(
+            5,
+            || 4,
+            |_, _| {
+                step.set(step.get() + 1);
+                false
+            },
+            50,
+        ));
+        assert_eq!(step.get(), 1);
+    }
+
+    /// An unsignalled content fence (a stalled or dying copy) must never stall the
+    /// compositor or unpin the previously completed slot: `take_frames` keeps redrawing
+    /// the last completed slot until the new frame's content fence completes.
+    #[test]
+    fn unready_content_fence_falls_back_to_previous_slot_without_stalling() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WS_POPUP};
+        let class = wide("STATIC");
+        let hwnd = unsafe { CreateWindowExW(0, class.as_ptr(), class.as_ptr(), WS_POPUP, 0, 0, 32, 32, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null()) };
+        type Create = unsafe extern "system" fn(usize, u32, usize, u32, *const u32, u32, u32, *mut usize, *mut u32, *mut usize) -> i32;
+        let create: Create = unsafe { std::mem::transmute(system_proc("d3d11.dll", c"D3D11CreateDevice").unwrap()) };
+        let (mut dev, mut fl, mut ctx) = (0usize, 0u32, 0usize);
+        assert!(unsafe { create(0, 5, 0, 0x20, std::ptr::null(), 0, 7, &mut dev, &mut fl, &mut ctx) } >= 0);
+        let ctx4 = query(ctx, &IID_ID3D11DEVICECONTEXT4);
+        let (m, objects) = shared_set(dev, ctx, 87, [0.0, 1.0, 0.0, 1.0], 0);
+        let content_fence = objects[SLOTS];
+
+        let surface = Arc::new(surface_again(&m));
+        let ring = RingBlock::create(std::process::id()).expect("ring block");
+        let mut r = Renderer::new(hwnd, luid_of(surface.textures[0]).unwrap()).expect("renderer");
+        let mut pane = Pane::default();
+        pane.draw = PaneDraw { dest: PaneRect { x: 0, y: 0, width: 32, height: 32 }, uv: FULL_UV, z: 0, sharpen: false, ring: Some(ring.clone()), surface: Some(surface.clone()) };
+        pane.opened = r.open(&surface);
+        assert!(pane.opened.is_some());
+
+        // Frame 1 in slot 0: content fence signalled to 1 -> taken and drawn with ready=0.
+        vcall!(ctx4, 147, fn(usize, u64) -> i32, content_fence, 1);
+        vcall!(ctx, 111, fn() -> ());
+        ring.header().publish(1, 0, 1);
+        let mut dirty = false;
+        let (fresh, take, taken) = take_frames(&mut r, std::slice::from_mut(&mut pane), &mut dirty);
+        assert!(fresh);
+        assert_eq!(take, vec![Some((0, 0))], "CPU-verified frame passes ready=0 (no GPU wait)");
+        assert_eq!(taken, vec![true]);
+        assert_eq!(ring.header().reading.load(Ordering::SeqCst), 1 << 32, "reading pinned on slot 0");
+
+        // Frame 2 in slot 1: published with ready=2, NOT signalled -> falls back to slot 0
+        // within a few ms and leaves `reading` pinned on slot 0.
+        ring.header().publish(1, 1, 2);
+        let t0 = std::time::Instant::now();
+        let (fresh, take, taken) = take_frames(&mut r, std::slice::from_mut(&mut pane), &mut dirty);
+        assert!(t0.elapsed() < std::time::Duration::from_millis(200), "bounded CPU wait");
+        assert!(!fresh);
+        assert_eq!(take, vec![Some((0, 0))], "redraws previously completed slot 0");
+        assert_eq!(taken, vec![false]);
+        assert_eq!(ring.header().reading.load(Ordering::SeqCst), 1 << 32, "reading still protects slot 0");
+
+        // Once the producer signals content fence to 2, slot 1 is taken right away.
+        vcall!(ctx4, 147, fn(usize, u64) -> i32, content_fence, 2);
+        vcall!(ctx, 111, fn() -> ());
+        let (fresh, take, taken) = take_frames(&mut r, std::slice::from_mut(&mut pane), &mut dirty);
+        assert!(fresh);
+        assert_eq!(take, vec![Some((1, 0))]);
+        assert_eq!(taken, vec![true]);
+        assert_eq!(ring.header().reading.load(Ordering::SeqCst), (1 << 32) | 1);
+        if system_proc("dcomp.dll", c"DCompositionCreateDevice").is_some() {
+            assert_ne!(r.dcomp_dev, 0, "DirectComposition device bound when dcomp.dll is present");
+            assert_ne!(r.dcomp_target, 0);
+            assert_ne!(r.dcomp_visual, 0);
+        }
+
+        drop(pane);
+        drop(r);
+        drop(surface);
+        for o in objects {
+            release(o);
+        }
+        release(ctx4);
+        release(ctx);
+        release(dev);
+        unsafe { DestroyWindow(hwnd) };
     }
 }
 
