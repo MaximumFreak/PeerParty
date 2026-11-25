@@ -2182,6 +2182,9 @@ mod tests {
                 let mut missed = Vec::new();
                 for g in app.lib.scanned.clone() {
                     let key = store::key_of(&g.exe);
+                    if !start_selected {
+                        app.lib.selected = None;
+                    }
                     // Where it is now: a card not drawn this frame keeps an old place.
                     let id = egui::Id::unique(("card-rect", key.as_str()));
                     ctx.data_mut(|d| d.remove::<Rect>(id));
@@ -2193,11 +2196,12 @@ mod tests {
                     let at = rect.center();
                     let click = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
                     run(&mut app, vec![egui::Event::PointerMoved(at)]);
+                    let over = format!("{:?}", ctx.layer_id_at(at));
                     run(&mut app, vec![click(true)]);
                     run(&mut app, vec![click(false)]);
                     run(&mut app, vec![egui::Event::PointerMoved(pos2(1.0, size.y - 1.0))]);
                     if app.lib.selected.as_deref() != Some(key.as_str()) {
-                        missed.push(format!("{} at {:?}", g.name, rect));
+                        missed.push(format!("{} at {:?}: {over}", g.name, rect));
                     }
                 }
                 assert!(missed.is_empty(), "{size:?}, selected first {start_selected}: no answer from {missed:#?}");
