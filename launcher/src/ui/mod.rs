@@ -606,14 +606,20 @@ impl App {
         self.settings.hidden.iter().any(|h| h == key)
     }
 
-    fn in_category(&self, g: &Game, key: &str, c: Category) -> bool {
+    /// The keys of the games the player added, for `in_category`: worked out once for a
+    /// pass over the library, not once a game.
+    fn added_keys(&self) -> HashSet<String> {
+        self.settings.added.iter().map(|p| store::key_of(p)).collect()
+    }
+
+    fn in_category(&self, g: &Game, key: &str, c: Category, added: &HashSet<String>) -> bool {
         let hidden = self.hidden(key);
         match c {
             Category::Hidden => hidden,
             _ if hidden => false,
             Category::All => true,
             Category::Recent => self.lib.recent.contains_key(key),
-            Category::Source(s) => g.source == s && !(s == Source::Added && !self.is_added(key)),
+            Category::Source(s) => g.source == s && !(s == Source::Added && !added.contains(key)),
         }
     }
 
@@ -626,28 +632,39 @@ impl App {
         self.settings.added.iter().any(|p| store::key_of(p) == key)
     }
 
-    fn count(&self, c: Category) -> usize {
-        self.lib.entries.iter().filter(|g| self.in_category(g, &store::key_of(&g.exe), c)).count()
-    }
-
-    /// The filters with games in them, in order.
-    fn categories(&self) -> Vec<Category> {
-        let mut cats = vec![Category::All, Category::Recent];
-        for s in [Source::Steam, Source::Epic, Source::Gog, Source::Xbox, Source::Folder, Source::Added] {
-            if self.count(Category::Source(s)) > 0 {
-                cats.push(Category::Source(s));
+    /// How many games each filter has, in one pass over the library (drawn every frame).
+    fn counts(&self) -> Vec<(Category, usize)> {
+        let mut counts: Vec<(Category, usize)> = [Category::All, Category::Recent]
+            .into_iter()
+            .chain([Source::Steam, Source::Epic, Source::Gog, Source::Xbox, Source::Folder, Source::Added].map(Category::Source))
+            .chain([Category::Hidden])
+            .map(|c| (c, 0))
+            .collect();
+        let added = self.added_keys();
+        for g in &self.lib.entries {
+            let key = store::key_of(&g.exe);
+            for (c, n) in counts.iter_mut() {
+                if self.in_category(g, &key, *c, &added) {
+                    *n += 1;
+                }
             }
         }
-        if self.count(Category::Hidden) > 0 {
-            cats.push(Category::Hidden);
-        }
-        cats
+        counts
+    }
+
+    /// The filters with games in them, in order, and how many each has.
+    fn categories(&self) -> Vec<(Category, usize)> {
+        self.counts()
+            .into_iter()
+            .filter(|&(c, n)| matches!(c, Category::All | Category::Recent) || n > 0)
+            .collect()
     }
 
     /// What the grid shows: the filter, or All narrowed by the search.
     fn visible(&self) -> Vec<usize> {
         let needle = self.lib.search.trim().to_lowercase();
         let shown = self.lib.shown();
+        let added = self.added_keys();
         let mut v: Vec<usize> = self
             .lib
             .entries
@@ -655,7 +672,7 @@ impl App {
             .enumerate()
             .filter(|(_, g)| {
                 let key = store::key_of(&g.exe);
-                self.in_category(g, &key, shown) && (needle.is_empty() || g.name.to_lowercase().contains(&needle) || key.contains(&needle))
+                self.in_category(g, &key, shown, &added) && (needle.is_empty() || g.name.to_lowercase().contains(&needle) || key.contains(&needle))
             })
             .map(|(i, _)| i)
             .collect();
@@ -1023,7 +1040,8 @@ impl App {
         self.view = View::Library;
         self.lib.selected = Some(key);
         self.lib.search.clear();
-        if !self.lib.entries.iter().any(|g| self.in_category(g, &store::key_of(&g.exe), self.lib.category)) {
+        let added = self.added_keys();
+        if !self.lib.entries.iter().any(|g| self.in_category(g, &store::key_of(&g.exe), self.lib.category, &added)) {
             self.lib.category = Category::All;
         }
     }
@@ -1133,8 +1151,8 @@ impl App {
             match self.view {
                 View::Library => {
                     let cats = self.categories();
-                    let i = cats.iter().position(|c| *c == self.lib.shown()).unwrap_or(0) as i32;
-                    self.lib.pick_category(cats[(i + d).rem_euclid(cats.len() as i32) as usize]);
+                    let i = cats.iter().position(|(c, _)| *c == self.lib.shown()).unwrap_or(0) as i32;
+                    self.lib.pick_category(cats[(i + d).rem_euclid(cats.len() as i32) as usize].0);
                 }
                 View::Settings => {
                     self.settings_tab = self.settings_tab.step(d);

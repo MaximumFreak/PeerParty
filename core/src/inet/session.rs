@@ -326,10 +326,12 @@ impl Session {
         let Some(keys) = &self.keys else { return };
         let c = self.counter;
         self.counter += 1;
-        let mut p = head(T_DATA).to_vec();
+        let mut p = Vec::with_capacity(HEAD + 8 + plain.len() + 16);
+        p.extend_from_slice(&head(T_DATA));
         p.extend_from_slice(&c.to_le_bytes());
-        let sealed = keys.seal(c, &p, plain);
-        p.extend_from_slice(&sealed);
+        let ad = p.len();
+        p.extend_from_slice(plain);
+        keys.seal_in_place(c, &mut p, ad);
         cx.send(to, &p);
         // Only what goes the path counts toward its keepalive: probes of other addresses
         // don't keep the path's NAT mapping open.

@@ -9,7 +9,7 @@
 //! means a later leak of the room code doesn't open recorded sessions without also
 //! breaking X25519.
 
-use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::aead::{Aead, AeadInPlace, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
@@ -125,6 +125,18 @@ impl Keys {
             .expect("ChaCha20-Poly1305 sealing can't fail")
     }
 
+    /// `seal` with the packet built in one buffer: `out[ad_len..]` is sealed where it is,
+    /// `out[..ad_len]` is the associated data, and the tag goes on the end. The same bytes
+    /// as `seal`'s after the associated data.
+    pub fn seal_in_place(&self, counter: u64, out: &mut Vec<u8>, ad_len: usize) {
+        let (ad, msg) = out.split_at_mut(ad_len);
+        let tag = self
+            .send
+            .encrypt_in_place_detached(&nonce(counter), ad, msg)
+            .expect("ChaCha20-Poly1305 sealing can't fail");
+        out.extend_from_slice(&tag);
+    }
+
     pub fn open(&self, counter: u64, ad: &[u8], sealed: &[u8]) -> Option<Vec<u8>> {
         self.recv
             .decrypt(&nonce(counter), Payload { msg: sealed, aad: ad })
@@ -197,6 +209,10 @@ mod tests {
         let ka = Keys::derive(&psk, &a, &b.blob).unwrap();
         let kb = Keys::derive(&psk, &b, &a.blob).unwrap();
         let sealed = ka.seal(7, b"ad", b"hello");
+        let mut packet = b"ad".to_vec();
+        packet.extend_from_slice(b"hello");
+        ka.seal_in_place(7, &mut packet, 2);
+        assert_eq!(&packet[2..], &sealed[..], "sealed in place, the same bytes");
         assert_eq!(kb.open(7, b"ad", &sealed).as_deref(), Some(&b"hello"[..]));
         assert!(kb.open(8, b"ad", &sealed).is_none(), "wrong counter");
         assert!(kb.open(7, b"AD", &sealed).is_none(), "wrong ad");

@@ -110,19 +110,18 @@ impl App {
 
     fn chips(&mut self, ui: &mut egui::Ui) {
         let cats = self.categories();
-        if !cats.contains(&self.lib.category) {
+        if !cats.iter().any(|(c, _)| *c == self.lib.category) {
             self.lib.category = Category::All;
         }
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
-            for c in cats {
+            for (c, n) in cats {
                 let label = match c {
                     Category::All => t!("filter.all"),
                     Category::Recent => t!("filter.recent"),
                     Category::Hidden => t!("filter.hidden"),
                     Category::Source(s) => super::source_name(s),
                 };
-                let n = self.count(c);
                 let lit = self.lib.shown() == c;
                 let r = widgets::chip(ui, label, Some(n), lit);
                 self.lib.top_bar_ids.insert(r.id);

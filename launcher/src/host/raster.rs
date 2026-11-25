@@ -423,8 +423,18 @@ fn triangle(
             continue;
         }
         if let Some(c) = solid_color {
+            // A solid colour over a run of equal pixels (a panel's background) blends to
+            // the same pixel each time: worked out once for the run.
+            let mut last: Option<(u32, u32)> = None;
             for dst in span {
-                blend(dst, c[0], c[1], c[2], c[3]);
+                match last {
+                    Some((under, over)) if under == *dst => *dst = over,
+                    _ => {
+                        let under = *dst;
+                        blend(dst, c[0], c[1], c[2], c[3]);
+                        last = Some((under, *dst));
+                    }
+                }
             }
             continue;
         }

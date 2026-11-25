@@ -181,11 +181,30 @@ pub fn trf(key: &'static str, args: &[(&str, String)]) -> String {
             None => lookup(i, key),
         }
     };
-    let mut s = pick(i).or_else(|| pick(0)).unwrap_or(key).to_string();
-    for (k, v) in args {
-        s = s.replace(&format!("{{{k}}}"), v);
+    fill(pick(i).or_else(|| pick(0)).unwrap_or(key), args)
+}
+
+/// `text` with each `{name}` that `args` has replaced by its value, in one pass (a value
+/// that itself holds a `{name}` stays as it is). Other braces are kept.
+fn fill(text: &str, args: &[(&str, String)]) -> String {
+    let mut out = String::with_capacity(text.len() + args.iter().map(|(_, v)| v.len()).sum::<usize>());
+    let mut rest = text;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        match after.find('}').and_then(|close| Some((close, args.iter().find(|(k, _)| *k == &after[..close])?))) {
+            Some((close, (_, v))) => {
+                out.push_str(v);
+                rest = &after[close + 1..];
+            }
+            None => {
+                out.push('{');
+                rest = after;
+            }
+        }
     }
-    s
+    out.push_str(rest);
+    out
 }
 
 /// `t!("key")` is the key's text; `t!("key", name = value, n = count)` fills it in.
@@ -204,6 +223,17 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
     use std::path::Path;
+
+    #[test]
+    fn values_fill_their_holes_once() {
+        let a = |k: &'static str, v: &str| (k, v.to_string());
+        assert_eq!(fill("{n} of {total}", &[a("n", "2"), a("total", "5")]), "2 of 5");
+        assert_eq!(fill("{name} joined {name}", &[a("name", "Ann")]), "Ann joined Ann");
+        assert_eq!(fill("{a}", &[a("a", "{b}"), a("b", "x")]), "{b}", "a value isn't filled in again");
+        assert_eq!(fill("{missing} {} {", &[a("n", "1")]), "{missing} {} {");
+        assert_eq!(fill("no holes", &[]), "no holes");
+        assert_eq!(fill("{n}{n}", &[a("n", "é")]), "éé");
+    }
 
     fn base(k: &str) -> &str {
         for f in [".one", ".few", ".many", ".other"] {
