@@ -1,5 +1,5 @@
-//! The hook DLLs are embedded in `peerparty.exe`, compressed (see build.rs), and written
-//! out on demand to `hooks\<content hash>\` in PeerParty's folder (`platform::data_dir`).
+//! The hook DLLs are embedded in `peerparty.exe` (see build.rs) and written out on
+//! demand to `hooks\<content hash>\` in PeerParty's folder (`platform::data_dir`).
 //! A new build lands in a new folder, so a game still running with the old DLL never
 //! blocks it.
 
@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 /// Each blob: an 8-byte tag, the DLL's length and FNV-1a hash (both u64 little-endian,
-/// worked out by build.rs), then the DLL as a raw deflate stream.
+/// worked out by build.rs), then the raw uncompressed DLL bytes.
 static HOOK64: &[u8] = include_bytes!(env!("PEERPARTY_HOOK64"));
 static HOOK32: &[u8] = include_bytes!(env!("PEERPARTY_HOOK32"));
 
@@ -44,14 +44,14 @@ pub fn extract(x86: bool) -> Result<PathBuf, String> {
     if fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() == len) {
         return Ok(path);
     }
-    let bytes = inflate(&blob[HEADER..], len as usize)?;
-    if fnv1a(&bytes) != hash {
-        return Err(format!("the embedded {name} is damaged (its hash doesn't match)"));
+    let bytes = &blob[HEADER..];
+    if bytes.len() as u64 != len || fnv1a(bytes) != hash {
+        return Err(format!("the embedded {name} is damaged (its length or hash doesn't match)"));
     }
     fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     // Write beside it and rename, so a second launcher never loads a partial file.
     let tmp = dir.join(format!("{name}.{}.tmp", std::process::id()));
-    fs::write(&tmp, &bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    fs::write(&tmp, bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
     if let Err(e) = fs::rename(&tmp, &path) {
         let _ = fs::remove_file(&tmp);
         // Another launcher may have won the race, or a game holds the file open.
@@ -60,17 +60,6 @@ pub fn extract(x86: bool) -> Result<PathBuf, String> {
         }
     }
     Ok(path)
-}
-
-/// A raw deflate stream of `len` bytes, inflated.
-fn inflate(z: &[u8], len: usize) -> Result<Vec<u8>, String> {
-    use std::io::Read;
-    let mut out = Vec::with_capacity(len);
-    flate2::read::DeflateDecoder::new(z).take(len as u64 + 1).read_to_end(&mut out).map_err(|e| format!("inflating a hook: {e}"))?;
-    if out.len() != len {
-        return Err(format!("inflating a hook: {} bytes, not {len}", out.len()));
-    }
-    Ok(out)
 }
 
 /// How long an earlier build's hook folder, or a log, is kept.
@@ -115,16 +104,17 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 mod tests {
     use super::*;
 
-    /// Both embedded blobs inflate to the length and hash their headers give (an empty
+    /// Both embedded blobs match the length and hash their headers give (an empty
     /// stub included).
     #[test]
-    fn embedded_hooks_inflate_to_their_header() {
+    fn embedded_hooks_match_their_header() {
         for blob in [HOOK64, HOOK32] {
             assert!(blob.len() >= HEADER);
             assert!(blob.starts_with(b"PPHK"));
             let (len, hash) = header(blob);
-            let dll = inflate(&blob[HEADER..], len as usize).unwrap();
-            assert_eq!(fnv1a(&dll), hash);
+            let dll = &blob[HEADER..];
+            assert_eq!(dll.len() as u64, len);
+            assert_eq!(fnv1a(dll), hash);
             assert!(dll.is_empty() || dll.starts_with(b"MZ"));
         }
     }

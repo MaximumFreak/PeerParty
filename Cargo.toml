@@ -56,39 +56,11 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 opt-level = 2
 
-# Optimized for size: most of the code (the UI, the SDK stand-ins, the control plane)
-# is cold, and every byte of the hook is paid twice in peerparty.exe (x64 and x86) and
-# again in each game's memory. The crates that do sustained work per packet or per
-# sample keep full speed below.
 [profile.release]
-opt-level = "s"
+opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
-
-# Voice: encoding and decoding every 20 ms frame.
-[profile.release.package.rusty-opus]
-opt-level = 3
-# The internet tunnel's per-packet AEAD and the handshakes.
-[profile.release.package.chacha20poly1305]
-opt-level = 3
-[profile.release.package.chacha20]
-opt-level = 3
-[profile.release.package.poly1305]
-opt-level = 3
-[profile.release.package.curve25519-dalek]
-opt-level = 3
-[profile.release.package.sha2]
-opt-level = 3
-# Cover art decoding in the launcher.
-[profile.release.package.zune-jpeg]
-opt-level = 3
-[profile.release.package.image]
-opt-level = 2
-# Inflating the embedded hooks, and (as a build dependency, which this also reaches)
-# compressing them in launcher/build.rs on every hook change.
-[profile.release.package.miniz_oxide]
-opt-level = 3
 
 # What tests/run_all.ps1 builds and runs. Same optimizations as release, without
 # link-time optimization and with incremental compilation, so a hook change doesn't

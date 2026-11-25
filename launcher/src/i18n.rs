@@ -14,40 +14,32 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
-/// The languages there are: code, the language's own name, its file (deflated by
-/// build.rs, without its comments; `text` inflates it).
-pub const LANGS: &[(&str, &str, &[u8])] = &[
-    ("en", "English", include_bytes!(concat!(env!("OUT_DIR"), "/locales/en.z"))),
-    ("de", "Deutsch", include_bytes!(concat!(env!("OUT_DIR"), "/locales/de.z"))),
-    ("es", "Español", include_bytes!(concat!(env!("OUT_DIR"), "/locales/es.z"))),
-    ("fr", "Français", include_bytes!(concat!(env!("OUT_DIR"), "/locales/fr.z"))),
-    ("it", "Italiano", include_bytes!(concat!(env!("OUT_DIR"), "/locales/it.z"))),
-    ("nl", "Nederlands", include_bytes!(concat!(env!("OUT_DIR"), "/locales/nl.z"))),
-    ("pl", "Polski", include_bytes!(concat!(env!("OUT_DIR"), "/locales/pl.z"))),
-    ("pt-BR", "Português (Brasil)", include_bytes!(concat!(env!("OUT_DIR"), "/locales/pt-BR.z"))),
-    ("ru", "Русский", include_bytes!(concat!(env!("OUT_DIR"), "/locales/ru.z"))),
-    ("uk", "Українська", include_bytes!(concat!(env!("OUT_DIR"), "/locales/uk.z"))),
-    ("tr", "Türkçe", include_bytes!(concat!(env!("OUT_DIR"), "/locales/tr.z"))),
-    ("ja", "日本語", include_bytes!(concat!(env!("OUT_DIR"), "/locales/ja.z"))),
-    ("ko", "한국어", include_bytes!(concat!(env!("OUT_DIR"), "/locales/ko.z"))),
-    ("zh-CN", "简体中文", include_bytes!(concat!(env!("OUT_DIR"), "/locales/zh-CN.z"))),
-    ("zh-TW", "繁體中文", include_bytes!(concat!(env!("OUT_DIR"), "/locales/zh-TW.z"))),
+/// The languages there are: code, the language's own name, its file (stripped of
+/// comments by build.rs and embedded as plain UTF-8 text).
+pub const LANGS: &[(&str, &str, &str)] = &[
+    ("en", "English", include_str!(concat!(env!("OUT_DIR"), "/locales/en.txt"))),
+    ("de", "Deutsch", include_str!(concat!(env!("OUT_DIR"), "/locales/de.txt"))),
+    ("es", "Español", include_str!(concat!(env!("OUT_DIR"), "/locales/es.txt"))),
+    ("fr", "Français", include_str!(concat!(env!("OUT_DIR"), "/locales/fr.txt"))),
+    ("it", "Italiano", include_str!(concat!(env!("OUT_DIR"), "/locales/it.txt"))),
+    ("nl", "Nederlands", include_str!(concat!(env!("OUT_DIR"), "/locales/nl.txt"))),
+    ("pl", "Polski", include_str!(concat!(env!("OUT_DIR"), "/locales/pl.txt"))),
+    ("pt-BR", "Português (Brasil)", include_str!(concat!(env!("OUT_DIR"), "/locales/pt-BR.txt"))),
+    ("ru", "Русский", include_str!(concat!(env!("OUT_DIR"), "/locales/ru.txt"))),
+    ("uk", "Українська", include_str!(concat!(env!("OUT_DIR"), "/locales/uk.txt"))),
+    ("tr", "Türkçe", include_str!(concat!(env!("OUT_DIR"), "/locales/tr.txt"))),
+    ("ja", "日本語", include_str!(concat!(env!("OUT_DIR"), "/locales/ja.txt"))),
+    ("ko", "한국어", include_str!(concat!(env!("OUT_DIR"), "/locales/ko.txt"))),
+    ("zh-CN", "简体中文", include_str!(concat!(env!("OUT_DIR"), "/locales/zh-CN.txt"))),
+    ("zh-TW", "繁體中文", include_str!(concat!(env!("OUT_DIR"), "/locales/zh-TW.txt"))),
 ];
 
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
 static TABLES: [OnceLock<HashMap<&'static str, &'static str>>; LANGS.len()] = [const { OnceLock::new() }; LANGS.len()];
-static TEXTS: [OnceLock<&'static str>; LANGS.len()] = [const { OnceLock::new() }; LANGS.len()];
 
-/// A language's file, inflated on first use and kept for the program's life (a run
-/// uses English and at most one other).
+/// A language's embedded text.
 pub fn text(i: usize) -> &'static str {
-    TEXTS[i].get_or_init(|| {
-        use std::io::Read;
-        let mut s = String::new();
-        // Built by build.rs from the files a test checks: it can't fail but by a bug.
-        flate2::read::DeflateDecoder::new(LANGS[i].2).read_to_string(&mut s).expect("an embedded language file");
-        Box::leak(s.into_boxed_str())
-    })
+    LANGS[i].2
 }
 
 /// Reads a language file: `key = text` lines.

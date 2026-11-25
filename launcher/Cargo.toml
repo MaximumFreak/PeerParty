@@ -20,9 +20,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Checking a downloaded update against its release checksum (src/release.rs).
 sha2 = "0.10"
-# The embedded hook DLLs and language files are deflated by build.rs (hooks.rs, i18n.rs).
-# Already in the build through png; the pure-Rust backend.
-flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 # The Win32 side (backend/windows, platform/windows.rs, host's windows and hooks).
 [target.'cfg(windows)'.dependencies]
@@ -35,7 +32,6 @@ libc = "0.2"
 eframe = { version = "0.37", default-features = false, features = ["x11", "wayland"] }
 
 [build-dependencies]
-flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # The exe icon's larger images (build.rs); already in the build through image.
 png = "0.18"
 

@@ -1896,7 +1896,6 @@ name = "peerparty"
 version = "0.5.2"
 dependencies = [
  "eframe",
- "flate2",
  "image",
  "libc",
  "peerparty_core",
@@ -1937,6 +1936,7 @@ dependencies = [
  "retour",
  "rusty-opus",
  "windows-sys 0.61.2",
+ "winresource",
 ]
 
 [[package]]

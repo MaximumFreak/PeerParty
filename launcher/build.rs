@@ -54,37 +54,28 @@ fn stub(out: &Path, key: &str) {
     embed(out, key, &stub);
 }
 
-/// Hands `include_bytes!` the hook DLL at `dll`, compressed: the two DLLs were most of
-/// the exe's size. The blob starts with a tag ("PPHK64" or "PPHK32" and two NULs, which
-/// the release check looks for), the DLL's length and its FNV-1a hash (the name of the
-/// folder it's written out to, so the launcher never hashes it), then the raw deflate
-/// stream. Compressed once per DLL: a rerun of this script with the DLL unchanged (same
-/// length and time) keeps the last blob.
+/// Hands `include_bytes!` the hook DLL at `dll` uncompressed with a 24-byte header:
+/// an 8-byte tag ("PPHK64" or "PPHK32" and two NULs, which the release check looks for),
+/// the DLL's length and its FNV-1a hash (the name of the folder it's written out to, so
+/// the launcher never hashes it at startup), then the raw DLL bytes. Keeping the DLLs
+/// uncompressed avoids high-entropy blobs in `.rdata` that trigger AV heuristics.
 fn embed(out: &Path, key: &str, dll: &Path) {
-    let blob = out.join(format!("{}.z", key.to_ascii_lowercase()));
-    let seen = out.join(format!("{}.z.src", key.to_ascii_lowercase()));
+    let blob = out.join(format!("{}.bin", key.to_ascii_lowercase()));
+    let seen = out.join(format!("{}.bin.src", key.to_ascii_lowercase()));
     let meta = std::fs::metadata(dll).unwrap_or_else(|e| panic!("{}: {e}", dll.display()));
     let stamp = format!("{} {:?} {}", meta.len(), meta.modified().ok(), dll.display());
     if !(blob.is_file() && std::fs::read_to_string(&seen).is_ok_and(|s| s == stamp)) {
         let bytes = std::fs::read(dll).unwrap_or_else(|e| panic!("{}: {e}", dll.display()));
         let tag: &[u8; 8] = if key.ends_with("32") { b"PPHK32\0\0" } else { b"PPHK64\0\0" };
-        let mut z = Vec::with_capacity(bytes.len() / 2 + 64);
-        z.extend_from_slice(tag);
-        z.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-        z.extend_from_slice(&fnv1a(&bytes).to_le_bytes());
-        let z = deflate(z, &bytes);
-        std::fs::write(&blob, z).expect("writing a compressed hook");
-        std::fs::write(&seen, stamp).expect("writing a compressed hook's stamp");
+        let mut out_bytes = Vec::with_capacity(24 + bytes.len());
+        out_bytes.extend_from_slice(tag);
+        out_bytes.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        out_bytes.extend_from_slice(&fnv1a(&bytes).to_le_bytes());
+        out_bytes.extend_from_slice(&bytes);
+        std::fs::write(&blob, out_bytes).expect("writing an embedded hook");
+        std::fs::write(&seen, stamp).expect("writing an embedded hook's stamp");
     }
     println!("cargo:rustc-env={key}={}", blob.display());
-}
-
-/// `bytes` deflated (raw, best compression) onto the end of `into`.
-fn deflate(into: Vec<u8>, bytes: &[u8]) -> Vec<u8> {
-    use std::io::Write;
-    let mut enc = flate2::write::DeflateEncoder::new(into, flate2::Compression::best());
-    enc.write_all(bytes).expect("deflating");
-    enc.finish().expect("deflating")
 }
 
 /// The same hash as `hooks::fnv1a` in the launcher.
@@ -92,9 +83,8 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3))
 }
 
-/// Each language file compressed, without its comments and blank lines (together they
-/// were most of a megabyte of the exe): `OUT_DIR/locales/<code>.z`, which `i18n`
-/// inflates for the languages a run uses.
+/// Each language file stripped of comments and blank lines: `OUT_DIR/locales/<code>.txt`,
+/// embedded directly as plain UTF-8 text.
 fn locales(out: &Path) {
     let src = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("locales");
     println!("cargo:rerun-if-changed={}", src.display());
@@ -118,7 +108,7 @@ fn locales(out: &Path) {
             kept.push('\n');
         }
         let name = p.file_stem().unwrap().to_string_lossy();
-        std::fs::write(dir.join(format!("{name}.z")), deflate(Vec::new(), kept.as_bytes())).expect("writing a compressed language");
+        std::fs::write(dir.join(format!("{name}.txt")), kept.as_bytes()).expect("writing a language file");
     }
 }
 
@@ -138,6 +128,7 @@ fn main() {
     // which a test run edits most and the hook doesn't contain.
     for p in [
         "hook/src",
+        "hook/build.rs",
         "hook/Cargo.toml",
         "core/src",
         "core/Cargo.toml",

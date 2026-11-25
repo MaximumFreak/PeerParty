@@ -25,7 +25,7 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
     WOW64_CONTEXT_INTEGER, Wow64GetThreadContext, Wow64SetThreadContext, WriteProcessMemory,
 };
 use windows_sys::Win32::System::Memory::{
-    MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, VirtualAllocEx, VirtualProtectEx,
+    MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE, VirtualAllocEx, VirtualProtectEx,
 };
 use windows_sys::Win32::System::ProcessStatus::{
     K32EnumProcessModulesEx, K32GetModuleBaseNameW, LIST_MODULES_32BIT,
@@ -92,17 +92,22 @@ pub unsafe fn inject(pi: &PROCESS_INFORMATION, dll: &Path) -> Result<(), String>
 }
 
 /// Starts the main thread on a `jmp $` of our own and parks it there; then makes that a
-/// `jmp entry`, so it carries on exactly as it would have.
+/// `jmp entry`, so it carries on exactly as it would have. Keeps the stub strictly W^X
+/// (`PAGE_READWRITE` while writing, `PAGE_EXECUTE_READ` while executing).
 unsafe fn park_on_stub(pi: &PROCESS_INFORMATION, ctx: &mut WOW64_CONTEXT, entry: u32) -> Result<(), String> {
     unsafe {
         let h = pi.hProcess;
-        let stub = VirtualAllocEx(h, ptr::null(), 5, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        let stub = VirtualAllocEx(h, ptr::null(), 5, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if stub.is_null() {
             return Err(os_error("VirtualAllocEx(start stub)"));
         }
         // A WOW64 process's memory is all below 4 GB.
         let stub = stub as usize as u32;
         write_code(h, stub, &[0xEB, 0xFE])?;
+        let mut old = 0u32;
+        if VirtualProtectEx(h, stub as *const c_void, 5, PAGE_EXECUTE_READ, &mut old) == 0 {
+            return Err(os_error("VirtualProtectEx(start stub exec)"));
+        }
         ctx.Eax = stub;
         if Wow64SetThreadContext(pi.hThread, ctx) == 0 {
             return Err(os_error("Wow64SetThreadContext"));
@@ -111,29 +116,42 @@ unsafe fn park_on_stub(pi: &PROCESS_INFORMATION, ctx: &mut WOW64_CONTEXT, entry:
         // Whatever happened, the game must not keep spinning on our stub.
         let mut jump = [0xE9, 0, 0, 0, 0];
         jump[1..].copy_from_slice(&entry.wrapping_sub(stub + 5).to_le_bytes());
-        let released = write_code(h, stub, &jump);
-        let mut old = 0u32;
-        VirtualProtectEx(h, stub as *const c_void, 5, PAGE_EXECUTE_READ, &mut old);
+        let released = if VirtualProtectEx(h, stub as *const c_void, 5, PAGE_READWRITE, &mut old) == 0 {
+            Err(os_error("VirtualProtectEx(start stub write)"))
+        } else {
+            let w = write_code(h, stub, &jump);
+            VirtualProtectEx(h, stub as *const c_void, 5, PAGE_EXECUTE_READ, &mut old);
+            w
+        };
         parked?;
         released
     }
 }
 
 /// Patches the entry point with `jmp $`, parks the main thread there, and puts the
-/// entry bytes back.
+/// entry bytes back (strict W^X: never writable and executable at the same time).
 unsafe fn park_on_entry(pi: &PROCESS_INFORMATION, entry: u32) -> Result<(), String> {
     unsafe {
         let h = pi.hProcess;
         let saved = read_bytes::<2>(h, entry)?;
         let mut old = 0u32;
-        if VirtualProtectEx(h, entry as *const c_void, 2, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+        if VirtualProtectEx(h, entry as *const c_void, 2, PAGE_READWRITE, &mut old) == 0 {
             return Err(os_error("VirtualProtectEx(entry point)"));
         }
         write_code(h, entry, &[0xEB, 0xFE])?;
+        if VirtualProtectEx(h, entry as *const c_void, 2, old, &mut old) == 0 {
+            return Err(os_error("VirtualProtectEx(entry point exec)"));
+        }
         let parked = park(pi, entry);
         // Whatever happened, the game must not keep spinning on our patch.
-        let restored = write_code(h, entry, &saved);
-        VirtualProtectEx(h, entry as *const c_void, 2, old, &mut old);
+        let mut cur = 0u32;
+        let restored = if VirtualProtectEx(h, entry as *const c_void, 2, PAGE_READWRITE, &mut cur) == 0 {
+            Err(os_error("VirtualProtectEx(entry point restore)"))
+        } else {
+            let w = write_code(h, entry, &saved);
+            VirtualProtectEx(h, entry as *const c_void, 2, old, &mut cur);
+            w
+        };
         parked?;
         restored
     }
