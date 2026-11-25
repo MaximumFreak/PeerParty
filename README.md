@@ -123,6 +123,64 @@ what is covered and what can't be.
 - **Games whose multiplayer runs on the publisher's own servers** (server-side game code,
   hosted dedicated servers) can't be played this way by any tool.
 
+## FAQ
+
+### How do I know my game will work?
+
+Running several copies of a game side by side in split screen works with most games, as
+long as your PC can handle that many copies at once.
+
+For those copies, or PCs on your network, or friends online, to **play together**, the
+game's multiplayer has to be **peer-to-peer**: one player hosts, the others join them,
+and no game server of the publisher's runs the match. A quick web search such as *"Does
+&lt;game&gt; use peer-to-peer multiplayer, and which service does it use?"* often turns up
+the answer. A **Host game** / **Join game** menu and invites through Steam or Epic are good
+signs.
+
+PeerParty carries these services today, and more can be added:
+
+- **Steamworks**: lobbies, P2P networking, invites, game servers and the server browser
+- **Epic Online Services**: lobbies, sessions, P2P, invites, voice
+- **PlayFab**: Party, Lobby and Matchmaking
+- **GOG Galaxy**: lobbies, P2P, invites
+- **Photon**: Realtime / PUN, Bolt, Fusion, Voice and Chat
+- **Unity Gaming Services**: Lobby, Relay and Vivox voice
+- **Demonware**: sign-in and matchmaking
+- **Xbox app games**: PlayFab Party's Xbox Live helper, friends and presence
+
+[What it covers](#what-it-covers) has the details. Games whose matches run on the
+publisher's own servers, and games with anti-cheat (EasyAntiCheat, BattlEye), can't be
+played this way.
+
+### My game isn't working!
+
+Let's fix that. Every game you start through PeerParty writes a log of what PeerParty did
+in it. To find it, open the launcher's **Settings** and press **Open logs**, or paste
+`%TEMP%\peerparty\logs` into File Explorer's address bar. There is one file per run,
+named after the game's exe and the time it started (for example
+`game-20261109-183005-4242.log`); the newest one for the game is the one you want.
+
+If it's a peer-to-peer game, please [open an issue](../../issues) saying which game and
+store it was, what you tried and what happened, and attach that log.
+[docs/testing.md](docs/testing.md) says which lines in it show what each layer did.
+
+### Do I need a copy of the game for every player?
+
+Play with copies you're licensed to run: PeerParty replaces a game's multiplayer
+services, not the store. Licence, DLC and purchase checks still go to the store's own
+SDK. See [LEGAL.md](LEGAL.md).
+
+### Does it change my game?
+
+No. PeerParty hooks the game in memory while it runs; the game's files are never
+changed. Its own settings and data live in `%LOCALAPPDATA%\peerparty`, and
+[LEGAL.md](LEGAL.md) lists everything it writes anywhere else.
+
+### Is it free?
+
+Yes: free and open source (MIT), with no account, no subscription and no servers of
+ours. One portable `.exe`, nothing to install.
+
 ## Download and run
 
 Download `peerparty.exe` from the [Releases](../../releases) page; there is nothing to
@@ -277,18 +335,6 @@ Commands on their own:
 
 `peerparty --help` prints them all. Every option, setting and environment variable is
 in [docs/usage.md](docs/usage.md).
-
-## If a game doesn't work
-
-Every game you start through PeerParty writes a log of what PeerParty did in it. To find
-it, open the launcher's **Settings** and press **Open logs**, or paste
-`%TEMP%\peerparty\logs` into File Explorer's address bar. There is one file per run,
-named after the game's exe and the time it started (for example
-`game-20261109-183005-4242.log`); the newest one for the game is the one you want.
-
-Please [open an issue](../../issues) saying which game and store it was, what you tried
-and what happened, and attach that log. [docs/testing.md](docs/testing.md) says which
-lines in it show what each layer did.
 
 ## Build from source
 
