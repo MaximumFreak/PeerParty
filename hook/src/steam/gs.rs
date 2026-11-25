@@ -370,15 +370,34 @@ fn pick_server_pipe(started: bool, server: i32, client: i32) -> Option<i32> {
     Some(server)
 }
 
-/// Whether a manual dispatch fetching from `pipe` is the game server's: its own pipe,
-/// or the game's when the two are one and this thread asked for the server's last.
-pub fn server_dispatch(pipe: i32) -> bool {
+/// Whether `pipe` is the game server's here: its own pipe, or the game's when the two
+/// are one and this thread asked for the server's last.
+fn server_side(pipe: i32) -> (bool, bool) {
     if server_pipe() == Some(pipe) {
-        return true;
+        return (true, false);
     }
     let shared = SERVER_STARTED.load(Ordering::Relaxed) && call_pipe(&GET_PIPE) == pipe;
-    if !shared_server_dispatch(shared, ASKED.with(|a| a.get())) {
-        return false;
+    (shared_server_dispatch(shared, ASKED.with(|a| a.get())), true)
+}
+
+/// Whether an interface the game fetches on `pipe` (ISteamClient's `getter`) is its game
+/// server's: Steamworks.NET asks for the server's pipe, then fetches the server's
+/// interfaces, and on a shared pipe that's the only sign of it.
+pub fn for_server(pipe: i32, getter: &str) -> bool {
+    let (server, shared) = server_side(pipe);
+    if server && shared {
+        crate::log::throttled(&format!("steam-lan shared-pipe getter {getter}"), 1, |_| {
+            log!("steam-lan {getter} on the game's own pipe ({pipe}) right after it asked for the game server's: the game server's interface")
+        });
+    }
+    server
+}
+
+/// Whether a manual dispatch fetching from `pipe` is the game server's (`server_side`).
+pub fn server_dispatch(pipe: i32) -> bool {
+    let (server, shared) = server_side(pipe);
+    if !server || !shared {
+        return server;
     }
     if !SHARED_SERVER_DISPATCH.swap(true, Ordering::Relaxed) {
         log!("steam-lan the game dispatches its game server's callbacks on its own pipe ({pipe}): they go to the dispatch that asks for the server's pipe first");

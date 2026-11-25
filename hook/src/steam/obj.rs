@@ -66,8 +66,10 @@ struct Proxy {
     server: bool,
 }
 
-/// real object -> stand-in, so a game asking twice gets the same object.
-static PROXIES: LazyLock<Mutex<HashMap<usize, usize>>> = LazyLock::new(Mutex::default);
+/// (real object, for the game server) -> stand-in, so a game asking twice gets the same
+/// object. The server's and the player's are told apart: a game server on the game's own
+/// pipe can be handed the very object the player has.
+static PROXIES: LazyLock<Mutex<HashMap<(usize, bool), usize>>> = LazyLock::new(Mutex::default);
 /// stand-in -> real.
 /// Read on every call through a stand-in: a read lock, so game threads never wait on each
 /// other there.
@@ -145,7 +147,7 @@ pub fn wrap_as(real: usize, version: &str, server: bool) -> usize {
     if REALS.read().unwrap().contains_key(&real) {
         return real;
     }
-    if let Some(p) = crate::sys::lock(&PROXIES).get(&real) {
+    if let Some(p) = crate::sys::lock(&PROXIES).get(&(real, server)) {
         return *p;
     }
     let fam = family(version);
@@ -180,10 +182,10 @@ pub fn wrap_as(real: usize, version: &str, server: bool) -> usize {
         // Another thread may have wrapped the same object meanwhile: the game must get
         // one stand-in per object, so the first one in stays (this one goes unused).
         let mut proxies = crate::sys::lock(&PROXIES);
-        if let Some(p) = proxies.get(&real) {
+        if let Some(p) = proxies.get(&(real, server)) {
             return *p;
         }
-        proxies.insert(real, proxy);
+        proxies.insert((real, server), proxy);
         REALS.write().unwrap().insert(proxy, real);
     }
     if !server {
@@ -257,7 +259,7 @@ pub fn is_server(this: usize) -> bool {
 /// PeerParty's own calls into it.
 pub fn seen(family: &str) -> Option<usize> {
     let (real, _) = *crate::sys::lock(&SEEN).get(family)?;
-    crate::sys::lock(&PROXIES).get(&real).copied()
+    crate::sys::lock(&PROXIES).get(&(real, false)).copied()
 }
 
 // ---- ISteamClient: hands out stand-ins ----
@@ -287,7 +289,7 @@ macro_rules! client_getter {
             fn $fn(this: usize, user: i32, pipe: i32, version: *const c_char) -> usize {
                 let real = call_real!(this, $name, fn(i32, i32, *const c_char) -> usize, 0, user, pipe, version);
                 // On the game server's pipe, it's the server's interface.
-                let server = crate::steam::gs::server_pipe() == Some(pipe) || $name == "GetISteamGameServer";
+                let server = crate::steam::gs::for_server(pipe, $name) || $name == "GetISteamGameServer";
                 wrap_as(real, &crate::sys::read::cstr(version as usize).unwrap_or_default(), server)
             }
         }
@@ -312,7 +314,7 @@ vmethod! {
     /// ISteamUtils takes only the pipe: the game server's pipe gets the server's.
     fn get_utils(this: usize, pipe: i32, version: *const c_char) -> usize {
         let real = call_real!(this, "GetISteamUtils", fn(i32, *const c_char) -> usize, 0, pipe, version);
-        let server = crate::steam::gs::server_pipe() == Some(pipe);
+        let server = crate::steam::gs::for_server(pipe, "GetISteamUtils");
         wrap_as(real, &crate::sys::read::cstr(version as usize).unwrap_or_default(), server)
     }
 }
@@ -1395,6 +1397,25 @@ mod tests {
     // 100 times its slot plus its argument.
     vmethod! { fn fake_slot_20(this: usize, a: u32) -> usize { this.wrapping_add(2000 + a as usize) } }
     vmethod! { fn fake_slot_21(this: usize, a: u32) -> usize { this.wrapping_add(2100 + a as usize) } }
+
+    /// A game server on the game's own pipe can be handed the object the player has:
+    /// the server gets a stand-in of its own (its P2P sessions are the server's).
+    #[test]
+    fn one_real_object_gets_a_players_and_a_servers_stand_in() {
+        unsafe { std::env::set_var("PEERPARTY_ACTIVE", "1") };
+        crate::config::reload();
+        let vt = vec![0usize; layout("SteamNetworking006").unwrap().1.len()];
+        let real = Box::leak(Box::new(Box::leak(vt.into_boxed_slice()).as_ptr() as usize)) as *const usize as usize;
+        let player = wrap_as(real, "SteamNetworking006", false);
+        let server = wrap_as(real, "SteamNetworking006", true);
+        assert!(player != real && server != real && player != server);
+        assert!(!is_server(player) && is_server(server));
+        assert_eq!(wrap_as(real, "SteamNetworking006", true), server, "same server stand-in again");
+        assert_eq!((unwrap(player), unwrap(server)), (real, real));
+        let first = |p: usize| unsafe { **(p as *const *const usize) };
+        assert_eq!(first(player), networking()[0].1, "the player's SendP2PPacket");
+        assert_eq!(first(server), crate::steam::p2p::server_networking()[0].1, "the server's SendP2PPacket");
+    }
 
     #[test]
     fn stand_ins_forward_other_methods_to_the_real_object() {
