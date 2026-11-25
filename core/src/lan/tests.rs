@@ -342,7 +342,7 @@ fn inbox_drops_the_oldest_past_its_caps() {
     assert_eq!(inbox.bytes, 500);
 
     assert!(inbox.take(None, |_| true).is_some());
-    assert_eq!((inbox.bytes, inbox.len, inbox.queues.len()), (0, 0, 0));
+    assert_eq!((inbox.bytes, inbox.len, live_queues(&inbox)), (0, 0, 0));
     inbox.push(packet(4, 7));
     inbox.push(packet(5, 9));
     inbox.retain(|p| p.data[0] == 5);
@@ -403,14 +403,61 @@ fn inbox_reads_by_socket_and_channel_in_arrival_order() {
     assert!(inbox.take(Some(0), steam).is_none());
     assert_eq!(inbox.take(None, |_| true).unwrap().data, [0], "any channel: the oldest");
     assert_eq!(inbox.take(Some(0), |_| true).unwrap().data, [201]);
-    assert_eq!((inbox.len, inbox.queues.len()), (99, 1));
+    assert_eq!((inbox.len, live_queues(&inbox)), (99, 1));
     // Full: the oldest anywhere goes, not the newest channel's.
     let mut inbox = Inbox::default();
     inbox.push_capped(p("a", 0, 1), 2, 1000);
     inbox.push_capped(p("b", 0, 2), 2, 1000);
     inbox.push_capped(p("b", 0, 3), 2, 1000);
     assert_eq!(inbox.iter().map(|p| p.data[0]).collect::<Vec<_>>(), [2, 3]);
-    assert!(!inbox.queues.contains_key(&("a".to_string(), 0)));
+    assert_eq!(live_queues(&inbox), 1);
+}
+
+/// A push wakes a thread waiting for packets (`Lan::wait_for_packet`) at once, not
+/// when its wait runs out.
+#[test]
+fn a_push_wakes_a_waiting_reader() {
+    let s = Arc::new(Mutex::new(Inbox::default()));
+    let (s2, start) = (s.clone(), Instant::now());
+    let waiter = std::thread::spawn(move || {
+        let mut g = s2.lock().unwrap();
+        let arrived = g.arrived.clone();
+        g.waiting += 1;
+        while g.len == 0 && start.elapsed() < Duration::from_secs(10) {
+            g = arrived.wait_timeout(g, Duration::from_secs(10)).unwrap().0;
+        }
+        g.waiting -= 1;
+        start.elapsed()
+    });
+    while s.lock().unwrap().waiting == 0 {
+        std::thread::yield_now();
+    }
+    s.lock().unwrap().push(packet(1, 4));
+    assert!(waiter.join().unwrap() < Duration::from_secs(5));
+}
+
+fn live_queues(inbox: &Inbox) -> usize {
+    inbox.queues.values().filter(|q| !q.is_empty()).count()
+}
+
+/// A socket's emptied queue stays for its next packet, up to `KEPT_EMPTY_QUEUES` of them;
+/// past that an emptied one goes, so new socket names can't pile up empty queues.
+#[test]
+fn inbox_keeps_a_bounded_number_of_emptied_queues() {
+    let p = |socket: String| Packet { peer: PeerId([1; 16]), socket, channel: 0, data: vec![1], ordered: true };
+    let mut inbox = Inbox::default();
+    inbox.push(p("steam:p2p".into()));
+    assert!(inbox.take(None, |_| true).is_some());
+    assert_eq!(inbox.queues.len(), 1, "kept for the next packet");
+    inbox.push(p("steam:p2p".into()));
+    assert_eq!(inbox.queues.len(), 1, "the same queue");
+    assert!(inbox.take(None, |_| true).is_some());
+    for n in 0..1000 {
+        inbox.push(p(format!("s{n}")));
+        assert!(inbox.take(None, |_| true).is_some());
+    }
+    assert!(inbox.queues.len() <= KEPT_EMPTY_QUEUES + 1, "{} queues", inbox.queues.len());
+    assert_eq!((inbox.len, inbox.bytes, live_queues(&inbox)), (0, 0, 0));
 }
 
 #[test]

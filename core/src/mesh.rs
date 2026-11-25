@@ -716,8 +716,7 @@ pub(crate) fn start(cfg: Config, sink: Arc<dyn Sink>) -> io::Result<Mesh> {
                     // elsewhere could otherwise redirect our traffic (a ping) or inject
                     // channel data.
                     let elsewhere = elsewhere(from, conn.addr, conn.udp_said);
-                    let theirs = conn.seq_in.lock().unwrap().epoch();
-                    if elsewhere && !foreign_ok(kind, body, conn.epoch, theirs) {
+                    if elsewhere && !foreign_ok(kind, body, conn.epoch, conn.seq_in.lock().unwrap().epoch()) {
                         foreign += 1;
                         if foreign <= 3 || foreign.is_power_of_two() {
                             sink.log(&format!(
@@ -1323,7 +1322,8 @@ fn handshake(
             // Set before this thread starts (`Sink::connected`), and fixed for the
             // connection: a better path is a new connection.
             let max = conn.frame_max();
-            while let Ok(frame) = read_frame_max(&mut reader, max) {
+            let mut frame = Vec::new();
+            while read_frame_into(&mut reader, max, &mut frame).is_ok() {
                 match Msg::decode(&frame) {
                     Some(msg) => sink.message(&conn, msg, true),
                     None => {
@@ -1382,6 +1382,15 @@ fn write_frame(w: &mut impl Write, body: &[u8]) -> io::Result<()> {
 /// A frame of at most `max` bytes: a longer one is an error before any of it is read
 /// (or room made for it). Room for the body grows as its bytes arrive.
 fn read_frame_max(r: &mut impl Read, max: usize) -> io::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    read_frame_into(r, max, &mut body)?;
+    Ok(body)
+}
+
+/// `read_frame_max` into `body`, which a connection's reader keeps from frame to frame
+/// rather than allocating one a message. After a big frame it goes back to
+/// FRAME_PREALLOC, so a peer's one large message isn't held for the connection's life.
+fn read_frame_into(r: &mut impl Read, max: usize, body: &mut Vec<u8>) -> io::Result<()> {
     let mut len = [0u8; 4];
     r.read_exact(&mut len)?;
     let len = u32::from_le_bytes(len) as usize;
@@ -1391,12 +1400,16 @@ fn read_frame_max(r: &mut impl Read, max: usize) -> io::Result<Vec<u8>> {
             "frame too large",
         ));
     }
-    let mut body = Vec::with_capacity(len.min(FRAME_PREALLOC));
-    r.take(len as u64).read_to_end(&mut body)?;
+    body.clear();
+    if body.capacity() > FRAME_PREALLOC {
+        body.shrink_to(FRAME_PREALLOC);
+    }
+    body.reserve(len.min(FRAME_PREALLOC));
+    r.take(len as u64).read_to_end(body)?;
     if body.len() != len {
         return Err(io::ErrorKind::UnexpectedEof.into());
     }
-    Ok(body)
+    Ok(())
 }
 
 /// A UDP socket on the discovery port that every copy on this machine can share.
@@ -1641,6 +1654,20 @@ mod tests {
             assert_eq!(read_frame_max(&mut r, MAX_FRAME).unwrap(), Vec::<u8>::new());
             assert!(r.is_empty());
         }
+        // One buffer for a connection's frames: each read replaces the last, and a big
+        // one doesn't keep its room.
+        let mut w = Vec::new();
+        write_frame(&mut w, &[1; 300_000]).unwrap();
+        write_frame(&mut w, &[2, 3]).unwrap();
+        write_frame(&mut w, &[]).unwrap();
+        let (mut r, mut frame) = (&w[..], Vec::new());
+        read_frame_into(&mut r, MAX_FRAME, &mut frame).unwrap();
+        assert_eq!(frame.len(), 300_000);
+        read_frame_into(&mut r, MAX_FRAME, &mut frame).unwrap();
+        assert_eq!(frame, [2, 3]);
+        assert!(frame.capacity() <= FRAME_PREALLOC, "{}", frame.capacity());
+        read_frame_into(&mut r, MAX_FRAME, &mut frame).unwrap();
+        assert!(frame.is_empty());
     }
 
     /// A frame that says it's bigger than allowed is refused from its length alone.

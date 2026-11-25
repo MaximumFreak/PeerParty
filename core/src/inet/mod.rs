@@ -1402,7 +1402,7 @@ mod tests {
         // Fed a byte at a time, it holds back until the whole hello is in.
         let mut out = Vec::new();
         for b in &bytes {
-            out.extend(peer_hello(&mut f, &[*b], id, 7777, None).unwrap());
+            out.extend(peer_hello(&mut f, &[*b], id, 7777, None).unwrap().unwrap_or_else(|| vec![*b]));
         }
         let len = u32::from_le_bytes(out[..4].try_into().unwrap()) as usize;
         match Msg::decode(&out[4..4 + len]) {
@@ -1413,7 +1413,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(&out[4 + len..], b"rest");
-        assert_eq!(peer_hello(&mut f, b"more", id, 7777, None).unwrap(), b"more");
+        assert_eq!(peer_hello(&mut f, b"more", id, 7777, None).unwrap(), None, "passes as it is");
         // Someone else's hello is refused.
         let mut f = HelloRewriter::default();
         assert!(peer_hello(&mut f, &bytes, PeerId::random(), 7777, None).is_err());
@@ -1440,12 +1440,12 @@ mod tests {
             b
         };
         // A room peer's name is cleaned up: no address, no control characters.
-        let out = peer_hello(&mut HelloRewriter::default(), &frame("203.0.113.9"), id, 1, None).unwrap();
+        let out = peer_hello(&mut HelloRewriter::default(), &frame("203.0.113.9"), id, 1, None).unwrap().unwrap();
         assert_eq!(hello_name(&out), "Player");
-        let out = peer_hello(&mut HelloRewriter::default(), &frame("Ro\u{202e}bin\n"), id, 1, None).unwrap();
+        let out = peer_hello(&mut HelloRewriter::default(), &frame("Ro\u{202e}bin\n"), id, 1, None).unwrap().unwrap();
         assert_eq!(hello_name(&out), "Robin");
         // A public player's is the one from its signed handshake.
-        let out = peer_hello(&mut HelloRewriter::default(), &frame("whatever"), id, 1, Some("Signed")).unwrap();
+        let out = peer_hello(&mut HelloRewriter::default(), &frame("whatever"), id, 1, Some("Signed")).unwrap().unwrap();
         assert_eq!(hello_name(&out), "Signed");
         // Ours, on the way out to a public player.
         let mut udp_seen = 0;
@@ -1455,6 +1455,7 @@ mod tests {
                 udp_seen = *udp;
                 Ok(())
             })
+            .unwrap()
             .unwrap();
         assert_eq!(hello_name(&out), "Player-abcd");
         assert_eq!(udp_seen, 5000);

@@ -375,7 +375,7 @@ fn pump(this: Weak<Inner>, key: EndKey, addr: SocketAddr, tcp: TcpStream, rx: Re
             let mut first = HelloRewriter::default();
             while let Ok(data) = rx.recv() {
                 let Ok(out) = first.no_udp(&data) else { break };
-                if writer.write_all(&out).is_err() {
+                if writer.write_all(out.as_deref().unwrap_or(&data)).is_err() {
                     break;
                 }
             }

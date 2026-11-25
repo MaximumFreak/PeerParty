@@ -288,8 +288,10 @@ fn writer(mut up: Up, rx: Receiver<String>) {
     let mut last_sent = Instant::now() - HEARTBEAT;
     loop {
         match rx.recv_timeout(STATE_EVERY) {
-            Ok(msg) => {
-                if up.write_all(msg.as_bytes()).and_then(|_| up.write_all(b"\n")).is_err() {
+            Ok(mut msg) => {
+                // One pipe write a line, its newline with it.
+                msg.push('\n');
+                if up.write_all(msg.as_bytes()).is_err() {
                     return;
                 }
                 continue;
@@ -297,11 +299,15 @@ fn writer(mut up: Up, rx: Receiver<String>) {
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
-        let state = std::panic::catch_unwind(state).unwrap_or_default();
-        if state.is_empty() || (state == last_state && last_sent.elapsed() < HEARTBEAT) {
+        let mut state = std::panic::catch_unwind(state).unwrap_or_default();
+        if state.is_empty() {
             continue;
         }
-        if up.write_all(state.as_bytes()).and_then(|_| up.write_all(b"\n")).is_err() {
+        state.push('\n');
+        if state == last_state && last_sent.elapsed() < HEARTBEAT {
+            continue;
+        }
+        if up.write_all(state.as_bytes()).is_err() {
             return;
         }
         last_state = state;

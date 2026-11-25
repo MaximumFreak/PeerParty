@@ -472,14 +472,15 @@ impl Inner {
 
     /// The address games are told a peer on this connection is at (see `Lan::peer_ip`).
     fn shown_ip(&self, conn: &Conn) -> IpAddr {
-        if self.tunnel(conn).is_some() {
+        if conn.addr.ip().is_loopback() && self.tunnels.lock().unwrap().contains_key(&conn.addr) {
             return crate::redact::stand_in(&conn.peer.0).into();
         }
         conn.addr.ip()
     }
 
+    /// Asked for every message that comes in: looked up without copying the tunnel.
     fn is_public(&self, conn: &Conn) -> bool {
-        self.tunnel(conn).is_some_and(|t| t.public)
+        conn.addr.ip().is_loopback() && self.tunnels.lock().unwrap().get(&conn.addr).is_some_and(|e| e.tunnel.public)
     }
 
     fn trust(&self, conn: &Conn) -> Trust {
@@ -1901,7 +1902,7 @@ impl Inner {
         if public {
             // A channel the stranger doesn't have yet, past what one player may have.
             if let Msg::ChanRequest { socket } | Msg::ChanData { socket, .. } = &msg
-                && !s.chans.contains_key(&(conn.peer, socket.clone()))
+                && !s.chans.contains_key(by(&(conn.peer, socket.as_str())))
                 && s.chans.keys().filter(|(p, _)| *p == conn.peer).count() >= PUBLIC_CHANNELS
             {
                 drop(s);
@@ -2187,14 +2188,6 @@ impl State {
     fn send_to(&mut self, peer: PeerId, msg: &Msg) {
         if let Some(p) = self.peers.get_mut(&peer) {
             p.post(msg);
-        }
-    }
-
-    fn send_unreliable_to(&self, peer: PeerId, msg: &Msg) {
-        if let Some(p) = self.peers.get(&peer)
-            && p.gone.is_none()
-        {
-            p.conn.send_unreliable(msg);
         }
     }
 

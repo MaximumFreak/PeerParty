@@ -101,7 +101,13 @@ struct Alias {
     local: u16,
     /// Where our game listens (loopback, or the address it bound to).
     target: SocketAddrV4,
-    last: Mutex<Instant>,
+    /// The peer's stand-in, worked out once: `udp_from` is asked for every datagram the
+    /// game reads, and the stand-in is an HMAC.
+    shown: Ipv4Addr,
+    born: Instant,
+    /// When a datagram last went through, in ms after `born` (`touch`), as both
+    /// directions note it per datagram.
+    last_ms: AtomicU64,
     dead: AtomicBool,
     /// The alias's own port is ours, not the game's.
     _own: crate::own::Held,
@@ -275,7 +281,7 @@ impl Forwarder {
         let peer = self.peer_at(*dest.ip())?;
         self.ensure_pump();
         let a = self.alias(peer, dest.port(), local)?;
-        *a.last.lock().unwrap() = Instant::now();
+        a.touch();
         Some(a.addr)
     }
 
@@ -284,7 +290,7 @@ impl Forwarder {
     pub fn udp_from(&self, from: SocketAddrV4) -> Option<SocketAddrV4> {
         let st = self.st.lock().unwrap();
         let a = st.by_addr.get(&from)?;
-        Some(SocketAddrV4::new(stand_in(&a.peer.0), a.remote))
+        Some(SocketAddrV4::new(a.shown, a.remote))
     }
 
     /// Where a TCP `connect` to `dest` should really go, when `dest` is a peer's stand-in.
@@ -604,7 +610,9 @@ impl Forwarder {
             remote,
             local,
             target: SocketAddrV4::new(ip, local),
-            last: Mutex::new(Instant::now()),
+            shown: stand_in(&peer.0),
+            born: Instant::now(),
+            last_ms: AtomicU64::new(0),
             dead: AtomicBool::new(false),
             _own: crate::own::udp(addr.port()),
         });
@@ -615,7 +623,7 @@ impl Forwarder {
         let spawned = thread::Builder::new().name("peerparty-ipfwd-udp".into()).spawn(move || {
             let mut buf = vec![0u8; 65536 + 4];
             loop {
-                if a2.dead.load(Ordering::Relaxed) || a2.last.lock().unwrap().elapsed() > UDP_IDLE {
+                if a2.dead.load(Ordering::Relaxed) || a2.idle() > UDP_IDLE {
                     break;
                 }
                 let Ok((n, from)) = a2.sock.recv_from(&mut buf[4..]) else { continue };
@@ -624,7 +632,7 @@ impl Forwarder {
                 if from.port() != a2.local || !ours {
                     continue;
                 }
-                *a2.last.lock().unwrap() = Instant::now();
+                a2.touch();
                 buf[0..2].copy_from_slice(&a2.remote.to_be_bytes());
                 buf[2..4].copy_from_slice(&a2.local.to_be_bytes());
                 me.lan.send(a2.peer, UDP_SOCKET, DATA, &buf[..n + 4], false, true, true);
@@ -705,7 +713,7 @@ impl Forwarder {
                 return;
             }
             if let Some(a) = self.alias(p.peer, src, dst) {
-                *a.last.lock().unwrap() = Instant::now();
+                a.touch();
                 let _ = a.sock.send_to(&p.data[4..], a.target);
             }
             return;
@@ -776,9 +784,14 @@ impl Forwarder {
                 for ev in &events {
                     me.event(ev);
                 }
+                let lan = me.lan.clone();
                 drop(me);
+                // Woken by the next packet for us rather than polling for it: a sleep
+                // of 1 ms is 15.6 on the default timer, and each forwarded datagram
+                // waited for it. At most until the next tick is due.
                 if !busy {
-                    thread::sleep(Duration::from_millis(1));
+                    let due = Duration::from_millis(5).saturating_sub(last_tick.elapsed()).max(Duration::from_millis(1));
+                    lan.wait_for_packet(due, |s| s.starts_with(PREFIX));
                 }
             }
             pump.done.store(true, Ordering::Release);
@@ -790,6 +803,17 @@ impl Drop for Forwarder {
     fn drop(&mut self) {
         // Not joined: the last handle may be the pump's own, dropped on its thread.
         self.pump.stop.store(true, Ordering::Release);
+    }
+}
+
+impl Alias {
+    fn touch(&self) {
+        self.last_ms.store(self.born.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// How long since a datagram last went through.
+    fn idle(&self) -> Duration {
+        self.born.elapsed().saturating_sub(Duration::from_millis(self.last_ms.load(Ordering::Relaxed)))
     }
 }
 

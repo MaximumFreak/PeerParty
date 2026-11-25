@@ -399,7 +399,8 @@ impl Session {
             return Ok(());
         };
         let name = (self.mode == Mode::Public).then_some(info.name.as_str());
-        let out = peer_hello(&mut self.filter, &data, info.id, b.relay_port, name)?;
+        // Past the Hello, the segment's own bytes go on (no copy).
+        let out = peer_hello(&mut self.filter, &data, info.id, b.relay_port, name)?.unwrap_or(data);
         if !out.is_empty() {
             let len = out.len();
             if b.to_tcp_bytes.fetch_add(len, Ordering::Relaxed) + len > crate::mesh::SEND_QUEUE_MAX {

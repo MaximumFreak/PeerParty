@@ -1835,8 +1835,9 @@ fn draw(queue: usize, info: &PresentInfo) -> Option<u64> {
         let ring = command_ring(fx, dev, family, RING, true)?;
         d.pools.insert(family, ring);
     }
-    let all_fences: Vec<u64> = d.pools.values().flat_map(|p| p.1.iter().map(|r| r.1)).collect();
+    // Listed only when a wait is needed (a new frame to stage, a resize), not every present.
     let wait = || unsafe {
+        let all_fences: Vec<u64> = d.pools.values().flat_map(|p| p.1.iter().map(|r| r.1)).collect();
         (fx.wait_fences)(dev, all_fences.len() as u32, all_fences.as_ptr(), 1, 1_000_000_000);
     };
     if d.gfx.is_none() {
@@ -1875,7 +1876,16 @@ fn draw(queue: usize, info: &PresentInfo) -> Option<u64> {
     }
     g.record(fx, cmd, pass, framebuffer, sw, sh);
     unsafe { (fx.end)(cmd) };
-    let stages = vec![0x10000u32; info.wait_count as usize];
+    // COLOR_ATTACHMENT_OUTPUT for each semaphore the game's present waits on: a handful,
+    // so on the stack unless a game passes more.
+    let (short, long);
+    let stages: &[u32] = if info.wait_count <= 16 {
+        short = [0x10000u32; 16];
+        &short[..info.wait_count as usize]
+    } else {
+        long = vec![0x10000u32; info.wait_count as usize];
+        &long
+    };
     let submit = SubmitInfo {
         s_type: 4,
         next: 0,

@@ -162,8 +162,15 @@ impl Stream {
         if off >= RECV_WINDOW {
             return Vec::new(); // old (a duplicate) or too far ahead
         }
-        self.ahead.entry(seq).or_insert(data);
-        let mut ready = Vec::new();
+        // The one expected next (most segments): its bytes are the start of what's ready,
+        // not copied. `ahead` never holds the expected one (it's drained below).
+        let mut ready = if off == 0 {
+            self.expected = self.expected.wrapping_add(1);
+            data
+        } else {
+            self.ahead.entry(seq).or_insert(data);
+            Vec::new()
+        };
         while let Some(d) = self.ahead.remove(&self.expected) {
             ready.extend_from_slice(&d);
             self.expected = self.expected.wrapping_add(1);
@@ -174,25 +181,22 @@ impl Stream {
     pub fn on_ack(&mut self, next: u32, sack: u64, now: Instant) {
         let mut acked_new = 0usize;
         let mut sample = None;
-        // Everything below `next`, then the selectively acknowledged ones.
-        let below: Vec<u32> = self
-            .in_flight
-            .keys()
-            .copied()
-            .filter(|&s| next.wrapping_sub(s).wrapping_sub(1) < MAX_IN_FLIGHT as u32 * 4)
-            .collect();
-        let sacked: Vec<u32> = (0..64u32)
-            .filter(|&i| sack & (1u64 << i) != 0)
-            .map(|i| next.wrapping_add(1 + i))
-            .collect();
-        for s in below.into_iter().chain(sacked.iter().copied()) {
-            if let Some(sent) = self.in_flight.remove(&s) {
-                acked_new += 1;
-                if sent.tries == 0 {
-                    sample = Some(now.duration_since(sent.at));
-                }
+        // Everything below `next`, and the selectively acknowledged ones: one pass, with
+        // no lists made for an ack.
+        let acked = |s: u32| {
+            let above = s.wrapping_sub(next).wrapping_sub(1);
+            next.wrapping_sub(s).wrapping_sub(1) < MAX_IN_FLIGHT as u32 * 4 || (above < 64 && sack & (1u64 << above) != 0)
+        };
+        self.in_flight.retain(|&s, sent| {
+            if !acked(s) {
+                return true;
             }
-        }
+            acked_new += 1;
+            if sent.tries == 0 {
+                sample = Some(now.duration_since(sent.at));
+            }
+            false
+        });
         if let Some(r) = sample {
             self.rtt_sample(r);
         }
@@ -352,6 +356,21 @@ mod tests {
         assert_eq!(b.on_segment(1, vec![9]), Vec::<u8>::new());
         assert_eq!(b.on_segment(5000, vec![9]), Vec::<u8>::new());
         assert_eq!(b.on_segment(2, vec![3]), vec![3]);
+    }
+
+    /// An ack frees what's below its `next` and what its bits name, nothing else.
+    #[test]
+    fn an_ack_frees_only_what_it_names() {
+        let mut a = Stream::default();
+        let now = Instant::now();
+        a.write(&vec![1u8; MAX_SEG * 4]);
+        let sent: Vec<u32> = a.poll(now).into_iter().filter_map(|o| if let Out::Seg { seq, .. } = o { Some(seq) } else { None }).collect();
+        assert_eq!(sent, [0, 1, 2, 3]);
+        // 0 in order, 2 selectively (bit 0 is next + 1).
+        a.on_ack(1, 0b1, now);
+        assert_eq!(a.in_flight.keys().copied().collect::<Vec<_>>(), [1, 3]);
+        a.on_ack(4, 0, now);
+        assert!(a.idle());
     }
 
     #[test]

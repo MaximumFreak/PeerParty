@@ -8,7 +8,7 @@ use super::*;
 /// The peer's side of a tunnel's mesh connection: its Hello must be from `expect`; its
 /// UDP port becomes our relay's, and its name the cleaned-up one (for a public player,
 /// the one its signed handshake gave).
-pub(super) fn peer_hello(filter: &mut HelloRewriter, data: &[u8], expect: PeerId, relay: u16, name: Option<&str>) -> Result<Vec<u8>, String> {
+pub(super) fn peer_hello(filter: &mut HelloRewriter, data: &[u8], expect: PeerId, relay: u16, name: Option<&str>) -> Result<Option<Vec<u8>>, String> {
     filter.edit(data, &mut |id, n, udp| {
         if id != expect {
             return Err(format!("the tunnel's hello is from {id}, not {expect}"));
@@ -201,16 +201,18 @@ pub(super) fn attach(sh: &Arc<Shared>, addr: SocketAddr, epoch: u64, tcp: TcpStr
                     Ok(0) | Err(_) => break,
                     Ok(n) => n,
                 };
-                let out: Vec<u8> = match &mut ours {
+                // What our mesh wrote goes into the session's stream from `buf` as it is,
+                // once the Hello is by.
+                let out: std::borrow::Cow<[u8]> = match &mut ours {
                     Some(filter) => {
-                        let name = sh.me.name.clone();
                         let r = filter.edit(&buf[..n], &mut |_, n, udp| {
-                            *n = name.clone();
+                            *n = sh.me.name.clone();
                             mesh_udp.store(*udp, Ordering::Relaxed);
                             Ok(())
                         });
                         match r {
-                            Ok(o) => o,
+                            Ok(Some(o)) => o.into(),
+                            Ok(None) => buf[..n].into(),
                             Err(_) => break,
                         }
                     }
@@ -221,7 +223,7 @@ pub(super) fn attach(sh: &Arc<Shared>, addr: SocketAddr, epoch: u64, tcp: TcpStr
                             mesh_udp.store(port, Ordering::Relaxed);
                             hello = None;
                         }
-                        buf[..n].to_vec()
+                        buf[..n].into()
                     }
                 };
                 if out.is_empty() {

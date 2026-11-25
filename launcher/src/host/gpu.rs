@@ -585,10 +585,41 @@ struct Renderer {
     params: Option<PaneParams>,
     sampler: usize,
     /// The window's monitor as last looked at (the swap chain's format follows it), and
-    /// when that was.
+    /// what the probe thread last found it shows.
     display: Display,
     monitor: usize,
-    display_checked: std::time::Instant,
+    probe: Arc<DisplayProbe>,
+}
+
+/// What a monitor shows, looked at again once a second on a thread of its own: building
+/// a DXGI factory and walking every output, then the display config, took milliseconds
+/// on the render thread, a stutter a second on some setups. The thread ends within a
+/// second of its renderer.
+struct DisplayProbe {
+    monitor: std::sync::atomic::AtomicUsize,
+    seen: Mutex<Option<(usize, Display)>>,
+}
+
+impl DisplayProbe {
+    fn start(monitor: usize) -> Arc<DisplayProbe> {
+        let p = Arc::new(DisplayProbe { monitor: monitor.into(), seen: Mutex::new(None) });
+        let weak = Arc::downgrade(&p);
+        let _ = std::thread::Builder::new().name("peerparty-display-probe".into()).spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let Some(p) = weak.upgrade() else { break };
+                let m = p.monitor.load(std::sync::atomic::Ordering::Acquire);
+                let d = display_of(m);
+                *p.seen.lock().unwrap_or_else(|e| e.into_inner()) = Some((m, d));
+            }
+        });
+        p
+    }
+
+    /// The newest look at `monitor` since the last call, if there is one.
+    fn take(&self, monitor: usize) -> Option<Display> {
+        self.seen.lock().unwrap_or_else(|e| e.into_inner()).take().filter(|(m, _)| *m == monitor).map(|(_, d)| d)
+    }
 }
 
 unsafe impl Send for Renderer {}
@@ -857,7 +888,7 @@ impl Renderer {
             sampler: 0,
             display: Display::SDR,
             monitor: monitor_of(hwnd),
-            display_checked: std::time::Instant::now(),
+            probe: DisplayProbe::start(monitor_of(hwnd)),
         };
         r.display = display_of(r.monitor);
         let mut fl = 0u32;
@@ -1026,17 +1057,21 @@ impl Renderer {
         }
     }
 
-    /// Looks at the window's monitor again when it moved to another one or a second has
-    /// passed, and moves the swap chain to the format it wants. Whether anything changed
-    /// (everything is drawn again).
+    /// Looks at the window's monitor at once when it moved to another one, else takes
+    /// the probe thread's latest look (`DisplayProbe`), and moves the swap chain to the
+    /// format it wants. Whether anything changed (everything is drawn again).
     fn check_display(&mut self) -> bool {
         let monitor = monitor_of(self.hwnd);
-        if monitor == self.monitor && self.display_checked.elapsed() < std::time::Duration::from_secs(1) {
-            return false;
-        }
-        self.monitor = monitor;
-        self.display_checked = std::time::Instant::now();
-        let d = display_of(monitor);
+        let d = if monitor != self.monitor {
+            self.monitor = monitor;
+            self.probe.monitor.store(monitor, std::sync::atomic::Ordering::Release);
+            display_of(monitor)
+        } else {
+            match self.probe.take(monitor) {
+                Some(d) => d,
+                None => return false,
+            }
+        };
         if d == self.display {
             return false;
         }
@@ -1717,9 +1752,10 @@ fn run(hwnd: usize, shared: &Shared, frames: HANDLE, wake: HANDLE, pause_on_occl
 }
 
 fn set_live(shared: &Shared, panes: &[Pane], presenting: bool) {
-    let live: Vec<bool> = panes.iter().map(|p| p.shown().is_some_and(|o| o.last.is_some())).collect();
+    let has_frame = |p: &Pane| p.shown().is_some_and(|o| o.last.is_some());
     let any_visible = panes.iter().any(|p| p.draw.dest.width > 0 && p.draw.dest.height > 0);
-    for (p, &has_frame) in panes.iter().zip(live.iter()) {
+    for p in panes {
+        let has_frame = has_frame(p);
         if let Some(ring) = &p.draw.ring {
             let visible = p.draw.dest.width > 0 && p.draw.dest.height > 0;
             let active = presenting && has_frame && visible;
@@ -1733,9 +1769,10 @@ fn set_live(shared: &Shared, panes: &[Pane], presenting: bool) {
             }
         }
     }
+    // Called every frame: the list is made again only when it changed.
     let mut l = shared.live.lock().unwrap_or_else(|e| e.into_inner());
-    if *l != live {
-        *l = live;
+    if l.len() != panes.len() || l.iter().zip(panes).any(|(&was, p)| was != has_frame(p)) {
+        *l = panes.iter().map(has_frame).collect();
     }
 }
 

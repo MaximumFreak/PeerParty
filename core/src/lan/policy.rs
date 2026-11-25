@@ -312,7 +312,11 @@ impl Inner {
         if !cap_public(msg) {
             return Err(None);
         }
-        scrub_public(msg, crate::redact::stand_in(&conn.peer.0));
+        // The stand-in is an HMAC: worked out only for what can carry an address, not
+        // for every packet of game data.
+        if may_carry_addresses(msg) {
+            scrub_public(msg, crate::redact::stand_in(&conn.peer.0));
+        }
         Ok(())
     }
 }

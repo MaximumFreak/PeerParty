@@ -177,6 +177,11 @@ impl RingHeader {
 
     /// Sets or clears one bit in `flags`; returns whether the bit was previously set.
     pub fn set_flag(&self, bit: u32, on: bool) -> bool {
+        // Set every frame, changed rarely: a read-modify-write on a line the game's
+        // process reads too is skipped when the bit is already so.
+        if (self.flags.load(Ordering::Acquire) & bit != 0) == on {
+            return on;
+        }
         let prev = if on {
             self.flags.fetch_or(bit, Ordering::AcqRel)
         } else {

@@ -24,20 +24,21 @@ pub(crate) struct HelloRewriter {
 
 impl HelloRewriter {
     /// Feeds bytes of the stream; returns what may pass on (nothing until the whole Hello
-    /// is in, then the rewritten Hello and whatever followed it, then everything as is).
-    pub(crate) fn edit(&mut self, data: &[u8], f: &mut HelloEdit) -> Result<Vec<u8>, String> {
+    /// is in, then the rewritten Hello and whatever followed it). None once the Hello went
+    /// by: `data` passes as it is, without a copy of everything after the Hello.
+    pub(crate) fn edit(&mut self, data: &[u8], f: &mut HelloEdit) -> Result<Option<Vec<u8>>, String> {
         if self.done {
-            return Ok(data.to_vec());
+            return Ok(None);
         }
         self.buf.extend_from_slice(data);
         let Some(len) = self.buf.get(..4).map(|l| u32::from_le_bytes(l.try_into().unwrap()) as usize) else {
-            return Ok(Vec::new());
+            return Ok(Some(Vec::new()));
         };
         if len > HELLO_MAX {
             return Err("the peer's first message is too big for a hello".into());
         }
         if self.buf.len() < 4 + len {
-            return Ok(Vec::new());
+            return Ok(Some(Vec::new()));
         }
         let Some(Msg::Hello { version, game, id, mut name, mut udp, key, nonce }) = Msg::decode(&self.buf[4..4 + len]) else {
             return Err("the first message isn't a hello".into());
@@ -49,13 +50,13 @@ impl HelloRewriter {
         out.extend_from_slice(&self.buf[4 + len..]);
         self.buf = Vec::new();
         self.done = true;
-        Ok(out)
+        Ok(Some(out))
     }
 
     /// The far end's side of a connection through another player: its Hello's UDP port
     /// can't be reached through the relay, so it says none and unreliable data stays on
     /// the connection.
-    pub(crate) fn no_udp(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
+    pub(crate) fn no_udp(&mut self, data: &[u8]) -> Result<Option<Vec<u8>>, String> {
         self.edit(data, &mut |_, _, udp| {
             *udp = 0;
             Ok(())
@@ -90,11 +91,12 @@ mod tests {
     fn the_hello_is_rewritten_in_pieces_and_the_rest_passes() {
         let s = stream();
         let mut f = HelloRewriter::default();
-        let mut out = f.no_udp(&s[..3]).unwrap();
+        let mut out = f.no_udp(&s[..3]).unwrap().unwrap();
         assert!(out.is_empty());
-        out.extend(f.no_udp(&s[3..10]).unwrap());
-        out.extend(f.no_udp(&s[10..]).unwrap());
-        out.extend(f.no_udp(b"more").unwrap());
+        out.extend(f.no_udp(&s[3..10]).unwrap().unwrap());
+        out.extend(f.no_udp(&s[10..]).unwrap().unwrap());
+        assert_eq!(f.no_udp(b"more").unwrap(), None, "passes as it is");
+        out.extend(b"more");
         let len = u32::from_le_bytes(out[..4].try_into().unwrap()) as usize;
         assert!(matches!(Msg::decode(&out[4..4 + len]), Some(Msg::Hello { udp: 0, .. })));
         assert_eq!(&out[4 + len..], b"aftermore");
@@ -112,6 +114,7 @@ mod tests {
                 *udp = 7;
                 Ok(())
             })
+            .unwrap()
             .unwrap();
         let len = u32::from_le_bytes(out[..4].try_into().unwrap()) as usize;
         match Msg::decode(&out[4..4 + len]) {

@@ -2,6 +2,57 @@
 //! held until then, and the inbox of received packets waiting for the game.
 
 use super::*;
+use std::borrow::Borrow;
+use std::hash::{Hash, Hasher};
+
+/// A `(T, String)` map key looked up as `(T, &str)` (`by`): channels and inbox queues
+/// are found once a packet, and a lookup that built the `String` allocated each time.
+pub(super) trait StrKey<T> {
+    fn parts(&self) -> (T, &str);
+}
+
+impl<T: Copy> StrKey<T> for (T, String) {
+    fn parts(&self) -> (T, &str) {
+        (self.0, &self.1)
+    }
+}
+
+impl<T: Copy> StrKey<T> for (T, &str) {
+    fn parts(&self) -> (T, &str) {
+        (self.0, self.1)
+    }
+}
+
+impl<'a, T: Copy + 'a> Borrow<dyn StrKey<T> + 'a> for (T, String) {
+    fn borrow(&self) -> &(dyn StrKey<T> + 'a) {
+        self
+    }
+}
+
+// Hashes as `(T, String)` does: a `String` hashes as its `str`.
+impl<T: Hash> Hash for dyn StrKey<T> + '_ {
+    fn hash<H: Hasher>(&self, h: &mut H) {
+        self.parts().hash(h)
+    }
+}
+
+impl<T: PartialEq> PartialEq for dyn StrKey<T> + '_ {
+    fn eq(&self, o: &Self) -> bool {
+        self.parts() == o.parts()
+    }
+}
+
+impl<T: Eq> Eq for dyn StrKey<T> + '_ {}
+
+/// `(t, s)` as a key of a `(T, String)` map.
+pub(super) fn by<'a, T: Copy + 'a>(k: &'a (T, &'a str)) -> &'a (dyn StrKey<T> + 'a) {
+    k
+}
+
+/// Emptied inbox queues kept for their socket's next packet, at most: a queue made and
+/// dropped for every packet cost two allocations each time, and without a bound a
+/// stranger naming new sockets would leave empty queues behind for good.
+pub(super) const KEPT_EMPTY_QUEUES: usize = 64;
 
 /// Received packets kept for the game at most: a game that stops reading, or a socket
 /// nobody reads, would otherwise grow the inbox without limit. The oldest go first.
@@ -151,7 +202,8 @@ pub(super) fn size_text(n: u64) -> String {
 /// packets of channels nobody reads (L-38).
 #[derive(Default)]
 pub(super) struct Inbox {
-    pub(super) queues: HashMap<(String, u8), VecDeque<(u64, Packet)>>,
+    /// By (channel, socket); emptied ones may stay (`KEPT_EMPTY_QUEUES`).
+    pub(super) queues: HashMap<(u8, String), VecDeque<(u64, Packet)>>,
     pub(super) next: u64,
     pub(super) len: usize,
     pub(super) bytes: usize,
@@ -161,6 +213,10 @@ pub(super) struct Inbox {
     pub(super) dropped: u64,
     /// Public players' packets dropped for going past their share, ever.
     pub(super) over_share: u64,
+    /// Threads in `Lan::wait_for_packet`, woken (`arrived`, with the state lock) by a
+    /// push; with none, a push signals nothing.
+    pub(super) waiting: usize,
+    pub(super) arrived: Arc<Condvar>,
 }
 
 impl Inbox {
@@ -190,7 +246,14 @@ impl Inbox {
         e.1 += p.data.len();
         let n = self.next;
         self.next += 1;
-        self.queues.entry((p.socket.clone(), p.channel)).or_default().push_back((n, p));
+        if let Some(q) = self.queues.get_mut(by(&(p.channel, p.socket.as_str()))) {
+            q.push_back((n, p));
+        } else {
+            self.queues.insert((p.channel, p.socket.clone()), VecDeque::from([(n, p)]));
+        }
+        if self.waiting > 0 {
+            self.arrived.notify_all();
+        }
         while self.len > max_n || (self.bytes > max_bytes && self.len > 1) {
             let Some(old) = self.take(None, |_| true) else { break };
             self.dropped += 1;
@@ -200,27 +263,30 @@ impl Inbox {
 
     /// The queue holding the oldest packet on a socket `want` accepts (and `channel`,
     /// if given).
-    pub(super) fn oldest(&self, channel: Option<u8>, want: impl Fn(&str) -> bool) -> Option<&(String, u8)> {
+    pub(super) fn oldest(&self, channel: Option<u8>, want: impl Fn(&str) -> bool) -> Option<&VecDeque<(u64, Packet)>> {
         self.queues
             .iter()
-            .filter(|((socket, ch), _)| channel.is_none_or(|c| c == *ch) && want(socket))
-            .filter_map(|(k, q)| q.front().map(|(n, _)| (k, *n)))
-            .min_by_key(|(_, n)| *n)
-            .map(|(k, _)| k)
+            .filter(|((ch, socket), q)| !q.is_empty() && channel.is_none_or(|c| c == *ch) && want(socket))
+            .min_by_key(|(_, q)| q.front().map(|(n, _)| *n))
+            .map(|(_, q)| q)
     }
 
     /// The size of the packet `take` would hand out.
     pub(super) fn peek_len(&self, channel: Option<u8>, want: impl Fn(&str) -> bool) -> Option<usize> {
-        let k = self.oldest(channel, want)?;
-        self.queues[k].front().map(|(_, p)| p.data.len())
+        self.oldest(channel, want)?.front().map(|(_, p)| p.data.len())
     }
 
     /// The oldest packet on a socket `want` accepts (and `channel`, if given).
     pub(super) fn take(&mut self, channel: Option<u8>, want: impl Fn(&str) -> bool) -> Option<Packet> {
-        let k = self.oldest(channel, want)?.clone();
-        let q = self.queues.get_mut(&k)?;
+        let many = self.queues.len() > KEPT_EMPTY_QUEUES;
+        let (k, q) = self
+            .queues
+            .iter_mut()
+            .filter(|((ch, socket), q)| !q.is_empty() && channel.is_none_or(|c| c == *ch) && want(socket))
+            .min_by_key(|(_, q)| q.front().map(|(n, _)| *n))?;
         let (_, p) = q.pop_front()?;
-        if q.is_empty() {
+        if q.is_empty() && many {
+            let k = k.clone();
             self.queues.remove(&k);
         }
         self.forget(&p);
@@ -300,13 +366,12 @@ impl Lan {
             self.inner.note_drop(peer, socket, &format!("not sent: {} bytes in one message, more than the {max} a message to this player can carry", data.len()));
             return SendResult::Dropped;
         }
-        let key = (peer, socket.to_string());
-        if !s.chans.contains_key(&key) {
+        if !s.chans.contains_key(by(&(peer, socket))) {
             if !auto_accept {
                 return SendResult::NoChannel;
             }
             s.chans.insert(
-                key.clone(),
+                (peer, socket.to_string()),
                 Chan::new(ChanState::Pending),
             );
             s.send_to(
@@ -316,7 +381,7 @@ impl Lan {
                 },
             );
         }
-        let chan = s.chans.get_mut(&key).unwrap();
+        let chan = s.chans.get_mut(by(&(peer, socket))).unwrap();
         if chan.state != ChanState::Open {
             if !allow_delayed
                 || !chan.hold(channel, reliable, data, DELAYED_MAX_PACKETS, DELAYED_MAX_BYTES)
@@ -334,16 +399,17 @@ impl Lan {
             return SendResult::Held;
         }
         chan.traffic.note_sent(data.len());
-        let msg = Msg::ChanData {
-            socket: socket.into(),
-            channel,
-            reliable,
-            data: data.to_vec(),
-        };
         if reliable {
+            let msg = Msg::ChanData { socket: socket.into(), channel, reliable, data: data.to_vec() };
             s.send_to(peer, &msg);
         } else {
-            s.send_unreliable_to(peer, &msg);
+            // A datagram has no number to take under the lock, and its send_to (or
+            // the TCP queue it falls back to) needn't hold every other thread up.
+            let conn = s.peers.get(&peer).filter(|p| p.gone.is_none()).map(|p| p.conn.clone());
+            drop(s);
+            if let Some(conn) = conn {
+                conn.send_unreliable(&Msg::ChanData { socket: socket.into(), channel, reliable, data: data.to_vec() });
+            }
         }
         SendResult::Sent
     }
@@ -412,7 +478,7 @@ impl Lan {
     /// Our channel with `peer` on `socket`, if there is one.
     pub fn channel_info(&self, peer: PeerId, socket: &str) -> Option<ChanInfo> {
         let s = self.inner.state.lock().unwrap();
-        let c = s.chans.get(&(peer, socket.to_string()))?;
+        let c = s.chans.get(by(&(peer, socket)))?;
         Some(ChanInfo {
             open: c.state == ChanState::Open,
             connecting: c.state == ChanState::Pending,
@@ -455,10 +521,30 @@ impl Lan {
         s.inbox.peek_len(channel, want)
     }
 
+    /// Waits up to `timeout` for a packet on a socket `want` accepts (true: one waits),
+    /// for a thread that reads its sockets' packets as they come rather than polling.
+    pub fn wait_for_packet(&self, timeout: Duration, want: impl Fn(&str) -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut s = self.inner.state.lock().unwrap();
+        loop {
+            if s.inbox.peek_len(None, &want).is_some() {
+                return true;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            let arrived = s.inbox.arrived.clone();
+            s.inbox.waiting += 1;
+            s = arrived.wait_timeout(s, left).unwrap().0;
+            s.inbox.waiting -= 1;
+        }
+    }
+
     pub fn receive_where(&self, channel: Option<u8>, want: impl Fn(&str) -> bool) -> Option<Packet> {
         let mut s = self.inner.state.lock().unwrap();
         let p = s.inbox.take(channel, want)?;
-        if let Some(c) = s.chans.get_mut(&(p.peer, p.socket.clone())) {
+        if let Some(c) = s.chans.get_mut(by(&(p.peer, p.socket.as_str()))) {
             c.traffic.note_read();
         }
         Some(p)
@@ -668,12 +754,9 @@ impl State {
                 data,
                 ..
             } => {
-                let key = (from, socket.clone());
-                match self.chans.get(&key).map(|c| c.state) {
-                    Some(ChanState::Open) => {
-                        if let Some(c) = self.chans.get_mut(&key) {
-                            c.traffic.note_got(data.len());
-                        }
+                match self.chans.get_mut(by(&(from, socket.as_str()))) {
+                    Some(c) if c.state == ChanState::Open => {
+                        c.traffic.note_got(data.len());
                         let p = Packet { peer: from, socket, channel, data, ordered };
                         if self.peers.get(&from).is_some_and(|p| p.stranger) {
                             self.inbox.push_stranger(p);
@@ -683,13 +766,13 @@ impl State {
                     }
                     None => {
                         self.chans.insert(
-                            key,
+                            (from, socket.clone()),
                             Chan::new(ChanState::Requested),
                         );
                         self.events
                             .push_back(Event::ChanRequest { peer: from, socket });
                     }
-                    _ => {}
+                    Some(_) => {}
                 }
             }
             Msg::ChanClose { socket } => self.close_chan((from, socket), false),

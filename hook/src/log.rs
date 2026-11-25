@@ -128,10 +128,13 @@ fn due(key: &str, first: u64) -> Option<(u64, ClearBusy)> {
 /// `what` as `gap: <layer> <what>`. The launcher sums these up when the game exits, so
 /// a game's first run names what it needs that PeerParty lacks.
 pub fn gap(layer: &str, what: &str) {
-    static SEEN: LazyLock<Mutex<std::collections::HashSet<String>>> = LazyLock::new(Mutex::default);
-    let key = format!("{layer} {what}");
-    if SEEN.lock().is_ok_and(|mut s| s.insert(key.clone())) {
-        crate::log!("gap: {key}");
+    // By a hash of the two, so a gap a game hits every frame builds no text once logged.
+    static SEEN: LazyLock<Mutex<std::collections::HashSet<u64>>> = LazyLock::new(Mutex::default);
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (layer, what).hash(&mut h);
+    if SEEN.lock().is_ok_and(|mut s| s.insert(h.finish())) {
+        crate::log!("gap: {layer} {what}");
     }
 }
 

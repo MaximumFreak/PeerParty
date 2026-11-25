@@ -3,7 +3,7 @@
 //! backends to composite onto the game's back buffer.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use peerparty_protocol::shm::{FrameHeader, HEADER_SIZE, fits};
 use peerparty_protocol::transport::ShmBacking;
@@ -137,6 +137,11 @@ fn map_file(path: &str) -> Option<(usize, usize)> {
     Some((view.Value as usize, usize::try_from(len).unwrap_or(usize::MAX)))
 }
 
+/// The last frame read whole (`Frame::stable`): a 4K frame is 33 MB, so it goes when
+/// the overlay hides (`HELD` says there's one, so a hidden overlay's presents don't lock).
+static COPY: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+static HELD: AtomicBool = AtomicBool::new(false);
+
 fn header() -> Option<(&'static FrameHeader, usize)> {
     let (base, size) = view();
     let h = unsafe { FrameHeader::from_raw(base as *const u8, size) }?;
@@ -157,6 +162,9 @@ pub struct Frame {
 pub fn frame() -> Option<Frame> {
     let (header, size) = header()?;
     if !header.is_visible() {
+        if HELD.swap(false, Ordering::AcqRel) {
+            *COPY.lock().unwrap_or_else(|e| e.into_inner()) = Vec::new();
+        }
         return None;
     }
     let info = header.read();
@@ -176,12 +184,12 @@ impl Frame {
     /// Copies the frame out of shared memory and checks afterwards that the launcher
     /// didn't rewrite it meanwhile.
     pub fn stable(&self) -> Option<std::sync::MutexGuard<'static, Vec<u32>>> {
-        static COPY: Mutex<Vec<u32>> = Mutex::new(Vec::new());
         if self.writing() {
             return None;
         }
         let n = self.w as usize * self.h as usize;
         let mut copy = COPY.lock().unwrap_or_else(|e| e.into_inner());
+        HELD.store(true, Ordering::Release);
         copy.clear();
         copy.reserve(n);
         unsafe {
@@ -214,6 +222,11 @@ impl Frame {
     pub unsafe fn write_rows(&self, px: &[u32], dst: *mut u8, pitch: usize) {
         let row = self.w as usize * 4;
         if px.len() < self.w as usize * self.h as usize {
+            return;
+        }
+        // Rows back to back (a texture as wide as the frame): one copy.
+        if pitch == row {
+            unsafe { std::ptr::copy_nonoverlapping(px.as_ptr() as *const u8, dst, row * self.h as usize) };
             return;
         }
         for y in 0..self.h as usize {
@@ -259,6 +272,24 @@ mod tests {
             )
         };
         shm.remove().unwrap();
+    }
+
+    /// Rows land `pitch` apart, in one copy when that is the frame's own width, and the
+    /// padding past each row is left alone.
+    #[test]
+    fn rows_are_written_at_the_pitch() {
+        let px: Vec<u32> = (1..=6).collect();
+        let f = Frame { seq: 2, w: 3, h: 2, px: px.as_ptr(), header: None };
+        let copy = f.stable().expect("a frame not in shared memory is whole");
+        assert_eq!(&copy[..], &px[..]);
+        let mut tight = [0u32; 6];
+        unsafe { f.write_rows(&copy, tight.as_mut_ptr() as *mut u8, 12) };
+        assert_eq!(tight, [1, 2, 3, 4, 5, 6]);
+        let mut padded = [9u32; 8];
+        unsafe { f.write_rows(&copy, padded.as_mut_ptr() as *mut u8, 16) };
+        assert_eq!(padded, [1, 2, 3, 9, 4, 5, 6, 9]);
+        drop(copy);
+        assert!(HELD.load(Ordering::Acquire));
     }
 
     /// A block without a frame header isn't used (and its view is let go).
