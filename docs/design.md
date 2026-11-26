@@ -57,7 +57,9 @@ game.exe
   %command%`) or the launcher window. peerparty.exe carries the x64 and x86 hook DLLs and
   writes the one a game needs under `%LOCALAPPDATA%\peerparty\hooks\` on first use.
 - The game is created suspended. A 64-bit game gets the hook through an early APC; a
-  32-bit (WOW64) game is held at its entry point and the hook loaded there. Either way
+  32-bit (WOW64) game is held at its entry point (a .NET one where its first thread
+  starts, once the loader is done, since the loader starts it in the .NET runtime
+  instead) and the hook loaded there. Either way
   the hook loads before the game's own code runs, and nothing on disk or in the registry
   changes.
 - **Microsoft Store (GDK) games** are packages Windows starts itself. PeerParty turns on

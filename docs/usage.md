@@ -130,7 +130,9 @@ game's exit code (all 32 bits of it, so a crash reads as `-1073741819`, 0xC00000
 When the game exits, PeerParty adds a line with the exit code, how long the game ran
 and what a crash code means to the end of that run's log (`[launcher 17:32:07] game
 exited after 0.3 s with exit code 3221225477 (0xC0000005), crash: access violation`),
-starting a log for it if the game died before the hook could open one. PowerShell doesn't wait for GUI programs: use
+starting a log for it if the game died before the hook could open one. A game that
+didn't start at all gets a log of its own saying why (`<exe>-<date>-<time>-launcher.log`,
+for example when PeerParty couldn't attach to it). PowerShell doesn't wait for GUI programs: use
 `Start-Process -Wait` there if a script needs to.
 
 ### Updates

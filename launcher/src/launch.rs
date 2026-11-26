@@ -576,7 +576,7 @@ pub fn start(l: Launch) -> Result<Exited, LaunchError> {
     for (k, v) in &l.sets {
         apply_set(&mut prefs, k, v);
     }
-    settings_env(&mut env, &prefs, &game)?;
+    settings_env(&mut env, &prefs, &game).map_err(|e| log_failure(&log_dir, &exe, e))?;
     env.set(penv::LOG_DIR, &log_dir);
     // The hook tells its LAN peers which PeerParty it is, commit included (net.rs).
     env.set(penv::VERSION, format!("{} ({})", env!("CARGO_PKG_VERSION"), option_env!("PEERPARTY_DESCRIBE").unwrap_or("no git")));
@@ -598,7 +598,7 @@ pub fn start(l: Launch) -> Result<Exited, LaunchError> {
 
     // Players' saves (saves.rs): which player this run is, its saves set up before the
     // game starts, held while it runs.
-    let (_held, lone) = players_saves(Want { split: l.split.as_ref(), player: l.player, multi: l.multi_instance, copy_saves: l.copy_saves }, &listed, &exe, root.as_deref(), &game, &prefs, &mut env)?;
+    let (_held, lone) = players_saves(Want { split: l.split.as_ref(), player: l.player, multi: l.multi_instance, copy_saves: l.copy_saves }, &listed, &exe, root.as_deref(), &game, &prefs, &mut env).map_err(|e| log_failure(&log_dir, &exe, e))?;
     if let Some(slot) = lone {
         env.set(penv::PLAYER_SLOT, slot.to_string());
     } else {
@@ -612,7 +612,7 @@ pub fn start(l: Launch) -> Result<Exited, LaunchError> {
         peerparty_core::Identity::ensure_first(&peerparty_core::Identity::default_dir());
         let mut split = split.clone();
         split.fill_names(&prefs);
-        return backend::start_session(target, env, &split, prefs, &log_dir, root.as_deref());
+        return backend::start_session(target, env, &split, prefs, &log_dir, root.as_deref()).map_err(|e| log_failure(&log_dir, &exe, e));
     }
     // The overlay's connection to the hook. On Linux it is also how `--invite` reaches
     // the game (backend/linux/control.rs), so it is made whether the overlay is on or not.
@@ -620,7 +620,32 @@ pub fn start(l: Launch) -> Result<Exited, LaunchError> {
     if let Some(p) = &pipe {
         connect(&mut env, p);
     }
-    backend::start(target, env, pipe, prefs, &log_dir, root.as_deref())
+    backend::start(target, env, pipe, prefs, &log_dir, root.as_deref()).map_err(|e| log_failure(&log_dir, &exe, e))
+}
+
+/// Writes why the game didn't start to a log of its own in the log folder
+/// (`<exe>-<date>-<time>-launcher.log`), and hands the error back. Started from the
+/// launcher window or another program, PeerParty's output is seen by no one, and the
+/// hook, which writes the game's log, never ran.
+fn log_failure(log_dir: &Path, exe: &Path, e: LaunchError) -> LaunchError {
+    let stem = exe.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let [year, month, day, hour, minute, second] = platform::local_time();
+    let path = log_dir.join(format!("{stem}-{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}-launcher.log"));
+    let why = e.why().map(|(r, v)| format!(" [{r}{}{v}]", if v.is_empty() { "" } else { ": " })).unwrap_or_default();
+    let text = format!(
+        "[launcher {hour:02}:{minute:02}:{second:02}] PeerParty {} ({})
+[launcher {hour:02}:{minute:02}:{second:02}] {} didn't start: {e}{why}
+",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("PEERPARTY_DESCRIBE").unwrap_or("no git"),
+        exe.display()
+    );
+    use std::io::Write;
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = f.write_all(text.as_bytes());
+        eprintln!("peerparty: why it didn't start is in {}", path.display());
+    }
+    e
 }
 
 /// Sets up the players' saves for a start: the game's id for them, the per-game save
@@ -1236,6 +1261,24 @@ mod tests {
             .collect();
         remaining.sort();
         assert_eq!(remaining, vec!["game-20260104-000000-4.log", "game-20260105-000000-5.log", "keep.txt", "subdir"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A start that fails leaves its reason in the log folder, where a start from the
+    /// launcher window can be looked into later.
+    #[test]
+    fn a_failed_start_is_logged() {
+        let dir = env::temp_dir().join(format!("peerparty-failed-start-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let e = log_failure(&dir, Path::new(r"C:\Games\Made Up\Made Up.exe"), LaunchError::Inject("SuspendThread failed".into()));
+        assert!(matches!(e, LaunchError::Inject(_)), "the error is handed back as it was");
+        let logs: Vec<PathBuf> = fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).collect();
+        assert_eq!(logs.len(), 1);
+        let name = logs[0].file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("Made Up-") && name.ends_with("-launcher.log"), "{name}");
+        let text = fs::read_to_string(&logs[0]).unwrap();
+        assert!(text.contains("didn't start: SuspendThread failed [inject]"), "{text}");
         let _ = fs::remove_dir_all(&dir);
     }
 

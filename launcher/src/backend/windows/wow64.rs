@@ -14,12 +14,19 @@
 //! point and act on what it finds there, and with `jmp $` written there a game quit at
 //! once (code 53). Only if the start address isn't the entry point (not seen) is the
 //! entry point patched instead.
+//!
+//! A .NET exe (one with a CLR header) is parked by its instruction pointer instead: the
+//! loader starts such an exe at mscoree's `_CorExeMain`, not at the start address it
+//! was given, so a stub put there was never reached: the main thread ran on without the
+//! hook and was found ending (`SuspendThread` refused). The first eip, the 32-bit
+//! `RtlUserThreadStart`, is where the thread goes once the loader is done: the stub goes
+//! there and then jumps on to it, with the start address the loader chose still in eax.
 
 use std::ffi::c_void;
 use std::path::Path;
 use std::{mem, ptr, thread, time::Duration, time::Instant};
 
-use windows_sys::Win32::Foundation::{HANDLE, HMODULE, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::{HANDLE, HMODULE, STILL_ACTIVE, WAIT_OBJECT_0};
 use windows_sys::Win32::System::Diagnostics::Debug::{
     FlushInstructionCache, ReadProcessMemory, WOW64_CONTEXT, WOW64_CONTEXT_CONTROL,
     WOW64_CONTEXT_INTEGER, Wow64GetThreadContext, Wow64SetThreadContext, WriteProcessMemory,
@@ -31,8 +38,8 @@ use windows_sys::Win32::System::ProcessStatus::{
     K32EnumProcessModulesEx, K32GetModuleBaseNameW, LIST_MODULES_32BIT,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateRemoteThread, GetExitCodeThread, PROCESS_INFORMATION, ResumeThread, SuspendThread,
-    WaitForSingleObject,
+    CreateRemoteThread, GetExitCodeProcess, GetExitCodeThread, PROCESS_INFORMATION, ResumeThread,
+    SuspendThread, WaitForSingleObject,
 };
 
 use super::launch::write_remote;
@@ -46,7 +53,7 @@ pub unsafe fn inject(pi: &PROCESS_INFORMATION, dll: &Path) -> Result<(), String>
         let h = pi.hProcess;
         // A new thread's ebx holds the PEB; PEB32.ImageBaseAddress is at +8.
         let mut ctx: WOW64_CONTEXT = mem::zeroed();
-        ctx.ContextFlags = WOW64_CONTEXT_INTEGER;
+        ctx.ContextFlags = WOW64_CONTEXT_INTEGER | WOW64_CONTEXT_CONTROL;
         if Wow64GetThreadContext(pi.hThread, &mut ctx) == 0 {
             return Err(os_error("Wow64GetThreadContext"));
         }
@@ -54,10 +61,17 @@ pub unsafe fn inject(pi: &PROCESS_INFORMATION, dll: &Path) -> Result<(), String>
         let lfanew = read_u32(h, base + 0x3c)?;
         // AddressOfEntryPoint: signature (4) + file header (20) + 16.
         let entry = base + read_u32(h, base + lfanew + 0x28)?;
+        // PE32 data directories start 96 bytes into the optional header (24 bytes in);
+        // the CLR header is the 15th.
+        let managed = read_u32(h, base + lfanew + 24 + 96 + 14 * 8)? != 0;
 
-        if ctx.Eax == entry {
-            park_on_stub(pi, &mut ctx, entry)?;
+        if managed {
+            eprintln!("peerparty: the game is a 32-bit .NET program: PeerParty attaches before its runtime starts");
+            park_on_stub(pi, &mut ctx, Start::Eip)?;
+        } else if ctx.Eax == entry {
+            park_on_stub(pi, &mut ctx, Start::Eax)?;
         } else {
+            eprintln!("peerparty: the game's start address ({:#x}) isn't its entry point ({entry:#x}): attaching at the entry point", ctx.Eax);
             park_on_entry(pi, entry)?;
         }
 
@@ -91,36 +105,58 @@ pub unsafe fn inject(pi: &PROCESS_INFORMATION, dll: &Path) -> Result<(), String>
     }
 }
 
+/// Which register of the main thread's first context the stub takes the place of.
+#[derive(Clone, Copy)]
+enum Start {
+    /// The start address `RtlUserThreadStart` calls (a native exe's entry point).
+    Eax,
+    /// `RtlUserThreadStart` itself (a .NET exe, whose start address the loader replaces).
+    Eip,
+}
+
 /// Starts the main thread on a `jmp $` of our own and parks it there; then makes that a
-/// `jmp entry`, so it carries on exactly as it would have. Keeps the stub strictly W^X
-/// (`PAGE_READWRITE` while writing, `PAGE_EXECUTE_READ` while executing).
-unsafe fn park_on_stub(pi: &PROCESS_INFORMATION, ctx: &mut WOW64_CONTEXT, entry: u32) -> Result<(), String> {
+/// `jmp` to what the register held, so it carries on exactly as it would have. Keeps the
+/// stub strictly W^X (`PAGE_READWRITE` while writing, `PAGE_EXECUTE_READ` while
+/// executing).
+///
+/// The stub sets a flag before it spins: a thread that hasn't run yet reads back the
+/// eip it was given, so with the stub at eip, eip alone said "parked" before the loader
+/// had run.
+unsafe fn park_on_stub(pi: &PROCESS_INFORMATION, ctx: &mut WOW64_CONTEXT, start: Start) -> Result<(), String> {
     unsafe {
         let h = pi.hProcess;
-        let stub = VirtualAllocEx(h, ptr::null(), 5, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if stub.is_null() {
+        let flag = VirtualAllocEx(h, ptr::null(), 4, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        let stub = VirtualAllocEx(h, ptr::null(), 12, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if flag.is_null() || stub.is_null() {
             return Err(os_error("VirtualAllocEx(start stub)"));
         }
         // A WOW64 process's memory is all below 4 GB.
-        let stub = stub as usize as u32;
-        write_code(h, stub, &[0xEB, 0xFE])?;
+        let (flag, stub) = (flag as usize as u32, stub as usize as u32);
+        // mov byte ptr [flag], 1; spin: jmp spin
+        let mut code = [0xC6, 0x05, 0, 0, 0, 0, 0x01, 0xEB, 0xFE];
+        code[2..6].copy_from_slice(&flag.to_le_bytes());
+        let spin = stub + 7;
+        write_code(h, stub, &code)?;
         let mut old = 0u32;
-        if VirtualProtectEx(h, stub as *const c_void, 5, PAGE_EXECUTE_READ, &mut old) == 0 {
+        if VirtualProtectEx(h, stub as *const c_void, 12, PAGE_EXECUTE_READ, &mut old) == 0 {
             return Err(os_error("VirtualProtectEx(start stub exec)"));
         }
-        ctx.Eax = stub;
+        let target = match start {
+            Start::Eax => mem::replace(&mut ctx.Eax, stub),
+            Start::Eip => mem::replace(&mut ctx.Eip, stub),
+        };
         if Wow64SetThreadContext(pi.hThread, ctx) == 0 {
             return Err(os_error("Wow64SetThreadContext"));
         }
-        let parked = park(pi, stub);
+        let parked = park(pi, spin, Some(flag));
         // Whatever happened, the game must not keep spinning on our stub.
         let mut jump = [0xE9, 0, 0, 0, 0];
-        jump[1..].copy_from_slice(&entry.wrapping_sub(stub + 5).to_le_bytes());
-        let released = if VirtualProtectEx(h, stub as *const c_void, 5, PAGE_READWRITE, &mut old) == 0 {
+        jump[1..].copy_from_slice(&target.wrapping_sub(spin + 5).to_le_bytes());
+        let released = if VirtualProtectEx(h, stub as *const c_void, 12, PAGE_READWRITE, &mut old) == 0 {
             Err(os_error("VirtualProtectEx(start stub write)"))
         } else {
-            let w = write_code(h, stub, &jump);
-            VirtualProtectEx(h, stub as *const c_void, 5, PAGE_EXECUTE_READ, &mut old);
+            let w = write_code(h, spin, &jump);
+            VirtualProtectEx(h, stub as *const c_void, 12, PAGE_EXECUTE_READ, &mut old);
             w
         };
         parked?;
@@ -142,7 +178,7 @@ unsafe fn park_on_entry(pi: &PROCESS_INFORMATION, entry: u32) -> Result<(), Stri
         if VirtualProtectEx(h, entry as *const c_void, 2, old, &mut old) == 0 {
             return Err(os_error("VirtualProtectEx(entry point exec)"));
         }
-        let parked = park(pi, entry);
+        let parked = park(pi, entry, None);
         // Whatever happened, the game must not keep spinning on our patch.
         let mut cur = 0u32;
         let restored = if VirtualProtectEx(h, entry as *const c_void, 2, PAGE_READWRITE, &mut cur) == 0 {
@@ -157,25 +193,37 @@ unsafe fn park_on_entry(pi: &PROCESS_INFORMATION, entry: u32) -> Result<(), Stri
     }
 }
 
-/// Resumes the main thread and suspends it again once it spins on the `jmp $` at `at`.
-unsafe fn park(pi: &PROCESS_INFORMATION, at: u32) -> Result<(), String> {
+/// Resumes the main thread and suspends it again once it spins on the `jmp $` at `at`
+/// (and has set `flag`, when given).
+unsafe fn park(pi: &PROCESS_INFORMATION, at: u32, flag: Option<u32>) -> Result<(), String> {
     unsafe {
         let started = Instant::now();
         if ResumeThread(pi.hThread) == u32::MAX {
             return Err(os_error("ResumeThread"));
         }
+        let mut last = 0u32;
         loop {
             thread::sleep(Duration::from_millis(2));
             if SuspendThread(pi.hThread) == u32::MAX {
-                return Err(os_error("SuspendThread"));
+                // An ending thread can't be suspended (access denied): the thread ran
+                // past the stub, so the game started without the hook, and has quit.
+                let why = os_error("SuspendThread");
+                let mut code = 0u32;
+                let ended = GetExitCodeProcess(pi.hProcess, &mut code) != 0 && code != STILL_ACTIVE as u32;
+                let state = if ended { format!("the game had already ended with exit code {code} ({code:#010X})") } else { "the game's main thread was ending".into() };
+                return Err(format!("{why}: {state} {:.1} s after it started, without stopping where PeerParty waits for it (at {at:#x}; last seen at {last:#x})", started.elapsed().as_secs_f64()));
             }
             let mut ctx: WOW64_CONTEXT = mem::zeroed();
             ctx.ContextFlags = WOW64_CONTEXT_CONTROL;
-            if Wow64GetThreadContext(pi.hThread, &mut ctx) != 0 && ctx.Eip == at {
-                return Ok(());
+            if Wow64GetThreadContext(pi.hThread, &mut ctx) != 0 {
+                if ctx.Eip == at && flag.is_none_or(|f| read_bytes::<1>(pi.hProcess, f).is_ok_and(|b| b[0] == 1)) {
+                    eprintln!("peerparty: the game's main thread stopped for the hook after {:.2} s", started.elapsed().as_secs_f64());
+                    return Ok(());
+                }
+                last = ctx.Eip;
             }
             if started.elapsed() > LOADER_TIMEOUT {
-                return Err("the game never reached its entry point".into());
+                return Err(format!("the game never reached its entry point within {} s (waited at {at:#x}; last seen at {last:#x})", LOADER_TIMEOUT.as_secs()));
             }
             ResumeThread(pi.hThread);
         }
