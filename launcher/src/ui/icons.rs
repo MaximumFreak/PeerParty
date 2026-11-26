@@ -149,6 +149,7 @@ pub enum Glyph {
     Back,
     Start,
     Dpad,
+    LStick,
     RStick,
 }
 
@@ -157,7 +158,7 @@ pub fn glyph_width(g: Glyph) -> f32 {
     match g {
         Glyph::Lb | Glyph::Rb | Glyph::Lt | Glyph::Rt => 26.0,
         Glyph::Back | Glyph::Start => 34.0,
-        Glyph::RStick => 20.0,
+        Glyph::LStick | Glyph::RStick => 20.0,
         Glyph::South | Glyph::East | Glyph::West | Glyph::North | Glyph::Dpad => 18.0,
     }
 }
@@ -219,9 +220,11 @@ pub fn glyph(p: &Painter, c: Pos2, g: Glyph, style: Style) {
             p.rect_filled(Rect::from_center_size(c, Vec2::new(5.0, 14.0)), CornerRadius::same(1), col);
             p.circle_filled(c, 1.6, Color32::from_rgb(36, 40, 50));
         }
-        Glyph::RStick => {
-            let label = match style {
-                Style::Nintendo => "R",
+        Glyph::LStick | Glyph::RStick => {
+            let label = match (style, g) {
+                (Style::Nintendo, Glyph::LStick) => "L",
+                (Style::Nintendo, _) => "R",
+                (_, Glyph::LStick) => "LS",
                 _ => "RS",
             };
             p.circle_filled(c, 9.5, Color32::from_rgb(56, 62, 78));

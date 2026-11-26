@@ -755,6 +755,13 @@ overlay's Split screen tab > **Arrange panes**). Every change shows at once:
   Drag a pane's corner or edge to resize it alone, for a picture in a picture.
 - Drag a pane onto another to swap the two players. The pane you pick up comes to the
   front, so in a picture-in-picture layout a small pane can sit over a large one.
+- A game that draws one shape whatever its pane's (black bars above and below, or at
+  the sides) is outlined by its picture, and its bars are hatched as the empty room they
+  are. Grabbing it moves or resizes the picture alone: the pane becomes the picture's
+  size, its bars go, and its corners keep the picture's shape (`Alt` held resizes
+  freely). **Trim bars** on a pane does the same without moving it, and **Fit
+  pictures** on the bar (left stick click on a controller) arranges every pane for the
+  biggest pictures with no bars.
 - Each pane: **Scale** `Fit` (the whole picture, with black bars), `Crop` (fills the
   pane, cutting the edges) or `Stretch`; **Ratio** `Auto` (the pane's own shape),
   `16:9`, `16:10`, `4:3` or `21:9`, the shape the game is told to render at, for a HUD

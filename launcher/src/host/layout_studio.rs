@@ -12,7 +12,7 @@
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, Color32, CornerRadius, Pos2, Rect, Stroke, Vec2, pos2, vec2};
-use peerparty_protocol::session::{LayoutPreset, NORM_MIN, NORM_SCALE, NormRect, PaneFit, PaneSlot, VirtualAspect};
+use peerparty_protocol::session::{LayoutPreset, NORM_MIN, NORM_SCALE, NormRect, PaneFit, PaneRect, PaneSlot, VirtualAspect};
 
 use super::desktop::{self, Rect as ScreenRect};
 use super::overlay_render::{FRAME_GAP, scale_for};
@@ -91,6 +91,8 @@ pub struct StudioInfo {
     pub keyboard: Option<usize>,
     pub zoomed: Option<usize>,
     pub sync: StudioSync,
+    /// Each copy's picture: its frames' size, once it has sent any.
+    pub pictures: Vec<Option<(u32, u32)>>,
 }
 
 /// Combined controller state passed into Layout Studio each frame.
@@ -186,12 +188,18 @@ enum DragMode {
         edges: Edges,
         start_rect: NormRect,
         anchor: Pos2,
+        /// The picture's shape (width over height, in pixels) the pane keeps: a game
+        /// that draws one shape whatever its pane's.
+        aspect: Option<f32>,
     },
     Move {
         pane: usize,
         start_rect: NormRect,
         anchor: Pos2,
         swap_target: Option<usize>,
+        /// The pane's rect before the drag (`start_rect` is its picture's, when it has
+        /// black bars): what a swap gives the other player.
+        pane_rect: NormRect,
     },
 }
 
@@ -228,6 +236,9 @@ pub struct LayoutStudio {
     last_info: Option<StudioInfo>,
     pub last_frame: Instant,
     pub dirty: bool,
+    /// Panes trimmed to their picture since Studio opened: their game draws one shape
+    /// whatever its pane's, so resizing them keeps the picture's.
+    trimmed: Vec<bool>,
 }
 
 impl LayoutStudio {
@@ -263,6 +274,7 @@ impl LayoutStudio {
             last_info: None,
             last_frame: now,
             dirty: true,
+            trimmed: Vec::new(),
         }
     }
 
@@ -270,6 +282,7 @@ impl LayoutStudio {
     /// current `sync` mode, and initial controller snapshot `pad`.
     pub fn open(&mut self, slots: Vec<PaneSlot>, focus: usize, sync: StudioSync, bounds: ScreenRect, overlay_scale: f32, pad: StudioPad) {
         self.active = true;
+        self.trimmed = vec![false; slots.len()];
         self.slots = slots.clone();
         self.initial = slots;
         self.initial_sync = sync;
@@ -315,6 +328,7 @@ impl LayoutStudio {
 
     /// Updates `slots` externally (e.g. when a preset is applied).
     pub fn set_slots(&mut self, slots: Vec<PaneSlot>) {
+        self.trimmed.resize(slots.len(), false);
         self.slots = slots;
         self.selected = self.selected.min(self.slots.len().saturating_sub(1));
         self.drag = None;
@@ -585,6 +599,22 @@ impl LayoutStudio {
                     if pressed_pad & pad::SOUTH != 0 {
                         self.pad_mode = PadMode::Adjust;
                         self.pad_moving = false;
+                        // Edited by its picture, as a mouse grab is (`picture_rect`).
+                        let i = self.selected;
+                        if let Some(pic) = picture_rect(&self.slots[i], info.pictures.get(i).copied().flatten(), info.screen) {
+                            self.slots[i].rect = pic;
+                            self.trimmed.resize(self.slots.len(), false);
+                            self.trimmed[i] = true;
+                            actions.push(StudioAction::Commit(self.slots.clone()));
+                        }
+                        self.dirty = true;
+                    }
+                    if pressed_pad & pad::LSTICK != 0
+                        && let Some(f) = fit_pictures(&self.slots, &info.pictures, info.screen).filter(|f| *f != self.slots)
+                    {
+                        self.slots = f;
+                        self.trimmed = vec![true; self.slots.len()];
+                        actions.push(StudioAction::Commit(self.slots.clone()));
                         self.dirty = true;
                     }
                     if pressed_pad & pad::NORTH != 0 {
@@ -702,8 +732,15 @@ impl LayoutStudio {
         actions: &mut Vec<StudioAction>,
     ) {
         let count = self.slots.len();
+        self.trimmed.resize(count, false);
         let snap_on = self.snap && !self.alt_down;
         let dividers = find_shared_dividers(&self.slots);
+        // Where each pane's picture is when it leaves black bars: the box, the handles
+        // and the grab are the picture's, and the bars are empty room.
+        let picture = |i: usize| info.pictures.get(i).copied().flatten();
+        let pictures: Vec<Option<NormRect>> = (0..count).map(|i| picture_rect(&self.slots[i], picture(i), info.screen)).collect();
+        let shown: Vec<NormRect> = (0..count).map(|i| pictures[i].unwrap_or(self.slots[i].rect)).collect();
+        let fitted = fit_pictures(&self.slots, &info.pictures, info.screen).filter(|f| *f != self.slots);
         let style = self.pad_style;
         let pad_browse = self.using_pad && self.pad_mode == PadMode::Browse;
         let pad_adjust = self.using_pad && self.pad_mode == PadMode::Adjust;
@@ -743,6 +780,15 @@ impl LayoutStudio {
                             }
                             if pad_browse {
                                 inline_glyph(ui, Glyph::Rb, style);
+                            }
+                            if let Some(f) = &fitted
+                                && pill_button(ui, t!("studio.fit_pictures"), false, false, pad_browse.then_some(Glyph::LStick), style, Some(t!("studio.tip_fit_pictures")))
+                            {
+                                self.slots = f.clone();
+                                self.trimmed = vec![true; count];
+                                self.drag = None;
+                                actions.push(StudioAction::Commit(self.slots.clone()));
+                                self.dirty = true;
                             }
                             ui.separator();
                             let kbm_label = match info.keyboard {
@@ -814,7 +860,7 @@ impl LayoutStudio {
         order.sort_by_key(|&i| (self.slots[i].z, i));
 
         for &i in &order {
-            let pr = norm_to_egui(self.slots[i].rect, screen);
+            let pr = norm_to_egui(shown[i], screen);
             let p_info = info.players.get(i);
             let pname = p_info.map(|p| p.name.as_str()).filter(|s| !s.is_empty()).unwrap_or("");
             let muted = p_info.is_some_and(|p| p.muted);
@@ -887,6 +933,15 @@ impl LayoutStudio {
                                     actions.push(StudioAction::Commit(self.slots.clone()));
                                     self.dirty = true;
                                 }
+                                if let Some(pic) = pictures[i]
+                                    && pill_button(ui, t!("studio.trim"), false, false, None, style, Some(t!("studio.tip_trim")))
+                                {
+                                    self.slots[i].rect = pic;
+                                    self.trimmed[i] = true;
+                                    self.selected = i;
+                                    actions.push(StudioAction::Commit(self.slots.clone()));
+                                    self.dirty = true;
+                                }
                                 let mute_txt = if muted { t!("studio.muted") } else { t!("studio.sound") };
                                 if pill_button(ui, mute_txt, muted, false, show_pad.then_some(Glyph::Lt), style, Some(t!("studio.tip_mute"))) {
                                     self.selected = i;
@@ -920,23 +975,18 @@ impl LayoutStudio {
                     start_slots: self.slots.clone(),
                 });
                 self.dirty = true;
-            } else if let Some((pane, edges)) = hit_pane_edges(&self.slots, self.cursor, screen) {
+            } else if let Some((pane, edges)) = hit_pane_edges(&shown_slots(&self.slots, &shown), self.cursor, screen) {
                 self.selected = pane;
+                // A pane with black bars is grabbed by its picture: dragged, it becomes
+                // the picture's size, and the bars' room is free.
+                let start_rect = shown[pane];
                 bring_to_front(&mut self.slots, pane);
                 if edges.any() {
-                    self.drag = Some(DragMode::Resize {
-                        pane,
-                        edges,
-                        start_rect: self.slots[pane].rect,
-                        anchor: self.cursor,
-                    });
+                    let locked = pictures[pane].is_some() || self.trimmed[pane];
+                    let aspect = (locked && !self.alt_down).then(|| picture(pane)).flatten().map(|(w, h)| w as f32 / h as f32);
+                    self.drag = Some(DragMode::Resize { pane, edges, start_rect, anchor: self.cursor, aspect });
                 } else {
-                    self.drag = Some(DragMode::Move {
-                        pane,
-                        start_rect: self.slots[pane].rect,
-                        anchor: self.cursor,
-                        swap_target: None,
-                    });
+                    self.drag = Some(DragMode::Move { pane, start_rect, anchor: self.cursor, swap_target: None, pane_rect: self.slots[pane].rect });
                 }
                 self.dirty = true;
             }
@@ -952,15 +1002,20 @@ impl LayoutStudio {
                         preview_changed = true;
                     }
                 }
-                Some(DragMode::Resize { pane, edges, start_rect, anchor }) => {
-                    let next_rect = apply_resize_drag(&self.slots, pane, start_rect, edges, self.cursor - anchor, screen, snap_on);
+                Some(DragMode::Resize { pane, edges, start_rect, anchor, aspect }) if self.cursor != anchor => {
+                    let mut next_rect = apply_resize_drag(&self.slots, pane, start_rect, edges, self.cursor - anchor, screen, snap_on);
+                    if let Some(a) = aspect {
+                        next_rect = keep_aspect(start_rect, next_rect, edges, a, info.screen);
+                    }
                     if next_rect != self.slots[pane].rect {
                         self.slots[pane].rect = next_rect;
+                        self.trimmed[pane] |= aspect.is_some();
                         preview_changed = true;
                     }
                 }
-                Some(DragMode::Move { pane, start_rect, anchor, .. }) => {
+                Some(DragMode::Move { pane, start_rect, anchor, pane_rect, .. }) if self.cursor != anchor => {
                     let next_rect = apply_move_drag(&self.slots, pane, start_rect, self.cursor - anchor, screen, snap_on);
+                    self.trimmed[pane] |= start_rect != pane_rect;
                     let swap_target = find_swap_target(&self.slots, pane, start_rect, self.cursor, screen);
                     if let Some(DragMode::Move { swap_target: st, .. }) = self.drag.as_mut() {
                         *st = swap_target;
@@ -970,7 +1025,7 @@ impl LayoutStudio {
                         preview_changed = true;
                     }
                 }
-                None => {}
+                _ => {}
             }
             if preview_changed {
                 actions.push(StudioAction::Preview(self.slots.clone()));
@@ -980,9 +1035,9 @@ impl LayoutStudio {
 
         if released_now && let Some(drag) = self.drag.take() {
             match drag {
-                DragMode::Move { pane, start_rect, swap_target: Some(other), .. } if other != pane => {
+                DragMode::Move { pane, pane_rect, swap_target: Some(other), .. } if other != pane => {
                     // Restore dragged pane's pre-drag rect, then swap slots (rect & z) cleanly!
-                    self.slots[pane].rect = start_rect;
+                    self.slots[pane].rect = pane_rect;
                     swap_slot_rects(&mut self.slots, pane, other);
                     actions.push(StudioAction::Commit(self.slots.clone()));
                 }
@@ -1001,10 +1056,13 @@ impl LayoutStudio {
         };
 
         for &i in &order {
-            let pr = norm_to_egui(self.slots[i].rect, screen);
+            let pr = norm_to_egui(shown[i], screen);
             let color = PLAYER_COLORS[i % PLAYER_COLORS.len()];
             let is_sel = i == self.selected;
             let is_swap = swap_target.is_some_and(|(_, t)| t == i);
+            if pictures[i].is_some() {
+                paint_bars(p, norm_to_egui(self.slots[i].rect, screen), pr, color);
+            }
 
             if pad_adjust && !is_sel {
                 p.rect_filled(pr, 2.0, Color32::from_rgba_premultiplied(0, 0, 0, 85));
@@ -1461,6 +1519,131 @@ fn swap_next_visual(slots: &mut [PaneSlot], pane: usize) {
     swap_slot_rects(slots, pane, other);
 }
 
+// ---- the game's picture in its pane ----
+
+/// A rectangle of the screen in pixels as a `NormRect`, its edges rounded the way
+/// `NormRect::to_pane_rect` rounds them back.
+fn px_to_norm(r: PaneRect, screen: (u32, u32)) -> NormRect {
+    let n = |v: i64, total: u32| -> u16 {
+        let total = u64::from(total.max(1));
+        ((v.max(0) as u64 * u64::from(NORM_SCALE) + total / 2) / total).min(u64::from(NORM_SCALE)) as u16
+    };
+    let (x0, y0) = (n(r.x.into(), screen.0), n(r.y.into(), screen.1));
+    let x1 = n(i64::from(r.x) + i64::from(r.width), screen.0);
+    let y1 = n(i64::from(r.y) + i64::from(r.height), screen.1);
+    NormRect::clamped(x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0))
+}
+
+/// Where pane `slot`'s picture is when the game's frames (`picture`: their size) leave
+/// black bars in it: drawn to fit (`PaneFit::Fit`), and of another shape than the pane.
+/// None when the picture fills its pane, or its size isn't known yet.
+fn picture_rect(slot: &PaneSlot, picture: Option<(u32, u32)>, screen: (u32, u32)) -> Option<NormRect> {
+    let (w, h) = picture.filter(|&(w, h)| w > 0 && h > 0)?;
+    if slot.fit != PaneFit::Fit || screen.0 == 0 || screen.1 == 0 {
+        return None;
+    }
+    let pane = slot.rect.to_pane_rect(screen.0, screen.1);
+    let drawn = super::compositor::fit_aspect(pane, w, h);
+    (drawn != pane).then(|| px_to_norm(drawn, screen)).filter(|r| *r != slot.rect)
+}
+
+/// `slots` with each pane where `shown` says (its picture, when it has bars), for
+/// grabbing panes by what's seen of them.
+fn shown_slots(slots: &[PaneSlot], shown: &[NormRect]) -> Vec<PaneSlot> {
+    slots.iter().zip(shown).map(|(s, r)| PaneSlot { rect: *r, ..*s }).collect()
+}
+
+/// `next`, a resize of `start` by `edges`, made `aspect` (width over height, in pixels)
+/// again: the side or corner dragged sets the size, the opposite side stays where it was
+/// (for a side, the middle of the other way too), and the whole stays on the screen.
+fn keep_aspect(start: NormRect, next: NormRect, edges: Edges, aspect: f32, screen: (u32, u32)) -> NormRect {
+    if aspect.is_nan() || aspect <= 0.0 || screen.0 == 0 || screen.1 == 0 {
+        return next;
+    }
+    // Width over height in the screen's units, which aren't square.
+    let r = aspect * screen.1 as f32 / screen.0 as f32;
+    let (sides, ends) = (edges.left || edges.right, edges.top || edges.bottom);
+    let (mut w, mut h) = (f32::from(next.w), f32::from(next.h));
+    if sides && !ends {
+        h = w / r;
+    } else if ends && !sides {
+        w = h * r;
+    } else if (w / f32::from(start.w.max(1)) - 1.0).abs() >= (h / f32::from(start.h.max(1)) - 1.0).abs() {
+        h = w / r;
+    } else {
+        w = h * r;
+    }
+    let max = f32::from(NORM_SCALE);
+    let (cx, cy) = (f32::from(start.x) + f32::from(start.w) / 2.0, f32::from(start.y) + f32::from(start.h) / 2.0);
+    let room_w = if edges.left { f32::from(start.right()) } else if edges.right { max - f32::from(start.x) } else { 2.0 * cx.min(max - cx) };
+    let room_h = if edges.top { f32::from(start.bottom()) } else if edges.bottom { max - f32::from(start.y) } else { 2.0 * cy.min(max - cy) };
+    let shrink = (room_w / w).min(room_h / h).min(1.0);
+    (w, h) = (w * shrink, h * shrink);
+    let min = f32::from(NORM_MIN);
+    let grow = (min / w).max(min / h).max(1.0);
+    (w, h) = (w * grow, h * grow);
+    let x = if edges.left { f32::from(start.right()) - w } else if edges.right { f32::from(start.x) } else { cx - w / 2.0 };
+    let y = if edges.top { f32::from(start.bottom()) - h } else if edges.bottom { f32::from(start.y) } else { cy - h / 2.0 };
+    NormRect::clamped(x.round().max(0.0) as u16, y.round().max(0.0) as u16, w.round() as u16, h.round() as u16)
+}
+
+/// The layout with the biggest pictures and no black bars: of the arrangements the
+/// presets give (those whose panes don't overlap), the one whose pictures cover the most
+/// of the screen, each pane then trimmed to its picture (`slots` keep their other
+/// settings). None before any picture's size is known.
+fn fit_pictures(slots: &[PaneSlot], pictures: &[Option<(u32, u32)>], screen: (u32, u32)) -> Option<Vec<PaneSlot>> {
+    let n = slots.len();
+    if n == 0 || screen.0 == 0 || screen.1 == 0 || !pictures.iter().take(n).any(Option::is_some) {
+        return None;
+    }
+    let mut best: Option<(u64, Vec<PaneSlot>)> = None;
+    for (_, preset, _) in preset_list(n) {
+        let cells = preset.to_slots(n);
+        if cells.len() != n || (0..n).any(|i| (i + 1..n).any(|j| rects_overlap(cells[i].rect, cells[j].rect))) {
+            continue;
+        }
+        let mut area = 0u64;
+        let mut out = Vec::with_capacity(n);
+        for (i, cell) in cells.iter().enumerate() {
+            let pane = cell.rect.to_pane_rect(screen.0, screen.1);
+            let drawn = match pictures.get(i).copied().flatten().filter(|&(w, h)| w > 0 && h > 0) {
+                Some((w, h)) => super::compositor::fit_aspect(pane, w, h),
+                None => pane,
+            };
+            area += u64::from(drawn.width) * u64::from(drawn.height);
+            out.push(PaneSlot { rect: px_to_norm(drawn, screen), fit: PaneFit::Fit, ..slots[i] });
+        }
+        if best.as_ref().is_none_or(|(a, _)| area > *a) {
+            best = Some((area, out));
+        }
+    }
+    best.map(|(_, s)| s)
+}
+
+/// A pane's black bars (`pane` around its `picture`), as the empty room they are:
+/// hatched, with the pane's outline dashed around them.
+fn paint_bars(p: &egui::Painter, pane: Rect, picture: Rect, color: Color32) {
+    let bars = [
+        Rect::from_min_max(pane.min, pos2(pane.right(), picture.top())),
+        Rect::from_min_max(pos2(pane.left(), picture.bottom()), pane.max),
+        Rect::from_min_max(pos2(pane.left(), picture.top()), pos2(picture.left(), picture.bottom())),
+        Rect::from_min_max(pos2(picture.right(), picture.top()), pos2(pane.right(), picture.bottom())),
+    ];
+    let hatch = Stroke::new(1.0, color.gamma_multiply(0.22));
+    for bar in bars.into_iter().filter(|b| b.width() >= 1.0 && b.height() >= 1.0) {
+        p.rect_filled(bar, 0.0, Color32::from_rgba_premultiplied(0, 0, 0, 120));
+        let clipped = p.with_clip_rect(bar);
+        let mut x = bar.left() - bar.height();
+        while x < bar.right() {
+            clipped.line_segment([pos2(x, bar.bottom()), pos2(x + bar.height(), bar.top())], hatch);
+            x += 14.0;
+        }
+    }
+    let r = pane.shrink(1.0);
+    let corners = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()];
+    p.extend(egui::Shape::dashed_line(&corners, Stroke::new(1.0, color.gamma_multiply(0.45)), 6.0, 5.0));
+}
+
 fn norm_to_egui(r: NormRect, screen: Vec2) -> Rect {
     let s = f32::from(NORM_SCALE);
     let x0 = f32::from(r.x) / s * screen.x;
@@ -1787,7 +1970,60 @@ mod tests {
             keyboard: Some(0),
             zoomed: None,
             sync: StudioSync::Full,
+            pictures: vec![None; n],
         }
+    }
+
+    /// A 16:9 game in the left half of an ultrawide screen: its picture is a band across
+    /// the pane's middle, and the pane trimmed to it has no bars left.
+    #[test]
+    fn a_letterboxed_pane_is_known_by_its_picture() {
+        let screen = (3440, 1440);
+        let slots = LayoutPreset::Horizontal.to_slots(2);
+        let pic = picture_rect(&slots[0], Some((1280, 720)), screen).expect("bars above and below");
+        let px = pic.to_pane_rect(screen.0, screen.1);
+        assert_eq!((px.x, px.width), (0, 1720));
+        assert!(px.height.abs_diff(968) <= 1 && px.y.abs_diff(236) <= 1, "{px:?}");
+        let trimmed = PaneSlot { rect: pic, ..slots[0] };
+        assert_eq!(picture_rect(&trimmed, Some((1280, 720)), screen), None, "nothing left to trim");
+        assert_eq!(picture_rect(&slots[0], None, screen), None, "picture not known yet");
+        let crop = PaneSlot { fit: PaneFit::Fill, ..slots[0] };
+        assert_eq!(picture_rect(&crop, Some((1280, 720)), screen), None, "a cropped pane has no bars");
+    }
+
+    /// Resizing a trimmed pane keeps its picture's shape, from the corner dragged, and
+    /// stays on the screen.
+    #[test]
+    fn a_trimmed_pane_resizes_as_its_picture() {
+        let screen = (3440, 1440);
+        let start = NormRect::clamped(0, 1639, 5000, 6722);
+        let corner = Edges { right: true, bottom: true, ..Default::default() };
+        let next = keep_aspect(start, NormRect::clamped(0, 1639, 4000, 6722), corner, 16.0 / 9.0, screen);
+        let px = next.to_pane_rect(screen.0, screen.1);
+        assert!((px.width as f32 / px.height as f32 - 16.0 / 9.0).abs() < 0.02, "{px:?}");
+        assert_eq!((next.x, next.y), (start.x, start.y), "the opposite corner stays");
+        // Grown past the screen's bottom: as big as fits.
+        let big = keep_aspect(start, NormRect::clamped(0, 1639, 9000, 6722), corner, 16.0 / 9.0, screen);
+        assert!(big.bottom() <= NORM_SCALE && big.right() <= NORM_SCALE, "{big:?}");
+        let px = big.to_pane_rect(screen.0, screen.1);
+        assert!((px.width as f32 / px.height as f32 - 16.0 / 9.0).abs() < 0.02, "{px:?}");
+    }
+
+    /// Fit pictures picks the arrangement with the biggest pictures and trims every pane:
+    /// two 16:9 games on an ultrawide screen go side by side, with no bars.
+    #[test]
+    fn fit_pictures_arranges_for_the_biggest_pictures() {
+        let screen = (3440, 1440);
+        let slots = LayoutPreset::Vertical.to_slots(2);
+        let pics = [Some((1280, 720)), Some((1280, 720))];
+        let got = fit_pictures(&slots, &pics, screen).expect("pictures known");
+        assert_eq!(got.len(), 2);
+        for (i, s) in got.iter().enumerate() {
+            assert_eq!(s.rect.w, 5_000, "half the width each: {s:?}");
+            assert_eq!(picture_rect(s, pics[i], screen), None, "no bars left: {s:?}");
+        }
+        assert!(got[0].rect.x != got[1].rect.x, "side by side");
+        assert_eq!(fit_pictures(&slots, &[None, None], screen), None);
     }
 
     #[test]

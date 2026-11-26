@@ -919,6 +919,7 @@ impl SessionHost {
             keyboard: (!self.kbm_off).then_some(self.focus),
             zoomed,
             sync: self.studio_sync(),
+            pictures: (0..total).map(|i| self.instances.get(i).and_then(|inst| inst.viewport.as_ref()).map(|v| (v.width, v.height)).filter(|&(w, h)| w > 0 && h > 0)).collect(),
         };
         let pad = self.studio_pad();
         let actions = self.layout_studio.tick(rect, self.prefs.overlay_scale, self.started.elapsed().as_secs_f64(), pad, &info);
