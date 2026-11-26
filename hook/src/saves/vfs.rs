@@ -122,7 +122,7 @@ pub fn roots() -> Roots {
     let under_profile = |rest: &str| profile.as_ref().map(|p| format!("{}\\{rest}", p.trim_end_matches('\\')));
     let mut shared: Vec<String> = ["TEMP", "TMP"].iter().filter_map(|k| env(k)).collect();
     shared.extend(crate::util::local_store::peerparty_dir().map(|d| d.to_string_lossy().into_owned()));
-    shared.extend([&c.galaxy_dir, &c.playfab_dir, &c.ugs_dir, &c.log_dir].into_iter().flatten().map(|d| d.to_string_lossy().into_owned()));
+    shared.extend([&c.galaxy_dir, &c.playfab_dir, &c.ugs_dir, &c.demonware_dir, &c.log_dir].into_iter().flatten().map(|d| d.to_string_lossy().into_owned()));
     shared.extend(c.shared_save_paths.iter().cloned());
     let game_dir = c.game_root.clone().or_else(|| std::env::current_exe().ok()?.parent().map(|p| p.to_string_lossy().into_owned()));
     Roots {

@@ -32,6 +32,7 @@ pub mod crypto;
 pub mod lobby;
 pub mod mm;
 pub mod schannel;
+pub mod storage;
 pub mod stun;
 
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, UdpSocket};
@@ -106,6 +107,7 @@ fn start(ip: Ipv4Addr) {
     STARTED.get_or_init(|| {
         match TcpListener::bind(SocketAddrV4::new(ip, PORT)) {
             Ok(listener) => {
+                peerparty_core::own::tcp(PORT).forever();
                 log!("demonware lobby service on {ip}:{PORT} (tcp)");
                 let _ = std::thread::Builder::new().name("peerparty-demonware-lobby".into()).spawn(move || {
                     for conn in listener.incoming().flatten() {
@@ -119,6 +121,7 @@ fn start(ip: Ipv4Addr) {
         }
         match UdpSocket::bind(SocketAddrV4::new(ip, PORT)) {
             Ok(sock) => {
+                peerparty_core::own::udp(PORT).forever();
                 log!("demonware stun service on {ip}:{PORT} (udp)");
                 let _ = std::thread::Builder::new()
                     .name("peerparty-demonware-stun".into())

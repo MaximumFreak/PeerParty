@@ -379,8 +379,9 @@ fn consider(m: Mod) {
         }
         let saves = crate::saves::enabled() || crate::saves::own_saves() || crate::saves::watching();
         // A copy in a pane opens an Unreal game's settings file as saves/screen_ini.rs
-        // says, from the game's first read of it.
-        if saves || crate::window::virtual_size().is_some() {
+        // says, from the game's first read of it; official Demonware sessions snapshot
+        // finalized files from the game's LPC cache for later LAN runs.
+        if saves || crate::window::virtual_size().is_some() || crate::demonware::storage::harvest_wanted() {
             let n = crate::saves::attach_kernelbase(&table.code);
             log!("saves {} file hooks {n}", m.full);
         }
@@ -415,7 +416,7 @@ fn consider(m: Mod) {
             log!("tls {} certificate check noted (hooked only once PeerParty's HTTPS server starts)", m.full);
         }
     } else if m.name.eq_ignore_ascii_case("sspicli.dll") {
-        if crate::net::enabled() && !crate::net::skip("demonware") {
+        if crate::demonware::wanted() {
             let n = crate::demonware::schannel::attach(&table.code);
             log!("demonware {} hooked {n} (SChannel's certificate check, for Demonware hosts only)", m.full);
         }

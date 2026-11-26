@@ -102,10 +102,11 @@ pub struct HookConfig {
     /// `PEERPARTY_PHOTON_IP`: a loopback address for the Photon servers (tests).
     pub photon_ip: Option<std::net::Ipv4Addr>,
     /// The stand-ins' folders, for tests: `PEERPARTY_PLAYFAB_DIR`, `_UGS_DIR`,
-    /// `_GALAXY_DIR` (non-empty).
+    /// `_GALAXY_DIR`, `_DEMONWARE_DIR` (non-empty).
     pub playfab_dir: Option<PathBuf>,
     pub ugs_dir: Option<PathBuf>,
     pub galaxy_dir: Option<PathBuf>,
+    pub demonware_dir: Option<PathBuf>,
 }
 
 impl HookConfig {
@@ -175,6 +176,7 @@ impl HookConfig {
             playfab_dir: dir(env::PLAYFAB_DIR),
             ugs_dir: dir(env::UGS_DIR),
             galaxy_dir: dir(env::GALAXY_DIR),
+            demonware_dir: dir(env::DEMONWARE_DIR),
         }
     }
 
@@ -234,6 +236,10 @@ impl HookConfig {
     pub fn galaxy_dir(&self) -> Option<PathBuf> {
         Self::live_dir(env::GALAXY_DIR, self.galaxy_dir.as_ref())
     }
+
+    pub fn demonware_dir(&self) -> Option<PathBuf> {
+        Self::live_dir(env::DEMONWARE_DIR, self.demonware_dir.as_ref())
+    }
 }
 
 static CURRENT: AtomicPtr<HookConfig> = AtomicPtr::new(std::ptr::null_mut());
@@ -279,6 +285,7 @@ mod tests {
             ("PEERPARTY_PIPE", r"\\.\pipe\x"),
             ("PEERPARTY_UGS_DIR", ""),
             ("PEERPARTY_GALAXY_DIR", r"C:\g"),
+            ("PEERPARTY_DEMONWARE_DIR", r"C:\dw"),
             ("PEERPARTY_MODE_PHOTON", " Official "),
             ("PEERPARTY_MODE_STEAMID", "Shared"),
         ]);
@@ -290,6 +297,7 @@ mod tests {
         assert_eq!(c.ipc.as_deref(), Some(r"\\.\pipe\x"));
         assert_eq!(c.ugs_dir, None);
         assert_eq!(c.galaxy_dir, Some(PathBuf::from(r"C:\g")));
+        assert_eq!(c.demonware_dir, Some(PathBuf::from(r"C:\dw")));
         assert_eq!(c.mode("photon"), SdkMode::Official);
         assert_eq!(c.mode_text("steamid"), "shared");
     }

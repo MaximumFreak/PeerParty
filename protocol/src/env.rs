@@ -100,6 +100,7 @@ pub const UGS: &str = "PEERPARTY_UGS";
 pub const UGS_DIR: &str = "PEERPARTY_UGS_DIR";
 pub const GALAXY_DIR: &str = "PEERPARTY_GALAXY_DIR";
 pub const DEMONWARE: &str = "PEERPARTY_DEMONWARE";
+pub const DEMONWARE_DIR: &str = "PEERPARTY_DEMONWARE_DIR";
 pub const VIVOX: &str = "PEERPARTY_VIVOX";
 pub const XBL: &str = "PEERPARTY_XBL";
 pub const XBL_REAL: &str = "PEERPARTY_XBL_REAL";

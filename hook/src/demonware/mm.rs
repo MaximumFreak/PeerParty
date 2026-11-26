@@ -44,6 +44,16 @@ impl<'a> Reader<'a> {
         (self.take(1)?[0] == t).then_some(())
     }
 
+    pub fn bool(&mut self) -> Option<bool> {
+        self.tag(typed::BOOL)?;
+        Some(self.take(1)?[0] != 0)
+    }
+
+    pub fn u16(&mut self) -> Option<u16> {
+        self.tag(typed::UINT16)?;
+        Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
+    }
+
     pub fn u32(&mut self) -> Option<u32> {
         self.tag(typed::UINT32)?;
         Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))

@@ -28,6 +28,11 @@ pub fn title() -> u32 {
     TITLE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The account id the game signed in as (0 before it has).
+pub fn signed_in() -> u64 {
+    SIGNED_IN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// bdAuthTicket's magic number.
 pub const TICKET_MAGIC: u32 = 0xEFBD_ADDE;
 

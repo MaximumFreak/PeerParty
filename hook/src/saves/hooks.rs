@@ -102,6 +102,35 @@ fn gone_a(name: *const u8) {
     BUSY.with(|b| b.set(false));
 }
 
+/// Official-mode Demonware cache snapshot: when the game writes or renames a file into
+/// its `LPC\` folder against official servers, copy finalized files into PeerParty's
+/// local publisher-file cache. Zero cost when Demonware isn't in `official` mode.
+fn harvest_w(name: *const u16, finalized: bool) {
+    if name.is_null() || !crate::demonware::storage::harvest_wanted() || BUSY.with(|b| b.get()) {
+        return;
+    }
+    BUSY.with(|b| b.set(true));
+    let _ = std::panic::catch_unwind(|| {
+        if let Some(p) = read::wstr(name as usize) {
+            crate::demonware::storage::note_lpc_write(&p, finalized);
+        }
+    });
+    BUSY.with(|b| b.set(false));
+}
+
+fn harvest_a(name: *const u8, finalized: bool) {
+    if name.is_null() || !crate::demonware::storage::harvest_wanted() || BUSY.with(|b| b.get()) {
+        return;
+    }
+    BUSY.with(|b| b.set(true));
+    let _ = std::panic::catch_unwind(|| {
+        if let Some(p) = ansi(name) {
+            crate::demonware::storage::note_lpc_write(&p, finalized);
+        }
+    });
+    BUSY.with(|b| b.set(false));
+}
+
 /// Rebinds `$name` to the routed path, kept alive in `$keep`; `Done` returns `$done`.
 macro_rules! own {
     ($f:ident, $name:ident, $intent:expr, $keep:ident, $done:expr) => {
@@ -339,6 +368,9 @@ unsafe extern "system" fn detour_create_file(name: *const u16, access: u32, shar
     own!(own_w, name, intent, keep, not_there());
     own!(ini_w, name, intent, keep_ini, not_there());
     let h = unsafe { CREATE_FILE.get().unwrap().call(name, access, share, sa, disposition, flags, template) };
+    if h != -1 && intent != Intent::Read {
+        harvest_w(asked, false);
+    }
     crate::input::opened_w(asked, h);
     h
 }
@@ -349,8 +381,12 @@ unsafe extern "system" fn detour_create_file_a(name: *const u8, access: u32, sha
     }
     touch_a(name);
     let asked = name;
-    own!(own_a, name, open_intent(access, disposition, flags), keep, not_there());
+    let intent = open_intent(access, disposition, flags);
+    own!(own_a, name, intent, keep, not_there());
     let h = unsafe { CREATE_FILE_A.get().unwrap().call(name, access, share, sa, disposition, flags, template) };
+    if h != -1 && intent != Intent::Read {
+        harvest_a(asked, false);
+    }
     crate::input::opened_a(asked, h);
     h
 }
@@ -367,6 +403,9 @@ unsafe extern "system" fn detour_create_file2(name: *const u16, access: u32, sha
     own!(own_w, name, intent, keep, not_there());
     own!(ini_w, name, intent, keep_ini, not_there());
     let h = unsafe { CREATE_FILE2.get().unwrap().call(name, access, share, disposition, params) };
+    if h != -1 && intent != Intent::Read {
+        harvest_w(asked, false);
+    }
     crate::input::opened_w(asked, h);
     h
 }
@@ -514,6 +553,7 @@ fn moved<T>(a: &Own<T>, b: &Own<T>) -> bool {
 
 unsafe extern "system" fn detour_move(from: *const u16, to: *const u16) -> i32 {
     let asked = from;
+    let to_asked = to;
     own!(own_w, from, Intent::MoveFrom, keep_f, done());
     own!(own_w, to, Intent::Create, keep_t, done());
     let ok = if moved(&keep_f, &keep_t) {
@@ -524,12 +564,14 @@ unsafe extern "system" fn detour_move(from: *const u16, to: *const u16) -> i32 {
     };
     if ok != 0 {
         gone_w(asked);
+        harvest_w(to_asked, true);
     }
     ok
 }
 
 unsafe extern "system" fn detour_move_a(from: *const u8, to: *const u8) -> i32 {
     let asked = from;
+    let to_asked = to;
     own!(own_a, from, Intent::MoveFrom, keep_f, done());
     own!(own_a, to, Intent::Create, keep_t, done());
     let ok = if moved(&keep_f, &keep_t) {
@@ -539,78 +581,91 @@ unsafe extern "system" fn detour_move_a(from: *const u8, to: *const u8) -> i32 {
     };
     if ok != 0 {
         gone_a(asked);
+        harvest_a(to_asked, true);
     }
     ok
 }
 
 unsafe extern "system" fn detour_move_ex(from: *const u16, to: *const u16, flags: u32) -> i32 {
     let asked = from;
+    let to_asked = to;
     own!(own_w, from, Intent::MoveFrom, keep_f, done());
     own!(own_w, to, Intent::Create, keep_t, done());
     let flags = if moved(&keep_f, &keep_t) { flags | COPY_ALLOWED } else { flags };
     let ok = unsafe { MOVE_EX.get().unwrap().call(from, to, flags) };
     if ok != 0 {
         gone_w(asked);
+        harvest_w(to_asked, true);
     }
     ok
 }
 
 unsafe extern "system" fn detour_move_ex_a(from: *const u8, to: *const u8, flags: u32) -> i32 {
     let asked = from;
+    let to_asked = to;
     own!(own_a, from, Intent::MoveFrom, keep_f, done());
     own!(own_a, to, Intent::Create, keep_t, done());
     let flags = if moved(&keep_f, &keep_t) { flags | COPY_ALLOWED } else { flags };
     let ok = unsafe { MOVE_EX_A.get().unwrap().call(from, to, flags) };
     if ok != 0 {
         gone_a(asked);
+        harvest_a(to_asked, true);
     }
     ok
 }
 
 unsafe extern "system" fn detour_move_progress(from: *const u16, to: *const u16, progress: usize, data: usize, flags: u32) -> i32 {
     let asked = from;
+    let to_asked = to;
     own!(own_w, from, Intent::MoveFrom, keep_f, done());
     own!(own_w, to, Intent::Create, keep_t, done());
     let flags = if moved(&keep_f, &keep_t) { flags | COPY_ALLOWED } else { flags };
     let ok = unsafe { MOVE_PROGRESS.get().unwrap().call(from, to, progress, data, flags) };
     if ok != 0 {
         gone_w(asked);
+        harvest_w(to_asked, true);
     }
     ok
 }
 
 unsafe extern "system" fn detour_move_progress_a(from: *const u8, to: *const u8, progress: usize, data: usize, flags: u32) -> i32 {
     let asked = from;
+    let to_asked = to;
     own!(own_a, from, Intent::MoveFrom, keep_f, done());
     own!(own_a, to, Intent::Create, keep_t, done());
     let flags = if moved(&keep_f, &keep_t) { flags | COPY_ALLOWED } else { flags };
     let ok = unsafe { MOVE_PROGRESS_A.get().unwrap().call(from, to, progress, data, flags) };
     if ok != 0 {
         gone_a(asked);
+        harvest_a(to_asked, true);
     }
     ok
 }
 
 unsafe extern "system" fn detour_replace(replaced: *const u16, replacement: *const u16, backup: *const u16, flags: u32, a: usize, b: usize) -> i32 {
     let asked = replacement;
+    let to_asked = replaced;
     own!(own_w, replaced, Intent::Write, keep_r, 0);
     own!(own_w, replacement, Intent::MoveFrom, keep_n, 0);
     own!(own_w, backup, Intent::Create, keep_b, 0);
     let ok = unsafe { REPLACE.get().unwrap().call(replaced, replacement, backup, flags, a, b) };
     if ok != 0 {
         gone_w(asked);
+        harvest_w(to_asked, true);
     }
     ok
 }
 
 unsafe extern "system" fn detour_replace_a(replaced: *const u8, replacement: *const u8, backup: *const u8, flags: u32, a: usize, b: usize) -> i32 {
     let asked = replacement;
+    let to_asked = replaced;
     own!(own_a, replaced, Intent::Write, keep_r, 0);
     own!(own_a, replacement, Intent::MoveFrom, keep_n, 0);
     own!(own_a, backup, Intent::Create, keep_b, 0);
     let ok = unsafe { REPLACE_A.get().unwrap().call(replaced, replacement, backup, flags, a, b) };
     if ok != 0 {
         gone_a(asked);
+        harvest_a(to_asked, true);
     }
     ok
 }
@@ -696,24 +751,40 @@ unsafe extern "system" fn detour_set_info(handle: isize, class: i32, info: *mut 
     const RENAME_EX: i32 = 22;
     const LINK_EX: i32 = 23;
     let real = || unsafe { SET_INFO.get().unwrap().call(handle, class, info, size) };
-    if !matches!(class, RENAME | LINK | RENAME_EX | LINK_EX) || vfs::state().is_none() || BUSY.with(|b| b.get()) {
+    let harvest = crate::demonware::storage::harvest_wanted();
+    if !matches!(class, RENAME | LINK | RENAME_EX | LINK_EX) || (vfs::state().is_none() && !harvest) || BUSY.with(|b| b.get()) {
         return real();
     }
     let Some((name_at, _len, target)) = rename_target(info, size) else { return real() };
-    BUSY.with(|b| b.set(true));
-    let r = std::panic::catch_unwind(|| vfs::route(&target, Intent::Create)).unwrap_or(Route::Same);
-    BUSY.with(|b| b.set(false));
-    let Route::To(new) = r else { return real() };
-    let w: Vec<u16> = new.encode_utf16().collect();
-    let mut buf = vec![0u8; name_at + w.len() * 2 + 2];
-    unsafe { std::ptr::copy_nonoverlapping(info, buf.as_mut_ptr(), name_at) };
-    let len_at = name_at - 4;
-    buf[len_at..name_at].copy_from_slice(&((w.len() * 2) as u32).to_le_bytes());
-    for (i, c) in w.iter().enumerate() {
-        buf[name_at + i * 2..name_at + i * 2 + 2].copy_from_slice(&c.to_le_bytes());
+    let r = if vfs::state().is_some() {
+        BUSY.with(|b| b.set(true));
+        let r = std::panic::catch_unwind(|| vfs::route(&target, Intent::Create)).unwrap_or(Route::Same);
+        BUSY.with(|b| b.set(false));
+        r
+    } else {
+        Route::Same
+    };
+    let ok = match r {
+        Route::To(new) => {
+            let w: Vec<u16> = new.encode_utf16().collect();
+            let mut buf = vec![0u8; name_at + w.len() * 2 + 2];
+            unsafe { std::ptr::copy_nonoverlapping(info, buf.as_mut_ptr(), name_at) };
+            let len_at = name_at - 4;
+            buf[len_at..name_at].copy_from_slice(&((w.len() * 2) as u32).to_le_bytes());
+            for (i, c) in w.iter().enumerate() {
+                buf[name_at + i * 2..name_at + i * 2 + 2].copy_from_slice(&c.to_le_bytes());
+            }
+            crate::log::throttled("saves rename", 8, |_| log!("saves: a handle's rename onto {target} goes to {new}"));
+            unsafe { SET_INFO.get().unwrap().call(handle, class, buf.as_mut_ptr(), buf.len() as u32) }
+        }
+        _ => real(),
+    };
+    if ok != 0 && harvest {
+        BUSY.with(|b| b.set(true));
+        let _ = std::panic::catch_unwind(|| crate::demonware::storage::note_lpc_write(&target, true));
+        BUSY.with(|b| b.set(false));
     }
-    crate::log::throttled("saves rename", 8, |_| log!("saves: a handle's rename onto {target} goes to {new}"));
-    unsafe { SET_INFO.get().unwrap().call(handle, class, buf.as_mut_ptr(), buf.len() as u32) }
+    ok
 }
 
 // `.ini` files read and written through Windows' profile calls.

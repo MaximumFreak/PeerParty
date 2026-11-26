@@ -61,8 +61,9 @@ const ENCRYPTED: u8 = 0x85;
 const CALL: u8 = 0x86;
 const TASK_REPLY: u8 = 1;
 
-/// The largest message taken: a game's calls are small, and only this PC reaches here.
-const MAX_MESSAGE: usize = 1 << 20;
+/// The largest message taken: publisher and user files can reach several megabytes, and
+/// only this PC reaches here.
+const MAX_MESSAGE: usize = 16 << 20;
 
 /// Demonware's names for the service ids games use, for the log.
 fn service_name(id: u8) -> &'static str {
@@ -102,11 +103,17 @@ fn service_name(id: u8) -> &'static str {
 pub mod typed {
     pub const BOOL: u8 = 1;
     pub const UBYTE: u8 = 3;
+    pub const UINT16: u8 = 6;
     pub const UINT32: u8 = 8;
     pub const UINT64: u8 = 10;
+    pub const FLOAT32: u8 = 13;
 
     pub fn u8(out: &mut Vec<u8>, v: u8) {
         out.extend_from_slice(&[UBYTE, v]);
+    }
+    pub fn u16(out: &mut Vec<u8>, v: u16) {
+        out.push(UINT16);
+        out.extend_from_slice(&v.to_le_bytes());
     }
     pub fn u32(out: &mut Vec<u8>, v: u32) {
         out.push(UINT32);
@@ -114,6 +121,10 @@ pub mod typed {
     }
     pub fn u64(out: &mut Vec<u8>, v: u64) {
         out.push(UINT64);
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    pub fn f32(out: &mut Vec<u8>, v: f32) {
+        out.push(FLOAT32);
         out.extend_from_slice(&v.to_le_bytes());
     }
     pub fn bool(out: &mut Vec<u8>, v: bool) {
@@ -127,8 +138,6 @@ pub mod typed {
     }
 }
 
-/// bdStorage's error for a file it doesn't have (BD_NO_FILE).
-const NO_FILE: u32 = 1000;
 /// The most DDL checksums one verify call is answered for.
 const MAX_DDL_FILES: u32 = 256;
 
@@ -170,41 +179,53 @@ pub fn task_error(task: u8, error: u32) -> Vec<u8> {
     b
 }
 
-/// The error service `service`'s task `task` answers with, where it has one.
-fn error(service: u8, task: u8, args: &[u8]) -> Option<(u32, String)> {
-    match (service, task) {
-        // bdStorage getPublisherFile: the title's own files (signed, Activision's) aren't
-        // PeerParty's to hand out; the server's answer for a file it doesn't have. An
-        // empty success would be read as a file that's there and broken.
-        (10, 21) => {
-            let mut r = super::mm::Reader::new(args);
-            let _ = r.string();
-            let name = r.string().map(|n| String::from_utf8_lossy(n).into_owned()).unwrap_or_default();
-            Some((NO_FILE, format!("publisher file {name:?}: not here (BD_NO_FILE)")))
-        }
-        // bdStorage's read of a player's own file (platform, name, owner, ...): this
-        // service keeps none, so none is there. An empty success was read as a broken
-        // file (the game then uploads a "badDecompress_" report of it).
-        (10, 12) => {
-            let mut r = super::mm::Reader::new(args);
-            let _ = r.string();
-            let name = r.string().map(|n| String::from_utf8_lossy(n).into_owned()).unwrap_or_default();
-            Some((NO_FILE, format!("user file {name:?}: not here (BD_NO_FILE)")))
-        }
-        _ => None,
-    }
+/// How one lobby call was answered, with an optional throttle suffix (`detail`, such as a
+/// file name) so distinct files under one task each appear in the log.
+enum Dispatch {
+    Results { results: Vec<Vec<u8>>, detail: String, note: String },
+    Error { code: u32, detail: String, why: String },
+    Empty,
 }
 
-/// The answer to service `service`'s task `task` (`args` after the task id): the
-/// results, or None for a task with no answer of its own here.
-fn answer(service: u8, task: u8, args: &[u8]) -> Option<Vec<Vec<u8>>> {
+/// Dispatches service `service`'s task `task` (`args` after the task id).
+fn dispatch(service: u8, task: u8, args: &[u8]) -> Dispatch {
+    if service == 10 {
+        return match super::storage::handle(task, args) {
+            super::storage::StorageReply::Results { results, detail, note } => Dispatch::Results { results, detail, note },
+            super::storage::StorageReply::Error { code, detail, why } => Dispatch::Error { code, detail, why },
+            super::storage::StorageReply::Unhandled => Dispatch::Empty,
+        };
+    }
     match (service, task) {
+        // bdDML getUserData (2): geolocation record (bdDMLRawData).
+        (27, 2) => {
+            let mut r = Vec::new();
+            typed::string(&mut r, b"US");
+            typed::string(&mut r, b"United States");
+            typed::string(&mut r, b"New York");
+            typed::string(&mut r, b"New York");
+            typed::f32(&mut r, 0.0);
+            typed::f32(&mut r, 0.0);
+            typed::u32(&mut r, 0);
+            typed::string(&mut r, b"+00:00");
+            Dispatch::Results { results: vec![r], detail: String::new(), note: "1 result(s)".into() }
+        }
+        // bdDML getUserHierarchicalData (3): empty success.
+        (27, 3) => Dispatch::Results { results: Vec::new(), detail: String::new(), note: "empty hierarchical data".into() },
+        // bdPublisherVariables retrievePublisherVariables (1): empty variable set.
+        (95, 1) => {
+            let mut r = super::mm::Reader::new(args);
+            let group = r.string().map(|s| String::from_utf8_lossy(s).into_owned()).unwrap_or_default();
+            let ns = r.string().map(|s| String::from_utf8_lossy(s).into_owned()).unwrap_or_default();
+            let note = format!("group {group:?}, namespace {ns:?}: empty variable set");
+            Dispatch::Results { results: Vec::new(), detail: format!("{group}:{ns}"), note }
+        }
         // bdDDL verifyDDLFiles: a count, then each DDL file's checksum. Every one matches
         // (a bdDDLChecksumResult: the checksum, then true): the server holds no other
         // copy of the game's data layouts to compare with.
         (96, 1) => {
             let mut r = super::mm::Reader::new(args);
-            let n = r.u32()?.min(MAX_DDL_FILES);
+            let Some(n) = r.u32().map(|n| n.min(MAX_DDL_FILES)) else { return Dispatch::Empty };
             let mut out = Vec::new();
             for _ in 0..n {
                 let Some(sum) = r.string() else { break };
@@ -213,17 +234,24 @@ fn answer(service: u8, task: u8, args: &[u8]) -> Option<Vec<Vec<u8>>> {
                 typed::bool(&mut v, true);
                 out.push(v);
             }
-            Some(out)
+            let note = format!("{} result(s)", out.len());
+            Dispatch::Results { results: out, detail: String::new(), note }
         }
         // bdTitleUtilities getServerTime: a bdTimeStamp.
         (12, 6) => {
             let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as u32).unwrap_or(0);
             let mut r = Vec::new();
             typed::u32(&mut r, now);
-            Some(vec![r])
+            Dispatch::Results { results: vec![r], detail: String::new(), note: "1 result(s)".into() }
         }
-        (21, _) => super::mm::answer(task, args),
-        _ => None,
+        (21, _) => match super::mm::answer(task, args) {
+            Some(results) => {
+                let note = format!("{} result(s)", results.len());
+                Dispatch::Results { results, detail: String::new(), note }
+            }
+            None => Dispatch::Empty,
+        },
+        _ => Dispatch::Empty,
     }
 }
 
@@ -398,14 +426,18 @@ fn call(conn: &mut TcpStream, c: &mut Conn, keys: &Keys, plain: &[u8]) -> io::Re
         [t, args @ ..] => (*t, args),
         [] => (0, &[][..]),
     };
-    let failed = error(service, task, args);
-    let results = if failed.is_some() { None } else { answer(service, task, args) };
-    let how = match (&failed, &results) {
-        (Some((code, why)), _) => format!(" (error {code}: {why})"),
-        (None, Some(r)) => format!(" ({} result(s))", r.len()),
-        (None, None) => " (no answer of its own: empty success)".to_string(),
+    let outcome = dispatch(service, task, args);
+    let (detail, how, reply_body) = match outcome {
+        Dispatch::Error { code, detail, why } => (detail, format!(" (error {code}: {why})"), task_error(task, code)),
+        Dispatch::Results { results, detail, note } => (detail, format!(" ({note})"), task_reply(task, &results)),
+        Dispatch::Empty => (String::new(), " (no answer of its own: empty success)".to_string(), task_reply(task, &[])),
     };
-    crate::log::throttled(&format!("demonware call {service} {task}"), 2, |n| {
+    let key = if detail.is_empty() {
+        format!("demonware call {service} {task}")
+    } else {
+        format!("demonware call {service} {task} {detail}")
+    };
+    crate::log::throttled(&key, 2, |n| {
         log!(
             "demonware lobby: {} ({service}) task {task}{how}: args {} n={n}",
             service_name(service),
@@ -413,10 +445,7 @@ fn call(conn: &mut TcpStream, c: &mut Conn, keys: &Keys, plain: &[u8]) -> io::Re
         )
     });
     let mut body = vec![TASK_REPLY];
-    match failed {
-        Some((code, _)) => body.extend_from_slice(&task_error(task, code)),
-        None => body.extend_from_slice(&task_reply(task, &results.unwrap_or_default())),
-    }
+    body.extend_from_slice(&reply_body);
     c.sent = c.sent.wrapping_add(1);
     conn.write_all(&seal(keys, c.sent, &body))
 }
@@ -509,7 +538,7 @@ mod tests {
         typed::string(&mut args, b"0123456789abcdef0123456789abcdef");
         typed::string(&mut args, b"fedcba9876543210fedcba9876543210");
         args.push(0);
-        let got = answer(96, 1, &args).unwrap();
+        let Dispatch::Results { results: got, .. } = dispatch(96, 1, &args) else { panic!("expected DDL results") };
         assert_eq!(got.len(), 2);
         let mut first = Vec::new();
         typed::string(&mut first, b"0123456789abcdef0123456789abcdef");
@@ -519,25 +548,50 @@ mod tests {
         let mut short = Vec::new();
         typed::u32(&mut short, u32::MAX);
         typed::string(&mut short, b"aa");
-        assert_eq!(answer(96, 1, &short).unwrap().len(), 1);
+        let Dispatch::Results { results: got_short, .. } = dispatch(96, 1, &short) else { panic!("expected DDL results") };
+        assert_eq!(got_short.len(), 1);
     }
 
     #[test]
     fn a_publisher_file_is_answered_not_there() {
         let mut args = Vec::new();
         typed::string(&mut args, b"");
-        typed::string(&mut args, b"keys.txt");
+        typed::string(&mut args, b"nonexistent_keys_test.txt");
         args.push(0);
-        let (code, why) = error(10, 21, &args).unwrap();
-        assert_eq!(code, NO_FILE);
-        assert!(why.contains("keys.txt"), "{why}");
+        let Dispatch::Error { code, why, detail } = dispatch(10, 21, &args) else { panic!("expected BD_NO_FILE") };
+        assert_eq!(code, super::super::storage::NO_FILE);
+        assert_eq!(detail, "nonexistent_keys_test.txt");
+        assert!(why.contains("nonexistent_keys_test.txt"), "{why}");
         // Error body: transaction id, the code, the task, the transaction id again.
-        let b = task_error(21, NO_FILE);
+        let b = task_error(21, super::super::storage::NO_FILE);
         assert_eq!(b.len(), 9 + 5 + 2 + 9);
         assert_eq!(b[9..14], [typed::UINT32, 0xE8, 3, 0, 0]);
         assert_eq!(b[14..16], [typed::UBYTE, 21]);
         assert_eq!(b[..9], b[16..]);
-        assert!(error(10, 20, &args).is_none());
+    }
+
+    #[test]
+    fn dml_and_publisher_variables_answer_cleanly() {
+        let Dispatch::Results { results: dml, .. } = dispatch(27, 2, &[]) else { panic!("expected bdDML result") };
+        assert_eq!(dml.len(), 1);
+        let mut r = super::super::mm::Reader::new(&dml[0]);
+        assert_eq!(r.string(), Some(&b"US"[..]));
+        assert_eq!(r.string(), Some(&b"United States"[..]));
+        assert_eq!(r.string(), Some(&b"New York"[..]));
+        assert_eq!(r.string(), Some(&b"New York"[..]));
+        assert!(matches!(dispatch(27, 3, &[]), Dispatch::Results { results, .. } if results.is_empty()));
+
+        let mut pv = Vec::new();
+        typed::string(&mut pv, b"5446");
+        typed::string(&mut pv, b"client");
+        match dispatch(95, 1, &pv) {
+            Dispatch::Results { results, detail, note } => {
+                assert!(results.is_empty());
+                assert_eq!(detail, "5446:client");
+                assert!(note.contains("client"), "{note}");
+            }
+            _ => panic!("expected bdPublisherVariables result"),
+        }
     }
 
     #[test]

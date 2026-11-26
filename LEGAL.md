@@ -40,7 +40,11 @@ players on one PC, directly with friends, and after its online services have clo
   - Xbox Live friends, presence and privacy queries are answered for the players
     PeerParty connects you to, with every permission allowed;
   - EOS sessions report sanctions as disabled, with no sanctioned players (Epic's
-    sanctions query itself still fails as offline).
+    sanctions query itself still fails as offline);
+  - Demonware sign-in, lobby authentication and token requests succeed locally with
+    PeerParty's own session tickets and tokens, and `bdDDL` checksum verification reports
+    matching checksums; publisher files aren't bundled with PeerParty and are served only
+    when already cached on the player's own PC.
 - **No piracy.** PeerParty is for games you're licensed to run. Issues and pull requests
   about running unlicensed copies are closed.
 - **No cheating.** PeerParty stops a game in which EasyAntiCheat or BattlEye loads, or
