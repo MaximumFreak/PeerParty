@@ -121,6 +121,36 @@ mod win {
         matches!(String::from_utf16_lossy(&class[..n]).as_str(), "ConsoleWindowClass" | "CASCADIA_HOSTING_WINDOW_CLASS")
     }
 
+    /// A standard dialog box (a message box, a game's start-up prompt): Windows' dialog
+    /// class. It's answered as it is, never taken for the game's main window.
+    pub fn is_dialog(h: HWND) -> bool {
+        let mut class = [0u16; 16];
+        let n = unsafe { GetClassNameW(h, class.as_mut_ptr(), class.len() as i32) }.max(0) as usize;
+        class[..n] == *"#32770".encode_utf16().collect::<Vec<_>>()
+    }
+
+    /// The visible dialog boxes of process `pid` (`is_dialog`), top-level ones.
+    pub fn dialogs(pid: u32) -> Vec<HWND> {
+        struct Find {
+            pid: u32,
+            found: Vec<HWND>,
+        }
+        unsafe extern "system" fn each(h: HWND, l: isize) -> i32 {
+            let f = unsafe { &mut *(l as *mut Find) };
+            let mut pid = 0u32;
+            unsafe { GetWindowThreadProcessId(h, &mut pid) };
+            if pid == f.pid && unsafe { IsWindowVisible(h) } != 0 && is_dialog(h) {
+                f.found.push(h);
+            }
+            1
+        }
+        let mut f = Find { pid, found: Vec::new() };
+        if pid != 0 {
+            unsafe { EnumWindows(Some(each), &mut f as *mut Find as isize) };
+        }
+        f.found
+    }
+
     /// The game's main window.
     pub struct GameWindow(HWND);
 
@@ -157,7 +187,7 @@ mod win {
                 if pid != f.pid || unsafe { IsWindowVisible(h) } == 0 {
                     return 1;
                 }
-                if !unsafe { GetWindow(h, GW_OWNER) }.is_null() {
+                if !unsafe { GetWindow(h, GW_OWNER) }.is_null() || is_dialog(h) {
                     return 1;
                 }
                 let mut r: RECT = unsafe { std::mem::zeroed() };

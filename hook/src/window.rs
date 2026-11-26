@@ -560,6 +560,14 @@ fn current_pane() -> Option<PaneRect> {
 
 /// Finds this process's biggest visible unowned top-level window when `PRIMARY_HWND`
 /// hasn't been reported by graphics hooks yet.
+/// A standard dialog box (Windows' dialog class: a message box, a start-up prompt): the
+/// session puts it over the pane at its own size; it's never the game's window.
+fn is_dialog(h: HWND) -> bool {
+    let mut class = [0u16; 16];
+    let n = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetClassNameW(h, class.as_mut_ptr(), class.len() as i32) }.max(0) as usize;
+    class[..n] == *wide("#32770").strip_suffix(&[0]).unwrap_or_default()
+}
+
 fn find_own_window() -> usize {
     struct Find {
         pid: u32,
@@ -570,7 +578,7 @@ fn find_own_window() -> usize {
         let f = unsafe { &mut *(l as *mut Find) };
         let mut pid = 0u32;
         unsafe { GetWindowThreadProcessId(h, &mut pid) };
-        if pid != f.pid || unsafe { IsWindowVisible(h) } == 0 || !unsafe { GetWindow(h, GW_OWNER) }.is_null() {
+        if pid != f.pid || unsafe { IsWindowVisible(h) } == 0 || !unsafe { GetWindow(h, GW_OWNER) }.is_null() || is_dialog(h) {
             return 1;
         }
         let mut r: RECT = unsafe { std::mem::zeroed() };

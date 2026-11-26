@@ -1138,6 +1138,13 @@ mod win {
         unsafe { EndPaint(h, &ps) };
     }
 
+    /// Where a dialog box of `size` goes in `pane` (client coordinates): centred, or at
+    /// the pane's top left when it's bigger than the pane.
+    pub(super) fn dialog_spot(pane: PaneRect, size: (i32, i32)) -> (i32, i32) {
+        let free = |room: u32, n: i32| ((room as i32).saturating_sub(n) / 2).max(0);
+        (pane.x + free(pane.width, size.0), pane.y + free(pane.height, size.1))
+    }
+
     /// Each pane's label: a copy that ended says so; one with nothing to show yet (no
     /// window, no frames) is starting. A pane hidden (another one zoomed) has none.
     pub(super) fn pane_labels(panes: &[(PaneRect, bool, bool)]) -> Vec<(usize, PaneRect, String)> {
@@ -1334,6 +1341,10 @@ mod win {
         pub notes: Vec<(usize, String)>,
         /// Whether CAS sharpening is enabled for upscaled panes.
         upscale: bool,
+        /// When the copies' dialog boxes were last looked for (`place_dialogs`).
+        dialogs_checked: Option<Instant>,
+        /// The dialog boxes put over their panes, already said in the copies' logs.
+        dialogs: Vec<usize>,
     }
 
     impl HostWindow {
@@ -1408,7 +1419,23 @@ mod win {
                 }
             }
             let gpu = Gpu::start(hwnd);
-            Some(HostWindow { hwnd, shown: Vec::new(), gpu, surfaces: Vec::new(), hidden_for_minimize: false, icon_big, icon_small, cursor_screen: Vec::new(), confined: None, display: Vec::new(), pressed: Vec::new(), notes: Vec::new(), upscale: true })
+            Some(HostWindow {
+                hwnd,
+                shown: Vec::new(),
+                gpu,
+                surfaces: Vec::new(),
+                hidden_for_minimize: false,
+                icon_big,
+                icon_small,
+                cursor_screen: Vec::new(),
+                confined: None,
+                display: Vec::new(),
+                pressed: Vec::new(),
+                notes: Vec::new(),
+                upscale: true,
+                dialogs_checked: None,
+                dialogs: Vec::new(),
+            })
         }
 
         pub fn set_upscale(&mut self, on: bool) {
@@ -1707,6 +1734,54 @@ mod win {
             }
             self.push_panes();
             self.label_panes(instances);
+            self.place_dialogs(bounds, instances);
+        }
+
+        /// A copy's dialog boxes (a start-up prompt, a message box) aren't the game: they
+        /// stay their own size, centred over the copy's pane and above the session's
+        /// window, so the player answers them with the real mouse and keyboard. Looked for
+        /// every quarter second.
+        fn place_dialogs(&mut self, bounds: MonitorBounds, instances: &[InstanceConn]) {
+            if self.dialogs_checked.is_some_and(|t| t.elapsed() < Duration::from_millis(250)) {
+                return;
+            }
+            self.dialogs_checked = Some(Instant::now());
+            let mut alive = Vec::new();
+            for (i, inst) in instances.iter().enumerate() {
+                if inst.gone {
+                    continue;
+                }
+                let Some(&(pane, ..)) = self.display.get(i).filter(|d| d.0.width > 0 && d.0.height > 0) else { continue };
+                for d in super::super::desktop::dialogs(inst.pid) {
+                    alive.push(d as usize);
+                    let mut r: RECT = unsafe { std::mem::zeroed() };
+                    if unsafe { GetWindowRect(d, &mut r) } == 0 {
+                        continue;
+                    }
+                    let (w, h) = (r.right - r.left, r.bottom - r.top);
+                    let (x, y) = dialog_spot(pane, (w, h));
+                    let (x, y) = (bounds.x.saturating_add(x), bounds.y.saturating_add(y));
+                    let placed = (r.left, r.top) == (x, y) && is_above(d, self.hwnd);
+                    if !placed {
+                        unsafe {
+                            SetWindowPos(d, HWND_TOP, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_ASYNCWINDOWPOS);
+                        }
+                    }
+                    if !self.dialogs.contains(&(d as usize)) {
+                        let mut title = [0u16; 128];
+                        let n = unsafe { GetWindowTextW(d, title.as_mut_ptr(), title.len() as i32) }.max(0) as usize;
+                        self.notes.push((
+                            i,
+                            format!(
+                                "session: player {}'s game shows a dialog box {:?} ({w}x{h}): centred over its pane, above the session's window, for the player to answer",
+                                i + 1,
+                                String::from_utf16_lossy(&title[..n])
+                            ),
+                        ));
+                    }
+                }
+            }
+            self.dialogs = alive;
         }
 
         /// Says in each empty pane what's going on there (`pane_labels`), repainted when
@@ -2188,6 +2263,15 @@ mod tests {
         c.set_layout(LayoutPreset::Horizontal);
         c.sync_instances(&mut one);
         assert_eq!(c.panes().len(), 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_dialog_box_sits_in_the_middle_of_its_pane() {
+        // The right half of a 3440x1440 window, a 300x130 prompt.
+        assert_eq!(win::dialog_spot(r(1720, 0, 1720, 1440), (300, 130)), (1720 + 710, 655));
+        // Bigger than its pane: from the pane's top left, never outside it to the left.
+        assert_eq!(win::dialog_spot(r(100, 50, 200, 100), (300, 130)), (100, 50));
     }
 
     #[cfg(windows)]
