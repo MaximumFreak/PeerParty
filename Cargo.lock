@@ -1893,7 +1893,7 @@ dependencies = [
 
 [[package]]
 name = "peerparty"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "eframe",
  "image",
@@ -1912,7 +1912,7 @@ dependencies = [
 
 [[package]]
 name = "peerparty_core"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "chacha20poly1305",
  "ed25519-dalek",
@@ -1929,7 +1929,7 @@ dependencies = [
 
 [[package]]
 name = "peerparty_hook"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "peerparty_core",
  "peerparty_protocol",
@@ -1941,7 +1941,7 @@ dependencies = [
 
 [[package]]
 name = "peerparty_protocol"
-version = "1.0.1"
+version = "1.0.2"
 
 [[package]]
 name = "peniko"
