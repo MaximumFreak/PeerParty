@@ -175,6 +175,14 @@ mod tests {
 
     vmethod! { fn twenty(this: usize, a: u32) -> usize { this.wrapping_add(20 + a as usize) } }
     vmethod! { fn ours(_this: usize, a: u32) -> usize { 1000 + a as usize } }
+    vmethod! {
+        fn is_nonzero(_this: usize, a: u32) -> bool {
+            if a == 0 {
+                return false;
+            }
+            true
+        }
+    }
 
     #[repr(C)]
     struct Proxy {
@@ -200,5 +208,11 @@ mod tests {
         assert_eq!(unsafe { slot(1)(this, 5) }, real + 25, "the real method, on the real object");
         assert!(build(MAX_SLOTS + 1, |_| None).is_none());
         assert!(forward_stub(MAX_SLOTS).is_none() && forward_stub(0).is_some());
+    }
+
+    #[test]
+    fn bool_vmethods_widen_to_full_register() {
+        assert_eq!(unsafe { is_nonzero(0, 0) }, 0usize);
+        assert_eq!(unsafe { is_nonzero(0, 7) }, 1usize);
     }
 }
