@@ -108,6 +108,7 @@ game.adv_change = Змінити…
 game.adv_use_found = Використати знайдену
 game.program_tip = Програма, яку запускає «Грати». Якщо це не сама гра (редактор чи інструмент поруч), виберіть програму гри.
 game.program_found = {name} (знайдена)
+game.program_other = Інша програма…
 game.adv_open_folder = Відкрити теку
 game.adv_args = Додаткові аргументи
 game.adv_args_hint = немає

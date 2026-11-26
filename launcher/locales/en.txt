@@ -105,6 +105,7 @@ game.adv_change = Change…
 game.adv_use_found = Use the one found
 game.program_tip = The program Play starts. If it's not the game itself (an editor or a tool beside it), pick the game's own.
 game.program_found = {name} (found)
+game.program_other = Another program…
 game.adv_open_folder = Open folder
 game.adv_args = Extra arguments
 game.adv_args_hint = none

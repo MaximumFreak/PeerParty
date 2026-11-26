@@ -100,6 +100,7 @@ game.adv_change = 변경…
 game.adv_use_found = 찾은 프로그램 사용
 game.program_tip = 플레이가 실행하는 프로그램입니다. 게임 자체가 아니라면(옆에 있는 편집기나 도구) 게임의 프로그램을 고르세요.
 game.program_found = {name} (찾음)
+game.program_other = 다른 프로그램…
 game.adv_open_folder = 폴더 열기
 game.adv_args = 추가 인수
 game.adv_args_hint = 없음

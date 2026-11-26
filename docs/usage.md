@@ -28,8 +28,8 @@ connected. It finds what's installed on any PC:
   `.` are skipped. A folder's program is picked by `launcher/src/ui/mainexe.rs`:
   a Unity game's exe, else one named after the folder, else the largest, skipping
   redistributables and old-renderer builds beside a newer one and ranking tools (an
-  editor, a packer, a server) last. If it picks the wrong one, the program under the
-  game's name in its panel lists the others in its folder.
+  editor, a packer, a server) last. If it picks the wrong one, Change… under the game's
+  Advanced > Program lists the others in its folder.
 - **Recent**: every game peerparty.exe starts (from the window, a .bat or a Steam
   launch option) is noted in `%LOCALAPPDATA%\peerparty\recent.tsv`, except a test run
   (`PEERPARTY_LOOPBACK=1`).

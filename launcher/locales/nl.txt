@@ -104,6 +104,7 @@ game.adv_change = Wijzigen…
 game.adv_use_found = Het gevonden programma gebruiken
 game.program_tip = Het programma dat Spelen start. Is het niet het spel zelf (een editor of hulpprogramma ernaast), kies dan dat van het spel.
 game.program_found = {name} (gevonden)
+game.program_other = Ander programma…
 game.adv_open_folder = Map openen
 game.adv_args = Extra argumenten
 game.adv_args_hint = geen

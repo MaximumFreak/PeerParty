@@ -100,6 +100,7 @@ game.adv_change = 変更…
 game.adv_use_found = 見つかったものを使う
 game.program_tip = 「プレイ」で起動するプログラム。ゲーム本体でない場合（隣にあるエディターやツール）は、ゲームのプログラムを選んでください。
 game.program_found = {name}（検出）
+game.program_other = 別のプログラム…
 game.adv_open_folder = フォルダーを開く
 game.adv_args = 追加の引数
 game.adv_args_hint = なし

@@ -108,6 +108,7 @@ game.adv_change = Изменить…
 game.adv_use_found = Использовать найденную
 game.program_tip = Программа, которую запускает «Играть». Если это не сама игра (редактор или инструмент рядом с ней), выберите программу игры.
 game.program_found = {name} (найдена)
+game.program_other = Другая программа…
 game.adv_open_folder = Открыть папку
 game.adv_args = Дополнительные аргументы
 game.adv_args_hint = нет

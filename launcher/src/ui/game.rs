@@ -73,10 +73,6 @@ impl App {
                         widgets::badge(ui.painter(), r.min, &label, theme::GOOD, false);
                     }
                 });
-                if g.source != Source::Xbox {
-                    ui.add_space(4.0);
-                    self.program_row(ui, &g, &key, &mut o);
-                }
                 ui.add_space(14.0);
                 self.play_button(ui, &g, &key, &o, &running, &mut actions);
                 ui.add_space(10.0);
@@ -168,19 +164,12 @@ impl App {
         self.apply(actions);
     }
 
-    /// The program Play starts, with the others in the game's folder to pick from: a
-    /// game can ship its tools beside it (an editor, a packer), as big as it and loading
+    /// Advanced's Change…: the programs in the game's folder, best first, and any other.
+    /// A game can ship its tools beside it (an editor, a packer), as big as it and loading
     /// the same SDKs, and the library may take one of them for the game.
-    fn program_row(&mut self, ui: &mut egui::Ui, g: &super::scan::Game, key: &str, o: &mut GameOptions) {
+    fn program_picker(&mut self, ui: &mut egui::Ui, g: &super::scan::Game, key: &str, o: &mut GameOptions) {
         let exe = o.exe.clone().unwrap_or_else(|| g.exe.clone());
-        let name = exe.file_name().unwrap_or_default().to_string_lossy().to_string();
-        let resp = ui
-            .horizontal(|ui| {
-                ui.label(egui::RichText::new(t!("game.adv_program")).size(12.5).color(TEXT3));
-                ui.add(egui::Button::new(egui::RichText::new(format!("{name}  \u{25BE}")).size(12.5).color(TEXT2)).frame(false))
-                    .on_hover_text(t!("game.program_tip"))
-            })
-            .inner;
+        let resp = widgets::button(ui, None, &format!("{}  \u{25BE}", t!("game.adv_change")), Kind::Secondary).on_hover_text(t!("game.program_tip"));
         if resp.clicked() {
             // Read each time the list opens, not every frame: it walks the folder.
             let mut list = mainexe::programs(&g.dir);
@@ -209,7 +198,7 @@ impl App {
                 }
             });
             ui.separator();
-            if ui.button(t!("game.adv_change")).clicked() {
+            if ui.button(t!("game.program_other")).clicked() {
                 if let Some(p) = rfd::FileDialog::new().set_directory(&g.dir).add_filter("Programs", &["exe"]).pick_file() {
                     o.exe = (store::key_of(&p) != key).then_some(p);
                 }
@@ -614,11 +603,7 @@ impl App {
         let exe = o.exe.clone().unwrap_or_else(|| g.exe.clone());
         ui.add(egui::Label::new(egui::RichText::new(exe.display().to_string()).monospace().size(12.0).color(TEXT2)).wrap());
         ui.horizontal_wrapped(|ui| {
-            if widgets::button(ui, None, t!("game.adv_change"), Kind::Secondary).clicked() {
-                if let Some(p) = rfd::FileDialog::new().set_directory(&g.dir).add_filter("Programs", &["exe"]).pick_file() {
-                    o.exe = (store::key_of(&p) != key).then_some(p);
-                }
-            }
+            self.program_picker(ui, g, key, o);
             if o.exe.is_some() && widgets::button(ui, None, t!("game.adv_use_found"), Kind::Ghost).clicked() {
                 o.exe = None;
             }

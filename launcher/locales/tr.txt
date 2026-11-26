@@ -104,6 +104,7 @@ game.adv_change = Değiştir…
 game.adv_use_found = Bulunanı kullan
 game.program_tip = Oyna'nın başlattığı program. Oyunun kendisi değilse (yanındaki bir düzenleyici ya da araç), oyunun kendi programını seçin.
 game.program_found = {name} (bulunan)
+game.program_other = Başka bir program…
 game.adv_open_folder = Klasörü aç
 game.adv_args = Ek argümanlar
 game.adv_args_hint = yok

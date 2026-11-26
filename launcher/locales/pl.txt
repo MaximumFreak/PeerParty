@@ -108,6 +108,7 @@ game.adv_change = Zmień…
 game.adv_use_found = Użyj znalezionego
 game.program_tip = Program uruchamiany przez Graj. Jeśli to nie sama gra (edytor lub narzędzie obok niej), wybierz program gry.
 game.program_found = {name} (znaleziony)
+game.program_other = Inny program…
 game.adv_open_folder = Otwórz folder
 game.adv_args = Dodatkowe argumenty
 game.adv_args_hint = brak

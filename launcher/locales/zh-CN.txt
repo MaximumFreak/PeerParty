@@ -100,6 +100,7 @@ game.adv_change = 更改…
 game.adv_use_found = 使用找到的程序
 game.program_tip = “开始游戏”启动的程序。如果它不是游戏本身（旁边的编辑器或工具），请选择游戏自己的程序。
 game.program_found = {name}（已找到）
+game.program_other = 其他程序…
 game.adv_open_folder = 打开文件夹
 game.adv_args = 附加参数
 game.adv_args_hint = 无
