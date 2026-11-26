@@ -395,6 +395,9 @@ pub fn patch_imports() {
         return;
     }
     for (module, _) in crate::watch::modules() {
+        if crate::sys::lock(&LEAVE_ALONE).contains(&module) {
+            continue;
+        }
         for (base, sdk, resolve) in &sdks {
             if module == *base || !crate::sys::lock(&PATCHED).insert((module, *base)) {
                 continue;

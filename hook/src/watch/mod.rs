@@ -320,16 +320,17 @@ fn consider(m: Mod) {
         }
         // An SDK whose names the swap answers is logged through it, its code untouched.
         let swapped = crate::sys::swap::registered(m.base as usize);
-        if swapped {
-            // Importers already bound (the game's exe, when the hook came in after
-            // start-up) are pointed here now; the rest on a later module's load.
-            crate::sys::swap::patch_imports();
-        }
         let summary = if watch {
             crate::sys::hook::install(&table.code, &typed.skip, swapped.then_some(m.base as usize))
         } else {
             crate::sys::hook::Summary { hooked: 0, failed: 0, samples: Vec::new() }
         };
+        if swapped {
+            // After hook::install so unreplaced static imports receive its call-logging stubs.
+            // Importers already bound (the game's exe, when the hook came in after
+            // start-up) are pointed here now; the rest on a later module's load.
+            crate::sys::swap::patch_imports();
+        }
         log!(
             "module {} base={:p} sdk={} exports={} forwarders={} skipped={} anticheat_unhooked={} hooked={} typed={} failed={} calls_logged={}",
             m.full,

@@ -1211,6 +1211,7 @@ fn pump(s: &mut State) {
                     let async_id = s.networks[&h].connect_async;
                     connected(s, h, descriptor, async_id);
                     publish_endpoint(s, lan, h);
+                    s.reconcile(lan, h);
                     s.chats_network_connected(lan, h);
                 } else {
                     log!("party-lan could not join network {lobby}: {result:?}");
