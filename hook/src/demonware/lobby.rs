@@ -182,6 +182,15 @@ fn error(service: u8, task: u8, args: &[u8]) -> Option<(u32, String)> {
             let name = r.string().map(|n| String::from_utf8_lossy(n).into_owned()).unwrap_or_default();
             Some((NO_FILE, format!("publisher file {name:?}: not here (BD_NO_FILE)")))
         }
+        // bdStorage's read of a player's own file (platform, name, owner, ...): this
+        // service keeps none, so none is there. An empty success was read as a broken
+        // file (the game then uploads a "badDecompress_" report of it).
+        (10, 12) => {
+            let mut r = super::mm::Reader::new(args);
+            let _ = r.string();
+            let name = r.string().map(|n| String::from_utf8_lossy(n).into_owned()).unwrap_or_default();
+            Some((NO_FILE, format!("user file {name:?}: not here (BD_NO_FILE)")))
+        }
         _ => None,
     }
 }

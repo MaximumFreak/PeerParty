@@ -20,6 +20,8 @@ use crate::https::server::Request;
 
 
 static TITLE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// The SteamID the last sign-in was for: the account the umbrella service's tokens are.
+static SIGNED_IN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The title id the game signed in with (0 before it has).
 pub fn title() -> u32 {
@@ -122,6 +124,28 @@ pub fn server_ticket(player: &Player, session_key: &[u8; 24]) -> [u8; 128] {
     t
 }
 
+/// The umbrella service's token for a signed-in player (`POST /v1.0/tokens/lsg/`, with
+/// the sign-in's server ticket, its seed and the title): an access token, the token to
+/// renew it, and the player's account. Nothing checks them but this stand-in.
+fn umbrella_tokens(req: &Request) -> (u16, String) {
+    let body = Json::parse(&String::from_utf8_lossy(&req.body)).unwrap_or(Json::Null);
+    let has_ticket = body.get("ticket").as_str().is_some_and(|t| !t.is_empty());
+    let account = SIGNED_IN.load(std::sync::atomic::Ordering::Relaxed);
+    let account = if account != 0 { account } else { crate::hub::accounts::my_steam_id() };
+    let token = |n| crate::util::encoding::base64(&crate::util::crypto::random_bytes(n));
+    log!(
+        "demonware umbrella: tokens for account {account} (title {}, {}): handed out",
+        num(body.get("titleID")).unwrap_or(0),
+        if has_ticket { "with the sign-in's ticket" } else { "no ticket in the request" }
+    );
+    let reply = Json::obj(vec![
+        ("accessToken", Json::str(token(32))),
+        ("refreshToken", Json::str(token(32))),
+        ("accountID", Json::U64(account)),
+    ]);
+    (200, reply.to_string())
+}
+
 /// Answers one request to a Demonware host over HTTPS: (HTTP status, JSON body).
 pub fn handle(req: &Request) -> (u16, String) {
     let host = req.header("Host").unwrap_or_default().split(':').next().unwrap_or_default().to_ascii_lowercase();
@@ -129,8 +153,17 @@ pub fn handle(req: &Request) -> (u16, String) {
     crate::log::throttled(&format!("demonware https {} {host}{path}", req.method), 3, |n| {
         log!("demonware {} https://{host}{path} n={n}", req.method)
     });
+    if req.method == "POST" && path.trim_end_matches('/') == "/v1.0/tokens/lsg" {
+        return umbrella_tokens(req);
+    }
     if !(req.method == "POST" && path.trim_end_matches('/') == "/auth") {
         log!("demonware: no answer for {} {host}{path} (body {} bytes)", req.method, req.body.len());
+        // What it asked, once per path: what an answer would have to look like.
+        crate::log::throttled(&format!("demonware unanswered {host}{path}"), 1, |_| {
+            let headers: Vec<String> = req.headers.iter().map(|(k, v)| format!("{k}: {}", v.chars().take(80).collect::<String>())).collect();
+            log!("demonware: that request's headers: {}", headers.join(" | "));
+            log!("demonware: that request's body: {}", String::from_utf8_lossy(&req.body[..req.body.len().min(600)]).replace(['\r', '\n'], " "));
+        });
         return (404, "{}".to_string());
     }
     let Some(body) = Json::parse(&String::from_utf8_lossy(&req.body)) else {
@@ -148,6 +181,7 @@ pub fn handle(req: &Request) -> (u16, String) {
         .unwrap_or_default();
     let player = read_app_ticket(&token);
     TITLE.store(title_id, std::sync::atomic::Ordering::Relaxed);
+    SIGNED_IN.store(player.steam_id, std::sync::atomic::Ordering::Relaxed);
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as u32).unwrap_or(0);
     let session_key: [u8; 24] = crate::util::crypto::random_bytes(24).try_into().unwrap();
     let client = client_ticket(title_id, &player, &session_key, now);
@@ -185,6 +219,22 @@ pub fn handle(req: &Request) -> (u16, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_umbrella_service_hands_out_tokens() {
+        let req = Request {
+            method: "POST".into(),
+            path: "/v1.0/tokens/lsg/?client=title-pc".into(),
+            headers: vec![("Host".into(), "prod.umbrella.demonware.net".into())],
+            body: br#"{"ticket": "AAAA", "initialVectorSeed": "MTIz", "titleID": 1234}"#.to_vec(),
+        };
+        let (status, body) = handle(&req);
+        assert_eq!(status, 200);
+        let j = Json::parse(&body).unwrap();
+        assert!(j.get("accessToken").as_str().is_some_and(|t| t.len() > 20), "{body}");
+        assert!(j.get("refreshToken").as_str().is_some(), "{body}");
+        assert!(j.get("accountID").as_u64().is_some(), "{body}");
+    }
 
     #[test]
     fn app_tickets_carry_the_games_key_and_name() {
