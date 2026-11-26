@@ -281,7 +281,18 @@ fn substitute(module: usize, name: *const u8) -> Option<usize> {
         let m = crate::sys::lock(&MODULES);
         m.iter().find(|x| x.base == module)?.resolve
     };
-    resolve(&crate::sys::read::cstr(name as usize)?)
+    answer(module, resolve, &crate::sys::read::cstr(name as usize)?)
+}
+
+/// What the game gets for `name` in the SDK at `base`: the front end's own function,
+/// else the export's call-logging stub (`hook::install` through the swap), else none.
+fn answer(base: usize, resolve: Resolver, name: &str) -> Option<usize> {
+    resolve(name).or_else(|| crate::sys::hook::stub_for(base, name))
+}
+
+/// Whether the SDK at `base` is registered here (its names are swapped).
+pub fn registered(base: usize) -> bool {
+    crate::sys::lock(&MODULES).iter().any(|m| m.base == base)
 }
 
 unsafe extern "system" fn detour_get_proc(module: usize, name: *const u8) -> usize {
@@ -403,7 +414,7 @@ pub fn patch_imports() {
             for imp in theirs {
                 let f = *cache
                     .entry(imp.name.clone())
-                    .or_insert_with(|| resolve(&imp.name));
+                    .or_insert_with(|| answer(*base, *resolve, &imp.name));
                 if let Some(f) = f {
                     if unsafe { crate::sys::pe::write_slot(imp.slot, f) } {
                         n += 1;

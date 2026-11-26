@@ -380,7 +380,12 @@ What the hook does:
 - Walks modules already loaded at startup, then watches for later loads.
 - Hooks Steamworks, PlayFab Party, PlayFab Lobby & Matchmaking, and
   PlayFab Core exports, and logs each call. Interface version strings and callback
-  ids are included. Hot calls are throttled.
+  ids are included. Hot calls are throttled. For an SDK whose functions PeerParty
+  already hands the game by name (steam_api, EOS, PlayFab Party and Multiplayer, Vivox), the game is handed
+  each function's logging stub that way and the SDK's code isn't patched at all (some
+  games check it); the `module` line says which (`calls_logged=`).
+  `PEERPARTY_CALLS_SKIP=prefix,...` leaves exports whose names start with one of the
+  prefixes (`*` for all) out of the logging, to find one a game objects to.
 - Hooks `getaddrinfo`, `GetAddrInfoW`, `GetAddrInfoExA/W`, `gethostbyname`,
   `DnsQuery_A/W` and `DnsQueryEx`, and logs the hostname.
 - EOS exports are logged the same way.

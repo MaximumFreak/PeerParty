@@ -309,13 +309,15 @@ fn consider(m: Mod) {
             typed.hooked += mine.len();
             typed.skip.extend(mine);
         }
+        // An SDK whose names the swap answers is logged through it, its code untouched.
+        let swapped = crate::sys::swap::registered(m.base as usize);
         let summary = if watch {
-            crate::sys::hook::install(&table.code, &typed.skip)
+            crate::sys::hook::install(&table.code, &typed.skip, swapped.then_some(m.base as usize))
         } else {
             crate::sys::hook::Summary { hooked: 0, failed: 0, samples: Vec::new() }
         };
         log!(
-            "module {} base={:p} sdk={} exports={} forwarders={} skipped={} anticheat_unhooked={} hooked={} typed={} failed={}",
+            "module {} base={:p} sdk={} exports={} forwarders={} skipped={} anticheat_unhooked={} hooked={} typed={} failed={} calls_logged={}",
             m.full,
             m.base,
             sdk::label(kind),
@@ -325,7 +327,8 @@ fn consider(m: Mod) {
             anticheat,
             summary.hooked,
             typed.hooked,
-            summary.failed
+            summary.failed,
+            if !watch { "off" } else if swapped { "by name (code untouched)" } else { "in the code" }
         );
         for sample in &summary.samples {
             log!("hook failed {sample}");
@@ -886,7 +889,7 @@ mod tests {
             assert!(found.is_some() && (expect.is_none() || found == *expect), "{path}: {found:?}");
             let expect = found.unwrap();
             let typed = crate::steam::attach(expect, &table.code);
-            let summary = crate::sys::hook::install(&table.code, &typed.skip);
+            let summary = crate::sys::hook::install(&table.code, &typed.skip, None);
             let ok = summary.hooked + typed.hooked;
             assert!(
                 ok > 20,

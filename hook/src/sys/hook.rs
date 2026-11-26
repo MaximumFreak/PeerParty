@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::panic::AssertUnwindSafe;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
 use retour::RawDetour;
 
@@ -186,17 +186,42 @@ pub fn hook_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 /// Hooks every code export except `skip` (already typed-hooked) and anti-cheat
-/// entry points, which are never detoured.
-pub fn install(exports: &[Export], skip: &HashSet<usize>) -> Summary {
-    with_lock(|| install_locked(exports, skip))
+/// entry points, which are never detoured. For an SDK whose names the swap answers
+/// (`swap::registered`), `swapped` is its base: its code isn't patched at all, the game
+/// is handed each export's stub by name instead (`stub_for`) and the stub goes on to
+/// the export as it is. Some games check their SDK's code for changes now and then.
+pub fn install(exports: &[Export], skip: &HashSet<usize>, swapped: Option<usize>) -> Summary {
+    with_lock(|| install_locked(exports, skip, swapped))
 }
 
-fn install_locked(exports: &[Export], skip: &HashSet<usize>) -> Summary {
+/// (SDK base, export name) -> its call-logging stub, for SDKs logged through the swap.
+static SWAPPED: LazyLock<Mutex<HashMap<(usize, String), usize>>> = LazyLock::new(Mutex::default);
+
+/// The call-logging stub of export `name` of the SDK at `base`, when its calls are
+/// logged through the swap.
+pub fn stub_for(base: usize, name: &str) -> Option<usize> {
+    crate::sys::lock(&SWAPPED).get(&(base, name.to_string())).copied()
+}
+
+/// Whether `name` is left without call logging by `PEERPARTY_CALLS_SKIP` (name prefixes,
+/// comma-separated; `*` for every export): for finding which hooked export a game
+/// objects to, a few at a time.
+fn calls_skipped(name: &str, prefixes: &str) -> bool {
+    prefixes.split(',').map(str::trim).filter(|p| !p.is_empty()).any(|p| p == "*" || name.starts_with(p))
+}
+
+fn install_locked(exports: &[Export], skip: &HashSet<usize>, swapped: Option<usize>) -> Summary {
     let mut groups: HashMap<usize, Vec<String>> = HashMap::new();
     let mut order = Vec::new();
+    let skip_names = std::env::var("PEERPARTY_CALLS_SKIP").unwrap_or_default();
+    let mut left = 0usize;
     for export in exports {
         let addr = export.addr as usize;
         if addr == 0 || skip.contains(&addr) {
+            continue;
+        }
+        if calls_skipped(&export.name, &skip_names) {
+            left += 1;
             continue;
         }
         if export.name.contains("AntiCheat") || export.name.contains("EasyAntiCheat") {
@@ -224,6 +249,15 @@ fn install_locked(exports: &[Export], skip: &HashSet<usize>) -> Summary {
                 continue;
             }
         };
+        if let Some(base) = swapped {
+            unsafe { stub_w.add(tramp_off).cast::<usize>().write_unaligned(addr) };
+            let mut map = crate::sys::lock(&SWAPPED);
+            for n in names {
+                map.insert((base, n.clone()), stub as usize);
+            }
+            summary.hooked += 1;
+            continue;
+        }
         let built = std::panic::catch_unwind(AssertUnwindSafe(|| unsafe {
             RawDetour::new(addr as *const (), stub as *const ())
         }));
@@ -252,6 +286,9 @@ fn install_locked(exports: &[Export], skip: &HashSet<usize>) -> Summary {
         // The trampoline has to outlive this function, not just skip its destructor.
         Box::leak(Box::new(detour));
         summary.hooked += 1;
+    }
+    if left > 0 {
+        log!("calls: {left} export(s) left without call logging (PEERPARTY_CALLS_SKIP={skip_names})");
     }
     summary
 }
@@ -548,6 +585,15 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn calls_skip_takes_name_prefixes() {
+        assert!(calls_skipped("SteamAPI_RunCallbacks", "SteamInternal_, SteamAPI_Run"));
+        assert!(!calls_skipped("SteamAPI_Init", "SteamInternal_,SteamAPI_Run"));
+        assert!(calls_skipped("anything", "*"));
+        assert!(!calls_skipped("SteamAPI_Init", ""));
+        assert!(!calls_skipped("SteamAPI_Init", " , "));
+    }
+
+    #[test]
     fn decodes_version_callback_and_init_blob() {
         let ver = CString::new("SteamNetworkingSockets012").unwrap();
         let got = detail(
@@ -576,6 +622,12 @@ mod tests {
         g: usize,
     ) -> usize {
         a + b + c + d + e + f + g
+    }
+
+    /// `sum7` again, a function of its own for the swap path.
+    #[inline(never)]
+    unsafe extern "C" fn sum8(a: usize, b: usize, c: usize, d: usize, e: usize, f: usize, g: usize) -> usize {
+        black_box(a + b + c + d + e + f) + g
     }
 
     #[inline(never)]
@@ -629,6 +681,7 @@ mod tests {
                 addr: code as *const (),
             }],
             &HashSet::new(),
+            None,
         );
         assert_eq!(summary.hooked, 1, "{:?}", summary.samples);
         assert_eq!(unsafe { black_box(func)() }, 1);
@@ -649,6 +702,7 @@ mod tests {
                 addr: sum7 as *const (),
             }],
             &HashSet::new(),
+            None,
         );
         install(
             &[Export {
@@ -656,6 +710,7 @@ mod tests {
                 addr: mix as *const (),
             }],
             &HashSet::new(),
+            None,
         );
         install(
             &[Export {
@@ -663,6 +718,7 @@ mod tests {
                 addr: find_iface as *const (),
             }],
             &HashSet::new(),
+            None,
         );
 
         let sum7 = black_box(
@@ -679,7 +735,19 @@ mod tests {
         let find = black_box(find_iface as unsafe extern "C" fn(usize, *const i8) -> usize);
         assert_eq!(unsafe { find(7, ver.as_ptr()) }, 7);
 
+        // Through the swap: the function's code stays as it was, and its stub (what the
+        // game is handed by name) logs, then runs it.
+        let before: Vec<u8> = unsafe { std::slice::from_raw_parts(sum8 as *const u8, 16) }.to_vec();
+        let summary = install(&[Export { name: "SumEight".into(), addr: sum8 as *const () }], &HashSet::new(), Some(0x5eed));
+        assert_eq!(summary.hooked, 1);
+        assert_eq!(unsafe { std::slice::from_raw_parts(sum8 as *const u8, 16) }, &before[..]);
+        assert_eq!(stub_for(0x5eed, "Other"), None);
+        let stub: unsafe extern "C" fn(usize, usize, usize, usize, usize, usize, usize) -> usize =
+            unsafe { std::mem::transmute(stub_for(0x5eed, "SumEight").expect("stub")) };
+        assert_eq!(unsafe { stub(1, 2, 3, 4, 5, 6, 8) }, 29);
+
         let text = std::fs::read_to_string(&log_path).unwrap();
+        assert!(text.contains("call SumEight n=1"), "{text}");
         assert!(text.contains("call SumSeven n=1"), "{text}");
         assert!(
             text.contains("SteamInternal_FindOrCreateUserInterface"),
