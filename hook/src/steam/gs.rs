@@ -1338,9 +1338,46 @@ where
     crate::sys::detour::arm_at(slot, addr, detour, "steam-gs", "detour")
 }
 
+/// The game server exports `attach` hooks.
+const HOOKED: [&str; 9] = [
+    "SteamGameServer_GetHSteamPipe",
+    "SteamAPI_GetHSteamPipe",
+    "GetHSteamPipe",
+    "SteamInternal_GameServer_Init_V2",
+    "SteamInternal_GameServer_Init",
+    "SteamGameServer_Shutdown",
+    "SteamGameServer_RunCallbacks",
+    "SteamGameServer_GetSteamID",
+    "SteamGameServer_BSecure",
+];
+
+/// The other exports whose code is at `addr` too, leaving out `name`'s other name
+/// (`GetHSteamPipe` is `SteamAPI_GetHSteamPipe`). A DLL whose small functions were folded
+/// into one body runs it for all of them, so a hook on it takes their calls for this
+/// one's: every call to any of them was a game server starting.
+fn sharing<'a>(exports: &'a [Export], name: &str, addr: usize) -> Vec<&'a str> {
+    let base = |n: &str| n.strip_prefix("SteamAPI_").unwrap_or(n).to_string();
+    exports
+        .iter()
+        .filter(|e| e.addr as usize == addr && e.name != name && base(&e.name) != base(name))
+        .map(|e| e.name.as_str())
+        .collect()
+}
+
 /// Hooks steam_api's game server exports. Returns the addresses it patched.
 pub fn attach(exports: &[Export]) -> Vec<usize> {
-    let find = |n: &str| exports.iter().find(|e| e.name == n).map(|e| e.addr as usize);
+    for name in HOOKED {
+        let Some(e) = exports.iter().find(|e| e.name == name) else { continue };
+        let others = sharing(exports, name, e.addr as usize);
+        if !others.is_empty() {
+            let more = if others.len() > 4 { format!(", and {} more", others.len() - 4) } else { String::new() };
+            log!(
+                "steam-gs: {name}'s code is other exports' too ({}{more}): not hooked, since its hook would take their calls for its own; a game server it starts goes unseen by PeerParty",
+                others[..others.len().min(4)].join(", ")
+            );
+        }
+    }
+    let find = |n: &str| exports.iter().find(|e| e.name == n).map(|e| e.addr as usize).filter(|&a| sharing(exports, n, a).is_empty());
     let mut patched = Vec::new();
     // The getters are hooked to see which pipe a dispatch asked for (`server_dispatch`).
     if let Some(a) = find("SteamGameServer_GetHSteamPipe") {
@@ -1756,6 +1793,24 @@ pub fn finish_empty() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An export whose code other exports share isn't hooked; one name's other name
+    /// (`SteamAPI_` in front) doesn't count as sharing.
+    #[test]
+    fn folded_exports_are_told_apart_from_other_names() {
+        let ex = |name: &str, addr: usize| Export { name: name.into(), addr: addr as *const () };
+        let exports = [
+            ex("SteamInternal_GameServer_Init_V2", 0x100),
+            ex("SteamAPI_InitFlat", 0x100),
+            ex("Steam_GetHSteamUserCurrent", 0x100),
+            ex("SteamAPI_GetHSteamPipe", 0x200),
+            ex("GetHSteamPipe", 0x200),
+            ex("SteamGameServer_Shutdown", 0x300),
+        ];
+        assert_eq!(sharing(&exports, "SteamInternal_GameServer_Init_V2", 0x100), vec!["SteamAPI_InitFlat", "Steam_GetHSteamUserCurrent"]);
+        assert!(sharing(&exports, "GetHSteamPipe", 0x200).is_empty());
+        assert!(sharing(&exports, "SteamGameServer_Shutdown", 0x300).is_empty());
+    }
 
     fn advert(kv: &[(&str, &str)]) -> Lobby {
         let mut l = Lobby::new(NS);
