@@ -26,7 +26,6 @@ pub struct Reader<'a> {
     pub at: usize,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const STRING: u8 = 0x10;
 pub(crate) const BLOB: u8 = 0x13;
 
@@ -61,7 +60,6 @@ impl<'a> Reader<'a> {
         self.take(n)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn string(&mut self) -> Option<&'a [u8]> {
         self.tag(STRING)?;
         let rest = self.b.get(self.at..)?;

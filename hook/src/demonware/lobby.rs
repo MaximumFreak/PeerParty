@@ -100,6 +100,7 @@ fn service_name(id: u8) -> &'static str {
 
 /// Demonware's typed encoding (byte_buffer with data types): a type byte, then the value.
 pub mod typed {
+    pub const BOOL: u8 = 1;
     pub const UBYTE: u8 = 3;
     pub const UINT32: u8 = 8;
     pub const UINT64: u8 = 10;
@@ -115,7 +116,21 @@ pub mod typed {
         out.push(UINT64);
         out.extend_from_slice(&v.to_le_bytes());
     }
+    pub fn bool(out: &mut Vec<u8>, v: bool) {
+        out.extend_from_slice(&[BOOL, v as u8]);
+    }
+    /// A string: its bytes and a NUL, no length.
+    pub fn string(out: &mut Vec<u8>, v: &[u8]) {
+        out.push(super::super::mm::STRING);
+        out.extend_from_slice(v);
+        out.push(0);
+    }
 }
+
+/// bdStorage's error for a file it doesn't have (BD_NO_FILE).
+const NO_FILE: u32 = 1000;
+/// The most DDL checksums one verify call is answered for.
+const MAX_DDL_FILES: u32 = 256;
 
 /// One connection's state.
 struct Conn {
@@ -143,10 +158,54 @@ pub fn task_reply(task: u8, results: &[Vec<u8>]) -> Vec<u8> {
     b
 }
 
+/// A task reply's body for an error: the error code, then the transaction id again in
+/// place of the results.
+pub fn task_error(task: u8, error: u32) -> Vec<u8> {
+    let id = TRANSACTION.fetch_add(1, Ordering::Relaxed) + 1;
+    let mut b = Vec::new();
+    typed::u64(&mut b, id);
+    typed::u32(&mut b, error);
+    typed::u8(&mut b, task);
+    typed::u64(&mut b, id);
+    b
+}
+
+/// The error service `service`'s task `task` answers with, where it has one.
+fn error(service: u8, task: u8, args: &[u8]) -> Option<(u32, String)> {
+    match (service, task) {
+        // bdStorage getPublisherFile: the title's own files (signed, Activision's) aren't
+        // PeerParty's to hand out; the server's answer for a file it doesn't have. An
+        // empty success would be read as a file that's there and broken.
+        (10, 21) => {
+            let mut r = super::mm::Reader::new(args);
+            let _ = r.string();
+            let name = r.string().map(|n| String::from_utf8_lossy(n).into_owned()).unwrap_or_default();
+            Some((NO_FILE, format!("publisher file {name:?}: not here (BD_NO_FILE)")))
+        }
+        _ => None,
+    }
+}
+
 /// The answer to service `service`'s task `task` (`args` after the task id): the
 /// results, or None for a task with no answer of its own here.
 fn answer(service: u8, task: u8, args: &[u8]) -> Option<Vec<Vec<u8>>> {
     match (service, task) {
+        // bdDDL verifyDDLFiles: a count, then each DDL file's checksum. Every one matches
+        // (a bdDDLChecksumResult: the checksum, then true): the server holds no other
+        // copy of the game's data layouts to compare with.
+        (96, 1) => {
+            let mut r = super::mm::Reader::new(args);
+            let n = r.u32()?.min(MAX_DDL_FILES);
+            let mut out = Vec::new();
+            for _ in 0..n {
+                let Some(sum) = r.string() else { break };
+                let mut v = Vec::new();
+                typed::string(&mut v, sum);
+                typed::bool(&mut v, true);
+                out.push(v);
+            }
+            Some(out)
+        }
         // bdTitleUtilities getServerTime: a bdTimeStamp.
         (12, 6) => {
             let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as u32).unwrap_or(0);
@@ -330,18 +389,25 @@ fn call(conn: &mut TcpStream, c: &mut Conn, keys: &Keys, plain: &[u8]) -> io::Re
         [t, args @ ..] => (*t, args),
         [] => (0, &[][..]),
     };
-    let results = answer(service, task, args);
-    let answered = results.is_some();
+    let failed = error(service, task, args);
+    let results = if failed.is_some() { None } else { answer(service, task, args) };
+    let how = match (&failed, &results) {
+        (Some((code, why)), _) => format!(" (error {code}: {why})"),
+        (None, Some(r)) => format!(" ({} result(s))", r.len()),
+        (None, None) => " (no answer of its own: empty success)".to_string(),
+    };
     crate::log::throttled(&format!("demonware call {service} {task}"), 2, |n| {
         log!(
-            "demonware lobby: {} ({service}) task {task}{}: args {} n={n}",
+            "demonware lobby: {} ({service}) task {task}{how}: args {} n={n}",
             service_name(service),
-            if answered { "" } else { " (no answer of its own: empty success)" },
             hex(&args[..args.len().min(if service == 21 { 400 } else { 96 })])
         )
     });
     let mut body = vec![TASK_REPLY];
-    body.extend_from_slice(&task_reply(task, &results.unwrap_or_default()));
+    match failed {
+        Some((code, _)) => body.extend_from_slice(&task_error(task, code)),
+        None => body.extend_from_slice(&task_reply(task, &results.unwrap_or_default())),
+    }
     c.sent = c.sent.wrapping_add(1);
     conn.write_all(&seal(keys, c.sent, &body))
 }
@@ -424,6 +490,45 @@ mod tests {
         assert_eq!(body[14..16], [typed::UBYTE, 6]);
         assert_eq!(body[16..21], [typed::UINT32, 1, 0, 0, 0]);
         assert_eq!(body[26], typed::UINT32);
+    }
+
+    #[test]
+    fn every_ddl_checksum_matches() {
+        // Two checksums, as a game sends them (trailing byte included).
+        let mut args = Vec::new();
+        typed::u32(&mut args, 2);
+        typed::string(&mut args, b"0123456789abcdef0123456789abcdef");
+        typed::string(&mut args, b"fedcba9876543210fedcba9876543210");
+        args.push(0);
+        let got = answer(96, 1, &args).unwrap();
+        assert_eq!(got.len(), 2);
+        let mut first = Vec::new();
+        typed::string(&mut first, b"0123456789abcdef0123456789abcdef");
+        first.extend_from_slice(&[typed::BOOL, 1]);
+        assert_eq!(got[0], first);
+        // A count larger than what follows answers what's there; a huge one is bounded.
+        let mut short = Vec::new();
+        typed::u32(&mut short, u32::MAX);
+        typed::string(&mut short, b"aa");
+        assert_eq!(answer(96, 1, &short).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_publisher_file_is_answered_not_there() {
+        let mut args = Vec::new();
+        typed::string(&mut args, b"");
+        typed::string(&mut args, b"keys.txt");
+        args.push(0);
+        let (code, why) = error(10, 21, &args).unwrap();
+        assert_eq!(code, NO_FILE);
+        assert!(why.contains("keys.txt"), "{why}");
+        // Error body: transaction id, the code, the task, the transaction id again.
+        let b = task_error(21, NO_FILE);
+        assert_eq!(b.len(), 9 + 5 + 2 + 9);
+        assert_eq!(b[9..14], [typed::UINT32, 0xE8, 3, 0, 0]);
+        assert_eq!(b[14..16], [typed::UBYTE, 21]);
+        assert_eq!(b[..9], b[16..]);
+        assert!(error(10, 20, &args).is_none());
     }
 
     #[test]

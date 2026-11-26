@@ -62,10 +62,18 @@ pub fn read_app_ticket(ticket: &[u8]) -> Player {
         let key = included.get(..24).unwrap_or_default().to_vec();
         let name_bytes = included.get(24..).unwrap_or_default();
         let end = name_bytes.iter().position(|b| *b == 0).unwrap_or(name_bytes.len()).min(64);
-        let name = String::from_utf8_lossy(&name_bytes[..end]).into_owned();
+        let mut name = String::from_utf8_lossy(&name_bytes[..end]).into_owned();
+        // A game that sends no data of its own with the ticket has no name in it.
+        if name.is_empty() {
+            name = lan_name();
+        }
         return Player { steam_id, name, key };
     }
-    Player { steam_id: crate::hub::accounts::my_steam_id(), name: crate::net::lan().map(|l| l.name().to_string()).unwrap_or_default(), key: Vec::new() }
+    Player { steam_id: crate::hub::accounts::my_steam_id(), name: lan_name(), key: Vec::new() }
+}
+
+fn lan_name() -> String {
+    crate::net::lan().map(|l| l.name().to_string()).unwrap_or_default()
 }
 
 /// The reply's `auth_task`: the request's plus one (Steam sign-in asks with 28 and
