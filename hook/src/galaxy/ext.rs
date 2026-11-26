@@ -1703,7 +1703,7 @@ vmethod! { fn close_connection_1(this: usize, id: u64) { unsafe { close_connecti
 vmethod! { fn request_ticket_2(this: usize, data: *const u8, size: u32) { unsafe { request_ticket(this, data, size, 0) } } }
 vmethod! {
     fn report_invalid_token_1(this: usize, token: *const c_char) -> bool {
-        unsafe { report_invalid_token(this, token, std::ptr::null()) }
+        unsafe { report_invalid_token(this, token, std::ptr::null()) != 0 }
     }
 }
 

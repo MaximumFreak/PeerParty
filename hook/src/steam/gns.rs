@@ -1639,7 +1639,7 @@ mod tests {
     #[test]
     fn socket_pairs_carry_messages_between_their_ends() {
         let (mut a, mut b) = (0u32, 0u32);
-        assert!(unsafe { create_socket_pair(0, &mut a, &mut b, true, std::ptr::null(), std::ptr::null()) });
+        assert!(unsafe { create_socket_pair(0, &mut a, &mut b, true, std::ptr::null(), std::ptr::null()) } != 0);
         assert_eq!(send(a, b"ping", SEND_RELIABLE).0, OK);
         let mut out = [std::ptr::null_mut::<Message>(); 4];
         // Without a LAN, only the pair's own queue is read.

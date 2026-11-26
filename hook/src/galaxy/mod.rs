@@ -844,7 +844,7 @@ vmethod! {
 vmethod! { fn get_user_data_count_0(this: usize) -> u32 { unsafe { get_user_data_count(this, by_value(&0)) } } }
 vmethod! {
     fn get_user_data_by_index_5(this: usize, index: u32, key: *mut c_char, klen: u32, value: *mut c_char, vlen: u32) -> bool {
-        unsafe { get_user_data_by_index(this, index, key, klen, value, vlen, by_value(&0)) }
+        unsafe { get_user_data_by_index(this, index, key, klen, value, vlen, by_value(&0)) != 0 }
     }
 }
 

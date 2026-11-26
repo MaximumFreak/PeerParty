@@ -509,20 +509,20 @@ mod tests {
         assert_eq!(i32::from_le_bytes(data[8..12].try_into().unwrap()), RESULT_OK);
         assert_eq!(u32::from_le_bytes(data[16..20].try_into().unwrap()), 2, "bytes read from offset 1");
         let mut buf = [0u8; 8];
-        assert!(unsafe { v_read_async_complete(0, call, buf.as_mut_ptr(), 8) });
+        assert!(unsafe { v_read_async_complete(0, call, buf.as_mut_ptr(), 8) } != 0);
         assert_eq!(&buf[..2], b"ne");
         // Streams.
         let h = unsafe { v_stream_open(0, c"big.bin".as_ptr()) };
-        assert!(unsafe { v_stream_chunk(0, h, b"ab".as_ptr(), 2) });
-        assert!(unsafe { v_stream_chunk(0, h, b"cd".as_ptr(), 2) });
-        assert!(unsafe { v_stream_close(0, h) });
+        assert!(unsafe { v_stream_chunk(0, h, b"ab".as_ptr(), 2) } != 0);
+        assert!(unsafe { v_stream_chunk(0, h, b"cd".as_ptr(), 2) } != 0);
+        assert!(unsafe { v_stream_close(0, h) } != 0);
         assert_eq!(read_file(&d, "big.bin").as_deref(), Some(&b"abcd"[..]));
         assert_eq!(unsafe { v_count(0) }, 3);
         let mut size = 0;
         let name = unsafe { v_name_and_size(0, 0, &mut size) };
         assert_eq!((crate::sys::read::cstr(name as usize).as_deref(), size), (Some("big.bin"), 4));
-        assert!(unsafe { v_delete(0, c"big.bin".as_ptr()) });
-        assert!(!unsafe { v_exists(0, c"big.bin".as_ptr()) });
+        assert!(unsafe { v_delete(0, c"big.bin".as_ptr()) } != 0);
+        assert!(unsafe { v_exists(0, c"big.bin".as_ptr()) } == 0);
         crate::saves::vfs::tests::uninstall();
         let _ = std::fs::remove_dir_all(&base);
     }
