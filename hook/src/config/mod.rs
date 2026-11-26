@@ -11,7 +11,9 @@
 //!
 //! - settings.rs: settings the overlay can change live.
 //! - modes.rs: per service, LAN stand-in or the official servers.
+//! - hooks.rs: the player's hooks files, for functions found by their bytes.
 
+pub(crate) mod hooks;
 pub(crate) mod modes;
 pub(crate) mod settings;
 
@@ -99,6 +101,10 @@ pub struct HookConfig {
     /// `PEERPARTY_PHOTON_TRACE`, `PEERPARTY_XBL_TRACE`: log every message.
     pub photon_trace: bool,
     pub xbl_trace: bool,
+    /// `PEERPARTY_HTTP_TRACE`: log the game's HTTP calls to known services (curl/).
+    pub http_trace: bool,
+    /// `PEERPARTY_PATTERNS_DIR`: the pattern files' folder (hooks.rs) in place of the usual one.
+    pub patterns_dir: Option<PathBuf>,
     /// `PEERPARTY_PHOTON_IP`: a loopback address for the Photon servers (tests).
     pub photon_ip: Option<std::net::Ipv4Addr>,
     /// The stand-ins' folders, for tests: `PEERPARTY_PLAYFAB_DIR`, `_UGS_DIR`,
@@ -172,6 +178,8 @@ impl HookConfig {
             steam_web: switch(env::STEAM_WEB),
             photon_trace: switch(env::PHOTON_TRACE) == Some(true),
             xbl_trace: switch(env::XBL_TRACE) == Some(true),
+            http_trace: switch(env::HTTP_TRACE) == Some(true),
+            patterns_dir: dir(env::PATTERNS_DIR),
             photon_ip: text(env::PHOTON_IP).and_then(|v| v.trim().parse::<std::net::Ipv4Addr>().ok()).filter(|ip| ip.is_loopback()),
             playfab_dir: dir(env::PLAYFAB_DIR),
             ugs_dir: dir(env::UGS_DIR),
@@ -280,6 +288,8 @@ mod tests {
             ("PEERPARTY_UGS", "off"),
             ("PEERPARTY_PHOTON", "maybe"),
             ("PEERPARTY_XBL_TRACE", "YES"),
+            ("PEERPARTY_HTTP_TRACE", "no"),
+            ("PEERPARTY_PATTERNS_DIR", r"C:\h"),
             ("PEERPARTY_SWAP", "Inline"),
             ("PEERPARTY_ROOM", "   "),
             ("PEERPARTY_PIPE", r"\\.\pipe\x"),
@@ -292,7 +302,8 @@ mod tests {
         assert!(c.active, "set, even empty");
         assert!(c.skips("photon") && c.skips("ugs") && c.skips("EOS") && !c.skips("steam"));
         assert_eq!((c.playfab, c.ugs, c.photon), (Some(true), Some(false), None));
-        assert!(c.xbl_trace && c.swap_inline);
+        assert!(c.xbl_trace && c.swap_inline && !c.http_trace);
+        assert_eq!(c.patterns_dir, Some(PathBuf::from(r"C:\h")));
         assert_eq!(c.room, None, "only spaces is no room");
         assert_eq!(c.ipc.as_deref(), Some(r"\\.\pipe\x"));
         assert_eq!(c.ugs_dir, None);

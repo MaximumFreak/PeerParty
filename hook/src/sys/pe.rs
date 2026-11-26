@@ -132,6 +132,108 @@ pub unsafe fn exports(base: *const u8) -> Result<ExportTable, &'static str> {
     }
 }
 
+/// The executable sections of a loaded image, as (start address, length), clipped to the
+/// image: where a function found by its bytes may be (sys/scan.rs).
+pub unsafe fn code_ranges(base: *const u8) -> Result<Vec<(usize, usize)>, &'static str> {
+    unsafe {
+        if base.is_null() || u16_at(base, 0)? != 0x5a4d {
+            return Err("not a PE");
+        }
+        let lfanew = u32_at(base, 0x3c)? as usize;
+        if lfanew > 0x1000 || u32_at(base, lfanew)? != 0x4550 {
+            return Err("not a PE");
+        }
+        let coff = lfanew + 4;
+        let sections_n = u16_at(base, coff + 2)? as usize;
+        let opt_size = u16_at(base, coff + 16)? as usize;
+        let opt = coff + 20;
+        let image_size = u32_at(base, opt + 56)? as usize;
+        if sections_n > 96 {
+            return Err("too many sections");
+        }
+        let sec_off = opt + opt_size;
+        let mut out = Vec::new();
+        for i in 0..sections_n {
+            let o = sec_off + i * 40;
+            if u32_at(base, o + 36)? & SCN_MEM_EXECUTE == 0 {
+                continue;
+            }
+            let va = u32_at(base, o + 12)? as usize;
+            let size = (u32_at(base, o + 8)? as usize).max(u32_at(base, o + 16)? as usize);
+            let end = va.saturating_add(size).min(image_size);
+            if end > va {
+                out.push((base as usize + va, end - va));
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// A loaded image's file version (`VS_FIXEDFILEINFO`'s, as "a.b.c.d"), from its version
+/// resource: what the hooks file matches a module's build by (config/hooks.rs).
+pub unsafe fn file_version(base: *const u8) -> Option<String> {
+    const RT_VERSION: u32 = 16;
+    unsafe {
+        if base.is_null() || u16_at(base, 0).ok()? != 0x5a4d {
+            return None;
+        }
+        let lfanew = u32_at(base, 0x3c).ok()? as usize;
+        if lfanew > 0x1000 || u32_at(base, lfanew).ok()? != 0x4550 {
+            return None;
+        }
+        let opt = lfanew + 24;
+        let dirs = match u16_at(base, opt).ok()? {
+            0x20b => opt + 112,
+            0x10b => opt + 96,
+            _ => return None,
+        };
+        let image_size = u32_at(base, opt + 56).ok()? as usize;
+        // The resource directory is the third data directory.
+        let root = u32_at(base, dirs + 16).ok()? as usize;
+        let inside = |rva: usize, len: usize| rva != 0 && rva.checked_add(len).is_some_and(|end| end <= image_size);
+        if !inside(root, 16) {
+            return None;
+        }
+        // One level of the resource tree: the entry with `id` (any for None), as its
+        // offset from the root and whether it's another directory.
+        let entry = |dir: usize, id: Option<u32>| -> Option<(usize, bool)> {
+            if !inside(root + dir, 16) {
+                return None;
+            }
+            let named = u16_at(base, root + dir + 12).ok()? as usize;
+            let ids = u16_at(base, root + dir + 14).ok()? as usize;
+            for i in 0..(named + ids).min(4096) {
+                let e = root + dir + 16 + i * 8;
+                if !inside(e, 8) {
+                    return None;
+                }
+                let name = u32_at(base, e).ok()?;
+                let to = u32_at(base, e + 4).ok()?;
+                if id.is_none_or(|id| name == id) {
+                    return Some(((to & 0x7fff_ffff) as usize, to & 0x8000_0000 != 0));
+                }
+            }
+            None
+        };
+        let (types, true) = entry(0, Some(RT_VERSION))? else { return None };
+        let (names, true) = entry(types, None)? else { return None };
+        let (data, false) = entry(names, None)? else { return None };
+        if !inside(root + data, 8) {
+            return None;
+        }
+        let (rva, size) = (u32_at(base, root + data).ok()? as usize, u32_at(base, root + data + 4).ok()? as usize);
+        if !inside(rva, size) {
+            return None;
+        }
+        // VS_VERSIONINFO: its header and key ("VS_VERSION_INFO"), then VS_FIXEDFILEINFO
+        // on a 4-byte boundary, which starts with its signature.
+        let at = (0..size.min(128).saturating_sub(16)).step_by(4).find(|o| u32_at(base, rva + o).ok() == Some(0xFEEF_04BD))?;
+        let ms = u32_at(base, rva + at + 8).ok()?;
+        let ls = u32_at(base, rva + at + 12).ok()?;
+        Some(format!("{}.{}.{}.{}", ms >> 16, ms & 0xffff, ls >> 16, ls & 0xffff))
+    }
+}
+
 pub struct Import {
     pub dll: String,
     pub name: String,
@@ -295,6 +397,16 @@ mod tests {
             table.code.len()
         );
         assert!(table.code.iter().all(|e| !e.addr.is_null()));
+        // Every code export lies in one of the code ranges.
+        let code = unsafe { code_ranges(base).unwrap() };
+        assert!(!code.is_empty());
+        assert!(table.code.iter().all(|e| code.iter().any(|&(at, len)| (e.addr as usize) >= at && (e.addr as usize) < at + len)));
+        assert!(unsafe { code_ranges(std::ptr::null()) }.is_err());
+        // Windows' own DLLs carry their version: 10.0.<build>.<revision>.
+        let v = unsafe { file_version(base) }.expect("kernel32's version");
+        assert!(v.starts_with("10.0."), "{v}");
+        assert_eq!(v.split('.').count(), 4);
+        assert_eq!(unsafe { file_version(std::ptr::null()) }, None);
     }
 
     #[test]

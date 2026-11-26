@@ -522,7 +522,13 @@ made with Windows' own crypto. It is trusted **inside the game process only**:
   ROOT store the game opens comes back as a collection with PeerParty's certificate
   added in memory;
 - GDK games' own pin check (`XNetworkingVerifyServerCertificate`, `hook/src/xgameui.rs`)
-  passes for that certificate only.
+  passes for that certificate only;
+- a libcurl with its own TLS (a libcurl DLL, or one linked into the game and found by
+  the patterns in the player's per-module hooks files, `hook/src/curl/`) is told, for a request to a host whose
+  lookup comes to the local server only, to pin that certificate's public key
+  (`CURLOPT_PINNEDPUBLICKEY`) with its chain and name checks off: curl aborts before
+  sending anything when the key differs. Its other requests keep the game's settings,
+  and a curl that can't pin is left as it is.
 
 Every other certificate chain, and every other server's pin check, goes to Windows and
 the runtime unchanged. Nothing is written to any Windows certificate store, and no other

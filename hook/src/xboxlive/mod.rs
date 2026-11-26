@@ -19,8 +19,8 @@
 //! - real.rs: privacy requests also go on, as the game signed them, to the real privacy
 //!   service: its block and mute lists and the account's limits (a child account's
 //!   settings) are merged into the LAN's answers, and kept for Party chat.
-//! - curl.rs, winhttp.rs: with `PEERPARTY_XBL_TRACE=1`, a trace of every Xbox Live
-//!   call the game makes (URLs and bodies), through XCurl or WinHTTP.
+//! - winhttp.rs: with `PEERPARTY_HTTP_TRACE=1` (or `PEERPARTY_XBL_TRACE=1`), a trace of
+//!   every Xbox Live call the game makes through WinHTTP; curl/ traces XCurl's.
 //!
 //! XUIDs: each copy learns its player's real XUID from the game's own requests to these
 //! hosts (the requester is in the path, `/users/xuid(X)/...`; presence and privacy
@@ -35,7 +35,6 @@
 //! `PEERPARTY_XBL=1`; `PEERPARTY_XBL=0` or `PEERPARTY_SKIP=xboxlive` turns it off.
 
 pub mod api;
-pub mod curl;
 pub mod real;
 pub mod ui;
 pub mod winhttp;

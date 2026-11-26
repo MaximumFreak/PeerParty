@@ -1,0 +1,57 @@
+{
+  "_comment": [
+    "Example hooks file for PeerParty (docs/usage.md, 'A game's own libcurl').",
+    "One file per module, named after it: this one is for MyGame-Win64-Shipping.exe. Put it in",
+    "%LOCALAPPDATA%\\peerparty\\patterns\\ (or the folder PEERPARTY_PATTERNS_DIR names). A DLL's",
+    "file works the same way (SomeLibrary.dll.json).",
+    "Each entry of 'versions' is for one build of the module: 'sha256' (of the module's file)",
+    "and/or 'file_version' (its version resource, a.b.c.d) say which; an entry with neither is",
+    "for any build. The log prints a module's version and SHA-256 when no entry is for it.",
+    "Of the entries that match, one with a sha256 wins, then one with a file_version, then one",
+    "with neither.",
+    "Patterns: hex bytes, '??' for a byte that changes (call and jump offsets, addresses).",
+    "The first pattern that matches exactly one place is used. curl_easy_setopt_patterns and",
+    "curl_easy_cleanup_patterns are both needed; curl_easy_reset_patterns only if the game calls",
+    "curl_easy_reset. A pattern needs at least 6 fixed bytes, at most 256 bytes in all, and",
+    "starts at the function's first byte.",
+    "curl_easy_setopt_patterns is curl_easy_setopt itself, the function with the '...': in x64",
+    "it starts by storing rdx, r8 and r9 (89 54 24 10 4C 89 44 24 18 4C 89 4C 24 20) and",
+    "returns 43 for a NULL handle. Not Curl_vsetopt, the one it calls with a va_list (it",
+    "keeps r8 as that va_list and goes straight into a switch on the option): hooked as",
+    "curl_easy_setopt, it would be handed the wrong arguments.",
+    "Keys that start with '_' are notes and are ignored."
+  ],
+  "versions": [
+    {
+      "_build": "One exact build, by its SHA-256 (made up here).",
+      "sha256": "3b1f0c9e5a7d24c8e6b0f4a2d9c87e15b3a6f0d2c4e8b1a7f9d3c5e2b0a8f6d4",
+      "curl_easy_setopt_patterns": [
+        "89 54 24 10 4C 89 44 24 18 4C 89 4C 24 20 48 83 EC 28 48 85 C9 75 08 8D 41 2B"
+      ],
+      "curl_easy_cleanup_patterns": [
+        "40 53 48 83 EC 20 48 8B D9 48 85 C9 0F 84 ?? ?? ?? ?? 48 89 7C 24 30 E8 ?? ?? ?? ??"
+      ]
+    },
+    {
+      "_build": "Any build with this file version.",
+      "file_version": "1.4.0.0",
+      "curl_easy_setopt_patterns": [
+        "89 54 24 10 4C 89 44 24 18 4C 89 4C 24 20 48 83 EC 28 48 85 C9 75 08 8D 41 2B"
+      ],
+      "curl_easy_cleanup_patterns": [
+        "40 53 48 83 EC 20 48 8B D9 48 85 C9 0F 84 ?? ?? ?? ?? 48 89 7C 24 30 E8 ?? ?? ?? ??"
+      ],
+      "curl_easy_reset_patterns": []
+    },
+    {
+      "_build": "Any other build: looser patterns, tried last.",
+      "curl_easy_setopt_patterns": [
+        "89 54 24 10 4C 89 44 24 18 4C 89 4C 24 20 48 83 EC 28 48 85 C9 75 08 8D 41 2B"
+      ],
+      "curl_easy_cleanup_patterns": [
+        "40 53 48 83 EC 20 48 8B D9 48 85 C9 0F 84 ?? ?? ?? ?? 48 89 7C 24 30 E8 ?? ?? ?? ??",
+        "40 53 48 83 EC 20 48 8B D9 48 85 C9 0F 84"
+      ]
+    }
+  ]
+}

@@ -310,9 +310,10 @@ both.
   overlay inside the game), `ipfwd` (typed-IP forwarding to internet players, and the
   path to another PC's Photon servers; without it they're reached directly, which that
   PC's firewall must allow), `vivox` (voice chat), `xboxlive` (the Xbox Live friends
-  list), `xgameui` (Xbox invite screens in Microsoft Store games), and
+  list), `xgameui` (Xbox invite screens in Microsoft Store games), `curl` (the hooks on
+  the game's own libcurl, below), and
   `calls` (the call logging in SDK modules). The launcher
-  window's game panel lists all but `calls` under Advanced, Parts of PeerParty, each
+  window's game panel lists all but `calls` and `curl` under Advanced, Parts of PeerParty, each
   switched on unless turned off for that game. When a turned-off layer is one the game
   needs (it loaded that service's SDK or looked up its servers; the general layers
   always), the overlay's Network page says so (and Players, at its top), with what it
@@ -365,6 +366,12 @@ both.
   folders: for a recording or screenshot that mustn't show your own games. An
   `installdir` that is a full path lists a game installed elsewhere, so a real one can be
   started from among them.
+- `PEERPARTY_HTTP_TRACE=1`: log the HTTP calls the game makes, through its curl or
+  WinHTTP, to the services PeerParty stands in for (PlayFab, Unity Gaming Services,
+  Xbox Live, Demonware, Steam's Web API), with their URLs and bodies (up to 4 KB each;
+  never their headers). Other hosts aren't logged. `PEERPARTY_XBL_TRACE=1` does the same.
+- `PEERPARTY_PATTERNS_DIR=folder`: the folder of pattern files to read instead of
+  `%LOCALAPPDATA%\peerparty\patterns` (below).
 
 The same thing from a prompt (x64 or x86):
 
@@ -790,6 +797,46 @@ How the window shows the copies (the game panel's Advanced > Split screen):
 What split screen does for now: it runs on Windows; one keyboard and mouse is shared
 between the players, plus a controller each, for up to four players. Racing wheels and
 a keyboard and mouse per player are planned.
+
+### A game's own libcurl
+
+A game whose web calls go through its own libcurl does its own TLS: it never asks
+Windows about certificates, so the trust PeerParty gives its local certificate (see the
+PlayFab notes above) doesn't reach it, and a call to a service PeerParty answers fails
+its certificate check. PeerParty hooks that curl's `curl_easy_setopt`, and a request to a
+host whose lookup comes to PeerParty's local server is told to accept that server's
+public key and no other (`CURLOPT_PINNEDPUBLICKEY`, with curl's own chain and name
+checks off for that request only). Every other request keeps the game's settings.
+
+- A libcurl DLL (any name, exporting `curl_easy_setopt`) is found by itself.
+- A libcurl linked into the game's exe, or into a DLL that doesn't export it, is found
+  by its bytes. Each such module has a file of its own,
+  `%LOCALAPPDATA%\peerparty\patterns\<module>.json` (`MyGame-Win64-Shipping.exe.json`,
+  `SomeLibrary.dll.json`), since its bytes change from one game and one build to the
+  next. Its `versions` list ties patterns to builds: an entry with `sha256` (of the
+  module's file) or `file_version` (its version resource) is for that build only, one
+  with neither for any; a SHA-256 match wins over a version match, which wins over an
+  entry for any build. An entry lists patterns for `curl_easy_setopt` (the function with
+  the `...`, not `Curl_vsetopt`) and `curl_easy_cleanup`, both needed, and, if the game
+  uses it, `curl_easy_reset`. Bytes are hex, `??` a wildcard; each pattern must match
+  exactly one place in the module's code, and the first that does is used. A packed exe
+  is searched again for a minute while it unpacks.
+
+  ```json
+  { "versions": [
+      { "file_version": "1.4.0.0",
+        "curl_easy_setopt_patterns": [ "89 54 24 10 4C 89 44 24 18 4C 89 4C 24 20 48 83 EC 28" ],
+        "curl_easy_cleanup_patterns": [ "40 53 48 83 EC 20 48 8B D9 48 85 C9 0F 84 ?? ?? ?? ??" ] } ] }
+  ```
+
+  The log says which entry applied (`hooks: <module> (version ...): entry 1 of ...`), or,
+  when none is for this build, the module's version and SHA-256 to write one; then what
+  each pattern found (`curl <module>: curl_easy_setopt at +0x...`).
+  [docs/examples/patterns/MyGame-Win64-Shipping.exe.json](examples/patterns/MyGame-Win64-Shipping.exe.json)
+  is a fuller example, with notes.
+- A curl that can't pin a key (older than 7.39, or a TLS back end without it) is left
+  alone, and its calls to PeerParty's hosts still fail (the log says `gap: curl ... can't
+  pin`). `PEERPARTY_SKIP=curl` turns the curl hooks off.
 
 ### Internet play
 

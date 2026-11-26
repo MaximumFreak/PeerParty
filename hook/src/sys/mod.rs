@@ -4,6 +4,7 @@
 //! - hook.rs: the generic logging hooks on every export, and the process-wide hook lock.
 //! - pe.rs: a module's export table, read from memory.
 //! - read.rs: safe reads of pointers a game hands over (strings, bytes).
+//! - scan.rs: finding a function in a module by its bytes (a pattern with wildcards).
 //! - win.rs: wide strings, module and export lookups, memory queries.
 //! - com.rs: GUIDs and calls through a COM vtable.
 //! - vtable.rs: C++ stand-in objects: `vmethod!` and the slot-forwarding stubs.
@@ -17,6 +18,7 @@ pub(crate) mod exitlog;
 pub(crate) mod hook;
 pub(crate) mod pe;
 pub(crate) mod read;
+pub(crate) mod scan;
 pub(crate) mod swap;
 pub(crate) mod vtable;
 pub(crate) mod win;

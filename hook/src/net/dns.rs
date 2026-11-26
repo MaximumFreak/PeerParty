@@ -236,6 +236,20 @@ fn redirect(host: &str) -> Option<String> {
     })
 }
 
+/// Whether a lookup of `host` comes to PeerParty's own HTTPS server (https/), so a
+/// connection to it reaches PeerParty's certificate. It's the same answer the lookup
+/// itself will get (and, like it, may start the server).
+pub fn answered_here(host: &str) -> bool {
+    let Some(to) = redirect(host) else { return false };
+    crate::https::server().is_some_and(|ip| ip.to_string() == to)
+}
+
+/// Whether `host` is one of a service PeerParty stands in for, answered here or not.
+pub fn is_service_host(host: &str) -> bool {
+    let h = host.trim_end_matches('.').to_ascii_lowercase();
+    crate::hub::DNS.iter().any(|s| (s.is_host)(&h))
+}
+
 thread_local! {
     /// Set on PeerParty's own threads whose lookups must reach the real hosts (modes.rs).
     static BYPASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };

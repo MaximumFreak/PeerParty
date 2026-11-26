@@ -1,10 +1,11 @@
-//! The same trace as curl.rs for games whose libHttpClient runs on WinHTTP directly
-//! (games that ship no XCurl.dll), also only with `PEERPARTY_XBL_TRACE=1`.
+//! The same trace as curl/ (XCurl) for games whose libHttpClient runs on WinHTTP directly
+//! (games that ship no XCurl.dll), also only with `PEERPARTY_HTTP_TRACE=1` (or
+//! `PEERPARTY_XBL_TRACE=1`).
 //! `WinHttpConnect` names the host and `WinHttpOpenRequest` the verb and path; each
 //! `*.xboxlive.com` request is logged with its request body (`WinHttpSendRequest`'s
 //! optional data, then any `WinHttpWriteData`, up to 4 KB) and may name the player
 //! making it. Responses aren't logged (WinHTTP hands them over asynchronously). When
-//! XCurl.dll is traced (it runs on WinHTTP too), curl.rs logs instead.
+//! XCurl.dll is traced (it runs on WinHTTP too), curl/ logs instead.
 //!
 //! Nothing a request does is changed.
 
@@ -55,7 +56,7 @@ pub fn attach(exports: &[Export]) -> usize {
     if let Some(a) = find("WinHttpOpenRequest") {
         n += usize::from(arm(&OPEN, unsafe { std::mem::transmute::<*const (), OpenRequest>(a) }, open as OpenRequest, "WinHttpOpenRequest"));
     }
-    if super::curl::bodies() {
+    if crate::curl::trace() {
         if let Some(a) = find("WinHttpSendRequest") {
             n += usize::from(arm(&SEND, unsafe { std::mem::transmute::<*const (), SendRequest>(a) }, send as SendRequest, "WinHttpSendRequest"));
         }
@@ -104,10 +105,10 @@ unsafe extern "system" fn open(
     if let Some(x) = super::own_xuid_in(&host, &path) {
         super::learn(x);
     }
-    if super::curl::active() {
+    if crate::curl::xcurl_traced() {
         return h;
     }
-    if super::curl::bodies() {
+    if crate::curl::trace() {
         let mut s = crate::sys::lock(&H);
         if s.requests.len() >= KEEP {
             s.requests.clear();

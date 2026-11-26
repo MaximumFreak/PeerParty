@@ -397,6 +397,46 @@ pub fn is_peerparty(context: *const CERT_CONTEXT) -> bool {
     is_ours(context).is_some()
 }
 
+/// The certificate's public key as curl's `CURLOPT_PINNEDPUBLICKEY` takes it: `sha256//`
+/// and the base64 of the SHA-256 of its DER SubjectPublicKeyInfo. A curl whose own
+/// certificate checks are off for PeerParty's hosts still talks only to the server with
+/// this key (curl/tls.rs).
+pub fn curl_pin() -> Option<&'static std::ffi::CStr> {
+    static PIN: OnceLock<Option<std::ffi::CString>> = OnceLock::new();
+    PIN.get_or_init(|| {
+        let der = public_key_info(cert()?)?;
+        let hash = crate::util::crypto::sha256(&der);
+        std::ffi::CString::new(format!("sha256//{}", crate::util::encoding::base64(&hash))).ok()
+    })
+    .as_deref()
+}
+
+/// The certificate's SubjectPublicKeyInfo, DER-encoded.
+fn public_key_info(cert: &Cert) -> Option<Vec<u8>> {
+    use windows_sys::Win32::Security::Cryptography::X509_PUBLIC_KEY_INFO;
+    if cert.context.is_null() {
+        return None;
+    }
+    // SAFETY: the context is the certificate made in make_cert, never freed.
+    let info = unsafe { (*cert.context).pCertInfo };
+    if info.is_null() {
+        return None;
+    }
+    let spki = unsafe { &raw const (*info).SubjectPublicKeyInfo };
+    let mut len = 0u32;
+    unsafe {
+        if CryptEncodeObjectEx(X509_ASN_ENCODING, X509_PUBLIC_KEY_INFO, spki.cast(), 0, ptr::null(), ptr::null_mut(), &mut len) == 0 {
+            return None;
+        }
+        let mut der = vec![0u8; len as usize];
+        if CryptEncodeObjectEx(X509_ASN_ENCODING, X509_PUBLIC_KEY_INFO, spki.cast(), 0, ptr::null(), der.as_mut_ptr().cast(), &mut len) == 0 {
+            return None;
+        }
+        der.truncate(len as usize);
+        Some(der)
+    }
+}
+
 fn is_ours(context: *const CERT_CONTEXT) -> Option<isize> {
     let cert = CERT.get()?.as_ref()?;
     if context.is_null() {
@@ -926,6 +966,21 @@ mod tests {
         unsafe { CertFreeCertificateChain(chain) };
         assert_ne!(ok, 0);
         status.dwError
+    }
+
+    /// The pin is Windows' own SHA-256 of the certificate's public key info.
+    #[test]
+    fn curls_pin_is_the_certificates_key() {
+        use windows_sys::Win32::Security::Cryptography::CryptHashPublicKeyInfo;
+        const CALG_SHA_256: u32 = 0x800c;
+        let cert = cert().expect("certificate");
+        let spki = unsafe { &raw const (*(*cert.context).pCertInfo).SubjectPublicKeyInfo };
+        let mut hash = [0u8; 32];
+        let mut len = hash.len() as u32;
+        let ok = unsafe { CryptHashPublicKeyInfo(0, CALG_SHA_256, 0, X509_ASN_ENCODING, spki, hash.as_mut_ptr(), &mut len) };
+        assert_ne!(ok, 0);
+        let pin = curl_pin().expect("pin").to_str().unwrap();
+        assert_eq!(pin, format!("sha256//{}", crate::util::encoding::base64(&hash)));
     }
 
     #[test]

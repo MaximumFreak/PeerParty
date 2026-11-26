@@ -15,7 +15,8 @@ it does and docs/usage.md how to use it; this file is about how changes get in.
   between `launcher` and `hook`.
 - `hook`: the DLL injected into the game. `watch/` sees SDK modules load and hooks them;
   one module or folder per SDK (`steam/`, `eos/`, `playfab/`, `galaxy/`, `photon/`, `ugs/`,
-  `demonware/`, `xboxlive/`); `input/` routes controllers, keyboard and mouse per copy and
+  `demonware/`, `xboxlive/`); `curl/` the game's own libcurl (exported, or found by the
+  patterns in the player's per-module hooks files, `config/hooks.rs`); `input/` routes controllers, keyboard and mouse per copy and
   holds them still while the overlay shows; `video/` draws the overlay inside a game's
   frames and captures frames for split screen; `net/` runs the shared LAN, DNS and the
   typed-IP forwarder.
