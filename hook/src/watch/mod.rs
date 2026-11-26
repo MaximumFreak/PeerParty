@@ -205,9 +205,11 @@ fn consider(m: Mod) {
             return;
         }
     }
-    // Modules loaded before this one have bound their imports by now.
+    // Modules loaded before this one have bound their imports by now. A game that
+    // imports an SDK statically never asks GetProcAddress for it, and only its import
+    // slots lead it to PeerParty's functions.
     crate::sys::swap::module_loaded();
-    crate::sys::swap::patch_get_proc_imports();
+    crate::sys::swap::patch_imports();
     let table = match unsafe { pe::exports(m.base.cast()) } {
         Ok(t) => t,
         Err(e) => {
@@ -311,6 +313,11 @@ fn consider(m: Mod) {
         }
         // An SDK whose names the swap answers is logged through it, its code untouched.
         let swapped = crate::sys::swap::registered(m.base as usize);
+        if swapped {
+            // Importers already bound (the game's exe, when the hook came in after
+            // start-up) are pointed here now; the rest on a later module's load.
+            crate::sys::swap::patch_imports();
+        }
         let summary = if watch {
             crate::sys::hook::install(&table.code, &typed.skip, swapped.then_some(m.base as usize))
         } else {
