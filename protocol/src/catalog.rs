@@ -184,6 +184,8 @@ pub const LAYERS: &[LayerEntry] = &[
     LayerEntry { on_game_page: false, ..service("steamown", false) },
     // The call-logging hooks on SDK exports.
     LayerEntry { id: "calls", kind: LayerKind::Diagnostic, on_game_page: false, always_reported: false, carries_lobbies: false },
+    // The hooks on the game's own libcurl (hook/src/curl/).
+    LayerEntry { id: "curl", kind: LayerKind::General, on_game_page: false, always_reported: false, carries_lobbies: false },
 ];
 
 /// A layer by its id (any case).
@@ -321,7 +323,7 @@ mod tests {
         lobbies.sort_unstable();
         assert_eq!(lobbies, ["eos", "galaxy", "party", "pfmp", "photon", "playfab", "steam", "ugs"]);
         // Every layer the hook checks with skip().
-        for id in ["steam", "eos", "party", "pfmp", "playfab", "galaxy", "photon", "ugs", "vivox", "xboxlive", "xgameui", "demonware", "invite", "padblock", "present", "ipfwd", "swap", "dns", "steamown", "calls"] {
+        for id in ["steam", "eos", "party", "pfmp", "playfab", "galaxy", "photon", "ugs", "vivox", "xboxlive", "xgameui", "demonware", "invite", "padblock", "present", "ipfwd", "swap", "dns", "steamown", "calls", "curl"] {
             assert!(layer(id).is_some(), "{id}");
         }
         let mut seen = std::collections::HashSet::new();

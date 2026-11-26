@@ -1935,6 +1935,7 @@ dependencies = [
  "peerparty_protocol",
  "retour",
  "rusty-opus",
+ "sha2",
  "windows-sys 0.61.2",
  "winresource",
 ]

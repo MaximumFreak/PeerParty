@@ -86,6 +86,7 @@ folder holding several):
 | `PPTEST_VIVOX_DIR` | A folder with a Unity game's 64-bit `VivoxNative.dll` and `vivoxsdk.dll` (its `Plugins\x86_64`) |
 | `PPTEST_STEAM_DLL`, `PPTEST_STEAM_APPID` | A `steam_api64.dll` or 32-bit `steam_api.dll` (any SDK with the flat API), and the app id of a game the signed-in Steam account owns |
 | `PPTEST_STEAM_LEGACY_DLL` | A `steam_api64.dll` from an older SDK, one that exports `SteamMatchmaking()` (with any files it reads kept beside it) |
+| `PPTEST_LIBCURL` | A 64-bit libcurl DLL (Git for Windows has `mingw64\bin\libcurl-4.dll`; cargo test only) |
 | `PPTEST_SDK_DLLS`, `PPTEST_SDK_DLLS_X86` | `;`-separated SDK DLLs the cargo test maps and hooks without running (64-bit, 32-bit) |
 
 Without the variable, `run_all.ps1` uses copies kept in

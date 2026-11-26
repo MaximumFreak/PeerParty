@@ -210,6 +210,13 @@ fn consider(m: Mod) {
     // slots lead it to PeerParty's functions.
     crate::sys::swap::module_loaded();
     crate::sys::swap::patch_imports();
+    // A module with a hooks file entry for its build (config/hooks.rs): its curl is found
+    // by its bytes, exports or not.
+    let listed = if crate::curl::enabled() { crate::config::hooks::for_module(&m.name, m.base as usize, &m.full) } else { None };
+    let listed = listed.is_some_and(|hooks| {
+        crate::curl::attach_listed(m.base as usize, &m.name, hooks);
+        true
+    });
     let table = match unsafe { pe::exports(m.base.cast()) } {
         Ok(t) => t,
         Err(e) => {
@@ -428,12 +435,16 @@ fn consider(m: Mod) {
             log!("demonware {} hooked {n} (SChannel's certificate check, for Demonware hosts only)", m.full);
         }
     } else if m.name.eq_ignore_ascii_case("xcurl.dll") {
-        if crate::net::enabled() && !crate::net::skip("xboxlive") && crate::xboxlive::curl::bodies() {
-            let n = crate::xboxlive::curl::attach(&table.code);
-            log!("xboxlive {} hooked {n} (the game's Xbox Live calls are traced)", m.full);
+        if crate::net::enabled() && !crate::net::skip("xboxlive") && crate::curl::trace() {
+            crate::curl::attach_xcurl(&m.name, &table.code);
+        }
+    } else if !listed && table.code.iter().any(|e| e.name == "curl_easy_setopt") {
+        // libcurl in a DLL of its own (any name): its TLS isn't crypt32's (curl/tls.rs).
+        if crate::curl::enabled() {
+            crate::curl::attach_library(&m.name, &table.code);
         }
     } else if m.name.eq_ignore_ascii_case("winhttp.dll") {
-        if crate::net::enabled() && !crate::net::skip("xboxlive") && crate::xboxlive::curl::bodies() && crate::xboxlive::title().is_some() {
+        if crate::net::enabled() && !crate::net::skip("xboxlive") && crate::curl::trace() && crate::xboxlive::title().is_some() {
             let n = crate::xboxlive::winhttp::attach(&table.code);
             log!("xboxlive {} hooked {n} (the game's Xbox Live calls are traced)", m.full);
         }

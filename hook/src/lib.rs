@@ -4,6 +4,7 @@
 
 // Shared infrastructure.
 mod config;
+mod curl;
 mod hub;
 mod https;
 mod log;

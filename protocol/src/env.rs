@@ -105,6 +105,13 @@ pub const VIVOX: &str = "PEERPARTY_VIVOX";
 pub const XBL: &str = "PEERPARTY_XBL";
 pub const XBL_REAL: &str = "PEERPARTY_XBL_REAL";
 pub const XBL_TRACE: &str = "PEERPARTY_XBL_TRACE";
+/// `1`: log the game's HTTP calls to the services PeerParty knows, with their bodies
+/// (hook/src/curl/), through any curl it uses, XCurl or WinHTTP. `PEERPARTY_XBL_TRACE`
+/// still does the same.
+pub const HTTP_TRACE: &str = "PEERPARTY_HTTP_TRACE";
+/// The folder of hooks files (`<module>.json`, hook/src/config/hooks.rs) instead of
+/// `%LOCALAPPDATA%\peerparty\patterns`.
+pub const PATTERNS_DIR: &str = "PEERPARTY_PATTERNS_DIR";
 pub const STEAM_ACCOUNTS: &str = "PEERPARTY_STEAM_ACCOUNTS";
 pub const STEAM_DUMP: &str = "PEERPARTY_STEAM_DUMP";
 /// `0`: Steam's Web API host goes to Steam as it is; `1`: PeerParty answers it in any

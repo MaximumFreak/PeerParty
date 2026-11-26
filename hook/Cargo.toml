@@ -12,6 +12,8 @@ crate-type = ["cdylib"]
 peerparty_core = { path = "../core" }
 peerparty_protocol = { path = "../protocol" }
 retour = "0.3.1"
+# A module's SHA-256, streamed from its file, for the hooks file (config/hooks.rs).
+sha2 = "0.10"
 # Voice (voice.rs): Opus in pure Rust, so the hook needs no C toolchain or codec DLL.
 # Its packet parsing and decoding are safe Rust (unsafe only in its SIMD kernels, each
 # guarded where it is called): it reads other players' packets inside the game.
