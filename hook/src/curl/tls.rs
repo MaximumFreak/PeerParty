@@ -86,8 +86,10 @@ impl Handles {
 
     /// The game sets one of the options (`is_option`) to `value` (`text`: a string
     /// option's text, read from the game's pointer). What curl gets instead, if the
-    /// handle is PeerParty's.
-    pub fn set(&mut self, h: usize, option: u32, value: usize, text: Option<CString>, pin: &CStr) -> Option<Value> {
+    /// handle is PeerParty's. `pin` is only asked when this handle is ours and the
+    /// option is `OPT_PINNEDPUBLICKEY`, so non-PeerParty curl calls never trigger
+    /// certificate creation.
+    pub fn set<'a>(&mut self, h: usize, option: u32, value: usize, text: Option<CString>, pin: impl FnOnce() -> Option<&'a CStr>) -> Option<Value> {
         let handle = self.entry(h);
         let g = &mut handle.game;
         match option {
@@ -98,7 +100,13 @@ impl Handles {
             OPT_PINNEDPUBLICKEY => g.pin = Some(text),
             _ => return None,
         }
-        handle.ours.then(|| ours(option, pin))
+        if !handle.ours {
+            return None;
+        }
+        match option {
+            OPT_PINNEDPUBLICKEY => pin().map(|p| Value::Text(Some(p.to_owned()))),
+            _ => Some(Value::Num(0)),
+        }
     }
 
     /// The handle's URL is set: `local` when its host is answered here. The options to
@@ -193,11 +201,12 @@ mod tests {
     #[test]
     fn a_handle_for_a_local_host_takes_the_pin_and_gives_the_games_settings_back() {
         let pin = pin();
+        let no_pin = || -> Option<&CStr> { panic!("pin must not be asked") };
         let mut t = Handles::default();
-        // The game's own settings before the URL: passed on as they are.
-        assert_eq!(t.set(1, OPT_SSL_VERIFYPEER, 1, None, &pin), None);
-        assert_eq!(t.set(1, OPT_SSL_CTX_FUNCTION, 0x5000, None, &pin), None);
-        assert_eq!(t.set(1, OPT_PINNEDPUBLICKEY, 0x6000, Some(CString::new("sha256//GAME").unwrap()), &pin), None);
+        // The game's own settings before the URL: passed on as they are, without asking for the pin.
+        assert_eq!(t.set(1, OPT_SSL_VERIFYPEER, 1, None, no_pin), None);
+        assert_eq!(t.set(1, OPT_SSL_CTX_FUNCTION, 0x5000, None, no_pin), None);
+        assert_eq!(t.set(1, OPT_PINNEDPUBLICKEY, 0x6000, Some(CString::new("sha256//GAME").unwrap()), no_pin), None);
         // A local host: the pin first, then the checks off.
         let plan = t.url(1, true, &pin);
         assert_eq!(plan[0], (OPT_PINNEDPUBLICKEY, Value::Text(Some(pin.clone()))));
@@ -206,8 +215,8 @@ mod tests {
         assert!(t.is_ours(1));
         // Another local URL changes nothing; the game's later settings are kept, not used.
         assert!(t.url(1, true, &pin).is_empty());
-        assert_eq!(t.set(1, OPT_SSL_VERIFYHOST, 2, None, &pin), Some(Value::Num(0)));
-        assert_eq!(t.set(1, OPT_PINNEDPUBLICKEY, 0, None, &pin), Some(Value::Text(Some(pin.clone()))));
+        assert_eq!(t.set(1, OPT_SSL_VERIFYHOST, 2, None, no_pin), Some(Value::Num(0)));
+        assert_eq!(t.set(1, OPT_PINNEDPUBLICKEY, 0, None, || Some(pin.as_c_str())), Some(Value::Text(Some(pin.clone()))));
         // Another host: the game's values (or curl's defaults) go back.
         let back = t.url(1, false, &pin);
         assert_eq!(
@@ -221,7 +230,7 @@ mod tests {
             ]
         );
         assert!(!t.is_ours(1));
-        assert_eq!(t.set(1, OPT_SSL_VERIFYPEER, 0, None, &pin), None, "the game's own again");
+        assert_eq!(t.set(1, OPT_SSL_VERIFYPEER, 0, None, no_pin), None, "the game's own again");
     }
 
     #[test]
@@ -238,18 +247,19 @@ mod tests {
     #[test]
     fn a_refused_pin_or_a_forgotten_handle_leaves_the_game_alone() {
         let pin = pin();
+        let no_pin = || -> Option<&CStr> { panic!("pin must not be asked") };
         let mut t = Handles::default();
         t.url(2, true, &pin);
         t.unpinned(2);
         assert!(!t.is_ours(2));
-        assert_eq!(t.set(2, OPT_SSL_VERIFYPEER, 1, None, &pin), None);
+        assert_eq!(t.set(2, OPT_SSL_VERIFYPEER, 1, None, no_pin), None);
         assert!(t.url(2, false, &pin).is_empty(), "nothing to give back");
         t.url(3, true, &pin);
         t.forget(3);
         assert!(!t.is_ours(3));
         assert!(t.url(3, false, &pin).is_empty());
         // Non-TLS options are none of this.
-        assert_eq!(t.set(3, 10002, 1, None, &pin), None);
+        assert_eq!(t.set(3, 10002, 1, None, no_pin), None);
         assert!(is_option(OPT_PINNEDPUBLICKEY) && !is_option(10002));
     }
 

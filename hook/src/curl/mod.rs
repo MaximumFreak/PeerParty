@@ -213,6 +213,10 @@ pub fn attach_listed(base: usize, module: &str, hooks: ModuleHooks) {
         let until = std::time::Instant::now() + RETRY_FOR;
         while std::time::Instant::now() < until {
             std::thread::sleep(RETRY_EVERY);
+            if crate::sys::win::module_of(base) != base {
+                log!("curl {module}: module unloaded; stopped searching");
+                return;
+            }
             if install_listed(base, &module, &hooks, true, false) {
                 return;
             }
@@ -287,8 +291,12 @@ fn install(kind: Kind, module: &str, setopt: usize, cleanup: usize, reset: usize
         at != 0 && crate::sys::detour::try_arm(slot, unsafe { std::mem::transmute::<usize, Cleanup>(at) }, detour, "curl", label, late) == Armed::Hooked
     };
     // Cleanup and reset first: by the time setopt notes a handle, its end is seen too.
-    let mut n = usize::from(arm(&copy.cleanup, cleanup, CLEANUPS[i], "curl_easy_cleanup"));
-    n += usize::from(arm(&copy.reset, reset, RESETS[i], "curl_easy_reset"));
+    if !arm(&copy.cleanup, cleanup, CLEANUPS[i], "curl_easy_cleanup") {
+        crate::sys::lock(&HOOKED).retain(|a| *a != setopt && *a != cleanup && *a != reset);
+        log!("curl {module}: curl_easy_cleanup couldn't be hooked; curl_easy_setopt left alone");
+        return 0;
+    }
+    let mut n = 1 + usize::from(arm(&copy.reset, reset, RESETS[i], "curl_easy_reset"));
     let target: SetOpt = unsafe { std::mem::transmute::<usize, SetOpt>(setopt) };
     n += usize::from(crate::sys::detour::try_arm(&copy.setopt, target, SETOPTS[i], "curl", "curl_easy_setopt", late) == Armed::Hooked);
     let what = match kind {
@@ -372,14 +380,12 @@ unsafe extern "C" fn setopt<const I: usize>(h: usize, option: u32, value: usize,
         if let Some(url) = &url {
             certificates(copy, h, url);
         } else if tls::is_option(option) {
-            if let Some(pin) = crate::https::tls::curl_pin() {
-                let text = (option == tls::OPT_PINNEDPUBLICKEY && value != 0)
-                    .then(|| crate::sys::read::utf8(value, URL_MAX).and_then(|t| CString::new(t).ok()))
-                    .flatten();
-                if let Some(v) = crate::sys::lock(&TLS).set(h, option, value, text, pin) {
-                    value = v.arg();
-                    text_value = Some(v);
-                }
+            let text = (option == tls::OPT_PINNEDPUBLICKEY && value != 0)
+                .then(|| crate::sys::read::utf8(value, URL_MAX).and_then(|t| CString::new(t).ok()))
+                .flatten();
+            if let Some(v) = crate::sys::lock(&TLS).set(h, option, value, text, crate::https::tls::curl_pin) {
+                value = v.arg();
+                text_value = Some(v);
             }
         } else if option == OPT_CURLU && value != 0 {
             crate::log::throttled(&format!("curl {} curlu", copy.label()), 1, |_| {
