@@ -12,6 +12,24 @@ use std::sync::OnceLock;
 
 /// Defines a C++ virtual method for a stand-in vtable.
 macro_rules! vmethod {
+    // A `bool` return only defines al, in Rust as in MSVC, and the rest of eax/rax is
+    // whatever the method left there. A game may still test the whole register (its
+    // compiler widened the result, or it declared the method `BOOL`), and then reads
+    // false as true; so a `bool` method returns 0 or 1 in the full register.
+    ($(#[$m:meta])* fn $name:ident($($a:ident: $t:ty),* $(,)?) -> bool $body:block) => {
+        $(#[$m])*
+        #[cfg(target_arch = "x86")]
+        unsafe extern "thiscall" fn $name($($a: $t),*) -> usize {
+            unsafe fn inner($($a: $t),*) -> bool $body
+            unsafe { inner($($a),*) as usize }
+        }
+        $(#[$m])*
+        #[cfg(not(target_arch = "x86"))]
+        unsafe extern "C" fn $name($($a: $t),*) -> usize {
+            unsafe fn inner($($a: $t),*) -> bool $body
+            unsafe { inner($($a),*) as usize }
+        }
+    };
     ($(#[$m:meta])* fn $name:ident($($a:ident: $t:ty),* $(,)?) $(-> $r:ty)? $body:block) => {
         $(#[$m])*
         #[cfg(target_arch = "x86")]
