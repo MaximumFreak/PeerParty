@@ -117,8 +117,35 @@ pub struct InstanceConn {
     pub focus_away: Option<(Instant, u32)>,
     /// It has been the window in front at least once.
     pub focus_seen: bool,
+    /// How its window came to the front: as it opened, or since.
+    pub front: Front,
     /// What closes it, every program of it (a session's copies).
     pub stop: Option<Box<dyn super::StopCopy>>,
+}
+
+/// How a copy's window has come to the front. Windows puts a window in front as it
+/// opens: a session's copy doing so wasn't chosen by a player, and the keyboard and mouse
+/// don't follow it (the last copy to start took them).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Front {
+    /// Never in front yet.
+    #[default]
+    Never,
+    /// In front since it opened, without having lost the front.
+    Opened,
+    /// It lost the front after opening: coming back is a player's doing.
+    Since,
+}
+
+impl Front {
+    /// The next state, with its window in front now or not.
+    pub fn next(self, in_front: bool) -> Front {
+        match (self, in_front) {
+            (Front::Never, true) => Front::Opened,
+            (Front::Opened, false) => Front::Since,
+            (s, _) => s,
+        }
+    }
 }
 
 impl InstanceConn {
@@ -154,6 +181,7 @@ impl InstanceConn {
             unseen: Unseen::default(),
             focus_away: None,
             focus_seen: false,
+            front: Front::Never,
             stop: None,
         }
     }
@@ -288,6 +316,7 @@ impl InstanceConn {
             return false;
         }
         self.pid = pid;
+        self.front = Front::Never;
         self.viewport = None;
         self.game_window = GameWindow::none();
         self.hwnd_checked = None;
@@ -401,6 +430,20 @@ impl InstanceConn {
 mod tests {
     use super::*;
     use peerparty_protocol::session::{InputAssignment, InstanceId, PaneRect};
+
+    /// A window in front as it opens isn't a player's choice until it has lost the front
+    /// once; every return after that is.
+    #[test]
+    fn a_window_in_front_as_it_opens_is_told_apart() {
+        let f = Front::Never.next(false);
+        assert_eq!(f, Front::Never, "not opened yet");
+        let f = f.next(true);
+        assert_eq!(f, Front::Opened);
+        assert_eq!(f.next(true), Front::Opened, "still in front from opening");
+        let f = f.next(false);
+        assert_eq!(f, Front::Since);
+        assert_eq!(f.next(true), Front::Since, "brought back: a choice");
+    }
 
     /// The overlay handed to a game that never draws it closes 2.5 s after the first
     /// hand-over (frames handed over meanwhile don't restart the clock); one the hook

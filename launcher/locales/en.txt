@@ -641,6 +641,7 @@ overlay.seat_swap = Swap
 overlay.seat_free = Free
 overlay.pane_closed = Player {n}: the game closed
 overlay.pane_starting = Player {n}: starting
+overlay.pane_waiting = Player {n}: starting soon
 overlay.keyboard_to = Keyboard and mouse go to
 overlay.keyboard_to_detail = Ctrl+Alt+1–4 or a click on a pane does it too
 snack.started_split = Started {game} in {n}-player split screen

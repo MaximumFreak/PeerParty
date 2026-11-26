@@ -732,6 +732,12 @@ controllers. The overlay's **Split screen** tab (first, and where it opens unles
 invite waits) lists this PC's players: swap two players' controllers, free one for the
 next controller pressed, or hand the keyboard and mouse to another player.
 
+The keyboard and mouse start with player 1 (or the player given them with `--inputs`)
+and move when a player clicks a pane, presses `Ctrl+Alt+1`–`4` or uses the overlay, or
+switches to a copy's window: not when a copy's window comes to the front by itself as it
+opens. A pane whose copy hasn't started yet (copies start one after another) says it's
+starting soon; once its copy runs and until its picture shows, that it's starting.
+
 Keys, with the session's window or a copy in front:
 
 - `Ctrl+Alt+E`: opens or closes Layout Studio.

@@ -626,6 +626,7 @@ overlay.seat_swap = 交换
 overlay.seat_free = 释放
 overlay.pane_closed = 玩家 {n}：游戏已关闭
 overlay.pane_starting = 玩家 {n}：正在启动
+overlay.pane_waiting = 玩家 {n}：即将启动
 overlay.keyboard_to = 键盘和鼠标给
 overlay.keyboard_to_detail = 也可以按 Ctrl+Alt+1–4 或点击画面
 snack.started_split = 已以 {n} 人分屏模式启动 {game}

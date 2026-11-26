@@ -656,6 +656,7 @@ overlay.seat_swap = Обміняти
 overlay.seat_free = Звільнити
 overlay.pane_closed = Гравець {n}: гру закрито
 overlay.pane_starting = Гравець {n}: запуск
+overlay.pane_waiting = Гравець {n}: незабаром запуск
 overlay.keyboard_to = Клавіатура й миша в
 overlay.keyboard_to_detail = Також Ctrl+Alt+1–4 або клік по панелі
 snack.started_split = Запущено {game} на розділеному екрані ({n} гравці)

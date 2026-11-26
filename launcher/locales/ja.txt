@@ -626,6 +626,7 @@ overlay.seat_swap = 交換
 overlay.seat_free = 解放
 overlay.pane_closed = プレイヤー {n}: ゲームは終了しました
 overlay.pane_starting = プレイヤー {n}: 起動中
+overlay.pane_waiting = プレイヤー {n}: まもなく起動
 overlay.keyboard_to = キーボードとマウスの割り当て先
 overlay.keyboard_to_detail = Ctrl+Alt+1–4 や画面のクリックでも切り替わります
 snack.started_split = {game} を {n} 人画面分割で起動しました

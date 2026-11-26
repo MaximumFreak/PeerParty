@@ -740,6 +740,37 @@ impl SessionHost {
         self.front_copy() == Some(self.focus)
     }
 
+    /// Each copy's window: in front as it opened, or since (`Front`). A split-screen
+    /// session's only; a copy alone follows the front as before.
+    fn note_fronts(&mut self) {
+        if self.compositor.is_none() || self.instances.len() <= 1 {
+            return;
+        }
+        let fg = desktop::foreground().pid;
+        for k in 0..self.instances.len() {
+            let inst = &mut self.instances[k];
+            if inst.gone {
+                continue;
+            }
+            let was = inst.front;
+            inst.front = was.next(inst.pid == fg);
+            if inst.front == instance::Front::Opened && was == instance::Front::Never && k != self.focus {
+                let text = format!(
+                    "session: player {}'s window came to the front as it opened: the keyboard and mouse stay with player {} (click a pane, or Ctrl+Alt+1-4, to move them)",
+                    k + 1,
+                    self.focus + 1
+                );
+                inst.send(&HostMsg::Note { text: text.clone() });
+                self.instances[self.focus].send(&HostMsg::Note { text });
+            }
+        }
+    }
+
+    /// Copy `i`'s window is in front only because it just opened (`Front::Opened`).
+    fn opened_in_front(&self, i: usize) -> bool {
+        self.instances.get(i).is_some_and(|c| c.in_front() && c.front == instance::Front::Opened)
+    }
+
     /// The PC's keyboard and mouse go to copy `i` (and its overlay) from now on.
     fn set_focus(&mut self, i: usize) {
         if i >= self.instances.len() || i == self.focus {
@@ -1435,9 +1466,13 @@ impl SessionHost {
         self.poll_pads();
         self.messages();
         self.reload_prefs();
+        self.note_fronts();
         if let Some(i) = self.front_copy().filter(|&i| i != self.focus) {
-            // Another copy came to the front: the keyboard follows it.
-            self.set_focus(i);
+            // Another copy came to the front: the keyboard follows it, unless its window
+            // is in front only because it just opened.
+            if !self.opened_in_front(i) {
+                self.set_focus(i);
+            }
         }
         self.session_tick();
         self.stagger_tick();
@@ -1657,11 +1692,13 @@ impl SessionHost {
         }
         let overlay_open = self.panes[self.focus].visible || self.layout_studio.active;
         let can_click: Vec<bool> = (0..self.instances.len()).map(|i| self.click_can_focus(i)).collect();
+        let pending: Vec<u32> = self.pending_spawns.iter().copied().collect();
         let clicked_focus = if let Some(c) = self.compositor.as_mut() {
-            c.maintain(&self.instances);
-            // What changed in the panes, into each copy's log.
+            c.maintain(&self.instances, &pending);
+            // What changed in the panes, into each copy's log (a pane whose copy hasn't
+            // started yet: player 1's).
             for (i, line) in c.take_notes() {
-                if let Some(inst) = self.instances.get(i) {
+                if let Some(inst) = self.instances.get(i).or(self.instances.first()) {
                     crate::launch::note(inst.pid, &line);
                 }
             }

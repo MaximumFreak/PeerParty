@@ -640,6 +640,7 @@ overlay.seat_swap = Ruilen
 overlay.seat_free = Vrijgeven
 overlay.pane_closed = Speler {n}: het spel is gesloten
 overlay.pane_starting = Speler {n}: wordt gestart
+overlay.pane_waiting = Speler {n}: start zo
 overlay.keyboard_to = Toetsenbord en muis gaan naar
 overlay.keyboard_to_detail = Ctrl+Alt+1–4 of een klik op een paneel kan ook
 snack.started_split = {game} gestart in splitscreen ({n} spelers)

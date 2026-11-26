@@ -640,6 +640,7 @@ overlay.seat_swap = Değiştir
 overlay.seat_free = Serbest bırak
 overlay.pane_closed = Oyuncu {n}: oyun kapandı
 overlay.pane_starting = Oyuncu {n}: başlatılıyor
+overlay.pane_waiting = Oyuncu {n}: birazdan başlıyor
 overlay.keyboard_to = Klavye ve fare şuna gider
 overlay.keyboard_to_detail = Ctrl+Alt+1–4 veya bir bölmeye tıklamak da olur
 snack.started_split = {game}, {n} oyunculu bölünmüş ekranda başlatıldı

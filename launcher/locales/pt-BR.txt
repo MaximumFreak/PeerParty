@@ -640,6 +640,7 @@ overlay.seat_swap = Trocar
 overlay.seat_free = Liberar
 overlay.pane_closed = Jogador {n}: o jogo foi fechado
 overlay.pane_starting = Jogador {n}: iniciando
+overlay.pane_waiting = Jogador {n}: iniciando em breve
 overlay.keyboard_to = Teclado e mouse vão para
 overlay.keyboard_to_detail = Ctrl+Alt+1–4 ou um clique em um painel também faz isso
 snack.started_split = {game} iniciado em tela dividida ({n} jogadores)

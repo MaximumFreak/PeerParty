@@ -580,13 +580,23 @@ impl CompositorWindow {
     /// Keeps adopted game windows tucked behind the compositor, hidden when the
     /// compositor is minimized, restored after Win+D/minimize, and refreshes their
     /// aspect-fitted DWM thumbnails when a game resizes its own window or backbuffer.
-    pub fn maintain(&mut self, instances: &[InstanceConn]) {
+    pub fn maintain(&mut self, instances: &[InstanceConn], pending: &[u32]) {
         #[cfg(windows)]
-        if let Some(w) = self.window.as_mut() {
-            w.maintain(self.bounds, instances);
+        if self.window.is_some() {
+            // The panes of players a staggered start hasn't started yet (`pending`, the
+            // slots still to start), after the copies'.
+            let waiting: Vec<PaneRect> = self
+                .display_panes()
+                .into_iter()
+                .enumerate()
+                .skip(instances.len())
+                .map(|(i, p)| if pending.contains(&(i as u32)) { p } else { HIDDEN })
+                .collect();
+            let w = self.window.as_mut().expect("checked");
+            w.maintain(self.bounds, instances, &waiting);
         }
         #[cfg(not(windows))]
-        let _ = instances;
+        let _ = (instances, pending);
     }
 
     /// Forwards queued keyboard and mouse messages from the compositor window to the
@@ -1145,21 +1155,34 @@ mod win {
         (pane.x + free(pane.width, size.0), pane.y + free(pane.height, size.1))
     }
 
+    /// What a pane has to show.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(super) enum PaneState {
+        /// Its game's window or frames.
+        Game,
+        /// Its copy ended.
+        Closed,
+        /// Its copy started, with no window or frames yet.
+        Starting,
+        /// A staggered start hasn't started its copy yet.
+        Waiting,
+    }
+
     /// Each pane's label: a copy that ended says so; one with nothing to show yet (no
-    /// window, no frames) is starting. A pane hidden (another one zoomed) has none.
-    pub(super) fn pane_labels(panes: &[(PaneRect, bool, bool)]) -> Vec<(usize, PaneRect, String)> {
+    /// window, no frames) is starting, and one not started yet is starting soon. A pane
+    /// hidden (another one zoomed) has none.
+    pub(super) fn pane_labels(panes: &[(PaneRect, PaneState)]) -> Vec<(usize, PaneRect, String)> {
         panes
             .iter()
             .enumerate()
-            .filter(|(_, (p, ..))| p.width > 0 && p.height > 0)
-            .filter_map(|(i, &(p, gone, empty))| {
+            .filter(|(_, (p, _))| p.width > 0 && p.height > 0)
+            .filter_map(|(i, &(p, state))| {
                 let n = i + 1;
-                let text = if gone {
-                    crate::t!("overlay.pane_closed", n = n)
-                } else if empty {
-                    crate::t!("overlay.pane_starting", n = n)
-                } else {
-                    return None;
+                let text = match state {
+                    PaneState::Game => return None,
+                    PaneState::Closed => crate::t!("overlay.pane_closed", n = n),
+                    PaneState::Starting => crate::t!("overlay.pane_starting", n = n),
+                    PaneState::Waiting => crate::t!("overlay.pane_waiting", n = n),
                 };
                 Some((i, p, text))
             })
@@ -1690,7 +1713,7 @@ mod win {
         /// Periodic maintenance: syncs hide/show with compositor minimize, restores any
         /// game windows minimized by Win+D, keeps game windows behind the compositor,
         /// does one 1-second grace re-containment, and updates aspect-fitted thumbnails.
-        pub fn maintain(&mut self, bounds: MonitorBounds, instances: &[InstanceConn]) {
+        pub fn maintain(&mut self, bounds: MonitorBounds, instances: &[InstanceConn], waiting: &[PaneRect]) {
             let minimized = unsafe { IsIconic(self.hwnd) } != 0;
             if minimized != self.hidden_for_minimize {
                 self.hidden_for_minimize = minimized;
@@ -1736,7 +1759,7 @@ mod win {
                 self.update(i, display_pane, vp, force_thumb, true);
             }
             self.push_panes();
-            self.label_panes(instances);
+            self.label_panes(instances, waiting);
             self.place_dialogs(bounds, instances);
         }
 
@@ -1800,16 +1823,23 @@ mod win {
 
         /// Says in each empty pane what's going on there (`pane_labels`), repainted when
         /// that changes, and in the copy's log.
-        fn label_panes(&mut self, instances: &[InstanceConn]) {
-            let state: Vec<(PaneRect, bool, bool)> = (0..instances.len())
+        fn label_panes(&mut self, instances: &[InstanceConn], waiting: &[PaneRect]) {
+            let mut state: Vec<(PaneRect, PaneState)> = (0..instances.len())
                 .map(|i| {
                     let pane = self.display.get(i).map(|d| d.0).unwrap_or(super::HIDDEN);
-                    let gone = instances[i].gone;
                     let window = self.shown.get(i).is_some_and(|s| s.is_some());
                     let frames = self.surfaces.get(i).is_some_and(|s| s.1.is_some());
-                    (pane, gone, !window && !frames)
+                    let what = if instances[i].gone {
+                        PaneState::Closed
+                    } else if !window && !frames {
+                        PaneState::Starting
+                    } else {
+                        PaneState::Game
+                    };
+                    (pane, what)
                 })
                 .collect();
+            state.extend(waiting.iter().map(|&p| (p, PaneState::Waiting)));
             let labels = pane_labels(&state);
             let Ok(mut held) = LABELS.lock() else { return };
             if *held == labels {
@@ -2294,11 +2324,14 @@ mod tests {
         let p = r(0, 0, 100, 100);
         let q = r(100, 0, 100, 100);
         let hidden = r(0, 0, 0, 0);
-        // Showing a game, ended, starting, and ended while another pane is zoomed.
-        let got = win::pane_labels(&[(p, false, false), (q, true, false), (p, false, true), (hidden, true, false)]);
-        assert_eq!(got.iter().map(|(i, rect, _)| (*i, *rect)).collect::<Vec<_>>(), vec![(1, q), (2, p)]);
-        assert!(got[0].2.contains('2') && got[1].2.contains('3'), "{got:?}");
+        use win::PaneState::*;
+        // Showing a game, ended, starting, ended while another pane is zoomed, and not
+        // started yet.
+        let got = win::pane_labels(&[(p, Game), (q, Closed), (p, Starting), (hidden, Closed), (q, Waiting)]);
+        assert_eq!(got.iter().map(|(i, rect, _)| (*i, *rect)).collect::<Vec<_>>(), vec![(1, q), (2, p), (4, q)]);
+        assert!(got[0].2.contains('2') && got[1].2.contains('3') && got[2].2.contains('5'), "{got:?}");
         assert_ne!(got[0].2, got[1].2);
+        assert_ne!(got[1].2, got[2].2);
     }
 
     #[test]
