@@ -236,9 +236,6 @@ pub struct LayoutStudio {
     last_info: Option<StudioInfo>,
     pub last_frame: Instant,
     pub dirty: bool,
-    /// Panes trimmed to their picture since Studio opened: their game draws one shape
-    /// whatever its pane's, so resizing them keeps the picture's.
-    trimmed: Vec<bool>,
 }
 
 impl LayoutStudio {
@@ -274,7 +271,6 @@ impl LayoutStudio {
             last_info: None,
             last_frame: now,
             dirty: true,
-            trimmed: Vec::new(),
         }
     }
 
@@ -282,7 +278,6 @@ impl LayoutStudio {
     /// current `sync` mode, and initial controller snapshot `pad`.
     pub fn open(&mut self, slots: Vec<PaneSlot>, focus: usize, sync: StudioSync, bounds: ScreenRect, overlay_scale: f32, pad: StudioPad) {
         self.active = true;
-        self.trimmed = vec![false; slots.len()];
         self.slots = slots.clone();
         self.initial = slots;
         self.initial_sync = sync;
@@ -328,7 +323,6 @@ impl LayoutStudio {
 
     /// Updates `slots` externally (e.g. when a preset is applied).
     pub fn set_slots(&mut self, slots: Vec<PaneSlot>) {
-        self.trimmed.resize(slots.len(), false);
         self.slots = slots;
         self.selected = self.selected.min(self.slots.len().saturating_sub(1));
         self.drag = None;
@@ -603,8 +597,7 @@ impl LayoutStudio {
                         let i = self.selected;
                         if let Some(pic) = picture_rect(&self.slots[i], info.pictures.get(i).copied().flatten(), info.screen) {
                             self.slots[i].rect = pic;
-                            self.trimmed.resize(self.slots.len(), false);
-                            self.trimmed[i] = true;
+                            self.slots[i].keep_picture = true;
                             actions.push(StudioAction::Commit(self.slots.clone()));
                         }
                         self.dirty = true;
@@ -613,7 +606,6 @@ impl LayoutStudio {
                         && let Some(f) = fit_pictures(&self.slots, &info.pictures, info.screen).filter(|f| *f != self.slots)
                     {
                         self.slots = f;
-                        self.trimmed = vec![true; self.slots.len()];
                         actions.push(StudioAction::Commit(self.slots.clone()));
                         self.dirty = true;
                     }
@@ -682,7 +674,7 @@ impl LayoutStudio {
                     let fine = pad.lt;
                     let dx = if fire & pad::RIGHT != 0 { 1 } else if fire & pad::LEFT != 0 { -1 } else { 0 };
                     let dy = if fire & pad::DOWN != 0 { 1 } else if fire & pad::UP != 0 { -1 } else { 0 };
-                    if (dx != 0 || dy != 0) && resize_pane_step(&mut self.slots, self.selected, dx, dy, self.snap && !fine, fine) {
+                    if (dx != 0 || dy != 0) && resize_pane_step(&mut self.slots, self.selected, dx, dy, self.snap && !fine, fine, &info.pictures, info.screen) {
                         actions.push(StudioAction::Commit(self.slots.clone()));
                         self.dirty = true;
                     }
@@ -732,7 +724,6 @@ impl LayoutStudio {
         actions: &mut Vec<StudioAction>,
     ) {
         let count = self.slots.len();
-        self.trimmed.resize(count, false);
         let snap_on = self.snap && !self.alt_down;
         let dividers = find_shared_dividers(&self.slots);
         // Where each pane's picture is when it leaves black bars: the box, the handles
@@ -785,7 +776,6 @@ impl LayoutStudio {
                                 && pill_button(ui, t!("studio.fit_pictures"), false, false, pad_browse.then_some(Glyph::LStick), style, Some(t!("studio.tip_fit_pictures")))
                             {
                                 self.slots = f.clone();
-                                self.trimmed = vec![true; count];
                                 self.drag = None;
                                 actions.push(StudioAction::Commit(self.slots.clone()));
                                 self.dirty = true;
@@ -937,7 +927,7 @@ impl LayoutStudio {
                                     && pill_button(ui, t!("studio.trim"), false, false, None, style, Some(t!("studio.tip_trim")))
                                 {
                                     self.slots[i].rect = pic;
-                                    self.trimmed[i] = true;
+                                    self.slots[i].keep_picture = true;
                                     self.selected = i;
                                     actions.push(StudioAction::Commit(self.slots.clone()));
                                     self.dirty = true;
@@ -982,7 +972,7 @@ impl LayoutStudio {
                 let start_rect = shown[pane];
                 bring_to_front(&mut self.slots, pane);
                 if edges.any() {
-                    let locked = pictures[pane].is_some() || self.trimmed[pane];
+                    let locked = pictures[pane].is_some() || self.slots[pane].keep_picture;
                     let aspect = (locked && !self.alt_down).then(|| picture(pane)).flatten().map(|(w, h)| w as f32 / h as f32);
                     self.drag = Some(DragMode::Resize { pane, edges, start_rect, anchor: self.cursor, aspect });
                 } else {
@@ -996,7 +986,8 @@ impl LayoutStudio {
             let mut preview_changed = false;
             match self.drag.clone() {
                 Some(DragMode::Divider { divider, start_slots }) => {
-                    let next = apply_divider_drag(&start_slots, &divider, self.cursor, screen, snap_on);
+                    let mut next = apply_divider_drag(&start_slots, &divider, self.cursor, screen, snap_on);
+                    relock_divider(&start_slots, &mut next, &divider, &info.pictures, info.screen);
                     if next != self.slots {
                         self.slots = next;
                         preview_changed = true;
@@ -1009,13 +1000,14 @@ impl LayoutStudio {
                     }
                     if next_rect != self.slots[pane].rect {
                         self.slots[pane].rect = next_rect;
-                        self.trimmed[pane] |= aspect.is_some();
+                        // Resized freely (Alt held), it's a shape of its own now.
+                        self.slots[pane].keep_picture = aspect.is_some();
                         preview_changed = true;
                     }
                 }
                 Some(DragMode::Move { pane, start_rect, anchor, pane_rect, .. }) if self.cursor != anchor => {
                     let next_rect = apply_move_drag(&self.slots, pane, start_rect, self.cursor - anchor, screen, snap_on);
-                    self.trimmed[pane] |= start_rect != pane_rect;
+                    self.slots[pane].keep_picture |= start_rect != pane_rect;
                     let swap_target = find_swap_target(&self.slots, pane, start_rect, self.cursor, screen);
                     if let Some(DragMode::Move { swap_target: st, .. }) = self.drag.as_mut() {
                         *st = swap_target;
@@ -1362,7 +1354,7 @@ fn select_pane_dir(slots: &[PaneSlot], cur: usize, dx: i32, dy: i32) -> Option<u
 /// Resizes `pane` by one controller step in `(dx, dy)`: slides a shared interior divider
 /// when `pane` borders one on that axis (keeping zero gaps between tiled panes), else
 /// adjusts `pane`'s own width/height directly (for PiP / free-form panes).
-fn resize_pane_step(slots: &mut [PaneSlot], pane: usize, dx: i32, dy: i32, snap: bool, fine: bool) -> bool {
+fn resize_pane_step(slots: &mut [PaneSlot], pane: usize, dx: i32, dy: i32, snap: bool, fine: bool, pictures: &[Option<(u32, u32)>], screen: (u32, u32)) -> bool {
     if pane >= slots.len() {
         return false;
     }
@@ -1377,6 +1369,7 @@ fn resize_pane_step(slots: &mut [PaneSlot], pane: usize, dx: i32, dy: i32, snap:
         let on_neg = divs.iter().find(|d| d.axis == axis && d.neg.contains(&pane)).cloned();
         let on_pos = divs.iter().find(|d| d.axis == axis && d.pos_panes.contains(&pane)).cloned();
         if let Some(d) = on_neg.or(on_pos) {
+            let before = slots.to_vec();
             let mut min_pos = NORM_MIN;
             let mut max_pos = NORM_SCALE - NORM_MIN;
             for &i in &d.neg {
@@ -1421,6 +1414,7 @@ fn resize_pane_step(slots: &mut [PaneSlot], pane: usize, dx: i32, dy: i32, snap:
                     }
                 }
             }
+            relock_divider(&before, slots, &d, pictures, screen);
             return true;
         }
         // Standalone / floating pane (e.g. PiP): grow/shrink the pane directly.
@@ -1436,6 +1430,27 @@ fn resize_pane_step(slots: &mut [PaneSlot], pane: usize, dx: i32, dy: i32, snap:
                 let ny = r.y.min(NORM_SCALE - nh);
                 NormRect::clamped(r.x, ny, r.w, nh)
             }
+        };
+        // A pane that keeps its picture's shape grows as its picture: the other way
+        // from its middle, else from one side, never onto another pane.
+        let next = match locked_aspect(&slots[pane], pictures.get(pane).copied().flatten()) {
+            Some(a) => {
+                let edges = match axis {
+                    Axis::Vertical => Edges { right: true, ..Default::default() },
+                    Axis::Horizontal => Edges { bottom: true, ..Default::default() },
+                };
+                let f = keep_aspect(r, next, edges, a, screen);
+                let options = match axis {
+                    Axis::Vertical => [f, NormRect::clamped(f.x, r.y, f.w, f.h), NormRect::clamped(f.x, r.bottom().saturating_sub(f.h), f.w, f.h)],
+                    Axis::Horizontal => [f, NormRect::clamped(r.x, f.y, f.w, f.h), NormRect::clamped(r.right().saturating_sub(f.w), f.y, f.w, f.h)],
+                };
+                let clear = |c: NormRect| (0..slots.len()).all(|j| j == pane || !rects_overlap(c, slots[j].rect) || rects_overlap(r, slots[j].rect));
+                match options.into_iter().find(|c| clear(*c)) {
+                    Some(c) => c,
+                    None => return false,
+                }
+            }
+            None => next,
         };
         if next != r {
             slots[pane].rect = next;
@@ -1547,6 +1562,44 @@ fn picture_rect(slot: &PaneSlot, picture: Option<(u32, u32)>, screen: (u32, u32)
     (drawn != pane).then(|| px_to_norm(drawn, screen)).filter(|r| *r != slot.rect)
 }
 
+/// The picture's shape (width over height, in pixels) pane `slot` keeps, when it keeps
+/// one (`PaneSlot::keep_picture`) and its game's picture size is known.
+fn locked_aspect(slot: &PaneSlot, picture: Option<(u32, u32)>) -> Option<f32> {
+    if !slot.keep_picture || slot.fit != PaneFit::Fit {
+        return None;
+    }
+    picture.filter(|&(w, h)| w > 0 && h > 0).map(|(w, h)| w as f32 / h as f32)
+}
+
+/// After divider `d` moved (`start` to `next`): each pane on it that keeps its picture's
+/// shape is its picture again in its new room, flush against the divider (the pictures
+/// on both sides stay together) and where its middle was along it. Moved as cells, those
+/// panes got black bars and their pictures slid away from the divider.
+fn relock_divider(start: &[PaneSlot], next: &mut [PaneSlot], d: &SharedDivider, pictures: &[Option<(u32, u32)>], screen: (u32, u32)) {
+    for (panes, before) in [(&d.neg, true), (&d.pos_panes, false)] {
+        for &i in panes {
+            let (Some(s), Some(a)) = (start.get(i), next.get(i).and_then(|n| locked_aspect(n, pictures.get(i).copied().flatten()))) else {
+                continue;
+            };
+            let cell = next[i].rect;
+            let edges = match (d.axis, before) {
+                (Axis::Vertical, true) => Edges { right: true, ..Default::default() },
+                (Axis::Vertical, false) => Edges { left: true, ..Default::default() },
+                (Axis::Horizontal, true) => Edges { bottom: true, ..Default::default() },
+                (Axis::Horizontal, false) => Edges { top: true, ..Default::default() },
+            };
+            let mut r = keep_aspect(s.rect, cell, edges, a, screen);
+            match (d.axis, before) {
+                (Axis::Vertical, true) => r.x = cell.right().saturating_sub(r.w),
+                (Axis::Vertical, false) => r.x = cell.x,
+                (Axis::Horizontal, true) => r.y = cell.bottom().saturating_sub(r.h),
+                (Axis::Horizontal, false) => r.y = cell.y,
+            }
+            next[i].rect = NormRect::clamped(r.x, r.y, r.w, r.h);
+        }
+    }
+}
+
 /// `slots` with each pane where `shown` says (its picture, when it has bars), for
 /// grabbing panes by what's seen of them.
 fn shown_slots(slots: &[PaneSlot], shown: &[NormRect]) -> Vec<PaneSlot> {
@@ -1611,7 +1664,8 @@ fn fit_pictures(slots: &[PaneSlot], pictures: &[Option<(u32, u32)>], screen: (u3
                 None => pane,
             };
             area += u64::from(drawn.width) * u64::from(drawn.height);
-            out.push(PaneSlot { rect: px_to_norm(drawn, screen), fit: PaneFit::Fit, ..slots[i] });
+            let keep_picture = pictures.get(i).copied().flatten().is_some();
+            out.push(PaneSlot { rect: px_to_norm(drawn, screen), fit: PaneFit::Fit, keep_picture, ..slots[i] });
         }
         if best.as_ref().is_none_or(|(a, _)| area > *a) {
             best = Some((area, out));
@@ -2007,6 +2061,72 @@ mod tests {
         assert!(big.bottom() <= NORM_SCALE && big.right() <= NORM_SCALE, "{big:?}");
         let px = big.to_pane_rect(screen.0, screen.1);
         assert!((px.width as f32 / px.height as f32 - 16.0 / 9.0).abs() < 0.02, "{px:?}");
+    }
+
+    /// The aspect of a pane in pixels on `screen`.
+    fn shape(r: NormRect, screen: (u32, u32)) -> f32 {
+        let px = r.to_pane_rect(screen.0, screen.1);
+        px.width as f32 / px.height as f32
+    }
+
+    /// Two fitted 16:9 pictures side by side: the controller's d-pad resizes the selected
+    /// one as a picture. Across, the divider moves and both stay pictures, flush against
+    /// it; up and down, it grows away from its neighbour, never onto it, and never moves
+    /// as a pane of another shape would (its picture re-centred in it).
+    #[test]
+    fn the_dpad_resizes_kept_pictures_as_pictures() {
+        let screen = (3440, 1440);
+        let pics = [Some((1280, 720)), Some((1280, 720))];
+        let mut slots = fit_pictures(&LayoutPreset::Horizontal.to_slots(2), &pics, screen).unwrap();
+        assert!(slots.iter().all(|s| s.keep_picture));
+        assert!(resize_pane_step(&mut slots, 0, 1, 0, false, false, &pics, screen), "right: the divider moves");
+        for s in &slots {
+            assert!((shape(s.rect, screen) - 16.0 / 9.0).abs() < 0.02, "{s:?}");
+            assert_eq!(picture_rect(s, Some((1280, 720)), screen), None, "no bars: {s:?}");
+        }
+        assert_eq!(slots[0].rect.right(), slots[1].rect.x, "flush against the divider");
+        assert!(slots[0].rect.w > slots[1].rect.w);
+        // Down: player 1 shrinks, as a picture, where it is.
+        let before = slots[0].rect;
+        assert!(resize_pane_step(&mut slots, 0, 0, -1, false, false, &pics, screen));
+        let after = slots[0].rect;
+        assert!(after.w < before.w && after.h < before.h, "{before:?} -> {after:?}");
+        assert!((shape(after, screen) - 16.0 / 9.0).abs() < 0.02);
+        assert!(!rects_overlap(slots[0].rect, slots[1].rect));
+        // Up again: it grows back without covering player 2.
+        assert!(resize_pane_step(&mut slots, 0, 0, 1, false, false, &pics, screen));
+        assert!(!rects_overlap(slots[0].rect, slots[1].rect), "{:?} {:?}", slots[0].rect, slots[1].rect);
+        // A pane that doesn't keep its picture's shape resizes as before: its width alone.
+        let mut free = LayoutPreset::Horizontal.to_slots(2);
+        assert!(resize_pane_step(&mut free, 0, 1, 0, false, false, &pics, screen));
+        assert_eq!(free[0].rect.h, NORM_SCALE);
+    }
+
+    /// Dragging the divider between two kept pictures keeps both pictures, flush against
+    /// it: no black bars come back.
+    #[test]
+    fn a_divider_between_kept_pictures_keeps_them() {
+        let screen = (3440, 1440);
+        let pics = [Some((1280, 720)), Some((1280, 720))];
+        let start = fit_pictures(&LayoutPreset::Horizontal.to_slots(2), &pics, screen).unwrap();
+        let d = find_shared_dividers(&start).into_iter().find(|d| d.axis == Axis::Vertical).expect("a divider between them");
+        let mut next = apply_divider_drag(&start, &d, pos2(700.0, 300.0), vec2(1720.0, 720.0), false);
+        relock_divider(&start, &mut next, &d, &pics, screen);
+        for s in &next {
+            assert!((shape(s.rect, screen) - 16.0 / 9.0).abs() < 0.02, "{s:?}");
+        }
+        assert_eq!(next[0].rect.right(), next[1].rect.x);
+        assert!(next[1].rect.w > next[0].rect.w, "the divider went left");
+    }
+
+    #[test]
+    fn a_kept_picture_survives_the_saved_layout() {
+        let mut s = PaneSlot::new(NormRect::clamped(0, 1639, 5000, 6722));
+        s.keep_picture = true;
+        assert_eq!(PaneSlot::decode(&s.encode()), Some(s));
+        assert_eq!(PaneSlot::from_json(&s.to_json()), Some(s));
+        let plain = PaneSlot::new(NormRect::FULL);
+        assert!(!plain.encode().ends_with(",p"));
     }
 
     /// Fit pictures picks the arrangement with the biggest pictures and trims every pane:

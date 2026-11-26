@@ -266,20 +266,28 @@ pub struct PaneSlot {
     pub aspect: VirtualAspect,
     /// Draw & hit-test order for overlapping Picture-in-Picture panes (higher is on top).
     pub z: u8,
+    /// The pane is its game's picture, and keeps the picture's shape when resized: its
+    /// game draws one shape whatever its pane's (Layout Studio's Trim bars and Fit
+    /// pictures), so a pane of another shape only gets black bars.
+    pub keep_picture: bool,
 }
 
 impl PaneSlot {
     pub fn new(rect: NormRect) -> PaneSlot {
-        PaneSlot { rect, fit: PaneFit::Fit, aspect: VirtualAspect::MatchPane, z: 0 }
+        PaneSlot { rect, fit: PaneFit::Fit, aspect: VirtualAspect::MatchPane, z: 0, keep_picture: false }
     }
 
     pub fn to_json(&self) -> Json {
-        Json::obj(vec![
+        let mut fields = vec![
             ("rect", self.rect.to_json()),
             ("fit", Json::str(self.fit.as_str())),
             ("aspect", Json::str(&self.aspect.label())),
             ("z", Json::u64(self.z.into())),
-        ])
+        ];
+        if self.keep_picture {
+            fields.push(("keep_picture", Json::Bool(true)));
+        }
+        Json::obj(fields)
     }
 
     pub fn from_json(v: &Json) -> Option<PaneSlot> {
@@ -288,17 +296,20 @@ impl PaneSlot {
             fit: v.get("fit").as_str().and_then(PaneFit::parse).unwrap_or_default(),
             aspect: v.get("aspect").as_str().and_then(VirtualAspect::parse).unwrap_or_default(),
             z: v.get("z").as_u64().and_then(|n| u8::try_from(n).ok()).unwrap_or(0),
+            keep_picture: v.get("keep_picture").as_bool().unwrap_or(false),
         })
     }
 
-    /// Compact shell-safe wire encoding (`x,y,w,h,fit,aspect,z`).
+    /// Compact shell-safe wire encoding (`x,y,w,h,fit,aspect,z`, then `,p` for a pane that
+    /// keeps its picture's shape).
     pub fn encode(&self) -> String {
-        format!("{},{},{},{},{},{},{}", self.rect.x, self.rect.y, self.rect.w, self.rect.h, self.fit.as_str(), self.aspect.label(), self.z)
+        let keep = if self.keep_picture { ",p" } else { "" };
+        format!("{},{},{},{},{},{},{}{keep}", self.rect.x, self.rect.y, self.rect.w, self.rect.h, self.fit.as_str(), self.aspect.label(), self.z)
     }
 
     pub fn decode(s: &str) -> Option<PaneSlot> {
         let parts: Vec<&str> = s.split(',').collect();
-        if parts.len() < 4 || parts.len() > 7 {
+        if parts.len() < 4 || parts.len() > 8 {
             return None;
         }
         let x: u16 = parts[0].parse().ok()?;
@@ -317,7 +328,12 @@ impl PaneSlot {
             Some(s) => s.parse::<u8>().ok()?,
             None => 0,
         };
-        Some(PaneSlot { rect: NormRect::clamped(x, y, w, h), fit, aspect, z })
+        let keep_picture = match parts.get(7) {
+            Some(&"p") => true,
+            Some(_) => return None,
+            None => false,
+        };
+        Some(PaneSlot { rect: NormRect::clamped(x, y, w, h), fit, aspect, z, keep_picture })
     }
 }
 
@@ -446,7 +462,7 @@ impl LayoutPreset {
             } else {
                 pad
             };
-            out.push(PaneSlot { rect: NormRect::clamped(x, y, inset_w, inset_h), fit: PaneFit::Fit, aspect: VirtualAspect::MatchPane, z: i.min(255) as u8 });
+            out.push(PaneSlot { rect: NormRect::clamped(x, y, inset_w, inset_h), fit: PaneFit::Fit, aspect: VirtualAspect::MatchPane, z: i.min(255) as u8, keep_picture: false });
         }
         out
     }
@@ -762,8 +778,8 @@ mod tests {
 
         // Normalized slots: resolution-independent, zero-seam edge rounding, fit/aspect/z.
         let slots = vec![
-            PaneSlot { rect: NormRect::clamped(0, 0, 6000, 10_000), fit: PaneFit::Fill, aspect: VirtualAspect::Ratio { num: 16, den: 9 }, z: 0 },
-            PaneSlot { rect: NormRect::clamped(6000, 0, 4000, 10_000), fit: PaneFit::Fit, aspect: VirtualAspect::MatchPane, z: 1 },
+            PaneSlot { rect: NormRect::clamped(0, 0, 6000, 10_000), fit: PaneFit::Fill, aspect: VirtualAspect::Ratio { num: 16, den: 9 }, z: 0, keep_picture: false },
+            PaneSlot { rect: NormRect::clamped(6000, 0, 4000, 10_000), fit: PaneFit::Fit, aspect: VirtualAspect::MatchPane, z: 1, keep_picture: true },
         ];
         let preset = LayoutPreset::Slots(slots.clone());
         let p = preset.compute_panes(1920, 1080, 2);

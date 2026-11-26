@@ -759,9 +759,13 @@ overlay's Split screen tab > **Arrange panes**). Every change shows at once:
   the sides) is outlined by its picture, and its bars are hatched as the empty room they
   are. Grabbing it moves or resizes the picture alone: the pane becomes the picture's
   size, its bars go, and its corners keep the picture's shape (`Alt` held resizes
-  freely). **Trim bars** on a pane does the same without moving it, and **Fit
-  pictures** on the bar (left stick click on a controller) arranges every pane for the
-  biggest pictures with no bars.
+  freely, and the pane is a shape of its own again). **Trim bars** on a pane does the
+  same without moving it, and **Fit pictures** on the bar (left stick click on a
+  controller) arranges every pane for the biggest pictures with no bars. A pane kept as
+  its picture stays one, also in the saved layout: the divider between two such panes
+  resizes both pictures, flush against it, and the controller's Resize mode grows or
+  shrinks it as a picture (the other way from its middle, or from one side when another
+  pane is in the way).
 - Each pane: **Scale** `Fit` (the whole picture, with black bars), `Crop` (fills the
   pane, cutting the edges) or `Stretch`; **Ratio** `Auto` (the pane's own shape),
   `16:9`, `16:10`, `4:3` or `21:9`, the shape the game is told to render at, for a HUD
