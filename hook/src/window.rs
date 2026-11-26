@@ -14,7 +14,7 @@ use retour::GenericDetour;
 use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetClientRect, GetWindow, GetWindowLongW,
+    EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GWLP_WNDPROC, GetClientRect, GetWindow, GetWindowLongW,
     GetWindowThreadProcessId, IsWindowVisible, SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED,
     SWP_NOACTIVATE, SWP_NOZORDER, SetWindowLongW, SetWindowPos, WS_BORDER, WS_CAPTION,
     WS_CHILD, WS_DLGFRAME, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_MAXIMIZEBOX,
@@ -51,6 +51,8 @@ type SetWindowPosFn = unsafe extern "system" fn(isize, isize, i32, i32, i32, i32
 type MoveWindowFn = unsafe extern "system" fn(isize, i32, i32, i32, i32, i32) -> i32;
 type SetWindowLongFn = unsafe extern "system" fn(isize, i32, i32) -> i32;
 type SetWindowLongPtrFn = unsafe extern "system" fn(isize, i32, isize) -> isize;
+/// `GetWindowLongPtrW/A`, or on x86 `GetWindowLongW/A` (the same call there).
+type GetWindowLongPtrFn = unsafe extern "system" fn(isize, i32) -> isize;
 type ShowWindowFn = unsafe extern "system" fn(isize, i32) -> i32;
 type EnumDisplaySettingsExWFn = unsafe extern "system" fn(*const u16, u32, *mut u8, u32) -> i32;
 type EnumDisplaySettingsExAFn = unsafe extern "system" fn(*const u8, u32, *mut u8, u32) -> i32;
@@ -117,6 +119,8 @@ static SET_LONG_W: OnceLock<GenericDetour<SetWindowLongFn>> = OnceLock::new();
 static SET_LONG_A: OnceLock<GenericDetour<SetWindowLongFn>> = OnceLock::new();
 static SET_LONG_PTR_W: OnceLock<GenericDetour<SetWindowLongPtrFn>> = OnceLock::new();
 static SET_LONG_PTR_A: OnceLock<GenericDetour<SetWindowLongPtrFn>> = OnceLock::new();
+static GET_LONG_PTR_W: OnceLock<GenericDetour<GetWindowLongPtrFn>> = OnceLock::new();
+static GET_LONG_PTR_A: OnceLock<GenericDetour<GetWindowLongPtrFn>> = OnceLock::new();
 static SHOW_WINDOW: OnceLock<GenericDetour<ShowWindowFn>> = OnceLock::new();
 static ENUM_DISP_EX_W: OnceLock<GenericDetour<EnumDisplaySettingsExWFn>> = OnceLock::new();
 static ENUM_DISP_EX_A: OnceLock<GenericDetour<EnumDisplaySettingsExAFn>> = OnceLock::new();
@@ -290,8 +294,7 @@ const MAX_WRAPPED: usize = 64;
 /// every copy; a copy told it lost it stops its menus taking input (Unity's UI ignores
 /// the mouse and controllers then), though the game itself goes on.
 fn keep_focus(hwnd: usize) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{GWLP_WNDPROC, IsWindowUnicode};
-    type Proc = unsafe extern "system" fn(HWND, u32, usize, isize) -> isize;
+    use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowUnicode;
     let h = hwnd as HWND;
     let mut w = crate::sys::lock(&WRAPPED);
     if w.iter().any(|x| x.hwnd == hwnd) {
@@ -303,14 +306,13 @@ fn keep_focus(hwnd: usize) {
     }
     let unicode = unsafe { IsWindowUnicode(h) } != 0;
     // The procedure is known before the window can call the wrapper.
-    let old = unsafe { if unicode { get_window_long_ptr_w(h, GWLP_WNDPROC) } else { get_window_long_ptr_a(h, GWLP_WNDPROC) } };
+    let old = unsafe { real_proc(h, unicode) };
     if old == 0 {
         return;
     }
     w.push(Wrapped { hwnd, old: old as usize, unicode });
     drop(w);
-    let new = focus_proc as Proc as usize as _;
-    let was = unsafe { if unicode { set_window_long_ptr_w(h, GWLP_WNDPROC, new) } else { set_window_long_ptr_a(h, GWLP_WNDPROC, new) } };
+    let was = unsafe { set_real_proc(h, unicode, wrapper()) };
     let mut w = crate::sys::lock(&WRAPPED);
     if was == 0 {
         w.retain(|x| x.hwnd != hwnd);
@@ -326,6 +328,96 @@ fn keep_focus(hwnd: usize) {
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrA as get_window_long_ptr_a, GetWindowLongPtrW as get_window_long_ptr_w, SetWindowLongPtrA as set_window_long_ptr_a, SetWindowLongPtrW as set_window_long_ptr_w};
 #[cfg(target_pointer_width = "32")]
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongA as get_window_long_ptr_a, GetWindowLongW as get_window_long_ptr_w, SetWindowLongA as set_window_long_ptr_a, SetWindowLongW as set_window_long_ptr_w};
+
+type Proc = unsafe extern "system" fn(HWND, u32, usize, isize) -> isize;
+
+fn wrapper() -> isize {
+    focus_proc as Proc as usize as isize
+}
+
+/// Window `h`'s procedure as Windows has it, past PeerParty's hooks on the calls.
+unsafe fn real_proc(h: HWND, unicode: bool) -> isize {
+    match (if unicode { &GET_LONG_PTR_W } else { &GET_LONG_PTR_A }).get() {
+        Some(d) => unsafe { d.call(h as isize, GWLP_WNDPROC) },
+        None => unsafe { (if unicode { get_window_long_ptr_w(h, GWLP_WNDPROC) } else { get_window_long_ptr_a(h, GWLP_WNDPROC) }) as isize },
+    }
+}
+
+/// Sets window `h`'s procedure past PeerParty's hooks on the call; the one it had.
+unsafe fn set_real_proc(h: HWND, unicode: bool, v: isize) -> isize {
+    #[cfg(target_pointer_width = "64")]
+    let hook = (if unicode { &SET_LONG_PTR_W } else { &SET_LONG_PTR_A }).get().map(|d| unsafe { d.call(h as isize, GWLP_WNDPROC, v) });
+    #[cfg(target_pointer_width = "32")]
+    let hook = (if unicode { &SET_LONG_W } else { &SET_LONG_A }).get().map(|d| unsafe { d.call(h as isize, GWLP_WNDPROC, v as i32) as isize });
+    hook.unwrap_or_else(|| unsafe { (if unicode { set_window_long_ptr_w(h, GWLP_WNDPROC, v as _) } else { set_window_long_ptr_a(h, GWLP_WNDPROC, v as _) }) as isize })
+}
+
+/// What the game reads as wrapped window `h`'s procedure (`unicode`: through the W call):
+/// the one the wrapper calls, as if PeerParty's weren't there; None for Windows' answer.
+/// A game that sees the wrapper and sets its own procedure in front, keeping the wrapper
+/// to call on, makes a loop: the wrapper calls the window's first procedure, which is the
+/// game's again (SDL2 subclasses so a window whose procedure isn't its own after
+/// CreateWindowEx), until the stack runs out.
+fn proc_seen_by_game(h: isize, unicode: bool) -> Option<isize> {
+    let x = crate::sys::lock(&WRAPPED).iter().find(|x| x.hwnd == h as usize).copied()?;
+    if x.unicode != unicode {
+        unwrap_window(x, "read");
+        return None;
+    }
+    Some(x.old as isize)
+}
+
+/// The game setting wrapped window `h`'s procedure to `v`: the wrapper stays in front and
+/// calls `v` from now on; the procedure the game had read before (None: Windows sets it).
+fn proc_set_by_game(h: isize, unicode: bool, v: isize) -> Option<isize> {
+    let x = crate::sys::lock(&WRAPPED).iter().find(|x| x.hwnd == h as usize).copied()?;
+    if x.unicode != unicode {
+        unwrap_window(x, "set");
+        return None;
+    }
+    // Something set its procedure past these hooks: the wrapper isn't in front to stay.
+    if unsafe { real_proc(h as HWND, unicode) } != wrapper() {
+        crate::log::throttled("window: wrapper not in front", 1, |_| {
+            log!("window: the game sets window 0x{h:x}'s procedure while PeerParty's focus wrapper isn't the one in front: set as asked");
+        });
+        return None;
+    }
+    if v == wrapper() {
+        return Some(x.old as isize);
+    }
+    let mut w = crate::sys::lock(&WRAPPED);
+    let e = w.iter_mut().find(|e| e.hwnd == h as usize)?;
+    let prev = std::mem::replace(&mut e.old, v as usize);
+    drop(w);
+    crate::log::throttled("window: game set proc", 3, |_| {
+        log!("window: the game set window 0x{h:x}'s procedure (0x{prev:x} -> 0x{v:x}); PeerParty's focus wrapper stays in front and calls it");
+    });
+    Some(prev as isize)
+}
+
+/// Puts wrapped window `x` back to the procedure it had: the game works with it through
+/// the other character set's calls, whose answers (Windows' conversion handles) the
+/// wrapper can't stand in for.
+fn unwrap_window(x: Wrapped, what: &str) {
+    let h = x.hwnd as HWND;
+    let front = unsafe { real_proc(h, x.unicode) } == wrapper();
+    if front {
+        unsafe { set_real_proc(h, x.unicode, x.old as isize) };
+        crate::sys::lock(&WRAPPED).retain(|e| e.hwnd != x.hwnd);
+    }
+    log!(
+        "window: the game {what} window 0x{:x}'s procedure through the {} calls: {}",
+        x.hwnd,
+        if x.unicode { "ANSI" } else { "Unicode" },
+        if front { "PeerParty's focus wrapper came off it, so the window is told when it loses the focus" } else { "PeerParty's focus wrapper isn't in front, so it stays" }
+    );
+}
+
+thread_local! {
+    /// The message (window, message, wparam, lparam) this thread's innermost `focus_proc`
+    /// is handing to the procedure it wraps.
+    static FORWARDING: std::cell::Cell<(usize, u32, usize, isize)> = const { std::cell::Cell::new((0, 0, 0, 0)) };
+}
 
 const WM_DESTROY: u32 = 0x0002;
 const WM_NCDESTROY: u32 = 0x0082;
@@ -344,6 +436,15 @@ unsafe extern "system" fn focus_proc(h: HWND, m: u32, w: usize, l: isize) -> isi
     use windows_sys::Win32::UI::WindowsAndMessaging::{CallWindowProcA, CallWindowProcW, DefWindowProcA, DefWindowProcW, WNDPROC};
     let me = crate::sys::lock(&WRAPPED).iter().find(|x| x.hwnd == h as usize).copied();
     let (old, unicode) = me.map_or((0, true), |x| (x.old, x.unicode));
+    // The procedure it wraps handing the same message back: one that holds the wrapper as
+    // its own previous procedure (set past PeerParty's hooks). Windows' default answers
+    // it, where calling on would go round until the stack runs out.
+    if FORWARDING.with(|f| f.get()) == (h as usize, m, w, l) {
+        crate::log::throttled("window: proc loop", 1, |_| {
+            log!("window: window 0x{:x}'s procedure handed message 0x{m:x} back to PeerParty's focus wrapper that gave it; Windows' default answers it (the game's procedure holds the wrapper as its previous one)", h as usize);
+        });
+        return unsafe { if unicode { DefWindowProcW(h, m, w, l) } else { DefWindowProcA(h, m, w, l) } };
+    }
     if should_suppress_focus_loss(m, w, FOCUS_SPOOF.load(Ordering::Relaxed)) {
         static TOLD: AtomicBool = AtomicBool::new(false);
         if !TOLD.swap(true, Ordering::Relaxed) {
@@ -357,7 +458,10 @@ unsafe extern "system" fn focus_proc(h: HWND, m: u32, w: usize, l: isize) -> isi
             return unsafe { if unicode { DefWindowProcW(h, m, w, l) } else { DefWindowProcA(h, m, w, l) } };
         }
         let proc: WNDPROC = unsafe { std::mem::transmute::<usize, WNDPROC>(old) };
-        unsafe { if unicode { CallWindowProcW(proc, h, m, w, l) } else { CallWindowProcA(proc, h, m, w, l) } }
+        let outer = FORWARDING.with(|f| f.replace((h as usize, m, w, l)));
+        let rc = unsafe { if unicode { CallWindowProcW(proc, h, m, w, l) } else { CallWindowProcA(proc, h, m, w, l) } };
+        FORWARDING.with(|f| f.set(outer));
+        rc
     };
     // A game that took the mouse as pointer messages gets the forwarded mouse as those
     // (pointer.rs).
@@ -767,6 +871,16 @@ fn arm_user32(src: &crate::sys::detour::Source) -> usize {
     one!(SET_LONG_A, c"SetWindowLongA", SetWindowLongFn, detour_set_window_long_a);
     one!(SET_LONG_PTR_W, c"SetWindowLongPtrW", SetWindowLongPtrFn, detour_set_window_long_ptr_w);
     one!(SET_LONG_PTR_A, c"SetWindowLongPtrA", SetWindowLongPtrFn, detour_set_window_long_ptr_a);
+    #[cfg(target_pointer_width = "64")]
+    {
+        one!(GET_LONG_PTR_W, c"GetWindowLongPtrW", GetWindowLongPtrFn, detour_get_window_long_ptr_w);
+        one!(GET_LONG_PTR_A, c"GetWindowLongPtrA", GetWindowLongPtrFn, detour_get_window_long_ptr_a);
+    }
+    #[cfg(target_pointer_width = "32")]
+    {
+        one!(GET_LONG_PTR_W, c"GetWindowLongW", GetWindowLongPtrFn, detour_get_window_long_ptr_w);
+        one!(GET_LONG_PTR_A, c"GetWindowLongA", GetWindowLongPtrFn, detour_get_window_long_ptr_a);
+    }
     one!(SHOW_WINDOW, c"ShowWindow", ShowWindowFn, detour_show_window);
     one!(ENUM_DISP_EX_W, c"EnumDisplaySettingsExW", EnumDisplaySettingsExWFn, detour_enum_display_ex_w);
     one!(ENUM_DISP_EX_A, c"EnumDisplaySettingsExA", EnumDisplaySettingsExAFn, detour_enum_display_ex_a);
@@ -1343,26 +1457,69 @@ unsafe extern "system" fn detour_move_window(h: isize, x: i32, y: i32, w: i32, h
 
 unsafe extern "system" fn detour_set_window_long_w(h: isize, index: i32, v: i32) -> i32 {
     let Some(hook) = SET_LONG_W.get() else { return 0 };
+    // x86's SetWindowLongW is its SetWindowLongPtrW (on x64 it refuses GWL_WNDPROC).
+    if cfg!(target_pointer_width = "32")
+        && index == GWLP_WNDPROC
+        && let Some(prev) = proc_set_by_game(h, true, v as isize)
+    {
+        return prev as i32;
+    }
     let v = if contained(h).is_some() { kept_style(index, v as u32) as i32 } else { v };
     unsafe { hook.call(h, index, v) }
 }
 
 unsafe extern "system" fn detour_set_window_long_a(h: isize, index: i32, v: i32) -> i32 {
     let Some(hook) = SET_LONG_A.get() else { return 0 };
+    if cfg!(target_pointer_width = "32")
+        && index == GWLP_WNDPROC
+        && let Some(prev) = proc_set_by_game(h, false, v as isize)
+    {
+        return prev as i32;
+    }
     let v = if contained(h).is_some() { kept_style(index, v as u32) as i32 } else { v };
     unsafe { hook.call(h, index, v) }
 }
 
 unsafe extern "system" fn detour_set_window_long_ptr_w(h: isize, index: i32, v: isize) -> isize {
     let Some(hook) = SET_LONG_PTR_W.get() else { return 0 };
+    if index == GWLP_WNDPROC
+        && let Some(prev) = proc_set_by_game(h, true, v)
+    {
+        return prev;
+    }
     let v = if contained(h).is_some() && matches!(index, GWL_STYLE | GWL_EXSTYLE) { kept_style(index, v as u32) as isize } else { v };
     unsafe { hook.call(h, index, v) }
 }
 
 unsafe extern "system" fn detour_set_window_long_ptr_a(h: isize, index: i32, v: isize) -> isize {
     let Some(hook) = SET_LONG_PTR_A.get() else { return 0 };
+    if index == GWLP_WNDPROC
+        && let Some(prev) = proc_set_by_game(h, false, v)
+    {
+        return prev;
+    }
     let v = if contained(h).is_some() && matches!(index, GWL_STYLE | GWL_EXSTYLE) { kept_style(index, v as u32) as isize } else { v };
     unsafe { hook.call(h, index, v) }
+}
+
+unsafe extern "system" fn detour_get_window_long_ptr_w(h: isize, index: i32) -> isize {
+    let Some(hook) = GET_LONG_PTR_W.get() else { return 0 };
+    if index == GWLP_WNDPROC
+        && let Some(p) = proc_seen_by_game(h, true)
+    {
+        return p;
+    }
+    unsafe { hook.call(h, index) }
+}
+
+unsafe extern "system" fn detour_get_window_long_ptr_a(h: isize, index: i32) -> isize {
+    let Some(hook) = GET_LONG_PTR_A.get() else { return 0 };
+    if index == GWLP_WNDPROC
+        && let Some(p) = proc_seen_by_game(h, false)
+    {
+        return p;
+    }
+    unsafe { hook.call(h, index) }
 }
 
 unsafe extern "system" fn detour_show_window(h: isize, cmd: i32) -> i32 {
@@ -1511,6 +1668,138 @@ mod tests {
         assert_eq!(ex & (WS_EX_TOPMOST | WS_EX_APPWINDOW | WS_EX_TOOLWINDOW), WS_EX_TOOLWINDOW);
         assert_eq!(kept_style(-21, 7), 7, "GWLP_USERDATA is the game's");
         assert_eq!((kept_show(6), kept_show(3), kept_show(5), kept_show(0), kept_show(8)), (4, 4, 4, 0, 8));
+    }
+
+    const TEST_MSG: u32 = 0x0400 + 0x2d1;
+
+    thread_local! {
+        /// What the test class's procedure calls on (0: Windows' default), and how often
+        /// it and the subclass procedure saw `TEST_MSG`.
+        static CLASS_PREV: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+        static CLASS_SEEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        static SUB_PREV: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+        static SUB_SEEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    fn call_on(prev: isize, h: HWND, m: u32, w: usize, l: isize) -> isize {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{CallWindowProcW, DefWindowProcW, WNDPROC};
+        if prev == 0 {
+            return unsafe { DefWindowProcW(h, m, w, l) };
+        }
+        unsafe { CallWindowProcW(std::mem::transmute::<isize, WNDPROC>(prev), h, m, w, l) }
+    }
+
+    /// A class procedure that subclasses the way SDL2 does: what it found in the window
+    /// after creating it, if not itself, is called after it for every message.
+    unsafe extern "system" fn class_proc(h: HWND, m: u32, w: usize, l: isize) -> isize {
+        if m == TEST_MSG {
+            CLASS_SEEN.with(|c| c.set(c.get() + 1));
+        }
+        call_on(CLASS_PREV.with(|c| c.get()), h, m, w, l)
+    }
+
+    unsafe extern "system" fn sub_proc(h: HWND, m: u32, w: usize, l: isize) -> isize {
+        if m == TEST_MSG {
+            SUB_SEEN.with(|c| c.set(c.get() + 1));
+        }
+        call_on(SUB_PREV.with(|c| c.get()), h, m, w, l)
+    }
+
+    fn class_window() -> HWND {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{CreateWindowExW, RegisterClassW, WNDCLASSW};
+        static CLASS: Once = Once::new();
+        let name = wide("PeerPartyTestChain");
+        CLASS.call_once(|| {
+            let wc = WNDCLASSW {
+                style: 0,
+                lpfnWndProc: Some(class_proc),
+                cbClsExtra: 0,
+                cbWndExtra: 0,
+                hInstance: unsafe { windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null()) },
+                hIcon: std::ptr::null_mut(),
+                hCursor: std::ptr::null_mut(),
+                hbrBackground: std::ptr::null_mut(),
+                lpszMenuName: std::ptr::null(),
+                lpszClassName: name.as_ptr(),
+            };
+            assert_ne!(unsafe { RegisterClassW(&wc) }, 0);
+        });
+        CLASS_PREV.with(|c| c.set(0));
+        CLASS_SEEN.with(|c| c.set(0));
+        SUB_PREV.with(|c| c.set(0));
+        SUB_SEEN.with(|c| c.set(0));
+        let h = unsafe { CreateWindowExW(0, name.as_ptr(), name.as_ptr(), WS_POPUP, 0, 0, 64, 64, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null()) };
+        assert!(!h.is_null());
+        h
+    }
+
+    fn send_test(h: HWND) {
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(h, TEST_MSG, 7, 9) };
+    }
+
+    /// The game reading its wrapped window's procedure gets its own class procedure, so a
+    /// class procedure that subclasses whatever isn't itself leaves it be, and each
+    /// message reaches it once.
+    #[test]
+    fn a_wrapped_window_shows_the_game_its_own_procedure() {
+        let h = class_window();
+        keep_focus(h as usize);
+        assert_eq!(unsafe { real_proc(h, true) }, wrapper());
+        let seen = proc_seen_by_game(h as isize, true).unwrap();
+        assert_eq!(seen, class_proc as Proc as usize as isize);
+        send_test(h);
+        assert_eq!(CLASS_SEEN.with(|c| c.get()), 1);
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(h) };
+        assert!(!is_wrapped_for_test(h as usize));
+    }
+
+    /// A procedure the game sets on its wrapped window goes behind the wrapper, and the one
+    /// it's told it replaced is the one it read: every procedure sees each message once.
+    #[test]
+    fn a_procedure_the_game_sets_goes_behind_the_wrapper() {
+        let h = class_window();
+        keep_focus(h as usize);
+        let prev = proc_set_by_game(h as isize, true, sub_proc as Proc as usize as isize).unwrap();
+        assert_eq!(prev, class_proc as Proc as usize as isize);
+        SUB_PREV.with(|c| c.set(prev));
+        assert_eq!(unsafe { real_proc(h, true) }, wrapper(), "the wrapper stays in front");
+        assert_eq!(proc_seen_by_game(h as isize, true), Some(sub_proc as Proc as usize as isize));
+        send_test(h);
+        assert_eq!((SUB_SEEN.with(|c| c.get()), CLASS_SEEN.with(|c| c.get())), (1, 1));
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(h) };
+    }
+
+    /// A class procedure that took the wrapper as its previous one past the hooks hands
+    /// every message back to it: the wrapper answers with Windows' default instead of
+    /// going round until the stack runs out.
+    #[test]
+    fn a_procedure_handing_messages_back_to_the_wrapper_does_not_loop() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW;
+        let h = class_window();
+        keep_focus(h as usize);
+        // What a class procedure that subclasses finds and does, with no hooks in this
+        // test process.
+        let found = unsafe { real_proc(h, true) };
+        assert_eq!(found, wrapper());
+        CLASS_PREV.with(|c| c.set(found));
+        unsafe { SetWindowLongPtrW(h, GWLP_WNDPROC, class_proc as Proc as usize as isize) };
+        send_test(h);
+        assert_eq!(CLASS_SEEN.with(|c| c.get()), 2, "once from Windows, once from the wrapper");
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(h) };
+    }
+
+    /// The game using the other character set's calls on its wrapped window takes the
+    /// wrapper off it (their answers are Windows' conversion handles).
+    #[test]
+    fn the_other_character_set_takes_the_wrapper_off() {
+        let h = class_window();
+        keep_focus(h as usize);
+        assert_eq!(proc_seen_by_game(h as isize, false), None);
+        assert!(!is_wrapped_for_test(h as usize));
+        assert_eq!(unsafe { real_proc(h, true) }, class_proc as Proc as usize as isize);
+        send_test(h);
+        assert_eq!(CLASS_SEEN.with(|c| c.get()), 1);
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(h) };
     }
 
     #[test]
