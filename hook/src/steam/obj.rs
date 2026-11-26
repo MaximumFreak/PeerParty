@@ -55,6 +55,25 @@ macro_rules! call_real {
 }
 pub(crate) use call_real;
 
+/// Calls steam_api's flat function `$f` that returns a CSteamID, as `$class` says this
+/// build's flat API does: through a hidden pointer before `self` (`true`), else as a
+/// plain number in a register. Gives the SteamID.
+macro_rules! call_flat_id {
+    ($class:expr, $f:expr, $self:expr $(, $a:expr => $t:ty)* $(,)?) => {{
+        let f: usize = $f;
+        if $class {
+            let f: unsafe extern "C" fn(*mut u64, usize $(, $t)*) -> *mut u64 = unsafe { std::mem::transmute(f) };
+            let mut id = 0u64;
+            unsafe { f(&mut id, $self $(, $a)*) };
+            id
+        } else {
+            let f: unsafe extern "C" fn(usize $(, $t)*) -> u64 = unsafe { std::mem::transmute(f) };
+            unsafe { f($self $(, $a)*) }
+        }
+    }};
+}
+pub(crate) use call_flat_id;
+
 /// The stand-in object. `real` sits right after the vtable pointer, where the
 /// forwarding stubs read it.
 #[repr(C)]
@@ -521,7 +540,32 @@ pub fn note_flat(exports: &[Export]) {
         log!("steam-lan flat methods served by the stand-ins: {}", methods.len());
         let _ = FLAT_METHODS.set((methods, base));
     }
+    let class = returns_class_flat(exports.iter().map(|e| e.name.as_str()));
+    FLAT_CLASS.store(class, std::sync::atomic::Ordering::Relaxed);
+    if class && exports.iter().any(|e| flat_interface(&e.name).is_some()) {
+        log!("steam-lan flat API without versioned accessors: its CSteamID returns come through a hidden pointer before self");
+    }
     let _ = FLAT_REAL.set(real);
+}
+
+/// Whether steam_api's flat functions that return a CSteamID declare it as the class:
+/// MSVC hands a class back through a hidden pointer before `self`. The flat API that
+/// added the versioned accessors (`SteamAPI_SteamUser_v020`) declares a plain number,
+/// returned in a register; the one before it the class.
+static FLAT_CLASS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn flat_returns_class() -> bool {
+    FLAT_CLASS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether these export names are the older flat API's: none is a versioned accessor of
+/// any interface.
+fn returns_class_flat<'a>(mut names: impl Iterator<Item = &'a str>) -> bool {
+    !names.any(|n| {
+        n.strip_prefix("SteamAPI_Steam")
+            .and_then(|rest| rest.rsplit_once("_v"))
+            .is_some_and(|(_, d)| (1..=3).contains(&d.len()) && d.bytes().all(|b| b.is_ascii_digit()))
+    })
 }
 
 /// PeerParty's function for a flat accessor or method `name`, for the by-name swap.
@@ -696,9 +740,18 @@ unsafe fn make_flat_thunks(n: usize) -> usize {
 
 /// A flat method PeerParty answers that returns a CSteamID: the stand-in's method with
 /// its hidden return pointer, the value handed back in a register; else steam_api's own
-/// flat function with the real object.
+/// flat function with the real object. `$old` is the same for the older flat API, whose
+/// callers pass a hidden return pointer before `self`.
 macro_rules! flat_returns_id {
-    ($fn:ident, $flat:literal, $method:literal $(, $a:ident: $t:ty)*) => {
+    ($fn:ident, $old:ident, $flat:literal, $method:literal $(, $a:ident: $t:ty)*) => {
+        unsafe extern "C" fn $old(out: *mut u64, this: usize $(, $a: $t)*) -> *mut u64 {
+            let id = unsafe { $fn(this $(, $a)*) };
+            if !out.is_null() {
+                unsafe { *out = id };
+            }
+            out
+        }
+
         unsafe extern "C" fn $fn(this: usize $(, $a: $t)*) -> u64 {
             if let Some(f) = unsafe { member(this, $method) } {
                 #[cfg(target_arch = "x86")]
@@ -710,28 +763,41 @@ macro_rules! flat_returns_id {
                 return id;
             }
             let Some(real) = FLAT_REAL.get().and_then(|r| r.get($flat).copied()) else { return 0 };
-            let f: unsafe extern "C" fn(usize $(, $t)*) -> u64 = unsafe { std::mem::transmute(real) };
-            unsafe { f(unwrap(this) $(, $a)*) }
+            call_flat_id!(flat_returns_class(), real, unwrap(this) $(, $a => $t)*)
         }
     };
 }
 
-flat_returns_id!(flat_user_steam_id, "SteamAPI_ISteamUser_GetSteamID", "GetSteamID");
-flat_returns_id!(flat_server_steam_id, "SteamAPI_ISteamGameServer_GetSteamID", "GetSteamID");
+flat_returns_id!(flat_user_steam_id, flat_user_steam_id_old, "SteamAPI_ISteamUser_GetSteamID", "GetSteamID");
+flat_returns_id!(flat_server_steam_id, flat_server_steam_id_old, "SteamAPI_ISteamGameServer_GetSteamID", "GetSteamID");
 flat_returns_id!(
     flat_unauthenticated,
+    flat_unauthenticated_old,
     "SteamAPI_ISteamGameServer_CreateUnauthenticatedUserConnection",
     "CreateUnauthenticatedUserConnection"
 );
-flat_returns_id!(flat_lobby_by_index, "SteamAPI_ISteamMatchmaking_GetLobbyByIndex", "GetLobbyByIndex", i: i32);
+flat_returns_id!(
+    flat_lobby_by_index,
+    flat_lobby_by_index_old,
+    "SteamAPI_ISteamMatchmaking_GetLobbyByIndex",
+    "GetLobbyByIndex",
+    i: i32
+);
 flat_returns_id!(
     flat_lobby_member,
+    flat_lobby_member_old,
     "SteamAPI_ISteamMatchmaking_GetLobbyMemberByIndex",
     "GetLobbyMemberByIndex",
     lobby: u64,
     i: i32
 );
-flat_returns_id!(flat_lobby_owner, "SteamAPI_ISteamMatchmaking_GetLobbyOwner", "GetLobbyOwner", lobby: u64);
+flat_returns_id!(
+    flat_lobby_owner,
+    flat_lobby_owner_old,
+    "SteamAPI_ISteamMatchmaking_GetLobbyOwner",
+    "GetLobbyOwner",
+    lobby: u64
+);
 
 // ---- ISteamNetworkingUtils's inline helpers ----
 //
@@ -827,6 +893,7 @@ fn adapters() -> Vec<(&'static str, usize)> {
     if FLAT_REAL.get().is_none() {
         return Vec::new();
     }
+    let id = |new: usize, old: usize| if flat_returns_class() { old } else { new };
     vec![
         ("SteamAPI_ISteamNetworkingUtils_SetGlobalConfigValueInt32", cfg_global_i32 as *const () as usize),
         ("SteamAPI_ISteamNetworkingUtils_SetGlobalConfigValueFloat", cfg_global_f32 as *const () as usize),
@@ -842,12 +909,30 @@ fn adapters() -> Vec<(&'static str, usize)> {
         ("SteamAPI_ISteamNetworkingUtils_SetGlobalCallback_MessagesSessionRequest", cb_session_request as *const () as usize),
         ("SteamAPI_ISteamNetworkingUtils_SetGlobalCallback_MessagesSessionFailed", cb_session_failed as *const () as usize),
         ("SteamAPI_ISteamNetworkingUtils_SetGlobalCallback_FakeIPResult", cb_fake_ip as *const () as usize),
-        ("SteamAPI_ISteamUser_GetSteamID", flat_user_steam_id as *const () as usize),
-        ("SteamAPI_ISteamGameServer_GetSteamID", flat_server_steam_id as *const () as usize),
-        ("SteamAPI_ISteamGameServer_CreateUnauthenticatedUserConnection", flat_unauthenticated as *const () as usize),
-        ("SteamAPI_ISteamMatchmaking_GetLobbyByIndex", flat_lobby_by_index as *const () as usize),
-        ("SteamAPI_ISteamMatchmaking_GetLobbyMemberByIndex", flat_lobby_member as *const () as usize),
-        ("SteamAPI_ISteamMatchmaking_GetLobbyOwner", flat_lobby_owner as *const () as usize),
+        (
+            "SteamAPI_ISteamUser_GetSteamID",
+            id(flat_user_steam_id as *const () as usize, flat_user_steam_id_old as *const () as usize),
+        ),
+        (
+            "SteamAPI_ISteamGameServer_GetSteamID",
+            id(flat_server_steam_id as *const () as usize, flat_server_steam_id_old as *const () as usize),
+        ),
+        (
+            "SteamAPI_ISteamGameServer_CreateUnauthenticatedUserConnection",
+            id(flat_unauthenticated as *const () as usize, flat_unauthenticated_old as *const () as usize),
+        ),
+        (
+            "SteamAPI_ISteamMatchmaking_GetLobbyByIndex",
+            id(flat_lobby_by_index as *const () as usize, flat_lobby_by_index_old as *const () as usize),
+        ),
+        (
+            "SteamAPI_ISteamMatchmaking_GetLobbyMemberByIndex",
+            id(flat_lobby_member as *const () as usize, flat_lobby_member_old as *const () as usize),
+        ),
+        (
+            "SteamAPI_ISteamMatchmaking_GetLobbyOwner",
+            id(flat_lobby_owner as *const () as usize, flat_lobby_owner_old as *const () as usize),
+        ),
     ]
 }
 
@@ -1517,6 +1602,39 @@ mod tests {
             assert_eq!(out, want, "slot {i} reached its own real overload");
         }
         std::mem::forget(vt);
+    }
+
+    #[test]
+    fn the_older_flat_api_is_the_one_without_versioned_accessors() {
+        let class = |names: &[&str]| returns_class_flat(names.iter().copied());
+        assert!(class(&["SteamAPI_Init", "SteamAPI_ISteamUser_GetSteamID", "SteamAPI_ISteamClient_GetISteamUser"]));
+        assert!(!class(&["SteamAPI_ISteamUser_GetSteamID", "SteamAPI_SteamUser_v020"]));
+        // Any interface's accessor counts, ones PeerParty leaves alone too.
+        assert!(!class(&["SteamAPI_SteamApps_v008"]));
+        assert!(!class(&["SteamAPI_SteamNetworkingSockets_SteamAPI_v012"]));
+        assert!(class(&["SteamAPI_SteamUser_vX", "SteamAPI_SteamUser_v"]));
+    }
+
+    unsafe extern "C" fn old_flat_id(out: *mut u64, this: usize, i: i32) -> *mut u64 {
+        unsafe { *out = this as u64 * 10 + i as u64 };
+        out
+    }
+
+    unsafe extern "C" fn new_flat_id(this: usize, i: i32) -> u64 {
+        this as u64 * 10 + i as u64
+    }
+
+    #[test]
+    fn flat_ids_are_read_the_way_each_flat_api_returns_them() {
+        let old = old_flat_id as *const () as usize;
+        let new = new_flat_id as *const () as usize;
+        assert_eq!(call_flat_id!(true, old, 7, 3 => i32), 73);
+        assert_eq!(call_flat_id!(false, new, 7, 3 => i32), 73);
+        // The game's own call into the older flat API gets the ID at its pointer.
+        let mut out = 99u64;
+        let p: *mut u64 = &mut out;
+        assert_eq!(unsafe { flat_lobby_by_index_old(p, 0, 2) }, p);
+        assert_eq!(out, 0);
     }
 
     #[test]
