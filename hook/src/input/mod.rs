@@ -153,16 +153,76 @@ static SEAT_AT_MS: AtomicU64 = AtomicU64::new(0);
 
 fn note_seat(pad: &VirtualPad) {
     let slot = pad.xinput_slot.map_or(0, |k| u32::from(k) + 1);
-    if SEAT_SLOT.load(Ordering::Relaxed) != slot {
+    let moved = SEAT_SLOT.load(Ordering::Relaxed) != slot;
+    if moved {
         SEAT_SLOT.store(slot, Ordering::Relaxed);
     }
-    if SEAT_KEY.load(Ordering::Relaxed) != pad.hid_key || (pad.connected && SEAT_SEEN.load(Ordering::Relaxed) != 2) {
+    if moved || SEAT_KEY.load(Ordering::Relaxed) != pad.hid_key || (pad.connected && SEAT_SEEN.load(Ordering::Relaxed) != 2) {
         SEAT_KEY.store(pad.hid_key, Ordering::Relaxed);
         SEAT_AT_MS.store(since_start_ms(), Ordering::Relaxed);
+        // The press that gave the seat its controller (a controller takes a seat when
+        // it's first used), for the game's first reads of it (`replay_opening`).
+        let opening = if pad.connected { pad.buttons & 0xFFFF } else { 0 };
+        OPENING_FIRST_MS.store(0, Ordering::Relaxed);
+        OPENING_READS.store(0, Ordering::Relaxed);
+        OPENING.store(opening, Ordering::Relaxed);
     }
     let seen = if pad.connected { 2 } else { 1 };
     if SEAT_SEEN.load(Ordering::Relaxed) != seen {
         SEAT_SEEN.store(seen, Ordering::Relaxed);
+    }
+}
+
+/// The buttons (`XINPUT_GAMEPAD`'s) of the press that gave the seat its controller, until
+/// the game has read them (`replay_opening`); 0 for none.
+static OPENING: AtomicU32 = AtomicU32::new(0);
+/// When the game first read them (`since_start_ms`; 0 not yet), and how many times.
+static OPENING_FIRST_MS: AtomicU64 = AtomicU64::new(0);
+static OPENING_READS: AtomicU32 = AtomicU32::new(0);
+/// How long after the seat is taken the press is still given to a game that hasn't read
+/// the controller yet.
+const OPENING_WITHIN_MS: u64 = 2000;
+/// How long, and for how many reads at least, the game reads the press down: a few
+/// frames, as a quick tap lasts.
+const OPENING_HOLD_MS: u64 = 80;
+const OPENING_HOLD_READS: u32 = 3;
+
+/// The press that took the seat, given to the game in its first reads of its new
+/// controller. A game polls a controller that isn't there now and then only (some input
+/// libraries check an absent slot every few hundred ms): it first read its new one after
+/// the press that took the seat was over, and that press never reached it. Its buttons
+/// are held down in `out` (an `XINPUT_STATE`) for a few frames from the game's first
+/// read, with the packet number moved so a game that skips unchanged packets sees both
+/// the press and its release.
+fn replay_opening(out: *mut u8) {
+    let buttons = OPENING.load(Ordering::Relaxed);
+    if buttons == 0 || out.is_null() {
+        return;
+    }
+    let now = since_start_ms();
+    let at = SEAT_AT_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(at) > OPENING_WITHIN_MS && OPENING_FIRST_MS.load(Ordering::Relaxed) == 0 {
+        OPENING.store(0, Ordering::Relaxed);
+        log!("input: the press that took this copy's seat ({buttons:#06x}) wasn't given to the game: it didn't read its controller within {} s", OPENING_WITHIN_MS / 1000);
+        return;
+    }
+    let first = match OPENING_FIRST_MS.compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed) {
+        Ok(_) => {
+            log!("input: the game first read its new controller {} ms after the press that took the seat ({buttons:#06x}): that press is given to it now, held for {OPENING_HOLD_MS} ms", now.saturating_sub(at));
+            now
+        }
+        Err(f) => f,
+    };
+    // XINPUT_STATE: dwPacketNumber, then XINPUT_GAMEPAD (wButtons first).
+    unsafe {
+        let packet = std::ptr::read_unaligned(out as *const u32);
+        std::ptr::write_unaligned(out as *mut u32, packet ^ 0x8000_0000);
+        let w = std::ptr::read_unaligned(out.add(4) as *const u16);
+        std::ptr::write_unaligned(out.add(4) as *mut u16, w | buttons as u16);
+    }
+    let reads = OPENING_READS.fetch_add(1, Ordering::Relaxed) + 1;
+    if reads >= OPENING_HOLD_READS && now.saturating_sub(first) >= OPENING_HOLD_MS {
+        OPENING.store(0, Ordering::Relaxed);
     }
 }
 
@@ -758,6 +818,7 @@ fn get_state(i: usize, pad: u32, out: *mut u8) -> u32 {
                     };
                     if rc == 0 {
                         XINPUT_OK.fetch_add(1, Ordering::Relaxed);
+                        replay_opening(out);
                         note_xinput_active(out);
                     } else {
                         XINPUT_ERR.fetch_add(1, Ordering::Relaxed);
@@ -781,6 +842,7 @@ fn get_state(i: usize, pad: u32, out: *mut u8) -> u32 {
                         let mut buf = [0u8; 16];
                         pack_xinput_state(&snap.pad, &mut buf);
                         unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), out, 16) };
+                        replay_opening(out);
                     }
                     XINPUT_OK.fetch_add(1, Ordering::Relaxed);
                     note_xinput_active(out);
@@ -1621,6 +1683,29 @@ pub(super) const fn guid(a: u32, b: u16, c: u16, d: [u8; 8]) -> [u8; 16] {
 mod tests {
     use super::*;
     use peerparty_protocol::input_shm::{VirtualKeyboard, VirtualMouse};
+
+    /// The press that took the seat reaches the game's first reads of its controller,
+    /// held a few reads and frames, then the controller reads as it is.
+    #[test]
+    fn the_press_that_took_the_seat_reaches_the_game() {
+        note_seat(&VirtualPad { connected: false, ..Default::default() });
+        note_seat(&VirtualPad { connected: true, xinput_slot: Some(2), buttons: 0x1000, ..Default::default() });
+        // The game reads the controller once the press is over: buttons up, packet 7.
+        let read = || {
+            let mut s = [0u8; 16];
+            s[..4].copy_from_slice(&7u32.to_le_bytes());
+            replay_opening(s.as_mut_ptr());
+            (u32::from_le_bytes(s[..4].try_into().unwrap()), u16::from_le_bytes([s[4], s[5]]))
+        };
+        let first = read();
+        assert_eq!(first.1, 0x1000, "the press is given");
+        assert_ne!(first.0, 7, "as a packet of its own");
+        read();
+        read();
+        std::thread::sleep(std::time::Duration::from_millis(OPENING_HOLD_MS + 20));
+        assert_eq!(read().1, 0x1000, "held for its time");
+        assert_eq!(read(), (7, 0), "then the controller as it is");
+    }
 
     fn load(name: &str) {
         let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();

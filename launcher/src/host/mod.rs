@@ -1227,10 +1227,21 @@ impl SessionHost {
         let seated = std::mem::take(&mut pads.newly_seated);
         let notes = std::mem::take(&mut pads.notes);
         self.pads = PadFrame { all, per: pads.per.clone(), spare: pads.spare, homes: std::mem::take(&mut pads.homes) };
+        let session = self.compositor.is_some() && self.instances.len() > 1;
         for (seat, name) in seated {
-            let text = format!("input: {name} claimed seat {seat} (player {})", seat + 1);
             let to = if seat < self.instances.len() { seat } else { self.focus };
+            // Its player is told which controller is theirs now, with more than one
+            // player (one playing alone needn't be).
+            let product = session.then(|| self.input.pads().product_name(seat)).flatten();
+            let named = product.as_ref().map(|p| format!(", {p:?}")).unwrap_or_default();
+            let text = format!("input: {name}{named} claimed seat {seat} (player {})", seat + 1);
             self.instances[to].send(&HostMsg::Note { text });
+            if let Some(p) = product
+                && self.prefs.toasts
+                && seat < self.panes.len()
+            {
+                self.panes[seat].overlay.toast(crate::t!("toast.pad_connected", name = p), crate::t!("toast.pad_connected_detail", n = seat + 1));
+            }
         }
         for text in notes {
             self.cur().send(&HostMsg::Note { text });

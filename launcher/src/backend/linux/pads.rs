@@ -256,6 +256,8 @@ mod device {
     const fn eviocgabs(axis: u16) -> libc::c_ulong {
         ior(0x40 + axis as u32, 24)
     }
+    /// `EVIOCGNAME(128)`: the device's name.
+    const EVIOCGNAME: libc::c_ulong = ior(0x06, 128);
 
     /// Opens every gamepad in `/dev/input` not read yet, each read on one of `threads`.
     pub fn scan(list: &Arc<Mutex<Vec<Hid>>>, threads: &Arc<Threads>) {
@@ -307,9 +309,16 @@ mod device {
             rz: range(super::ABS_RZ).unwrap_or(default.rz),
         };
         let (vid, pid) = (id[1], id[2]);
+        let mut name = [0u8; 128];
+        let product = if unsafe { libc::ioctl(fd, EVIOCGNAME, name.as_mut_ptr()) } > 0 {
+            let n = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+            String::from_utf8_lossy(&name[..n]).trim().to_string()
+        } else {
+            String::new()
+        };
         let state = Arc::new(Mutex::new(State::default()));
         let alive = Arc::new(AtomicBool::new(true));
-        list.lock().unwrap().push(Hid { path, vid, pid, style: style_of(vid), state: state.clone(), alive: alive.clone(), home: true, stick: 0, serial_key: 0, inst_key: 0 });
+        list.lock().unwrap().push(Hid { path, vid, pid, product, style: style_of(vid), state: state.clone(), alive: alive.clone(), home: true, stick: 0, serial_key: 0, inst_key: 0 });
         let (stop, reader_alive) = (threads.clone(), alive.clone());
         let read = move || {
             let alive = reader_alive;

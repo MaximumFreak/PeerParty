@@ -132,6 +132,8 @@ pub(crate) struct Hid {
     pub(crate) path: String,
     pub(crate) vid: u16,
     pub(crate) pid: u16,
+    /// Its product name, as the device gives it ("" for none).
+    pub(crate) product: String,
     pub(crate) style: Style,
     pub(crate) state: Arc<Mutex<State>>,
     pub(crate) alive: Arc<AtomicBool>,
@@ -471,6 +473,25 @@ impl Pads {
                 Some(SeatInfo { style: k.style, name: k.name.clone(), here })
             })
             .collect()
+    }
+
+    /// Seat `k`'s controller's name for its player ("XBOX 360 For Windows"): the
+    /// device's product name, else one for its kind (`friendly_name`). Asked once per
+    /// seating: an XInput controller's means a look through the HID devices.
+    pub fn product_name(&self, k: usize) -> Option<String> {
+        let s = self.seats.get(k)?.as_ref()?;
+        let style = self.known.iter().find(|c| c.id.same(s)).map_or(Style::Xbox, |c| c.style);
+        let product = match s {
+            #[cfg(windows)]
+            Seat::XInput(slot) => xinput_ids(*slot).and_then(|(vid, pid)| xinput_product(vid, pid)).unwrap_or_default(),
+            #[cfg(not(windows))]
+            Seat::XInput(_) => String::new(),
+            Seat::Device { .. } => {
+                let hid = self.hid.lock().unwrap();
+                hid.iter().find(|h| device_seat(h, &hid).same(s)).map(|h| h.product.clone()).unwrap_or_default()
+            }
+        };
+        Some(friendly_name(&product, style))
     }
 
     /// A seat's controller's name for the log.
@@ -1129,6 +1150,23 @@ fn scan_hid(list: &Arc<Mutex<Vec<Hid>>>, threads: &Arc<Threads>) {
 
 #[cfg(windows)]
 fn scan_hid(list: &Arc<Mutex<Vec<Hid>>>, threads: &Arc<Threads>) {
+    for path in hid_paths() {
+        if threads.stopping() {
+            return;
+        }
+        if path.to_ascii_lowercase().contains("ig_") {
+            continue;
+        }
+        if list.lock().unwrap().iter().any(|h| h.path == path) {
+            continue;
+        }
+        open_hid(list, threads, path);
+    }
+}
+
+/// Every HID device's path.
+#[cfg(windows)]
+fn hid_paths() -> Vec<String> {
     use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
         DIGCF_DEVICEINTERFACE, DIGCF_PRESENT, SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W,
         SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW, SetupDiGetDeviceInterfaceDetailW,
@@ -1138,7 +1176,7 @@ fn scan_hid(list: &Arc<Mutex<Vec<Hid>>>, threads: &Arc<Threads>) {
     unsafe { HidD_GetHidGuid(&mut guid) };
     let set = unsafe { SetupDiGetClassDevsW(&guid, std::ptr::null(), std::ptr::null_mut(), DIGCF_PRESENT | DIGCF_DEVICEINTERFACE) };
     if set as isize == -1 {
-        return;
+        return Vec::new();
     }
     let mut paths = Vec::new();
     for i in 0.. {
@@ -1164,18 +1202,7 @@ fn scan_hid(list: &Arc<Mutex<Vec<Hid>>>, threads: &Arc<Threads>) {
         paths.push(String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(p, n) }));
     }
     unsafe { SetupDiDestroyDeviceInfoList(set) };
-    for path in paths {
-        if threads.stopping() {
-            return;
-        }
-        if path.to_ascii_lowercase().contains("ig_") {
-            continue;
-        }
-        if list.lock().unwrap().iter().any(|h| h.path == path) {
-            continue;
-        }
-        open_hid(list, threads, path);
-    }
+    paths
 }
 
 #[cfg(windows)]
@@ -1213,7 +1240,8 @@ fn open_hid(list: &Arc<Mutex<Vec<Hid>>>, threads: &Arc<Threads>, path: String) {
     let serial = serial_of(h);
     let serial_key = if serial.trim().is_empty() { 0 } else { peerparty_protocol::input_shm::hid_key(attr.VendorID, attr.ProductID, &serial) };
     let inst_key = peerparty_protocol::input_shm::hid_instance_key(attr.VendorID, attr.ProductID, &path).unwrap_or(0);
-    let entry = Hid { path, vid: attr.VendorID, pid: attr.ProductID, style: style_of(attr.VendorID), state: state.clone(), alive: alive.clone(), home: true, stick: 0, serial_key, inst_key };
+    let product = product_of(h);
+    let entry = Hid { path, vid: attr.VendorID, pid: attr.ProductID, product, style: style_of(attr.VendorID), state: state.clone(), alive: alive.clone(), home: true, stick: 0, serial_key, inst_key };
     let (vid, pid, len) = (attr.VendorID, attr.ProductID, caps.InputReportByteLength as usize);
     let ranges = Ranges {
         x: value_range(pre, 0x01, 0x30),
@@ -1270,6 +1298,75 @@ fn open_hid(list: &Arc<Mutex<Vec<Hid>>>, threads: &Arc<Threads>, path: String) {
         unsafe { HidD_FreePreparsedData(pre) };
         unsafe { windows_sys::Win32::Foundation::CloseHandle(h as _) };
     }
+}
+
+/// A HID device's product name ("Controller (XBOX 360 For Windows)"), empty when it has
+/// none.
+#[cfg(windows)]
+fn product_of(h: windows_sys::Win32::Foundation::HANDLE) -> String {
+    let mut buf = [0u16; 128];
+    let ok = unsafe { windows_sys::Win32::Devices::HumanInterfaceDevice::HidD_GetProductString(h, buf.as_mut_ptr().cast(), (buf.len() * 2) as u32) };
+    if !ok {
+        return String::new();
+    }
+    let n = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..n]).trim().to_string()
+}
+
+/// An XInput controller's USB ids, from `XInputGetCapabilitiesEx` (xinput1_4's ordinal
+/// 108, which XInputGetCapabilities lacks them in).
+#[cfg(windows)]
+fn xinput_ids(slot: u32) -> Option<(u16, u16)> {
+    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW};
+    type CapsEx = unsafe extern "system" fn(u32, u32, u32, *mut [u8; 28]) -> u32;
+    let wide: Vec<u16> = "xinput1_4.dll".encode_utf16().chain(Some(0)).collect();
+    let m = unsafe { LoadLibraryExW(wide.as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
+    if m.is_null() {
+        return None;
+    }
+    let f: CapsEx = unsafe { std::mem::transmute(GetProcAddress(m, 108 as *const u8)?) };
+    // XINPUT_CAPABILITIES (20 bytes), then the vendor and product ids.
+    let mut caps = [0u8; 28];
+    (unsafe { f(1, slot, 0, &mut caps) } == 0).then(|| (u16::from_le_bytes([caps[20], caps[21]]), u16::from_le_bytes([caps[22], caps[23]])))
+}
+
+/// The product name of the XInput-side HID device (`IG_` in its path) with these ids:
+/// what Windows calls an XInput controller ("Controller (XBOX 360 For Windows)").
+#[cfg(windows)]
+fn xinput_product(vid: u16, pid: u16) -> Option<String> {
+    use windows_sys::Win32::Devices::HumanInterfaceDevice::{HIDD_ATTRIBUTES, HidD_GetAttributes};
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
+    hid_paths().into_iter().filter(|p| p.to_ascii_lowercase().contains("ig_")).find_map(|path| {
+        let wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+        // No access asked: enough for its attributes and strings, and never refused.
+        let h = unsafe { CreateFileW(wide.as_ptr(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE, std::ptr::null(), OPEN_EXISTING, 0, std::ptr::null_mut()) };
+        if h == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut attr: HIDD_ATTRIBUTES = unsafe { std::mem::zeroed() };
+        attr.Size = size_of::<HIDD_ATTRIBUTES>() as u32;
+        let ok = unsafe { HidD_GetAttributes(h, &mut attr) } && attr.VendorID == vid && attr.ProductID == pid;
+        let name = if ok { product_of(h) } else { String::new() };
+        unsafe { CloseHandle(h) };
+        (!name.is_empty()).then_some(name)
+    })
+}
+
+/// A controller's name for a player: its product name without the "Controller ( )"
+/// Windows wraps some in, else one for its kind.
+pub fn friendly_name(product: &str, style: Style) -> String {
+    let p = product.trim();
+    let p = p.strip_prefix("Controller (").and_then(|r| r.strip_suffix(')')).unwrap_or(p).trim();
+    if !p.is_empty() {
+        return p.to_string();
+    }
+    match style {
+        Style::Xbox => "Xbox controller",
+        Style::PlayStation => "PlayStation controller",
+        Style::Nintendo => "Nintendo controller",
+    }
+    .to_string()
 }
 
 /// A HID device's serial number, empty when it has none (the game's hook reads the same,
@@ -1728,7 +1825,7 @@ mod tests {
     /// A HID device on the list, as the scan adds one: its state and liveness to set.
     fn add_hid(pads: &Pads, path: &str, serial_key: u64) -> (Arc<Mutex<State>>, Arc<AtomicBool>) {
         let (state, alive) = (Arc::new(Mutex::new(State::default())), Arc::new(AtomicBool::new(true)));
-        let h = Hid { path: path.into(), vid: 0x054c, pid: 0x09cc, style: Style::PlayStation, state: state.clone(), alive: alive.clone(), home: true, stick: 0, serial_key, inst_key: 0 };
+        let h = Hid { path: path.into(), vid: 0x054c, pid: 0x09cc, product: String::new(), style: Style::PlayStation, state: state.clone(), alive: alive.clone(), home: true, stick: 0, serial_key, inst_key: 0 };
         pads.hid.lock().unwrap().push(h);
         (state, alive)
     }
