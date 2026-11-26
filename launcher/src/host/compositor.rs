@@ -1345,6 +1345,8 @@ mod win {
         dialogs_checked: Option<Instant>,
         /// The dialog boxes put over their panes, already said in the copies' logs.
         dialogs: Vec<usize>,
+        /// How often the session's window went under a dialog box (the first few logged).
+        dialogs_sunk: u32,
     }
 
     impl HostWindow {
@@ -1435,6 +1437,7 @@ mod win {
                 upscale: true,
                 dialogs_checked: None,
                 dialogs: Vec::new(),
+                dialogs_sunk: 0,
             })
         }
 
@@ -1761,10 +1764,21 @@ mod win {
                     let (w, h) = (r.right - r.left, r.bottom - r.top);
                     let (x, y) = dialog_spot(pane, (w, h));
                     let (x, y) = (bounds.x.saturating_add(x), bounds.y.saturating_add(y));
-                    let placed = (r.left, r.top) == (x, y) && is_above(d, self.hwnd);
-                    if !placed {
+                    let above = is_above(d, self.hwnd);
+                    if (r.left, r.top) != (x, y) || !above {
                         unsafe {
                             SetWindowPos(d, HWND_TOP, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_ASYNCWINDOWPOS);
+                        }
+                    }
+                    // Windows doesn't let another program's window be raised over the
+                    // active one (the session's, once a pane is clicked): the session's
+                    // window goes just under the dialog instead, still active.
+                    if !above && unsafe { GetForegroundWindow() } == self.hwnd {
+                        unsafe { SetWindowPos(self.hwnd, d, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE) };
+                        self.dialogs_sunk += 1;
+                        if self.dialogs_sunk <= 5 {
+                            let line = format!("session: player {}'s dialog box was under the session's window: the window went under it ({} time(s))", i + 1, self.dialogs_sunk);
+                            self.notes.push((i, line));
                         }
                     }
                     if !self.dialogs.contains(&(d as usize)) {
