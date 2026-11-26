@@ -11,7 +11,7 @@ use super::settings::{layers, mode_labels, mode_values, sdk_name};
 use super::store::{GameOptions, sdk_modes};
 use super::theme::{self, ACCENT, ACCENT_HI, TEXT, TEXT2, TEXT3};
 use super::widgets::{self, Kind};
-use super::{Action, App, View, first_focus, fx, store};
+use super::{Action, App, View, first_focus, fx, mainexe, store};
 use crate::t;
 
 /// How long the Play button's spark lasts.
@@ -73,6 +73,10 @@ impl App {
                         widgets::badge(ui.painter(), r.min, &label, theme::GOOD, false);
                     }
                 });
+                if g.source != Source::Xbox {
+                    ui.add_space(4.0);
+                    self.program_row(ui, &g, &key, &mut o);
+                }
                 ui.add_space(14.0);
                 self.play_button(ui, &g, &key, &o, &running, &mut actions);
                 ui.add_space(10.0);
@@ -141,7 +145,7 @@ impl App {
                 ui.add_space(14.0);
                 ui.horizontal_wrapped(|ui| {
                     if widgets::button(ui, Some(Icon::Folder), t!("game.show_in_folder"), Kind::Ghost).clicked() {
-                        actions.push(Action::Reveal(g.exe.clone()));
+                        actions.push(Action::Reveal(o.exe.clone().unwrap_or_else(|| g.exe.clone())));
                     }
                     let hidden = self.hidden(&key);
                     if widgets::button(ui, Some(Icon::Hidden), if hidden { t!("game.unhide") } else { t!("game.hide") }, Kind::Ghost).clicked() {
@@ -162,6 +166,56 @@ impl App {
             self.save_settings();
         }
         self.apply(actions);
+    }
+
+    /// The program Play starts, with the others in the game's folder to pick from: a
+    /// game can ship its tools beside it (an editor, a packer), as big as it and loading
+    /// the same SDKs, and the library may take one of them for the game.
+    fn program_row(&mut self, ui: &mut egui::Ui, g: &super::scan::Game, key: &str, o: &mut GameOptions) {
+        let exe = o.exe.clone().unwrap_or_else(|| g.exe.clone());
+        let name = exe.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let resp = ui
+            .horizontal(|ui| {
+                ui.label(egui::RichText::new(t!("game.adv_program")).size(12.5).color(TEXT3));
+                ui.add(egui::Button::new(egui::RichText::new(format!("{name}  \u{25BE}")).size(12.5).color(TEXT2)).frame(false))
+                    .on_hover_text(t!("game.program_tip"))
+            })
+            .inner;
+        if resp.clicked() {
+            // Read each time the list opens, not every frame: it walks the folder.
+            let mut list = mainexe::programs(&g.dir);
+            for p in [Some(g.exe.clone()), o.exe.clone()].into_iter().flatten().rev() {
+                if !list.iter().any(|l| store::key_of(l) == store::key_of(&p)) {
+                    list.insert(0, p);
+                }
+            }
+            self.lib.programs = Some((key.to_string(), list));
+        }
+        egui::Popup::menu(&resp).show(|ui| {
+            ui.set_min_width(260.0);
+            let list = match &self.lib.programs {
+                Some((k, list)) if k == key => list.clone(),
+                _ => Vec::new(),
+            };
+            egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                for p in &list {
+                    let rel = p.strip_prefix(&g.dir).unwrap_or(p).display().to_string();
+                    let found = store::key_of(p) == key;
+                    let label = if found { t!("game.program_found", name = rel) } else { rel };
+                    if ui.selectable_label(store::key_of(p) == store::key_of(&exe), label).clicked() {
+                        o.exe = (!found).then(|| p.clone());
+                        ui.close();
+                    }
+                }
+            });
+            ui.separator();
+            if ui.button(t!("game.adv_change")).clicked() {
+                if let Some(p) = rfd::FileDialog::new().set_directory(&g.dir).add_filter("Programs", &["exe"]).pick_file() {
+                    o.exe = (store::key_of(&p) != key).then_some(p);
+                }
+                ui.close();
+            }
+        });
     }
 
     /// Players on this PC: how many, and with two or more how they share it (split

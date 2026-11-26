@@ -26,8 +26,10 @@ connected. It finds what's installed on any PC:
 - **Game folders**: every subfolder of the folders in the list, `C:\Games` to begin
   with. Add others, or remove `C:\Games`, in Settings > Library. Folders starting with
   `.` are skipped. A folder's program is picked by `launcher/src/ui/mainexe.rs`:
-  `.gamebox.json`'s `main`, else a Unity game's exe, else the largest, skipping
-  redistributables, tools, and old-renderer builds beside a newer one.
+  a Unity game's exe, else one named after the folder, else the largest, skipping
+  redistributables and old-renderer builds beside a newer one and ranking tools (an
+  editor, a packer, a server) last. If it picks the wrong one, the program under the
+  game's name in its panel lists the others in its folder.
 - **Recent**: every game peerparty.exe starts (from the window, a .bat or a Steam
   launch option) is noted in `%LOCALAPPDATA%\peerparty\recent.tsv`, except a test run
   (`PEERPARTY_LOOPBACK=1`).

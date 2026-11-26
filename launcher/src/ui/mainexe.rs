@@ -1,11 +1,16 @@
 //! Which program is a game's own, for a folder with several. The rules of the Game Bar
-//! add-on's local games importer (its MainExecutable.cs, from the
-//! HTPC's main_program()): a folder's `.gamebox.json` may name it; otherwise, of the .exe
-//! files up to 6 folders down, not in a redistributables folder and not named as a
-//! tool, a Unity game's (the one with its `<name>_Data` folder beside it), else the
-//! largest. Ties go to the shallower, then by path. An old renderer's build
-//! (`game_dx11.exe`) never wins over the same program beside it with a newer renderer
-//! or none (`game.exe`).
+//! add-on's local games importer (its MainExecutable.cs, from the HTPC's
+//! main_program()): of the .exe files up to 6 folders down, not in a redistributables
+//! folder and not named as an installer or the like, a Unity game's (the one with its
+//! `<name>_Data` folder beside it), else the largest. Ties go to the shallower, then by
+//! path. An old renderer's build (`game_dx11.exe`) never wins over the same program
+//! beside it with a newer renderer or none (`game.exe`).
+//!
+//! Two rules on top of the importer's, for folders where a game ships its own tools
+//! beside it, each as big as the game and loading the same SDKs: a program named as a
+//! tool (an editor, a packer, a dedicated server) wins only when nothing else is left,
+//! and one named after the folder ("SG2" or "SomeGame" in "Some Game II") wins over a
+//! bigger one that isn't, as long as it's no stub (a quarter of the biggest's size).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,7 +19,6 @@ use std::sync::LazyLock;
 use super::pattern::Pattern;
 
 pub const MAX_DEPTH: usize = 6;
-const GAMEBOX: &str = ".gamebox.json";
 
 /// Programs that are never the game. Whole names, case ignored, no ".exe".
 const UTILITY_NAMES: &[&str] = &[
@@ -41,6 +45,20 @@ const REDIST_DIRS: &[&str] = &[
     r"dotnet", r"\.net", r"physx", r"prerequisites", r"prereqs?", r"support", r"__installer", r"installers?",
     r"_installer", r"__macosx", r"artbook", r"gamingrepair",
 ];
+
+/// Programs that come with a game and aren't it. Whole names, case ignored, no ".exe";
+/// ranked last rather than left out, since a game's own name may end in one of these.
+const TOOL_NAMES: &[&str] = &[
+    r".*(editor|toolkit|tools?|packager|packer|unpacker|modkit|devkit|sdk|uploader|converter|compiler|configurator|config|settings|benchmark|server)([ _-]?(64|32|x64|x86))?",
+    r".*(map|level|world)[ _-]?(maker|builder)([ _-]?(64|32|x64|x86))?",
+];
+
+/// Words of a program's name that say how it was built, not what it is.
+const BUILD_WORDS: &[&str] = &["win64", "win32", "x64", "x86", "64", "32", "shipping", "release", "final"];
+
+/// A stub (a launcher that starts the real program) is smaller than this share of the
+/// biggest program, so naming the folder doesn't make it the game.
+const STUB_SHARE: u64 = 4;
 
 const RENDERER_TAGS: &[&str] = &[r"(dx|d3d)(9|10|11|12)", r"vulkan", r"vk"];
 const OLD_RENDERER_TAGS: &[&str] = &[r"(dx|d3d)(9|10|11)"];
@@ -75,13 +93,56 @@ fn without_tags(tags: &Pattern, name: &str) -> String {
 }
 
 static MAIN_NOT: LazyLock<Pattern> = LazyLock::new(|| whole(&[UTILITY_NAMES, MAIN_NOT_EXTRA], r"\.exe"));
+static TOOL: LazyLock<Pattern> = LazyLock::new(|| whole(&[TOOL_NAMES], ""));
 static NOT_GAME_DIR: LazyLock<Pattern> = LazyLock::new(|| whole(&[REDIST_DIRS], ""));
 static RENDERER_TAG: LazyLock<Pattern> = LazyLock::new(|| tag(RENDERER_TAGS));
 static OLD_RENDERER_TAG: LazyLock<Pattern> = LazyLock::new(|| tag(OLD_RENDERER_TAGS));
 
 /// The game's main program, or None if the folder has none.
 pub fn find(folder: &Path) -> Option<PathBuf> {
-    recorded(folder).or_else(|| choose(folder, &executables(folder)))
+    choose(folder, &executables(folder))
+}
+
+/// Every program in `folder` that could be the game, the likeliest first (the one
+/// `find` picks), for picking another by hand.
+pub fn programs(folder: &Path) -> Vec<PathBuf> {
+    rank(folder, &executables(folder)).into_iter().map(|c| c.path).collect()
+}
+
+/// A name's words for matching: lower case, letters and digits only, a roman numeral
+/// as its number ("Some Game II" is some, game, 2).
+fn words(name: &str) -> Vec<String> {
+    name.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let w = w.to_lowercase();
+            const ROMAN: &[&str] = &["ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x"];
+            match ROMAN.iter().position(|r| *r == w) {
+                Some(i) => (i + 2).to_string(),
+                None => w,
+            }
+        })
+        .collect()
+}
+
+/// Whether a program's name (`stem`, no ".exe") is its folder's: the same letters, the
+/// folder's with more after them ("SomeGameClient"), or an abbreviation of them (each
+/// letter in order, from the first: "SG2" for "Some Game II"). Build words
+/// ("-Win64-Shipping") don't count.
+fn names_folder(stem: &str, folder: &str) -> bool {
+    let folder: String = words(&super::scan::clean_name(folder)).concat();
+    let stem: String = words(stem).into_iter().filter(|w| !BUILD_WORDS.contains(&w.as_str())).collect();
+    if stem.chars().count() < 2 || folder.is_empty() {
+        return false;
+    }
+    if stem.starts_with(&folder) {
+        return true;
+    }
+    if stem.chars().next() != folder.chars().next() {
+        return false;
+    }
+    let mut rest = folder.chars();
+    stem.chars().all(|c| rest.any(|f| f == c))
 }
 
 /// Every .exe up to MAX_DEPTH folders down, skipping folders that can't hold the game.
@@ -106,18 +167,6 @@ pub fn executables(folder: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// The program `.gamebox.json` names (a relative path inside the folder), if it's there.
-fn recorded(folder: &Path) -> Option<PathBuf> {
-    let text = fs::read_to_string(folder.join(GAMEBOX)).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let main = json.get("main")?.as_str()?.trim();
-    if main.is_empty() || Path::new(main).is_absolute() || main.split(['/', '\\']).any(|p| p == "..") {
-        return None;
-    }
-    let full = folder.join(main.replace('/', "\\"));
-    (full.extension().is_some_and(|x| x.eq_ignore_ascii_case("exe")) && full.is_file()).then_some(full)
-}
-
 struct Candidate {
     path: PathBuf,
     size: u64,
@@ -127,10 +176,34 @@ struct Candidate {
     dir: PathBuf,
     base: String,
     old_renderer: bool,
+    tool: bool,
+    /// Named after the folder, and no stub.
+    named: bool,
 }
 
 /// The rules over these programs of `folder`.
 pub fn choose(folder: &Path, exes: &[PathBuf]) -> Option<PathBuf> {
+    let ranked = rank(folder, exes);
+    let first = ranked.first()?;
+    // Said only where these rules beat the importer's (largest wins), so a game's log
+    // shows why its program isn't the biggest one in its folder.
+    if let Some(largest) = ranked.iter().filter(|c| c.unity == first.unity).max_by_key(|c| c.size) {
+        if largest.path != first.path {
+            let why = if largest.tool { "named as a tool" } else { "not named after the folder" };
+            eprintln!(
+                "peerparty: library: {}: {} rather than the bigger {} ({why})",
+                folder.display(),
+                first.sort_key,
+                largest.sort_key
+            );
+        }
+    }
+    ranked.into_iter().next().map(|c| c.path)
+}
+
+/// `choose`'s candidates, best first.
+fn rank(folder: &Path, exes: &[PathBuf]) -> Vec<Candidate> {
+    let folder_name = folder.file_name().unwrap_or_default().to_string_lossy().to_string();
     let mut candidates = Vec::new();
     for exe in exes {
         let Ok(rel) = exe.strip_prefix(folder) else { continue };
@@ -150,6 +223,8 @@ pub fn choose(folder: &Path, exes: &[PathBuf]) -> Option<PathBuf> {
             unity: dir.join(format!("{stem}_Data")).is_dir(),
             base: without_tags(&RENDERER_TAG, &stem).to_lowercase(),
             old_renderer: OLD_RENDERER_TAG.is_match(&stem),
+            tool: TOOL.is_match(&stem),
+            named: names_folder(&stem, &folder_name),
             dir,
         });
     }
@@ -167,16 +242,23 @@ pub fn choose(folder: &Path, exes: &[PathBuf]) -> Option<PathBuf> {
         .zip(keep)
         .filter_map(|(c, k)| k.then_some(c))
         .collect();
-    if candidates.iter().any(|c| c.unity) {
-        candidates.retain(|c| c.unity);
+    // A Unity game's program first (the importer drops the rest; they stay here, after
+    // it, to be picked by hand).
+    let unity = candidates.iter().any(|c| c.unity);
+    let biggest = candidates.iter().filter(|c| !c.tool && c.unity == unity).map(|c| c.size).max().unwrap_or(0);
+    for c in &mut candidates {
+        c.named &= c.size.saturating_mul(STUB_SHARE) >= biggest;
     }
     candidates.sort_by(|a, b| {
-        b.size
-            .cmp(&a.size)
+        b.unity
+            .cmp(&a.unity)
+            .then(a.tool.cmp(&b.tool))
+            .then(b.named.cmp(&a.named))
+            .then(b.size.cmp(&a.size))
             .then(a.depth.cmp(&b.depth))
             .then(a.sort_key.cmp(&b.sort_key))
     });
-    candidates.into_iter().next().map(|c| c.path)
+    candidates
 }
 
 #[cfg(test)]
@@ -184,7 +266,12 @@ mod tests {
     use super::*;
 
     fn tree(files: &[(&str, usize)], dirs: &[&str]) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("peerparty-mainexe-{}", std::process::id()));
+        tree_in("peerparty-mainexe", files, dirs)
+    }
+
+    /// The tree in a folder of this name (in a folder of its own, for this test run).
+    fn tree_in(name: &str, files: &[(&str, usize)], dirs: &[&str]) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("peerparty-mainexe-{}", std::process::id())).join(name);
         let _ = fs::remove_dir_all(&root);
         for d in dirs {
             fs::create_dir_all(root.join(d)).unwrap();
@@ -220,13 +307,56 @@ mod tests {
         assert_eq!(find(&root).unwrap().file_name().unwrap(), "game.exe");
         assert!(find(&root).unwrap().parent().unwrap().ends_with("bin"));
 
-        // .gamebox.json wins when it names a real program inside the folder.
-        let root = tree(&[("a.exe", 1), ("big.exe", 100)], &[]);
-        fs::write(root.join(GAMEBOX), r#"{"main":"a.exe"}"#).unwrap();
-        assert_eq!(find(&root).unwrap().file_name().unwrap(), "a.exe");
-        fs::write(root.join(GAMEBOX), r#"{"main":"../x.exe"}"#).unwrap();
-        assert_eq!(find(&root).unwrap().file_name().unwrap(), "big.exe");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A game shipping its tools beside it, each bigger than it and loading the same
+    /// SDKs: the program named after the folder wins, the tools rank last.
+    #[test]
+    fn tools_beside_the_game_lose() {
+        let root = tree_in(
+            "Mallet Keep II",
+            &[("EDITOR.exe", 1250), ("MK2.exe", 700), ("MK2Toolkit.exe", 650), ("PACKAGER.exe", 640)],
+            &[],
+        );
+        assert_eq!(find(&root).unwrap().file_name().unwrap(), "MK2.exe");
+        let names: Vec<String> = programs(&root).iter().map(|p| p.file_name().unwrap().to_string_lossy().to_string()).collect();
+        assert_eq!(names, ["MK2.exe", "EDITOR.exe", "MK2Toolkit.exe", "PACKAGER.exe"]);
+
+        // Without the folder's name to go by, the tools still lose.
+        let root = tree_in("Elsewhere", &[("LevelEditor.exe", 900), ("Run.exe", 500), ("DedicatedServer.exe", 800)], &[]);
+        assert_eq!(find(&root).unwrap().file_name().unwrap(), "Run.exe");
+        // Only tools: the biggest.
+        let root = tree_in("Tools only", &[("Editor.exe", 900), ("Packer.exe", 500)], &[]);
+        assert_eq!(find(&root).unwrap().file_name().unwrap(), "Editor.exe");
+
+        // A stub named after the folder doesn't beat the real program; a shipping build
+        // is named after it too.
+        let root = tree_in(
+            "Copper Tide",
+            &[("CopperTide.exe", 10), ("Binaries/Win64/CopperTide-Win64-Shipping.exe", 900), ("Benchmark.exe", 950)],
+            &[],
+        );
+        assert_eq!(find(&root).unwrap().file_name().unwrap(), "CopperTide-Win64-Shipping.exe");
+        let root = tree_in("Copper Tide 2", &[("CopperTide.exe", 10), ("Other.exe", 900)], &[]);
+        assert_eq!(find(&root).unwrap().file_name().unwrap(), "Other.exe");
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn names_its_folder() {
+        assert!(names_folder("MK2", "Mallet Keep II"));
+        assert!(names_folder("MalletKeep2", "Mallet Keep II"));
+        assert!(names_folder("mallet_keep", "Mallet Keep (v1.2) [GOG]"));
+        assert!(names_folder("MalletKeepClient", "Mallet Keep"));
+        assert!(names_folder("MalletKeep-Win64-Shipping", "Mallet Keep"));
+        assert!(!names_folder("MK2Toolkit", "Mallet Keep II"));
+        assert!(!names_folder("EDITOR", "Mallet Keep II"));
+        assert!(!names_folder("K2", "Mallet Keep II"), "an abbreviation starts where the name does");
+        assert!(!names_folder("M", "Mallet Keep II"), "one letter says nothing");
+        assert!(TOOL.is_match("MK2Toolkit"));
+        assert!(TOOL.is_match("Map Maker x64"));
+        assert!(!TOOL.is_match("MK2"));
     }
 
     /// The rules as built, against the regex crate's reading of the same patterns.
@@ -235,16 +365,19 @@ mod tests {
         let all: Vec<&str> = [UTILITY_NAMES, MAIN_NOT_EXTRA].iter().flat_map(|n| n.iter().copied()).collect();
         let main_not = regex::Regex::new(&format!(r"(?i)^({})\.exe$", all.join("|"))).unwrap();
         let dirs = regex::Regex::new(&format!("(?i)^({})$", REDIST_DIRS.join("|"))).unwrap();
+        let tool = regex::Regex::new(&format!("(?i)^({})$", TOOL_NAMES.join("|"))).unwrap();
         let renderer = regex::Regex::new(&format!(r"(?i)[ _.-]?({})(?P<sep>$|[ _.-])", RENDERER_TAGS.join("|"))).unwrap();
         let names = [
             "unins000.exe", "UnityCrashHandler64.exe", "game.exe", "Game_dx11.exe", "setup.exe", "my setup tool.exe",
             "dxwnd.exe", "cdb.exe", "cdbx.exe", "Overlay64.exe", "GameLauncher.exe", "Battle.net-Setup.exe", "redist",
             "_CommonRedist", "Support", "supporting", "__MACOSX", "game_dx11_vk", "Game-D3D12", "game.vulkan.x", "dx9",
             "game dx10 ", "game_dx13", "game__dx11", "über_dx11", "日本_dx9", "pbsvc_r.exe", "Touchup.exe", "",
+            "EDITOR", "MK2Toolkit", "Map Maker x64", "LevelBuilder_64", "DedicatedServer", "Settings", "tool", "mk2",
         ];
         for n in names {
             assert_eq!(MAIN_NOT.is_match(n), main_not.is_match(n), "main-not {n:?}");
             assert_eq!(NOT_GAME_DIR.is_match(n), dirs.is_match(n), "dir {n:?}");
+            assert_eq!(TOOL.is_match(n), tool.is_match(n), "tool {n:?}");
             assert_eq!(without_tags(&RENDERER_TAG, n), renderer.replace_all(n, "${sep}"), "tags {n:?}");
         }
     }

@@ -233,6 +233,9 @@ struct LibraryState {
     focus_search: bool,
     /// The top bar's controls this frame: down from one goes back to the grid.
     top_bar_ids: HashSet<egui::Id>,
+    /// The programs in a game's folder (its key, `mainexe::programs`), read when its
+    /// panel's program list opens.
+    programs: Option<(String, Vec<PathBuf>)>,
 }
 
 impl LibraryState {
@@ -255,6 +258,7 @@ impl LibraryState {
             scroll_to_selected: false,
             focus_search: false,
             top_bar_ids: HashSet::new(),
+            programs: None,
         };
         lib.reload_recent();
         if !lib.recent.is_empty() {
@@ -291,12 +295,30 @@ impl LibraryState {
                 out.push(scan::loose(exe, Source::Added));
             }
         }
-        for r in store::recent() {
-            if r.exe.is_file() && seen.insert(store::key_of(&r.exe)) {
+        // A launch of a program that's part of a library game (the one picked in place
+        // of its found one, or one an earlier scan took for it) is that game's.
+        let picked: HashMap<String, String> = settings
+            .games
+            .iter()
+            .filter_map(|(k, o)| Some((store::key_of(o.exe.as_deref()?), k.clone())))
+            .collect();
+        let launches = store::recent();
+        for r in &launches {
+            let key = store::key_of(&r.exe);
+            if r.exe.is_file() && !picked.contains_key(&key) && owner(&out, &key).is_none() && seen.insert(key) {
                 out.push(scan::loose(&r.exe, Source::Added));
             }
         }
         out.sort_by_key(|g| g.name.to_lowercase());
+        let mut recent: HashMap<String, u64> = HashMap::new();
+        for r in launches {
+            let key = store::key_of(&r.exe);
+            let game = if out.iter().any(|g| store::key_of(&g.exe) == key) { Some(key.clone()) } else { None };
+            let game = game.or_else(|| picked.get(&key).cloned()).or_else(|| owner(&out, &key)).unwrap_or(key);
+            let when = recent.entry(game).or_insert(r.when);
+            *when = (*when).max(r.when);
+        }
+        self.recent = recent;
         self.entries = out;
     }
 
@@ -310,8 +332,10 @@ impl LibraryState {
         self.rebuild(settings);
     }
 
-    fn poll_scan(&mut self, settings: &Settings) {
+    /// True once a scan has finished.
+    fn poll_scan(&mut self, settings: &Settings) -> bool {
         let mut changed = false;
+        let mut done = false;
         while let Ok(f) = self.found_rx.try_recv() {
             match f {
                 Found::Game(g) => match self.rescanned.as_mut() {
@@ -327,18 +351,68 @@ impl LibraryState {
                     }
                     self.scanning = false;
                     changed = true;
+                    done = true;
                 }
             }
         }
         if changed {
             self.rebuild(settings);
         }
+        done
     }
 
     fn game(&self, key: &str) -> Option<&Game> {
         self.entries.iter().find(|g| store::key_of(&g.exe) == key)
     }
+}
 
+/// The key of the library game in `games` whose folder holds the program `exe_key` (a
+/// `key_of`), the innermost such folder. A game added by hand owns no folder: its folder
+/// is only where its program happens to be.
+fn owner(games: &[Game], exe_key: &str) -> Option<String> {
+    let exe = Path::new(exe_key);
+    games
+        .iter()
+        .filter(|g| g.source != Source::Added && !g.dir.as_os_str().is_empty() && store::key_of(&g.exe) != exe_key)
+        .filter(|g| exe.starts_with(store::key_of(&g.dir)))
+        .max_by_key(|g| g.dir.components().count())
+        .map(|g| store::key_of(&g.exe))
+}
+
+/// Options and Hide kept under a program an earlier scan took for a game (a tool in its
+/// folder, before the rules knew better) moved to the program found now, so a better
+/// pick keeps what the player set. True if any moved.
+fn rekey_moved(settings: &mut Settings, games: &[Game]) -> bool {
+    let keys: HashSet<String> = games.iter().map(|g| store::key_of(&g.exe)).collect();
+    let mut moved = false;
+    let mut stale: Vec<String> = settings.games.keys().filter(|k| !keys.contains(*k)).cloned().collect();
+    stale.sort();
+    for old in stale {
+        let Some(new) = owner(games, &old) else { continue };
+        if settings.games.contains_key(&new) {
+            continue;
+        }
+        let Some(mut o) = settings.games.remove(&old) else { continue };
+        // Picked by hand in place of the one found then: now it's the one found.
+        o.exe = o.exe.filter(|e| store::key_of(e) != new);
+        eprintln!("peerparty: library: {old}: its options now belong to {new}, the program found for its game");
+        settings.games.insert(new, o);
+        moved = true;
+    }
+    let stale: Vec<String> = settings.hidden.iter().filter(|k| !keys.contains(*k)).cloned().collect();
+    for old in stale {
+        let Some(new) = owner(games, &old) else { continue };
+        settings.hidden.retain(|h| *h != old);
+        if !settings.hidden.contains(&new) {
+            eprintln!("peerparty: library: {old}: hidden, so {new} (the program found for its game) is too");
+            settings.hidden.push(new);
+        }
+        moved = true;
+    }
+    moved
+}
+
+impl LibraryState {
     /// The filter the grid is showing: a search looks through All, whichever filter was
     /// picked (in Hidden it looks through the hidden games, which All leaves out).
     fn shown(&self) -> Category {
@@ -645,6 +719,14 @@ impl App {
 
     fn rebuild(&mut self) {
         self.lib.rebuild(&self.settings);
+    }
+
+    /// `rekey_moved` once a whole scan is in (until then the game may not be).
+    fn rekey_moved_games(&mut self) {
+        if rekey_moved(&mut self.settings, &self.lib.entries) {
+            self.save_settings();
+            self.rebuild();
+        }
     }
 
     fn rescan(&mut self) {
@@ -968,6 +1050,7 @@ impl App {
                 self.say(text, false);
             }
             self.lib.reload_recent();
+            self.lib.rebuild(&self.settings);
         }
         let (due, wait): (Vec<PendingStart>, Vec<PendingStart>) = std::mem::take(&mut self.sessions.pending).into_iter().partition(|p| p.at <= now);
         self.sessions.pending = wait;
@@ -1787,7 +1870,9 @@ impl eframe::App for App {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.lib.poll_scan(&self.settings);
+        if self.lib.poll_scan(&self.settings) {
+            self.rekey_moved_games();
+        }
         self.icons.poll(ctx);
         self.updates_tick(ctx);
         self.tick();
@@ -1943,6 +2028,33 @@ mod tests {
         // A reason this window doesn't know: the English line.
         assert_eq!(why_text("peerparty: something new\npeerparty-why: later\t\n").as_deref(), Some("something new"));
         assert_eq!(why_text("\n"), None);
+    }
+
+    /// A game whose found program changed (a tool beside it was taken for it before)
+    /// keeps its options and Hide; a game added by hand owns no folder.
+    #[test]
+    fn options_follow_a_better_pick() {
+        let found = PathBuf::from(r"C:\Games\Mallet Keep II\MK2.exe");
+        let games = vec![
+            Game { name: "Mallet Keep II".into(), dir: found.parent().unwrap().to_path_buf(), exe: found.clone(), source: Source::Folder, cover: None, art: None },
+            scan::loose(Path::new(r"C:\Loose\Thing.exe"), Source::Added),
+        ];
+        let old = store::key_of(Path::new(r"C:\Games\Mallet Keep II\EDITOR.exe"));
+        let loose_tool = store::key_of(Path::new(r"C:\Loose\sub\Tool.exe"));
+        let mut s = Settings::default();
+        s.games.insert(old.clone(), GameOptions { players: 2, exe: Some(found.clone()), ..GameOptions::default() });
+        s.games.insert(loose_tool.clone(), GameOptions { players: 3, ..GameOptions::default() });
+        s.hidden.push(old.clone());
+        assert_eq!(owner(&games, &old), Some(store::key_of(&found)));
+        assert_eq!(owner(&games, &store::key_of(&found)), None, "a game's own program is its own");
+        assert_eq!(owner(&games, &loose_tool), None);
+        assert!(rekey_moved(&mut s, &games));
+        let o = &s.games[&store::key_of(&found)];
+        assert_eq!((o.players, o.exe.clone()), (2, None), "the pick by hand is now the one found");
+        assert!(!s.games.contains_key(&old));
+        assert_eq!(s.games[&loose_tool].players, 3);
+        assert_eq!(s.hidden, [store::key_of(&found)]);
+        assert!(!rekey_moved(&mut s, &games), "once");
     }
 
     fn sample() -> Vec<Game> {
