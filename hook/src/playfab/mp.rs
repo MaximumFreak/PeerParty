@@ -889,15 +889,31 @@ impl State {
         }
     }
 
-    /// We're in: our attributes go up, the game hears MemberAdded for us and then the
-    /// completion.
+    /// We're in: our attributes go up, the game hears MemberAdded for the members already
+    /// there and for us, the completion, then an update naming everything the lobby
+    /// holds. As the service does: a game may learn the lobby's properties (the host's
+    /// network to connect to) only from that update, and who owns it from MemberAdded.
     fn joined(&mut self, lan: &Lan, h: usize, kind: JoinKind, ctx: usize) {
         let Some(l) = self.lobbies.get_mut(&h) else { return };
         l.phase = Phase::Joined;
         let _ = lan.update(&l.id, None, &l.member_attrs, &[]);
         let (id, entity, ty) = (l.id.clone(), l.entity.clone(), l.ty.clone());
-        if let Some(lobby) = lan.lobby(&id) {
-            self.set_view(h, View::of(&lobby));
+        let snapshot = lan.lobby(&id).map(|lobby| {
+            let view = View::of(&lobby);
+            let d = diff(&View::default(), &view);
+            (view, d)
+        });
+        if let Some((_, d)) = &snapshot {
+            for (e, t) in d.added.iter().filter(|(e, _)| *e != entity) {
+                self.lobby_changes.push(
+                    MemberAdded {
+                        ty: MEMBER_ADDED,
+                        lobby: h,
+                        member: key(e, t),
+                    },
+                    Vec::new(),
+                );
+            }
         }
         let me = key(&entity, &ty);
         self.lobby_changes.push(
@@ -918,6 +934,12 @@ impl State {
             },
             Vec::new(),
         );
+        if let Some((view, d)) = snapshot {
+            if d.updated() {
+                self.push_updated(h, &id, &d);
+            }
+            self.set_view(h, view);
+        }
         log!("pfmp-lan joined lobby {id} as {entity}");
     }
 
@@ -1024,52 +1046,57 @@ impl State {
             );
         }
         if d.updated() {
-            let mut text = Strings::default();
-            let search = text.array(&d.search);
-            let props = text.array(&d.props);
-            let member_keys: Vec<Vec<usize>> = d.members.iter().map(|(_, _, k)| text.array(k)).collect();
-            let summaries: Vec<MemberUpdateSummary> = d
-                .members
-                .iter()
-                .zip(&member_keys)
-                .map(|((e, t, _), k)| MemberUpdateSummary {
-                    member: key(e, t),
-                    connection_updated: false,
-                    count: k.len() as u32,
-                    keys: ptr_of(k),
-                })
-                .collect();
-            let c = Updated {
-                ty: UPDATED,
-                lobby: h,
-                owner: d.owner,
-                max_members: d.max_members,
-                access: d.access,
-                lock: d.lock,
-                search_count: search.len() as u32,
-                search_keys: ptr_of(&search),
-                lobby_count: props.len() as u32,
-                lobby_keys: ptr_of(&props),
-                member_count: summaries.len() as u32,
-                members: ptr_of(&summaries),
-                server: false,
-                server_count: 0,
-                server_keys: 0,
-                server_connection: false,
-            };
-            trace("lobby updated", || format!("{id} {d:?}"));
-            self.lobby_changes.push(
-                c,
-                vec![
-                    Box::new(text.owned),
-                    Box::new(search),
-                    Box::new(props),
-                    Box::new(member_keys),
-                    Box::new(summaries),
-                ],
-            );
+            self.push_updated(h, &id, &d);
         }
         self.set_view(h, new);
+    }
+
+    /// Tells the game which parts of a lobby changed; it reads them through PFLobbyGet*.
+    fn push_updated(&mut self, h: usize, id: &str, d: &Diff) {
+        let mut text = Strings::default();
+        let search = text.array(&d.search);
+        let props = text.array(&d.props);
+        let member_keys: Vec<Vec<usize>> = d.members.iter().map(|(_, _, k)| text.array(k)).collect();
+        let summaries: Vec<MemberUpdateSummary> = d
+            .members
+            .iter()
+            .zip(&member_keys)
+            .map(|((e, t, _), k)| MemberUpdateSummary {
+                member: key(e, t),
+                connection_updated: false,
+                count: k.len() as u32,
+                keys: ptr_of(k),
+            })
+            .collect();
+        let c = Updated {
+            ty: UPDATED,
+            lobby: h,
+            owner: d.owner,
+            max_members: d.max_members,
+            access: d.access,
+            lock: d.lock,
+            search_count: search.len() as u32,
+            search_keys: ptr_of(&search),
+            lobby_count: props.len() as u32,
+            lobby_keys: ptr_of(&props),
+            member_count: summaries.len() as u32,
+            members: ptr_of(&summaries),
+            server: false,
+            server_count: 0,
+            server_keys: 0,
+            server_connection: false,
+        };
+        trace("lobby updated", || format!("{id} {d:?}"));
+        self.lobby_changes.push(
+            c,
+            vec![
+                Box::new(text.owned),
+                Box::new(search),
+                Box::new(props),
+                Box::new(member_keys),
+                Box::new(summaries),
+            ],
+        );
     }
 }
 
