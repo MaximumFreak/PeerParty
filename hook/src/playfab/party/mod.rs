@@ -1210,6 +1210,7 @@ fn pump(s: &mut State) {
                     log!("party-lan connected to network {lobby}");
                     let async_id = s.networks[&h].connect_async;
                     connected(s, h, descriptor, async_id);
+                    publish_endpoint(s, lan, h);
                     s.chats_network_connected(lan, h);
                 } else {
                     log!("party-lan could not join network {lobby}: {result:?}");
@@ -2055,18 +2056,29 @@ unsafe extern "system" fn party_network_create_endpoint(
         network: net,
         endpoint: ep,
     });
-    let attr = Attr {
-        key: ENTITY_KEY.into(),
-        value: Value::Str(entity.clone()),
-        public: true,
-    };
-    let uid_attr = Attr { key: UID_KEY.into(), value: Value::Str(uid.to_string()), public: true };
-    if let Err(e) = lan.update(&guid, None, &[uid_attr, attr], &[]) {
-        log!("party-lan endpoint on {guid}: {e:?}");
+    // A game may create its endpoint right after asking to connect, before the join is
+    // through: the others are told of it once it is (`JoinDone`).
+    if s.networks[&net].connected {
+        publish_endpoint(&s, lan, net);
     }
     log!("party-lan endpoint {entity} on network {guid}");
     s.reconcile(lan, net);
     OK
+}
+
+/// Shows the network's other members our endpoint: without it they drop what it sends.
+fn publish_endpoint(s: &State, lan: &Lan, net: usize) {
+    let Some(n) = s.networks.get(&net) else { return };
+    let Some(ep) = n.local_endpoint.and_then(|ep| s.endpoints.get(&ep)) else { return };
+    let attr = Attr {
+        key: ENTITY_KEY.into(),
+        value: Value::Str(ep.entity.to_string_lossy().into_owned()),
+        public: true,
+    };
+    let uid_attr = Attr { key: UID_KEY.into(), value: Value::Str(ep.uid.to_string()), public: true };
+    if let Err(e) = lan.update(&n.guid, None, &[uid_attr, attr], &[]) {
+        log!("party-lan endpoint on {}: {e:?}", n.guid);
+    }
 }
 
 extern "system" fn party_network_destroy_endpoint(net: usize, ep: usize, async_id: usize) -> u32 {
