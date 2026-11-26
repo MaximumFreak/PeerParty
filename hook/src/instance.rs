@@ -11,10 +11,17 @@
 //!   (a game that checks for itself by one of those instead) is renamed the same way.
 //! - FindWindow(Ex) doesn't find the other copy's windows (a game that looks for its own
 //!   window class at start-up and quits, or hands over to it, when one is there).
+//!
+//! A check that goes by some other name isn't caught by the rules above. So that a log
+//! shows which one it was, the start says whether another copy of the program is running,
+//! and a named object the game finds already there (created by another program, or
+//! opened) that isn't renamed is logged once by name.
 
-use std::sync::OnceLock;
+use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex, OnceLock};
 
 use retour::GenericDetour;
+use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, SetLastError};
 use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 
 use crate::log;
@@ -59,12 +66,20 @@ fn single_instance(name: &str, stem: &str) -> bool {
     if name.contains(MARKER) {
         return true;
     }
-    let lower = name.to_ascii_lowercase();
-    let bare = lower.rsplit('\\').next().unwrap_or(&lower);
-    if NEVER.iter().any(|n| bare.starts_with(n)) {
+    if shared_on_purpose(name) {
         return false;
     }
+    let lower = name.to_ascii_lowercase();
+    let bare = lower.rsplit('\\').next().unwrap_or(&lower);
     bare.contains("instance") || (stem.len() >= 4 && bare.contains(stem))
+}
+
+/// Whether `name` is an SDK's, Windows' or PeerParty's object (`NEVER`): shared with
+/// other programs on purpose.
+fn shared_on_purpose(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let bare = lower.rsplit('\\').next().unwrap_or(&lower);
+    NEVER.iter().any(|n| bare.starts_with(n))
 }
 
 /// This program's name without its extension, lower case.
@@ -81,6 +96,7 @@ pub fn enabled() -> bool {
 
 /// Hooks kernelbase's mutex entry points. kernel32's exports forward here.
 pub fn attach_kernelbase(exports: &[Export]) -> usize {
+    log_other_copies();
     let mut n = 0;
     n += hook_one(exports, "CreateMutexW", |addr| {
         let target: CreateMutexW = unsafe { std::mem::transmute(addr) };
@@ -138,8 +154,10 @@ unsafe extern "system" fn detour_create(
 ) -> isize {
     let Some(hook) = CREATE.get() else { return 0 };
     let renamed = rename(name, "CreateMutexW");
-    let name = renamed.as_ref().map_or(name, |w| w.as_ptr());
-    unsafe { hook.call(attrs, owner, name) }
+    let at = renamed.as_ref().map_or(name, |w| w.as_ptr());
+    let h = unsafe { hook.call(attrs, owner, at) };
+    found("CreateMutexW", name, renamed.is_some(), h, false);
+    h
 }
 
 unsafe extern "system" fn detour_create_ex(
@@ -152,15 +170,19 @@ unsafe extern "system" fn detour_create_ex(
         return 0;
     };
     let renamed = rename(name, "CreateMutexExW");
-    let name = renamed.as_ref().map_or(name, |w| w.as_ptr());
-    unsafe { hook.call(attrs, name, flags, access) }
+    let at = renamed.as_ref().map_or(name, |w| w.as_ptr());
+    let h = unsafe { hook.call(attrs, at, flags, access) };
+    found("CreateMutexExW", name, renamed.is_some(), h, false);
+    h
 }
 
 unsafe extern "system" fn detour_open(access: u32, inherit: i32, name: *const u16) -> isize {
     let Some(hook) = OPEN.get() else { return 0 };
     let renamed = rename(name, "OpenMutexW");
-    let name = renamed.as_ref().map_or(name, |w| w.as_ptr());
-    unsafe { hook.call(access, inherit, name) }
+    let at = renamed.as_ref().map_or(name, |w| w.as_ptr());
+    let h = unsafe { hook.call(access, inherit, at) };
+    found("OpenMutexW", name, renamed.is_some(), h, true);
+    h
 }
 
 /// `name`, renamed for this copy when it's a single-instance check's (`rename`).
@@ -170,52 +192,156 @@ fn named(name: *const u16, api: &str) -> (Option<Vec<u16>>, *const u16) {
     (renamed, at)
 }
 
+/// The most distinct names `found` logs.
+const MAX_FOUND: usize = 32;
+
+/// After a Create* or Open* call on `name` that returned `handle`: a named object this
+/// copy found already there, not renamed, is logged once. With another copy running,
+/// the one a game checks for itself by is among these. The game's last error is kept.
+fn found(api: &str, name: *const u16, renamed: bool, handle: isize, open: bool) {
+    let err = unsafe { GetLastError() };
+    if !renamed && !name.is_null() && handle != 0 && (open || err == ERROR_ALREADY_EXISTS) {
+        note_found(api, name, open);
+    }
+    unsafe { SetLastError(err) };
+}
+
+#[inline(never)]
+fn note_found(api: &str, name: *const u16, open: bool) {
+    static SEEN: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
+    let Some(text) = read::wstr(name as usize) else { return };
+    if text.contains("-peerparty-") || shared_on_purpose(&text) {
+        return;
+    }
+    {
+        let mut seen = crate::sys::lock(&SEEN);
+        if seen.len() >= MAX_FOUND || !seen.insert(text.clone()) {
+            return;
+        }
+    }
+    crate::log::throttled("instance found", u64::MAX, |_| {
+        log!(
+            "instance {api} {text}: {}, and shared (not renamed: not named like a single-instance check)",
+            if open { "opened one another program made" } else { "already there" }
+        )
+    });
+}
+
+/// Says whether other copies of this program are running, at the start: a copy that
+/// stops early while one is has likely met its own single-instance check.
+fn log_other_copies() {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS};
+    let Some(mine) = std::env::current_exe().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())) else { return };
+    let me = unsafe { GetCurrentProcessId() };
+    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snap == INVALID_HANDLE_VALUE {
+        return;
+    }
+    let mut e: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    e.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+    let mut others = Vec::new();
+    let mut ok = unsafe { Process32FirstW(snap, &mut e) } != 0;
+    while ok && others.len() < 16 {
+        let n = e.szExeFile.iter().position(|c| *c == 0).unwrap_or(e.szExeFile.len());
+        if e.th32ProcessID != me && String::from_utf16_lossy(&e.szExeFile[..n]).eq_ignore_ascii_case(&mine) && same_program(e.th32ProcessID) {
+            others.push(e.th32ProcessID);
+        }
+        ok = unsafe { Process32NextW(snap, &mut e) } != 0;
+    }
+    unsafe { CloseHandle(snap) };
+    if others.is_empty() {
+        log!("instance: no other copy of {mine} is running");
+    } else {
+        let pids: Vec<String> = others.iter().map(u32::to_string).collect();
+        log!(
+            "instance: {} other cop{} of {mine} running (pid {}); named objects this copy finds already there are logged as `instance ... already there`",
+            others.len(),
+            if others.len() == 1 { "y is" } else { "ies are" },
+            pids.join(", ")
+        );
+    }
+}
+
+/// Whether process `pid` runs this program (the same file).
+fn same_program(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW};
+    let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if h.is_null() {
+        return false;
+    }
+    let mut buf = vec![0u16; 1024];
+    let mut len = buf.len() as u32;
+    let ok = unsafe { QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len) } != 0;
+    unsafe { CloseHandle(h) };
+    let theirs = ok.then(|| String::from_utf16_lossy(&buf[..len as usize]).to_ascii_lowercase());
+    let mine = std::env::current_exe().ok().map(|p| p.to_string_lossy().to_ascii_lowercase());
+    theirs.is_some() && theirs == mine
+}
+
 unsafe extern "system" fn detour_event(attrs: *const core::ffi::c_void, manual: i32, initial: i32, name: *const u16) -> isize {
     let Some(hook) = EVENT.get() else { return 0 };
-    let (_keep, name) = named(name, "CreateEventW");
-    unsafe { hook.call(attrs, manual, initial, name) }
+    let (keep, at) = named(name, "CreateEventW");
+    let h = unsafe { hook.call(attrs, manual, initial, at) };
+    found("CreateEventW", name, keep.is_some(), h, false);
+    h
 }
 
 unsafe extern "system" fn detour_event_ex(attrs: *const core::ffi::c_void, name: *const u16, flags: u32, access: u32) -> isize {
     let Some(hook) = EVENT_EX.get() else { return 0 };
-    let (_keep, name) = named(name, "CreateEventExW");
-    unsafe { hook.call(attrs, name, flags, access) }
+    let (keep, at) = named(name, "CreateEventExW");
+    let h = unsafe { hook.call(attrs, at, flags, access) };
+    found("CreateEventExW", name, keep.is_some(), h, false);
+    h
 }
 
 unsafe extern "system" fn detour_open_event(access: u32, inherit: i32, name: *const u16) -> isize {
     let Some(hook) = OPEN_EVENT.get() else { return 0 };
-    let (_keep, name) = named(name, "OpenEventW");
-    unsafe { hook.call(access, inherit, name) }
+    let (keep, at) = named(name, "OpenEventW");
+    let h = unsafe { hook.call(access, inherit, at) };
+    found("OpenEventW", name, keep.is_some(), h, true);
+    h
 }
 
 unsafe extern "system" fn detour_semaphore(attrs: *const core::ffi::c_void, initial: i32, max: i32, name: *const u16) -> isize {
     let Some(hook) = SEMAPHORE.get() else { return 0 };
-    let (_keep, name) = named(name, "CreateSemaphoreW");
-    unsafe { hook.call(attrs, initial, max, name) }
+    let (keep, at) = named(name, "CreateSemaphoreW");
+    let h = unsafe { hook.call(attrs, initial, max, at) };
+    found("CreateSemaphoreW", name, keep.is_some(), h, false);
+    h
 }
 
 unsafe extern "system" fn detour_semaphore_ex(attrs: *const core::ffi::c_void, initial: i32, max: i32, name: *const u16, flags: u32, access: u32) -> isize {
     let Some(hook) = SEMAPHORE_EX.get() else { return 0 };
-    let (_keep, name) = named(name, "CreateSemaphoreExW");
-    unsafe { hook.call(attrs, initial, max, name, flags, access) }
+    let (keep, at) = named(name, "CreateSemaphoreExW");
+    let h = unsafe { hook.call(attrs, initial, max, at, flags, access) };
+    found("CreateSemaphoreExW", name, keep.is_some(), h, false);
+    h
 }
 
 unsafe extern "system" fn detour_open_semaphore(access: u32, inherit: i32, name: *const u16) -> isize {
     let Some(hook) = OPEN_SEMAPHORE.get() else { return 0 };
-    let (_keep, name) = named(name, "OpenSemaphoreW");
-    unsafe { hook.call(access, inherit, name) }
+    let (keep, at) = named(name, "OpenSemaphoreW");
+    let h = unsafe { hook.call(access, inherit, at) };
+    found("OpenSemaphoreW", name, keep.is_some(), h, true);
+    h
 }
 
 unsafe extern "system" fn detour_mapping(file: isize, attrs: *const core::ffi::c_void, protect: u32, high: u32, low: u32, name: *const u16) -> isize {
     let Some(hook) = MAPPING.get() else { return 0 };
-    let (_keep, name) = named(name, "CreateFileMappingW");
-    unsafe { hook.call(file, attrs, protect, high, low, name) }
+    let (keep, at) = named(name, "CreateFileMappingW");
+    let h = unsafe { hook.call(file, attrs, protect, high, low, at) };
+    found("CreateFileMappingW", name, keep.is_some(), h, false);
+    h
 }
 
 unsafe extern "system" fn detour_open_mapping(access: u32, inherit: i32, name: *const u16) -> isize {
     let Some(hook) = OPEN_MAPPING.get() else { return 0 };
-    let (_keep, name) = named(name, "OpenFileMappingW");
-    unsafe { hook.call(access, inherit, name) }
+    let (keep, at) = named(name, "OpenFileMappingW");
+    let h = unsafe { hook.call(access, inherit, at) };
+    found("OpenFileMappingW", name, keep.is_some(), h, true);
+    h
 }
 
 // ---- FindWindow ----
@@ -344,5 +470,20 @@ mod tests {
         assert!(!single_instance("GameBarPresenceWriter", "game"));
         assert!(single_instance("Local\\GameLauncherRunning", "game"));
         assert!(!single_instance("Local\\peerparty-frame-7-0102", "frame"), "PeerParty's own mappings");
+    }
+
+    #[test]
+    fn noting_a_found_object_keeps_the_games_last_error() {
+        assert!(shared_on_purpose("Local\\Steam3Master_SharedMemLock"));
+        assert!(!shared_on_purpose("Local\\{0F2A}Lock"));
+        let name = wide("Local\\SomeGameStartupLock");
+        for (err, open) in [(ERROR_ALREADY_EXISTS, false), (0, true), (5, false)] {
+            unsafe { SetLastError(err) };
+            found("CreateMutexW", name.as_ptr(), false, 1, open);
+            assert_eq!(unsafe { GetLastError() }, err);
+        }
+        unsafe { SetLastError(ERROR_ALREADY_EXISTS) };
+        found("CreateMutexW", std::ptr::null(), false, 1, false);
+        assert_eq!(unsafe { GetLastError() }, ERROR_ALREADY_EXISTS);
     }
 }
