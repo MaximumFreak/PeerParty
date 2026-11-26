@@ -1087,6 +1087,10 @@ mod win {
                     return 0;
                 }
             }
+            WM_PAINT => {
+                paint_labels(h);
+                return 0;
+            }
             // Ask the running game copies to close cleanly; the session ends with them.
             WM_CLOSE => {
                 CLOSE_REQUESTED.store(true, Ordering::Release);
@@ -1095,6 +1099,64 @@ mod win {
             _ => {}
         }
         unsafe { DefWindowProcW(h, m, w, l) }
+    }
+
+    /// What an empty pane says, where (`HostWindow::label_panes`). The window's own
+    /// background shows wherever no frames or thumbnail are drawn, so it's painted there.
+    static LABELS: Mutex<Vec<(usize, PaneRect, String)>> = Mutex::new(Vec::new());
+
+    /// Paints the window's black background and each empty pane's label, centred in it.
+    fn paint_labels(h: HWND) {
+        use windows_sys::Win32::Graphics::Gdi::{
+            BeginPaint, CreateFontW, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FillRect, PAINTSTRUCT, SelectObject,
+            SetBkMode, SetTextColor, TRANSPARENT,
+        };
+        let mut ps: PAINTSTRUCT = unsafe { std::mem::zeroed() };
+        let dc = unsafe { BeginPaint(h, &mut ps) };
+        if dc.is_null() {
+            return;
+        }
+        unsafe { FillRect(dc, &ps.rcPaint, GetStockObject(BLACK_BRUSH) as HBRUSH) };
+        let labels = LABELS.lock().map(|l| l.clone()).unwrap_or_default();
+        unsafe {
+            SetBkMode(dc, TRANSPARENT as i32);
+            SetTextColor(dc, 0x00a0_a0a0);
+        }
+        let face: Vec<u16> = "Segoe UI".encode_utf16().chain(Some(0)).collect();
+        for (_, p, text) in labels {
+            let height = (p.height / 24).clamp(14, 40) as i32;
+            let font = unsafe { CreateFontW(-height, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, face.as_ptr()) };
+            let old = unsafe { SelectObject(dc, font) };
+            let mut r = RECT { left: p.x, top: p.y, right: p.x + p.width as i32, bottom: p.y + p.height as i32 };
+            let mut w: Vec<u16> = text.encode_utf16().collect();
+            unsafe {
+                DrawTextW(dc, w.as_mut_ptr(), w.len() as i32, &mut r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                SelectObject(dc, old);
+                DeleteObject(font);
+            }
+        }
+        unsafe { EndPaint(h, &ps) };
+    }
+
+    /// Each pane's label: a copy that ended says so; one with nothing to show yet (no
+    /// window, no frames) is starting. A pane hidden (another one zoomed) has none.
+    pub(super) fn pane_labels(panes: &[(PaneRect, bool, bool)]) -> Vec<(usize, PaneRect, String)> {
+        panes
+            .iter()
+            .enumerate()
+            .filter(|(_, (p, ..))| p.width > 0 && p.height > 0)
+            .filter_map(|(i, &(p, gone, empty))| {
+                let n = i + 1;
+                let text = if gone {
+                    crate::t!("overlay.pane_closed", n = n)
+                } else if empty {
+                    crate::t!("overlay.pane_starting", n = n)
+                } else {
+                    return None;
+                };
+                Some((i, p, text))
+            })
+            .collect()
     }
 
     fn client_size(hwnd: HWND) -> (u32, u32) {
@@ -1644,6 +1706,34 @@ mod win {
                 self.update(i, display_pane, vp, force_thumb, true);
             }
             self.push_panes();
+            self.label_panes(instances);
+        }
+
+        /// Says in each empty pane what's going on there (`pane_labels`), repainted when
+        /// that changes, and in the copy's log.
+        fn label_panes(&mut self, instances: &[InstanceConn]) {
+            let state: Vec<(PaneRect, bool, bool)> = (0..instances.len())
+                .map(|i| {
+                    let pane = self.display.get(i).map(|d| d.0).unwrap_or(super::HIDDEN);
+                    let gone = instances[i].gone;
+                    let window = self.shown.get(i).is_some_and(|s| s.is_some());
+                    let frames = self.surfaces.get(i).is_some_and(|s| s.1.is_some());
+                    (pane, gone, !window && !frames)
+                })
+                .collect();
+            let labels = pane_labels(&state);
+            let Ok(mut held) = LABELS.lock() else { return };
+            if *held == labels {
+                return;
+            }
+            for (i, _, text) in &labels {
+                if !held.iter().any(|(j, _, t)| j == i && t == text) {
+                    self.notes.push((*i, format!("session: player {}'s pane shows no game; it says {text:?}", i + 1)));
+                }
+            }
+            *held = labels;
+            drop(held);
+            unsafe { windows_sys::Win32::Graphics::Gdi::InvalidateRect(self.hwnd, std::ptr::null(), 1) };
         }
 
         /// Drains keyboard/mouse messages received by the compositor window and forwards
@@ -2098,6 +2188,19 @@ mod tests {
         c.set_layout(LayoutPreset::Horizontal);
         c.sync_instances(&mut one);
         assert_eq!(c.panes().len(), 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn empty_panes_say_why() {
+        let p = r(0, 0, 100, 100);
+        let q = r(100, 0, 100, 100);
+        let hidden = r(0, 0, 0, 0);
+        // Showing a game, ended, starting, and ended while another pane is zoomed.
+        let got = win::pane_labels(&[(p, false, false), (q, true, false), (p, false, true), (hidden, true, false)]);
+        assert_eq!(got.iter().map(|(i, rect, _)| (*i, *rect)).collect::<Vec<_>>(), vec![(1, q), (2, p)]);
+        assert!(got[0].2.contains('2') && got[1].2.contains('3'), "{got:?}");
+        assert_ne!(got[0].2, got[1].2);
     }
 
     #[test]
