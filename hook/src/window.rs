@@ -1120,6 +1120,31 @@ fn note_created_window(hwnd: usize) {
 
 const WM_DEVICECHANGE: u32 = 0x0219;
 const DBT_DEVNODES_CHANGED: usize = 0x0007;
+const DBT_DEVICEARRIVAL: usize = 0x8000;
+
+/// `DEV_BROADCAST_DEVICEINTERFACE_W` with an empty name.
+#[repr(C)]
+struct DevBroadcastInterface {
+    size: u32,
+    device_type: u32,
+    reserved: u32,
+    class: [u8; 16],
+    name: [u16; 1],
+}
+
+/// A HID device interface's arrival (`GUID_DEVINTERFACE_HID`), sent with the plain
+/// "devices changed": some engines look for controllers again only on an interface's
+/// arrival (SDL 2.0's joystick thread), and an arrival makes the newer ones look at
+/// every controller, which finds one gone too. Static: it's posted, and read later.
+static HID_ARRIVAL: DevBroadcastInterface = DevBroadcastInterface {
+    size: std::mem::size_of::<DevBroadcastInterface>() as u32,
+    // DBT_DEVTYP_DEVICEINTERFACE.
+    device_type: 5,
+    reserved: 0,
+    // {4D1E55B2-F16F-11CF-88CB-001111000030}
+    class: [0xB2, 0x55, 0x1E, 0x4D, 0x6F, 0xF1, 0xCF, 0x11, 0x88, 0xCB, 0x00, 0x11, 0x11, 0x00, 0x00, 0x30],
+    name: [0],
+};
 
 /// Tells this process's windows that its controllers changed (`WM_DEVICECHANGE` /
 /// `DBT_DEVNODES_CHANGED`), so an engine that stops polling disconnected XInput slots
@@ -1166,12 +1191,15 @@ pub fn notify_devices_changed() {
         c.hwnds.push(primary);
     }
     let mut posted = Vec::new();
+    let arrival = &HID_ARRIVAL as *const DevBroadcastInterface as isize;
     for h in c.hwnds {
-        if unsafe { PostMessageW(h as HWND, WM_DEVICECHANGE, DBT_DEVNODES_CHANGED, 0) } != 0 {
+        let nodes = unsafe { PostMessageW(h as HWND, WM_DEVICECHANGE, DBT_DEVNODES_CHANGED, 0) } != 0;
+        let arrived = unsafe { PostMessageW(h as HWND, WM_DEVICECHANGE, DBT_DEVICEARRIVAL, arrival) } != 0;
+        if nodes || arrived {
             posted.push(format!("0x{h:x}"));
         }
     }
-    log!("window: told {} game window(s) [{}] that controllers changed (WM_DEVICECHANGE; {message_only} of them message-only)", posted.len(), posted.join(", "));
+    log!("window: told {} game window(s) [{}] that controllers changed (WM_DEVICECHANGE, devices changed and a HID device arrived; {message_only} of them message-only)", posted.len(), posted.join(", "));
 }
 
 /// Pure helper: whether a `CreateWindowExW` call looks like the game's top-level window

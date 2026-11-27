@@ -668,9 +668,15 @@ session; a Linux one (frames read back as pixels) isn't at the same level yet.
   player's controller only; where that controller can be reached as it is (its XInput
   slot, its HID device) the game's reads go to it untouched, and the other players'
   devices read as unplugged or at rest. Devices are told apart by which one's buttons
-  moved, so two identical controllers stay two seats. The mouse is held inside the
-  focused pane while its game holds its cursor, and the pointer hides then, while the
-  game hid it, and when the mouse sits still while players are on controllers.
+  moved, so two identical controllers stay two seats. Before its block comes (the
+  launcher sends it once the copy connects) a copy has no controllers, rather than the
+  PC's every one: a game that looks once at start-up would keep one that isn't its own.
+  When a controller takes a seat, the copy's windows are told devices changed and a HID
+  device arrived (some engines look again only on an arrival). The mouse is held inside
+  the focused pane while its game holds its cursor, and the pointer hides then, while the
+  game hid it (`ShowCursor`, or `SetCursor` with none), and when the mouse sits still
+  while players are on controllers. A cursor the focused pane's game sets is the
+  session's real pointer over the window, so a hardware cursor stays one.
 - **Players' saves** (`hook/src/saves/`, `launcher/src/saves.rs`). Player 1's copy uses
   the game's own saves, untouched and the same ones it has when played alone. In players
   2–4's copies, the file calls for a save folder (Windows' data folders, Documents,

@@ -99,6 +99,8 @@ pub struct InstanceConn {
     pub cursor_locked: bool,
     /// Its game hid its cursor (`HookMsg::CursorHide`).
     pub cursor_hidden: bool,
+    /// The cursor its game set (`HookMsg::CursorShape`): None before it set one, 0 none.
+    pub cursor_shape: Option<u64>,
     /// Invites and players at its last state, so each new one toasts once.
     pub seen_pending: Vec<u64>,
     pub seen_peers: Vec<String>,
@@ -172,6 +174,7 @@ impl InstanceConn {
             slot_told: false,
             cursor_locked: false,
             cursor_hidden: false,
+            cursor_shape: None,
             seen_pending: Vec::new(),
             seen_peers: Vec::new(),
             first_state: true,

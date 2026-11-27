@@ -633,12 +633,12 @@ impl CompositorWindow {
     /// and hides the pointer over the window while confined, while the focused game hid
     /// its cursor (`game_hide`), or while the mouse has sat idle (`idle_hide`). Returns
     /// whether confinement changed.
-    pub fn update_pointer(&mut self, confine: Option<usize>, game_hide: bool, idle_hide: bool) -> bool {
+    pub fn update_pointer(&mut self, confine: Option<usize>, game_hide: bool, idle_hide: bool, shape: u64) -> bool {
         #[cfg(windows)]
         if let Some(w) = self.window.as_mut() {
-            return w.update_pointer(confine, game_hide, idle_hide);
+            return w.update_pointer(confine, game_hide, idle_hide, shape);
         }
-        let _ = (confine, game_hide, idle_hide);
+        let _ = (confine, game_hide, idle_hide, shape);
         false
     }
 
@@ -951,6 +951,39 @@ mod win {
     /// The pointer hid (1) or showed (2) for the mouse sitting idle or moving, since the
     /// last look (0: no change).
     static POINTER_CHANGED: AtomicU8 = AtomicU8::new(0);
+    /// The cursor the focused pane's game set (`update_pointer`'s `shape`), copied for
+    /// this window (`CopyIcon`; 0: the arrow), and the game's handle it was copied from.
+    /// The game's window is under this one, so its cursor would never show; this window's
+    /// real pointer takes it, and moves with the mouse like any hardware cursor.
+    static GAME_CURSOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static GAME_CURSOR_FROM: AtomicU64 = AtomicU64::new(0);
+
+    /// The pointer over the window when it shows: the game's cursor, else the arrow.
+    fn shown_cursor() -> HCURSOR {
+        match GAME_CURSOR.load(Ordering::Relaxed) {
+            0 => unsafe { LoadCursorW(std::ptr::null_mut(), IDC_ARROW) },
+            c => c as HCURSOR,
+        }
+    }
+
+    /// Takes the game's cursor `shape` (0: none to take, the arrow then). The copy it
+    /// replaced, to destroy once it's no longer the one shown; None when nothing changed.
+    fn take_game_cursor(shape: u64) -> Option<usize> {
+        if GAME_CURSOR_FROM.swap(shape, Ordering::Relaxed) == shape {
+            return None;
+        }
+        let copy = if shape == 0 { 0 } else { (unsafe { CopyIcon(shape as usize as HICON) }) as usize };
+        if shape != 0 && copy == 0 {
+            eprintln!("peerparty: session: the game's cursor 0x{shape:x} couldn't be copied (error {}): the pointer stays the arrow", unsafe { windows_sys::Win32::Foundation::GetLastError() });
+        }
+        Some(GAME_CURSOR.swap(copy, Ordering::Relaxed))
+    }
+
+    fn drop_game_cursor(old: usize) {
+        if old != 0 {
+            unsafe { DestroyIcon(old as HICON) };
+        }
+    }
 
     /// Whether a mouse move to client `(x, y)` moved it.
     pub(super) fn moved(last: &AtomicU64, x: i32, y: i32) -> bool {
@@ -1056,6 +1089,10 @@ mod win {
                 unsafe { SetCursor(std::ptr::null_mut()) };
                 return 1;
             }
+            WM_SETCURSOR if GAME_CURSOR.load(Ordering::Relaxed) != 0 && (l & 0xffff) as u32 == HTCLIENT => {
+                unsafe { SetCursor(shown_cursor()) };
+                return 1;
+            }
             WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_RBUTTONDBLCLK | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_XBUTTONDOWN | WM_XBUTTONUP => {
                 let (x, y) = (i32::from(l as u16 as i16), i32::from((l >> 16) as u16 as i16));
                 let is_button_down = matches!(m, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN);
@@ -1067,7 +1104,7 @@ mod win {
                     LAST_MOUSE_MS.store(mono_ms(), Ordering::Relaxed);
                     if !FORCE_HIDE_POINTER.load(Ordering::Relaxed) && HIDE_POINTER.swap(false, Ordering::Relaxed) {
                         POINTER_CHANGED.store(2, Ordering::Relaxed);
-                        unsafe { SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_ARROW)) };
+                        unsafe { SetCursor(shown_cursor()) };
                     }
                 }
                 if m == WM_LBUTTONDOWN {
@@ -1397,6 +1434,9 @@ mod win {
             CLICK.store(NO_CLICK, Ordering::Release);
             HIDE_POINTER.store(false, Ordering::Relaxed);
             FORCE_HIDE_POINTER.store(false, Ordering::Relaxed);
+            if let Some(old) = take_game_cursor(0) {
+                drop_game_cursor(old);
+            }
             LAST_MOUSE_MS.store(0, Ordering::Relaxed);
             LAST_MOVE.store(NO_CLICK, Ordering::Relaxed);
             STILL_MOVES.store(0, Ordering::Relaxed);
@@ -1497,7 +1537,8 @@ mod win {
         /// hides the pointer over the window when confined, when the focused game hid its
         /// cursor (`game_hide`), or when the mouse is idle (`idle_hide`). Returns whether
         /// confinement changed.
-        pub fn update_pointer(&mut self, confine: Option<usize>, game_hide: bool, idle_hide: bool) -> bool {
+        pub fn update_pointer(&mut self, confine: Option<usize>, game_hide: bool, idle_hide: bool, shape: u64) -> bool {
+            let replaced = take_game_cursor(shape);
             let dest = confine.and_then(|i| self.shown.get(i)?.as_ref()).map(|s| s.dest).filter(|d| d.width > 0 && d.height > 0);
             let i = confine.filter(|_| dest.is_some());
             if let Some(d) = dest {
@@ -1518,7 +1559,7 @@ mod win {
             let force_hide = i.is_some() || game_hide;
             FORCE_HIDE_POINTER.store(force_hide, Ordering::Relaxed);
             let want_hide = force_hide || (idle_hide && mouse_idle());
-            if HIDE_POINTER.swap(want_hide, Ordering::Relaxed) != want_hide {
+            if HIDE_POINTER.swap(want_hide, Ordering::Relaxed) != want_hide || (replaced.is_some() && !want_hide) {
                 if !force_hide {
                     POINTER_CHANGED.store(if want_hide { 1 } else { 2 }, Ordering::Relaxed);
                 }
@@ -1527,10 +1568,13 @@ mod win {
                 // swallows mouse moves (an open overlay or Layout Studio).
                 let mut pt = POINT { x: 0, y: 0 };
                 unsafe {
-                    SetCursor(if want_hide { std::ptr::null_mut() } else { LoadCursorW(std::ptr::null_mut(), IDC_ARROW) });
+                    SetCursor(if want_hide { std::ptr::null_mut() } else { shown_cursor() });
                     GetCursorPos(&mut pt);
                     SetCursorPos(pt.x, pt.y);
                 }
+            }
+            if let Some(old) = replaced {
+                drop_game_cursor(old);
             }
             confine_changed
         }
@@ -2093,6 +2137,10 @@ mod win {
             }
             HIDE_POINTER.store(false, Ordering::Relaxed);
             FORCE_HIDE_POINTER.store(false, Ordering::Relaxed);
+            if let Some(old) = take_game_cursor(0) {
+                unsafe { SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_ARROW)) };
+                drop_game_cursor(old);
+            }
             // The drawing thread goes before the window it draws in; one that won't stop
             // keeps the window (hidden), rather than presenting to a destroyed one.
             let stopped = self.gpu.as_mut().is_none_or(|g| g.stop());

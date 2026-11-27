@@ -10,12 +10,16 @@
 //!   real mouse in the copy's pane meanwhile (compositor.rs `confine`).
 //! - `GetPhysicalCursorPos`, `GetCursorInfo` and `GetMessagePos` say what
 //!   `GetCursorPos` does.
+//! - `SetCursor` (the cursor the game shows, or none) is told to the session
+//!   (`HookMsg::CursorShape`), whose real pointer takes it: the game's window is under
+//!   the session's, so its own cursor would never show, and a game that hides the
+//!   pointer this way (SDL does) and draws its own would get a second one.
 //!
 //! A copy alone (no input block) has the real cursor, and its calls go through.
 
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use peerparty_protocol::input_shm::InputSnapshot;
@@ -32,6 +36,7 @@ type GetMessagePosFn = unsafe extern "system" fn() -> u32;
 type GetPhysicalCursorPosFn = unsafe extern "system" fn(*mut POINT) -> i32;
 type GetCursorInfoFn = unsafe extern "system" fn(*mut CursorInfo) -> i32;
 type ShowCursorFn = unsafe extern "system" fn(i32) -> i32;
+type SetCursorFn = unsafe extern "system" fn(isize) -> isize;
 
 static SET_POS: OnceLock<GenericDetour<SetCursorPosFn>> = OnceLock::new();
 static CLIP: OnceLock<GenericDetour<ClipCursorFn>> = OnceLock::new();
@@ -40,6 +45,7 @@ static MESSAGE_POS: OnceLock<GenericDetour<GetMessagePosFn>> = OnceLock::new();
 static PHYSICAL_POS: OnceLock<GenericDetour<GetPhysicalCursorPosFn>> = OnceLock::new();
 static CURSOR_INFO: OnceLock<GenericDetour<GetCursorInfoFn>> = OnceLock::new();
 static SHOW_CURSOR: OnceLock<GenericDetour<ShowCursorFn>> = OnceLock::new();
+static SET_CURSOR: OnceLock<GenericDetour<SetCursorFn>> = OnceLock::new();
 
 /// Win32 `CURSORINFO`.
 #[repr(C)]
@@ -78,6 +84,9 @@ static OWN: Mutex<Own> = Mutex::new(Own { anchor: None, clip: None, show_count: 
 static LOCKED: AtomicBool = AtomicBool::new(false);
 /// The session was told the cursor is hidden (`HookMsg::CursorHide`).
 static HIDDEN: AtomicBool = AtomicBool::new(false);
+/// The cursor the session was last told the game set (`HookMsg::CursorShape`);
+/// `usize::MAX` before the first.
+static SHAPE: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 /// Pure helper: the copy's cursor from snapshot `snap` (the copy has the mouse:
 /// `snap.mouse.active`) and its own state, at `now`. Moved by the mouse from where the
@@ -209,6 +218,22 @@ unsafe extern "system" fn show_cursor(show: i32) -> i32 {
     count
 }
 
+unsafe extern "system" fn set_cursor(cursor: isize) -> isize {
+    let prev = SET_CURSOR.get().map_or(0, |h| unsafe { h.call(cursor) });
+    if ours() && SHAPE.swap(cursor as usize, Ordering::Relaxed) != cursor as usize {
+        static TOLD: AtomicUsize = AtomicUsize::new(0);
+        if TOLD.fetch_add(1, Ordering::Relaxed) < 4 {
+            if cursor == 0 {
+                log!("input: the game hides its cursor (SetCursor(NULL)): the session hides the pointer while its pane has focus");
+            } else {
+                log!("input: the game sets its cursor (SetCursor 0x{cursor:x}): the session's pointer takes it while its pane has focus");
+            }
+        }
+        crate::ipc::send(peerparty_protocol::ipc::HookMsg::CursorShape { handle: cursor as u64 });
+    }
+    prev
+}
+
 /// The cursor calls, in user32 (`hook_kbm`).
 pub(super) fn hook() -> usize {
     let Some(m) = module("user32.dll") else { return 0 };
@@ -227,6 +252,7 @@ pub(super) fn hook() -> usize {
     one!(PHYSICAL_POS, c"GetPhysicalCursorPos", GetPhysicalCursorPosFn, get_physical_cursor_pos);
     one!(CURSOR_INFO, c"GetCursorInfo", GetCursorInfoFn, get_cursor_info);
     one!(SHOW_CURSOR, c"ShowCursor", ShowCursorFn, show_cursor);
+    one!(SET_CURSOR, c"SetCursor", SetCursorFn, set_cursor);
     n
 }
 

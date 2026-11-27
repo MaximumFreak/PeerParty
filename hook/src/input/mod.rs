@@ -142,6 +142,35 @@ pub fn policy() -> Policy {
     Policy::PassThrough
 }
 
+/// `policy()` for controllers: a copy of a split-screen session of several, before its
+/// input block is there (the launcher sends it once the copy connects), has none yet.
+/// Read through, the real XInput would show it every controller on the PC: a game that
+/// looks once at start-up (SDL does) keeps the one it found, then can't open it once the
+/// block says it isn't this copy's, and never looks again.
+fn pad_policy() -> Policy {
+    if shm::attached() || !crate::window::focus_spoofed() {
+        return policy();
+    }
+    static FIRST: OnceLock<std::time::Instant> = OnceLock::new();
+    let waited = FIRST.get_or_init(std::time::Instant::now).elapsed();
+    if waited >= BLOCK_WAIT {
+        static TOLD: AtomicBool = AtomicBool::new(false);
+        if !TOLD.swap(true, Ordering::Relaxed) {
+            log!("input: this split-screen copy's input block didn't come within {} s: it sees the PC's controllers as they are", BLOCK_WAIT.as_secs());
+        }
+        return policy();
+    }
+    static TOLD: AtomicBool = AtomicBool::new(false);
+    if !TOLD.swap(true, Ordering::Relaxed) {
+        log!("input: the game asks for controllers before this copy's input block came: it has none until then (not the PC's every controller)");
+    }
+    Policy::Virtual(InputSnapshot { mode: InputMode::Virtual, ..Default::default() })
+}
+
+/// How long a split-screen copy waits for its input block before seeing the real
+/// controllers.
+const BLOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// The split-screen copy's seat as `Virtual` last said it (`seat`): 0 not known, 1 no
 /// controller, 2 a controller (`SEAT_SLOT`, `SEAT_KEY`).
 static SEAT_SEEN: AtomicU32 = AtomicU32::new(0);
@@ -268,7 +297,7 @@ pub(super) fn seat_or_nothing() -> Option<InputSnapshot> {
 /// Which controllers the game sees: `policy()`, but a split-screen copy's seat while
 /// the overlay has the controllers (`seat_or_nothing`), at rest.
 pub(super) fn topology() -> Policy {
-    match policy() {
+    match pad_policy() {
         Policy::BlockAll => seat_or_nothing().map_or(Policy::BlockAll, Policy::Virtual),
         p => p,
     }
@@ -773,7 +802,7 @@ fn get_state(i: usize, pad: u32, out: *mut u8) -> u32 {
         let Some(h) = STATES.hooks[i].get() else { return ERROR_DEVICE_NOT_CONNECTED };
         return unsafe { h.call(pad, out) };
     }
-    match policy() {
+    match pad_policy() {
         Policy::PassThrough => {
             let Some(h) = STATES.hooks[i].get() else { return ERROR_DEVICE_NOT_CONNECTED };
             let _g = XInputCall::enter();
@@ -1155,7 +1184,7 @@ fn get_keystroke(i: usize, pad: u32, reserved: u32, out: *mut u8) -> u32 {
     if in_xinput() {
         return unsafe { h.call(pad, reserved, out) };
     }
-    match policy() {
+    match pad_policy() {
         Policy::PassThrough => {
             let _g = XInputCall::enter();
             unsafe { h.call(pad, reserved, out) }

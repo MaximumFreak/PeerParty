@@ -1144,9 +1144,10 @@ impl SessionHost {
         let overlay_owns = ours && (self.panes[f].visible || self.layout_studio.active) && !self.under_gamebar;
         let active = ours && !self.panes[f].visible && !self.layout_studio.active && self.instances.get(f).is_some_and(|i| !i.gone);
         let lock = active && !self.kbm_off && self.instances[f].cursor_locked;
-        let game_hide = overlay_owns || (active && !self.kbm_off && self.instances[f].cursor_hidden);
+        let shape = if active && !self.kbm_off { self.instances[f].cursor_shape } else { None };
+        let game_hide = overlay_owns || (active && !self.kbm_off && (self.instances[f].cursor_hidden || shape == Some(0)));
         let idle_hide = active && (self.kbm_off || has_pad);
-        if c.update_pointer(lock.then_some(f), game_hide, idle_hide) {
+        if c.update_pointer(lock.then_some(f), game_hide, idle_hide, shape.unwrap_or(0)) {
             let text = if lock {
                 "session: the game locked its cursor: the mouse stays in its pane, the pointer hidden, while the session is in front".to_string()
             } else {
@@ -1818,6 +1819,7 @@ impl SessionHost {
             HookMsg::Log(_) => {}
             HookMsg::CursorLock { on } => self.instances[i].cursor_locked = on,
             HookMsg::CursorHide { hidden } => self.instances[i].cursor_hidden = hidden,
+            HookMsg::CursorShape { handle } => self.instances[i].cursor_shape = Some(handle),
             HookMsg::Viewport { width, height, hwnd, api } => {
                 let v = Viewport { width, height, hwnd, api };
                 let inst = &mut self.instances[i];

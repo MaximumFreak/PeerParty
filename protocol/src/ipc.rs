@@ -551,6 +551,11 @@ pub enum HookMsg {
     /// A split-screen copy's game hid its cursor (`ShowCursor(FALSE)`), or showed it
     /// again: the session hides the real pointer over the window while its pane has focus.
     CursorHide { hidden: bool },
+    /// A split-screen copy's game set its cursor (`SetCursor`): the cursor's handle (a
+    /// cursor any process on the desktop can show), 0 for none (the game hides the
+    /// pointer that way, and draws its own if any). The session's real pointer takes it
+    /// over the window while its pane has focus, so a hardware cursor stays one.
+    CursorShape { handle: u64 },
     /// A line for the launcher's log.
     Log(String),
     /// The game's frames: their size in pixels, its window (0: none known) and the
@@ -582,6 +587,7 @@ impl HookMsg {
             HookMsg::Close => Json::obj(vec![("t", Json::str("close"))]),
             HookMsg::CursorLock { on } => Json::obj(vec![("t", Json::str("cursor_lock")), ("on", Json::Bool(*on))]),
             HookMsg::CursorHide { hidden } => Json::obj(vec![("t", Json::str("cursor_hide")), ("hidden", Json::Bool(*hidden))]),
+            HookMsg::CursorShape { handle } => Json::obj(vec![("t", Json::str("cursor_shape")), ("handle", Json::u64(*handle))]),
             HookMsg::Log(text) => Json::obj(vec![("t", Json::str("log")), ("text", Json::str(text.as_str()))]),
             HookMsg::Viewport { width, height, hwnd, api } => Json::obj(vec![
                 ("t", Json::str("viewport")),
@@ -619,6 +625,7 @@ impl HookMsg {
             "close" => HookMsg::Close,
             "cursor_lock" => HookMsg::CursorLock { on: v.get("on").as_bool()? },
             "cursor_hide" => HookMsg::CursorHide { hidden: v.get("hidden").as_bool()? },
+            "cursor_shape" => HookMsg::CursorShape { handle: v.get("handle").as_u64()? },
             "log" => HookMsg::Log(text(v, "text")?),
             "viewport" => HookMsg::Viewport {
                 width: u32_of(v, "width")?,
@@ -793,6 +800,8 @@ mod tests {
             HookMsg::Close,
             HookMsg::CursorLock { on: true },
             HookMsg::CursorHide { hidden: true },
+            HookMsg::CursorShape { handle: 0x1_0003 },
+            HookMsg::CursorShape { handle: 0 },
             HookMsg::Log("hello".into()),
         ] {
             assert_eq!(HookMsg::from_line(&m.to_line()), Some(m));
