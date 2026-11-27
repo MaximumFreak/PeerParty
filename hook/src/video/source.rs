@@ -283,9 +283,14 @@ unsafe fn restore_cmd_flags(cmd_ptr: usize, orig_flags: u32) {
 fn allow_mat_setvideomode() -> Option<(usize, u32)> {
     let vstdlib = com::module("vstdlib.dll");
     if vstdlib.is_null() {
+        log!("video: Source vstdlib.dll not loaded; running mat_setvideomode without flag check");
         return None;
     }
-    let create: CreateInterfaceFn = unsafe { std::mem::transmute(com::proc(vstdlib, c"CreateInterface")?) };
+    let Some(create_addr) = com::proc(vstdlib, c"CreateInterface") else {
+        log!("video: Source vstdlib.dll has no CreateInterface export");
+        return None;
+    };
+    let create: CreateInterfaceFn = unsafe { std::mem::transmute(create_addr) };
     for (name, find_slot) in CVAR_FIND_SLOTS {
         let mut rc = 0i32;
         let cvar = unsafe { create(name.as_ptr(), &mut rc) };
@@ -294,20 +299,33 @@ fn allow_mat_setvideomode() -> Option<(usize, u32)> {
         }
         let cmd_ptr = unsafe { call_find_command_base(cvar, find_slot, c"mat_setvideomode".as_ptr()) };
         if cmd_ptr == 0 {
+            log!("video: Source {} FindCommandBase(mat_setvideomode) returned null", name.to_string_lossy());
             continue;
+        }
+        if !unsafe { is_mat_setvideomode_cmd(cmd_ptr) } {
+            log!("video: Source {} FindCommandBase(mat_setvideomode) layout check didn't match; leaving flags alone", name.to_string_lossy());
+            return None;
         }
         if let Some(patched) = unsafe { ensure_cmd_executable(cmd_ptr) } {
             log!("video: temporarily enabled FCVAR_CLIENTCMD_CAN_EXECUTE on mat_setvideomode ({})", name.to_string_lossy());
             return Some(patched);
         }
+        log!("video: Source mat_setvideomode already allows ClientCmd ({})", name.to_string_lossy());
         return None;
     }
     None
 }
 
-/// Self-verifies `IVEngineClient::GetScreenSize` against `(vw, vh)`.
-fn screen_size_matches(sw: i32, sh: i32, vw: u32, vh: u32) -> bool {
-    sw > 0 && sh > 0 && (sw as u32).abs_diff(vw) <= 2 && (sh as u32).abs_diff(vh) <= 2
+/// Self-verifies `IVEngineClient::GetScreenSize` against either the current Direct3D 9
+/// viewport `(vw, vh)` or the new pane size `(tw, th)` (Source updates its window/screen
+/// size on `WM_SIZE` even when its Direct3D 9 back buffer stays at the old size).
+fn screen_size_matches(sw: i32, sh: i32, vw: u32, vh: u32, tw: u32, th: u32) -> bool {
+    if sw <= 0 || sh <= 0 {
+        return false;
+    }
+    let (sw, sh) = (sw as u32, sh as u32);
+    let near = |a: u32, b: u32, w: u32, h: u32| w > 0 && h > 0 && a.abs_diff(w) <= 2 && b.abs_diff(h) <= 2;
+    near(sw, sh, vw, vh) || near(sw, sh, tw, th)
 }
 
 /// Issues `mat_setvideomode <tw> <th 1>` through `engine.dll`'s `IVEngineClient`.
@@ -337,16 +355,16 @@ fn issue_resize(tw: u32, th: u32, vw: u32, vh: u32) -> Option<(usize, u32)> {
     };
     let (mut sw, mut sh) = (0i32, 0i32);
     unsafe { call_get_screen_size(iface, &mut sw, &mut sh) };
-    if vw > 0 && vh > 0 && !screen_size_matches(sw, sh, vw, vh) {
+    if vw > 0 && vh > 0 && !screen_size_matches(sw, sh, vw, vh, tw, th) {
         disable_with(&format!(
-            "Source {} GetScreenSize ({sw}x{sh}) didn't match Direct3D 9 viewport ({vw}x{vh}); skipping live resize",
+            "Source {} GetScreenSize ({sw}x{sh}) didn't match Direct3D 9 viewport ({vw}x{vh}) or pane ({tw}x{th}); skipping live resize",
             name.to_string_lossy()
         ));
         return None;
     }
     let patched = allow_mat_setvideomode();
     log!(
-        "video: asking Source engine ({}) to resize live from {sw}x{sh} to {tw}x{th} (mat_setvideomode)",
+        "video: asking Source engine ({}) to resize live from {vw}x{vh} to {tw}x{th} (mat_setvideomode)",
         name.to_string_lossy()
     );
     unsafe { call_client_cmd(iface, cmd.as_ptr().cast()) };
@@ -378,11 +396,12 @@ mod tests {
 
     #[test]
     fn screen_size_verification_allows_tiny_rounding_and_rejects_mismatch() {
-        assert!(screen_size_matches(1720, 1440, 1720, 1440));
-        assert!(screen_size_matches(1721, 1440, 1720, 1440));
-        assert!(!screen_size_matches(1920, 1080, 1720, 1440));
-        assert!(!screen_size_matches(0, 0, 1720, 1440));
-        assert!(!screen_size_matches(-1, 1440, 1720, 1440));
+        assert!(screen_size_matches(1720, 1440, 1720, 1440, 2231, 1440));
+        assert!(screen_size_matches(1721, 1440, 1720, 1440, 2231, 1440));
+        assert!(screen_size_matches(2231, 1440, 1720, 1440, 2231, 1440));
+        assert!(!screen_size_matches(1920, 1080, 1720, 1440, 2231, 1440));
+        assert!(!screen_size_matches(0, 0, 1720, 1440, 2231, 1440));
+        assert!(!screen_size_matches(-1, 1440, 1720, 1440, 2231, 1440));
     }
 
     #[test]
