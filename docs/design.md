@@ -653,7 +653,12 @@ session; a Linux one (frames read back as pixels) isn't at the same level yet.
   values (`hook/src/screen_prefs.rs`), and Unreal's `GameUserSettings.ini`, read as a
   fullscreen window at the pane's size, since in exclusive fullscreen Unreal doesn't
   follow its window when the pane is resized (`hook/src/saves/screen_ini.rs`; what the
-  game saves goes back to its file with the single-window values kept). The copy keeps
+  game saves goes back to its file with the single-window values kept). A graphics
+  driver in the game (a module from Windows' driver store) is told the real screen: told
+  the pane's, an OpenGL driver finds the borderless window covering "the monitor" and
+  takes the display for it as fullscreen. Minimizing the session's window leaves every
+  pane as it was (its windows are hidden meanwhile), and a copy among several never
+  changes the display mode, pane or not. The copy keeps
   reading as the window in front (`GetForegroundWindow`,
   `GetFocus` and focus-loss messages) while another pane has the keyboard and mouse.
 - **Input** (`protocol/src/input_shm.rs`, `host/input_hub.rs`, `hook/src/input/`). The

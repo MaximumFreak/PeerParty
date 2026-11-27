@@ -1544,6 +1544,12 @@ mod win {
 
         /// The client area on screen, with the window's monitor's DPI.
         pub fn client_bounds(&self) -> Option<MonitorBounds> {
+            // Minimized, the window is parked off screen with no client area: panes of
+            // 0x0 would let every copy out of its pane until it's restored (a game going
+            // fullscreen meanwhile sizes itself to the whole monitor, or changes its mode).
+            if unsafe { IsIconic(self.hwnd) } != 0 {
+                return None;
+            }
             let mut r: RECT = unsafe { std::mem::zeroed() };
             let mut tl = POINT { x: 0, y: 0 };
             if unsafe { GetClientRect(self.hwnd, &mut r) } == 0 {
@@ -1717,6 +1723,16 @@ mod win {
             let minimized = unsafe { IsIconic(self.hwnd) } != 0;
             if minimized != self.hidden_for_minimize {
                 self.hidden_for_minimize = minimized;
+                for inst in instances.iter().filter(|inst| !inst.gone) {
+                    crate::launch::note(
+                        inst.pid,
+                        if minimized {
+                            "session: the window was minimized: the games' windows are hidden and keep their panes"
+                        } else {
+                            "session: the window was restored: the games' windows are shown in their panes again"
+                        },
+                    );
+                }
                 for s in self.shown.iter().flatten() {
                     if minimized {
                         unsafe { ShowWindowAsync(s.source as HWND, SW_HIDE) };

@@ -640,17 +640,97 @@ pub fn in_pane() -> bool {
     current_pane().is_some()
 }
 
-/// A display mode change while this copy is in a pane: it would change the monitor
-/// under every pane, so it is answered as done and nothing changes. `None` passes it on.
+/// A display mode change while this copy is in a pane, or one of several copies sharing
+/// the screen (between panes too): it would change the monitor under every pane, so it
+/// is answered as done and nothing changes. `None` passes it on.
 fn keep_display_mode(mode: usize) -> Option<i32> {
-    if !in_pane() {
+    let pane = in_pane();
+    if !pane && !FOCUS_SPOOF.load(Ordering::Relaxed) {
         return None;
     }
     if mode != 0 && !TOLD_DISPLAY_MODE.swap(true, Ordering::Relaxed) {
-        log!("window: the game changes the display mode (fullscreen): left as it is, as this copy is in a pane");
+        log!(
+            "window: the game changes the display mode (fullscreen): left as it is, as this copy {}",
+            if pane { "is in a pane" } else { "shares the screen with other copies (it has no pane right now)" }
+        );
     }
     // DISP_CHANGE_SUCCESSFUL.
     Some(0)
+}
+
+/// The screen size the user32 screen calls answer (`virtual_size`), unless a graphics
+/// driver asks: it gets the real one. A driver told the pane's size finds the game's
+/// borderless window covering "the whole monitor" and takes the display for it as
+/// fullscreen, drawing straight to the screen (zoomed, over every window including the
+/// session's and the Start menu, and unseen by screen captures).
+fn screen_for_caller() -> Option<(u32, u32)> {
+    let size = virtual_size()?;
+    (!from_graphics_driver()).then_some(size)
+}
+
+/// What a module calling the screen calls is: Windows' own and PeerParty's are looked
+/// past, to the module that called them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Caller {
+    Passed,
+    Driver,
+    Other,
+}
+
+/// Modules looked at by `from_graphics_driver`, by base.
+static CALLERS: Mutex<Vec<(usize, Caller)>> = Mutex::new(Vec::new());
+
+/// Whether the call being answered comes from a graphics driver's module (one installed
+/// in Windows' driver store, such as the OpenGL driver a game loads through
+/// opengl32.dll), past PeerParty's and Windows' own modules on the stack.
+#[inline(never)]
+fn from_graphics_driver() -> bool {
+    use windows_sys::Win32::System::LibraryLoader::{GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleHandleExW};
+    let mut frames = [std::ptr::null_mut(); 12];
+    let n = unsafe { windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace(1, frames.len() as u32, frames.as_mut_ptr(), std::ptr::null_mut()) } as usize;
+    let owner = |addr: usize| {
+        let mut m = std::ptr::null_mut();
+        let flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
+        (unsafe { GetModuleHandleExW(flags, addr as *const u16, &mut m) } != 0).then_some(m as usize)
+    };
+    let ours = owner(from_graphics_driver as *const () as usize);
+    for &f in &frames[..n.min(frames.len())] {
+        // Code outside any module (a game's generated code, another program's patch).
+        let Some(m) = owner(f as usize) else { return false };
+        let kind = if Some(m) == ours { Caller::Passed } else { caller_kind(m) };
+        match kind {
+            Caller::Passed => continue,
+            Caller::Driver => return true,
+            Caller::Other => return false,
+        }
+    }
+    false
+}
+
+fn caller_kind(m: usize) -> Caller {
+    if let Some(&(_, k)) = crate::sys::lock(&CALLERS).iter().find(|(b, _)| *b == m) {
+        return k;
+    }
+    let mut buf = [0u16; 520];
+    let len = unsafe { windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW(m as _, buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    let path = String::from_utf16_lossy(&buf[..len]).to_ascii_lowercase();
+    let system = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()).to_ascii_lowercase();
+    let kind = if path.contains(r"\driverstore\") {
+        Caller::Driver
+    } else if path.starts_with(&format!(r"{system}\system32\")) || path.starts_with(&format!(r"{system}\syswow64\")) {
+        Caller::Passed
+    } else {
+        Caller::Other
+    };
+    if kind == Caller::Driver {
+        let name = path.rsplit('\\').next().unwrap_or(&path).to_string();
+        log!("window: {name} (a graphics driver) asks for the screen's size: it's told the real one, not the pane's (told the pane's, it takes the display for the game's window as fullscreen)");
+    }
+    let mut c = crate::sys::lock(&CALLERS);
+    if c.len() < 256 {
+        c.push((m, kind));
+    }
+    kind
 }
 
 /// Current pane rectangle, if a split-screen session assigned one.
@@ -1161,7 +1241,7 @@ fn patch_monitor_info(mi: *mut MonitorInfo) {
     if mi.is_null() {
         return;
     }
-    let Some((w, h)) = virtual_size() else { return };
+    let Some((w, h)) = screen_for_caller() else { return };
     let mi = unsafe { &mut *mi };
     if (mi.cb_size as usize) < std::mem::size_of::<MonitorInfo>() {
         return;
@@ -1175,7 +1255,7 @@ fn patch_devmode(mode: u32, dm: *mut u8, off_w: usize, off_h: usize) {
     if dm.is_null() || (mode != ENUM_CURRENT_SETTINGS && mode != ENUM_REGISTRY_SETTINGS && mode != 0) {
         return;
     }
-    let Some((w, h)) = virtual_size() else { return };
+    let Some((w, h)) = screen_for_caller() else { return };
     unsafe {
         (dm.add(off_w) as *mut u32).write_unaligned(w);
         (dm.add(off_h) as *mut u32).write_unaligned(h);
@@ -1206,7 +1286,7 @@ unsafe extern "system" fn detour_get_system_metrics(index: i32) -> i32 {
     if !spoofed_metric(index) {
         return real;
     }
-    spoof_system_metric(index, real, virtual_size())
+    spoof_system_metric(index, real, screen_for_caller())
 }
 
 /// Whether `spoof_system_metric` changes metric `index`: the rest skip the session's
@@ -1564,7 +1644,7 @@ unsafe extern "system" fn detour_get_system_metrics_for_dpi(index: i32, dpi: u32
     if !spoofed_metric(index) {
         return real;
     }
-    spoof_system_metric(index, real, virtual_size())
+    spoof_system_metric(index, real, screen_for_caller())
 }
 
 type MonitorEnumProc = unsafe extern "system" fn(isize, isize, *mut RECT, isize) -> i32;
@@ -1574,7 +1654,7 @@ type MonitorEnumProc = unsafe extern "system" fn(isize, isize, *mut RECT, isize)
 /// pick the biggest, or to span them, finds only its pane.
 unsafe extern "system" fn detour_enum_display_monitors(hdc: isize, clip: *const RECT, f: Option<MonitorEnumProc>, data: isize) -> i32 {
     let Some(hook) = ENUM_MONITORS.get() else { return 0 };
-    let (Some(pane), Some((w, h)), Some(f)) = (current_pane(), virtual_size(), f) else {
+    let (Some(pane), Some((w, h)), Some(f)) = (current_pane(), screen_for_caller(), f) else {
         return unsafe { hook.call(hdc, clip, f, data) };
     };
     if hdc != 0 || !clip.is_null() {
