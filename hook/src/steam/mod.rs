@@ -203,6 +203,20 @@ pub fn inject_server(id: i32, data: Vec<u8>) {
     push(0, id, data, true);
 }
 
+/// Drops queued game server callbacks (on server shutdown or fresh init, so callbacks
+/// from a previous server instance never reach a newly started one).
+pub fn clear_server_callbacks() -> usize {
+    let mut q = crate::sys::lock(&INJECT);
+    let before = q.len();
+    q.retain(|p| !p.server);
+    let dropped = before - q.len();
+    drop(q);
+    if dropped > 0 {
+        log!("steam-lan dropped {dropped} stale game server callback(s)");
+    }
+    dropped
+}
+
 /// `inject_server` for a callback meant for the game server, else `inject`. A game
 /// server with no dispatch of its own to deliver it (manual dispatch on the game's one
 /// pipe, never run as the server's: `gs::server_dispatch`) gets it through the game's.
@@ -1107,5 +1121,19 @@ mod tests {
         unsafe { detour_run_frame(1) };
         IN_RUN_CALLBACKS.with(|c| c.set(false));
         assert!(!MANUAL.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn clearing_server_callbacks_leaves_client_ones() {
+        const TEST_CLIENT: i32 = 999_001;
+        const TEST_SERVER: i32 = 999_002;
+        inject(TEST_CLIENT, vec![1]);
+        inject_server(TEST_SERVER, vec![2]);
+        assert!(clear_server_callbacks() >= 1);
+        let q = crate::sys::lock(&INJECT);
+        assert!(!q.iter().any(|p| p.server && p.id == TEST_SERVER));
+        assert!(q.iter().any(|p| !p.server && p.id == TEST_CLIENT));
+        drop(q);
+        crate::sys::lock(&INJECT).retain(|p| p.id != TEST_CLIENT);
     }
 }

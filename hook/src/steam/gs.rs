@@ -690,12 +690,15 @@ pub fn tick() {
             match lan.create_lobby(l) {
                 Ok(l) => {
                     log!(
-                        "steam-lan game server advertised: \"{}\" map={} port={} players={}/{}",
+                        "steam-lan game server advertised: \"{}\" gamedir={} map={} port={} players={}/{} password={} tags=\"{}\"",
                         server.name,
+                        server.mod_dir,
                         server.map,
                         server.game_port,
                         server.players.len(),
-                        server.max_players
+                        server.max_players,
+                        server.password,
+                        server.tags
                     );
                     crate::sys::lock(&S).advert = Some(l.id);
                 }
@@ -706,6 +709,19 @@ pub fn tick() {
             if let Some(mut l) = lan.lobby(&id) {
                 l.attrs = advert_attrs(&server);
                 let _ = lan.update(&id, Some(&l), &[], &[]);
+                crate::log::throttled("steam-lan game server advert updated", 6, |n| {
+                    log!(
+                        "steam-lan game server advert updated: \"{}\" gamedir={} map={} port={} players={}/{} password={} tags=\"{}\" (n={n})",
+                        server.name,
+                        server.mod_dir,
+                        server.map,
+                        server.game_port,
+                        server.players.len(),
+                        server.max_players,
+                        server.password,
+                        server.tags
+                    );
+                });
             }
         }
         (false, Some(id)) => {
@@ -841,14 +857,21 @@ fn tag_list(v: &str) -> Vec<String> {
 /// "or", "nand" and "nor" take the next N filters (groups within groups too), as Steam's
 /// master server reads them.
 fn passes(l: &Lobby, filters: &[(String, String)]) -> bool {
+    rejecting_filter(l, filters).is_none()
+}
+
+/// The first filter (as `"key=value"`) that rejects `l`, or `None` if all pass.
+fn rejecting_filter(l: &Lobby, filters: &[(String, String)]) -> Option<String> {
     let item = item_of(l);
     let mut at = 0;
     while at < filters.len() {
+        let start = at;
         if !one_filter(l, &item, filters, &mut at, 0) {
-            return false;
+            let (k, v) = &filters[start];
+            return Some(format!("{k}={v:?}"));
         }
     }
-    true
+    None
 }
 
 /// The filter at `*at` (with a group's members), moving `*at` past what it took.
@@ -969,6 +992,8 @@ vmethod! {
         SERVER_STARTED.store(ok, Ordering::Relaxed);
         if ok {
             started(ip, game_port, query_port, &s(version));
+        } else {
+            log!("steam-lan InitGameServer failed: ip={ip:#x} port={game_port} query={query_port}");
         }
         ok
     }
@@ -1277,6 +1302,9 @@ static GET_ID: OnceLock<GenericDetour<IdFn>> = OnceLock::new();
 static BSECURE: OnceLock<GenericDetour<BoolFn>> = OnceLock::new();
 
 fn started(ip: u32, game_port: u16, query_port: u16, version: &str) {
+    // Discard any undelivered callbacks left over from a previous server instance so a
+    // restarted server doesn't receive stale disconnect/connect events.
+    crate::steam::clear_server_callbacks();
     let version = version.to_string();
     let mut changed = false;
     with_server(|s| {
@@ -1343,6 +1371,7 @@ unsafe extern "C" fn detour_init_safe(ip: u32, steam_port: u16, game_port: u16, 
 unsafe extern "C" fn detour_shutdown() {
     log_off();
     crate::sys::lock(&S).server = None;
+    crate::steam::clear_server_callbacks();
     if let Some(h) = SHUTDOWN.get() {
         unsafe { h.call() };
     }
@@ -1806,7 +1835,27 @@ pub fn on_event(ev: &Event) {
             list.refreshing = false;
             list.items = results
                 .iter()
-                .filter(|l| l.namespace == NS && passes(l, &list.filters))
+                .filter(|l| {
+                    if l.namespace != NS {
+                        return false;
+                    }
+                    if let Some(why) = rejecting_filter(l, &list.filters) {
+                        crate::log::throttled(&format!("steam-lan server filter {why}"), 4, |n| {
+                            log!(
+                                "steam-lan server list {:?} filtered out \"{}\" (gamedir={} map={} tags=\"{}\" players={}/{}): failed {why} (n={n})",
+                                list.kind,
+                                text(l, "name"),
+                                text(l, "gamedir"),
+                                text(l, "map"),
+                                text(l, "tags"),
+                                players_of(l).len(),
+                                text(l, "max"),
+                            );
+                        });
+                        return false;
+                    }
+                    true
+                })
                 .map(|l| Box::new(item_of(l)))
                 .collect();
             log!("steam-lan server list {:?} request={h:#x}: {} servers", list.kind, list.items.len());
@@ -2039,6 +2088,8 @@ mod tests {
         assert!(!passes(&l, &f(&[("nand", "2"), ("map", "forest"), ("gamedir", "mygame")])));
         assert!(passes(&l, &f(&[("and", "2"), ("or", "2"), ("map", "x"), ("map", "forest"), ("gamedir", "mygame")])), "a group in a group");
         assert!(passes(&l, &f(&[("full", "1"), ("empty", "1")])), "Steam's own keys");
+        assert_eq!(rejecting_filter(&l, &f(&[("gamedir", "mygame"), ("gametagsand", "coop,pvp")])).as_deref(), Some("gametagsand=\"coop,pvp\""));
+        assert_eq!(rejecting_filter(&l, &f(&[("gamedir", "mygame"), ("gametagsand", "coop"), ("gametagsand", "hard")])), None);
     }
 
     #[test]

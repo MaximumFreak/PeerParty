@@ -58,8 +58,8 @@ pub fn remote_storage() -> Vec<(&'static str, usize)> {
         ("GetFileCount", v_count as *const () as usize),
         ("GetFileNameAndSize", v_name_and_size as *const () as usize),
         ("GetQuota", v_quota as *const () as usize),
-        ("IsCloudEnabledForAccount", v_enabled as *const () as usize),
-        ("IsCloudEnabledForApp", v_enabled as *const () as usize),
+        ("IsCloudEnabledForAccount", v_enabled_account as *const () as usize),
+        ("IsCloudEnabledForApp", v_enabled_app as *const () as usize),
         ("SetCloudEnabledForApp", v_set_enabled as *const () as usize),
         ("BeginFileWriteBatch", v_batch as *const () as usize),
         ("EndFileWriteBatch", v_batch as *const () as usize),
@@ -146,7 +146,18 @@ vmethod! {
     fn v_write(this: usize, file: *const c_char, data: *const u8, len: i32) -> bool {
         let Some(d) = dir() else {
             watched();
-            return call_real!(this, "FileWrite", fn(*const c_char, *const u8, i32) -> bool, false, file, data, len);
+            let ok = call_real!(this, "FileWrite", fn(*const c_char, *const u8, i32) -> bool, false, file, data, len);
+            let name = name_of(file).unwrap_or_default();
+            if !ok {
+                crate::log::throttled("steam-remote p1 write fail", 6, |n| {
+                    log!("steam-remote: player 1 FileWrite({name}, {len} bytes) failed (n={n})")
+                });
+            } else {
+                crate::log::throttled("steam-remote p1 write", 6, |_| {
+                    log!("steam-remote: player 1 FileWrite({name}, {len} bytes) ok")
+                });
+            }
+            return ok;
         };
         let (Some(name), Ok(n)) = (name_of(file), usize::try_from(len)) else { return false };
         if n > MAX_FILE || (data.is_null() && n > 0) {
@@ -160,10 +171,24 @@ vmethod! {
 vmethod! {
     fn v_read(this: usize, file: *const c_char, out: *mut u8, len: i32) -> i32 {
         let Some(d) = dir() else {
-            return call_real!(this, "FileRead", fn(*const c_char, *mut u8, i32) -> i32, 0, file, out, len);
+            let got = call_real!(this, "FileRead", fn(*const c_char, *mut u8, i32) -> i32, 0, file, out, len);
+            if got == 0 && len > 0 {
+                let name = name_of(file).unwrap_or_default();
+                crate::log::throttled("steam-remote p1 read 0", 6, |n| {
+                    log!("steam-remote: player 1 FileRead({name}, {len} bytes) returned 0 (n={n})")
+                });
+            }
+            return got;
         };
         let (Some(name), Ok(n)) = (name_of(file), usize::try_from(len)) else { return 0 };
-        let Some(data) = read_file(&d, &name) else { return 0 };
+        let Some(data) = read_file(&d, &name) else {
+            if n > 0 {
+                crate::log::throttled("steam-remote read 0", 6, |c| {
+                    log!("steam-remote: FileRead({name}, {n} bytes) not found (n={c})")
+                });
+            }
+            return 0;
+        };
         let k = data.len().min(n);
         if k > 0 && !out.is_null() {
             unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), out, k) };
@@ -176,7 +201,14 @@ vmethod! {
     fn v_write_async(this: usize, file: *const c_char, data: *const u8, len: u32) -> u64 {
         let Some(d) = dir() else {
             watched();
-            return call_real!(this, "FileWriteAsync", fn(*const c_char, *const u8, u32) -> u64, 0, file, data, len);
+            let call = call_real!(this, "FileWriteAsync", fn(*const c_char, *const u8, u32) -> u64, 0, file, data, len);
+            if call == 0 {
+                let name = name_of(file).unwrap_or_default();
+                crate::log::throttled("steam-remote p1 write_async fail", 6, |n| {
+                    log!("steam-remote: player 1 FileWriteAsync({name}, {len} bytes) returned 0 (n={n})")
+                });
+            }
+            return call;
         };
         let n = len as usize;
         let ok = match name_of(file) {
@@ -395,10 +427,14 @@ vmethod! {
 
 vmethod! {
     fn v_count(this: usize) -> i32 {
-        let Some(d) = dir() else {
-            return call_real!(this, "GetFileCount", fn() -> i32, 0);
+        let n = match dir() {
+            Some(d) => list(&d).len() as i32,
+            None => call_real!(this, "GetFileCount", fn() -> i32, 0),
         };
-        list(&d).len() as i32
+        crate::log::throttled(&format!("steam-remote count {n}"), 2, |_| {
+            log!("steam-remote: GetFileCount -> {n}")
+        });
+        n
     }
 }
 
@@ -447,9 +483,17 @@ vmethod! {
 }
 
 vmethod! {
-    fn v_enabled(this: usize) -> bool {
+    fn v_enabled_account(this: usize) -> bool {
         if dir().is_none() {
-            // Both slots share this function: either answers the same for player 1.
+            return call_real!(this, "IsCloudEnabledForAccount", fn() -> bool, false);
+        }
+        true
+    }
+}
+
+vmethod! {
+    fn v_enabled_app(this: usize) -> bool {
+        if dir().is_none() {
             return call_real!(this, "IsCloudEnabledForApp", fn() -> bool, false);
         }
         true
