@@ -696,7 +696,7 @@ fn keep_display_mode(mode: usize) -> Option<i32> {
 /// borderless window covering "the whole monitor" and takes the display for it as
 /// fullscreen, drawing straight to the screen (zoomed, over every window including the
 /// session's and the Start menu, and unseen by screen captures).
-fn screen_for_caller() -> Option<(u32, u32)> {
+pub(crate) fn screen_for_caller() -> Option<(u32, u32)> {
     let size = virtual_size()?;
     (!from_graphics_driver()).then_some(size)
 }
@@ -888,6 +888,27 @@ pub fn restore_from_compositor() {
     log!("window: the session's window went away: restored taskbar visibility for game window 0x{hwnd:x}");
 }
 
+/// Re-applies the game window's pane placement and size asynchronously on the pane thread
+/// (for example when an exclusive-fullscreen swap chain adopts a non-pane backbuffer size
+/// or returns to the pane's size).
+pub(crate) fn sync_window_size() {
+    if let Some(pane) = current_pane() {
+        reposition_window(pane);
+    }
+}
+
+/// Pure helper: the client size a contained window should keep inside `pane`. Normally
+/// the pane itself; if the game asked for exclusive fullscreen and created a smaller or
+/// different backbuffer `exclusive`, keeping the window at that backbuffer size keeps
+/// `GetClientRect`, `WM_MOUSEMOVE` and `GetCursorPos` 1:1 with the game's render/UI
+/// coordinates instead of stretching them apart.
+pub(crate) fn target_window_size(pane: PaneRect, exclusive: Option<(u32, u32)>) -> (i32, i32) {
+    match exclusive {
+        Some((w, h)) if w >= 320 && h >= 200 => (w as i32, h as i32),
+        _ => (pane.width as i32, pane.height as i32),
+    }
+}
+
 fn put_in_pane(pane: PaneRect) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{HWND_NOTOPMOST, SWP_ASYNCWINDOWPOS, SWP_NOMOVE, SWP_NOSIZE, ShowWindowAsync, WS_EX_TOPMOST};
     let mut hwnd = live_primary() as usize;
@@ -901,6 +922,7 @@ fn put_in_pane(pane: PaneRect) {
         return;
     }
     let h = hwnd as HWND;
+    let (tw, th) = target_window_size(pane, crate::video::fullscreen::exclusive_size());
     unsafe {
         let style = GetWindowLongW(h, GWL_STYLE) as u32;
         let want_style = (style & !CHROME_STYLES) | WS_POPUP;
@@ -928,8 +950,8 @@ fn put_in_pane(pane: PaneRect) {
             std::ptr::null_mut(),
             pane.x,
             pane.y,
-            pane.width as i32,
-            pane.height as i32,
+            tw,
+            th,
             SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS,
         );
     }
@@ -1570,7 +1592,9 @@ pub fn kept_show(cmd: i32) -> i32 {
 
 unsafe extern "system" fn detour_set_window_pos(h: isize, after: isize, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> i32 {
     let Some(hook) = SET_WINDOW_POS.get() else { return 0 };
-    let Some(p) = contained(h) else { return unsafe { hook.call(h, after, x, y, cx, cy, flags) } };
+    let Some(mut p) = contained(h) else { return unsafe { hook.call(h, after, x, y, cx, cy, flags) } };
+    let (tw, th) = target_window_size(p, crate::video::fullscreen::exclusive_size());
+    (p.width, p.height) = (tw as u32, th as u32);
     let (nx, ny, ncx, ncy, nflags) = kept_window_pos(p, x, y, cx, cy, flags);
     // HWND_NOTOPMOST only takes it down: that one goes through.
     const HWND_NOTOPMOST: isize = -2;
@@ -1587,10 +1611,11 @@ unsafe extern "system" fn detour_move_window(h: isize, x: i32, y: i32, w: i32, h
     let Some(hook) = MOVE_WINDOW.get() else { return 0 };
     match contained(h) {
         Some(p) => {
-            if (x, y, w, ht) != (p.x, p.y, p.width as i32, p.height as i32) {
+            let (tw, th) = target_window_size(p, crate::video::fullscreen::exclusive_size());
+            if (x, y, w, ht) != (p.x, p.y, tw, th) {
                 told_kept("MoveWindow");
             }
-            unsafe { hook.call(h, p.x, p.y, p.width as i32, p.height as i32, repaint) }
+            unsafe { hook.call(h, p.x, p.y, tw, th, repaint) }
         }
         None => unsafe { hook.call(h, x, y, w, ht, repaint) },
     }

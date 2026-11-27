@@ -2005,9 +2005,18 @@ mod win {
                     let (cw, ch) = client_size(src);
                     let ex = unsafe { GetWindowLongW(src, GWL_EXSTYLE) } as u32;
                     let needs_style = (ex & WS_EX_TOOLWINDOW) == 0 || (ex & WS_EX_APPWINDOW) != 0;
+                    // Don't stretch a game window away from its own GPU backbuffer (for
+                    // example an exclusive-fullscreen game running at a lower resolution
+                    // inside the pane): keeping client == backbuffer keeps mouse
+                    // coordinates 1:1 with the game's UI.
+                    let matches_vp = instances
+                        .get(i)
+                        .and_then(|inst| inst.viewport.as_ref())
+                        .is_some_and(|v| v.width > 0 && v.height > 0 && cw == v.width && ch == v.height);
                     let wrong_size = s.layout_pane.width > 0
                         && s.layout_pane.height > 0
-                        && (cw != s.layout_pane.width || ch != s.layout_pane.height);
+                        && (cw != s.layout_pane.width || ch != s.layout_pane.height)
+                        && !matches_vp;
                     if needs_style || wrong_size {
                         contain_window(self.hwnd, src, s.layout_pane, bounds, false);
                         force_thumb = true;

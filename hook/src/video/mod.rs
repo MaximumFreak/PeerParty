@@ -14,7 +14,7 @@ mod d3d11;
 mod d3d12;
 mod d3d9;
 mod dxgi;
-mod fullscreen;
+pub(crate) mod fullscreen;
 mod gl;
 mod overlay;
 mod pixels;

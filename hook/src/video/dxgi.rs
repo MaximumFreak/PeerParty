@@ -179,8 +179,8 @@ pub(super) fn window_destroyed(hwnd: usize) -> bool {
 
 #[repr(C)]
 pub(super) struct SwapChainDesc {
-    width: u32,
-    height: u32,
+    pub(super) width: u32,
+    pub(super) height: u32,
     refresh_num: u32,
     refresh_den: u32,
     format: u32,
@@ -363,6 +363,9 @@ fn on_present(swap: usize) {
 
     let mut desc: SwapChainDesc = unsafe { std::mem::zeroed() };
     vcall!(swap, 12, fn(*mut SwapChainDesc) -> i32, &mut desc);
+    if desc.width > 0 && desc.height > 0 {
+        super::fullscreen::note_backbuffer_size(swap, desc.width, desc.height);
+    }
 
     // Drawn with Vulkan underneath: the Vulkan hooks draw into and copy these frames, and
     // what this side made for the swap chain goes (or the session would get two sets).
@@ -455,6 +458,9 @@ fn on_present(swap: usize) {
 fn before_resize(swap: usize, w: u32, h: u32) {
     crate::log::throttled("video: resize buffers", 3, |n| log!("video: the game resizes its swap chain's buffers to {w}x{h} (0: its window's size) (call {n})"));
     VIEWPORT_DIRTY.store(true, Ordering::Release);
+    if w > 0 && h > 0 {
+        super::fullscreen::note_backbuffer_size(swap, w, h);
+    }
     let mut st = crate::sys::lock(&STATES);
     if let Some(s) = st.iter_mut().find(|s| s.swap == swap)
         && let Some(Drawer::D3d12(r)) = &mut s.drawer
