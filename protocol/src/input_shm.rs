@@ -14,7 +14,8 @@
 //! | 64 | mouse: active, cursor x, y, motion x, y, wheel, buttons; 1 reserved |
 //! | 96 | keyboard: active, 8 words of keys (bit `vk % 32` of word `vk / 32`); 3 reserved |
 //! | 144 | wheel: connected, steer, throttle, brake, clutch, buttons; 2 reserved |
-//! | 176 | reserved, zero |
+//! | 176 | pane projection: dest x, y, w, h, uv[4], compositor hwnd lo/hi, pointer flags; 9 reserved |
+//! | 256 | cursor channel (128 bytes, optional): host->hook coalesced move; hook->host cursor shape, hide, clip |
 //!
 //! Signed values (thumbs, cursor, motion, steer) are their `i32` bits; narrower ones
 //! (triggers, pedals, thumbs) take the word's low bits.
@@ -49,6 +50,33 @@ pub const MOUSE_RIGHT: u32 = 1 << 1;
 pub const MOUSE_MIDDLE: u32 = 1 << 2;
 pub const MOUSE_X1: u32 = 1 << 3;
 pub const MOUSE_X2: u32 = 1 << 4;
+
+/// `PaneProjection::flags`: this copy is driven by the real OS pointer, so the hook can
+/// project the live hardware cursor directly in-process instead of waiting on host IPC.
+pub const POINTER_LIVE_OS: u32 = 1 << 0;
+/// `PaneProjection::flags`: the session's compositor window currently holds the
+/// foreground (no overlay or Layout Studio open), so a one-shot visible `SetCursorPos`
+/// from the game may move the real pointer into its pane.
+pub const POINTER_COMPOSITOR_FRONT: u32 = 1 << 1;
+
+/// Offset and size of the bidirectional `CursorChannel` inside the mapped 4 KiB page,
+/// past `InputHeader` (256 bytes).
+pub const CURSOR_CHANNEL_OFFSET: usize = 256;
+pub const CURSOR_CHANNEL_SIZE: usize = 128;
+
+/// Window message (`WM_APP + 0x43`) posted by the hook to `PaneProjection::compositor_hwnd`
+/// whenever cursor shape, visibility, or confinement changes, waking the session host at
+/// once instead of waiting for the next host tick.
+pub const WM_APP_CURSOR: u32 = 0x8043;
+
+/// `CursorFeedback::flags` bits.
+pub const CURSOR_HAS_SHAPE: u32 = 1 << 0;
+pub const CURSOR_HIDDEN_SHOW: u32 = 1 << 1;
+pub const CURSOR_HIDDEN_SHAPE: u32 = 1 << 2;
+pub const CURSOR_CLIPPED: u32 = 1 << 3;
+pub const CURSOR_RECENTERING: u32 = 1 << 4;
+pub const CURSOR_HAS_CLIP_RECT: u32 = 1 << 5;
+pub const CURSOR_COALESCING: u32 = 1 << 6;
 
 /// What the hook does with the game's input calls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
@@ -222,6 +250,114 @@ pub struct VirtualWheel {
     pub buttons: u32,
 }
 
+/// Where this copy's frames sit on screen (compositor physical pixels) and which UV
+/// sub-rect they sample, so the hook can map between the live OS hardware pointer and
+/// the game's client pixels in-process with zero IPC latency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub struct PaneProjection {
+    pub dest_x: i32,
+    pub dest_y: i32,
+    pub dest_w: u32,
+    pub dest_h: u32,
+    /// `f32::to_bits` of `[u0, v0, u1, v1]`; all-zero means `[0.0, 0.0, 1.0, 1.0]`.
+    pub uv_bits: [u32; 4],
+    /// Session compositor HWND (`0` when none), for instant `WM_APP_CURSOR` wakeups.
+    pub compositor_hwnd: u64,
+    /// `POINTER_*` flags.
+    pub flags: u32,
+}
+
+impl PaneProjection {
+    pub fn uv_to_bits(uv: [f32; 4]) -> [u32; 4] {
+        [uv[0].to_bits(), uv[1].to_bits(), uv[2].to_bits(), uv[3].to_bits()]
+    }
+
+    /// Source UV sub-rectangle `[u0, v0, u1, v1]` in `0.0..=1.0`.
+    pub fn uv(&self) -> [f32; 4] {
+        if self.uv_bits == [0; 4] {
+            [0.0, 0.0, 1.0, 1.0]
+        } else {
+            self.uv_bits.map(f32::from_bits)
+        }
+    }
+
+    pub fn live_os(&self) -> bool {
+        self.flags & POINTER_LIVE_OS != 0 && self.dest_w > 0 && self.dest_h > 0
+    }
+
+    pub fn compositor_front(&self) -> bool {
+        self.flags & POINTER_COMPOSITOR_FRONT != 0
+    }
+
+    /// Projects a physical screen point `(sx, sy)` on the compositor into game client
+    /// pixels `(0..cw, 0..ch)`.
+    pub fn project_to_client(&self, sx: i32, sy: i32, cw: u32, ch: u32) -> Option<(i32, i32)> {
+        if self.dest_w == 0 || self.dest_h == 0 || cw == 0 || ch == 0 {
+            return None;
+        }
+        let uv = self.uv();
+        let rx = ((f64::from(sx) - f64::from(self.dest_x)) / f64::from(self.dest_w)).clamp(0.0, 1.0);
+        let ry = ((f64::from(sy) - f64::from(self.dest_y)) / f64::from(self.dest_h)).clamp(0.0, 1.0);
+        let u = f64::from(uv[0]) + rx * f64::from(uv[2] - uv[0]);
+        let v = f64::from(uv[1]) + ry * f64::from(uv[3] - uv[1]);
+        let gx = (u * f64::from(cw)).floor().clamp(0.0, f64::from(cw - 1)) as i32;
+        let gy = (v * f64::from(ch)).floor().clamp(0.0, f64::from(ch - 1)) as i32;
+        Some((gx, gy))
+    }
+
+    /// Inverse of `project_to_client`: maps a game client pixel `(gx, gy)` back to
+    /// physical screen coordinates inside the compositor's drawn frame rect.
+    pub fn unproject_from_client(&self, gx: i32, gy: i32, cw: u32, ch: u32) -> Option<(i32, i32)> {
+        if self.dest_w == 0 || self.dest_h == 0 || cw == 0 || ch == 0 {
+            return None;
+        }
+        let uv = self.uv();
+        let uw = f64::from(uv[2] - uv[0]);
+        let vh = f64::from(uv[3] - uv[1]);
+        if uw <= 1e-6 || vh <= 1e-6 {
+            return None;
+        }
+        let u = (f64::from(gx) + 0.5) / f64::from(cw);
+        let v = (f64::from(gy) + 0.5) / f64::from(ch);
+        let rx = ((u - f64::from(uv[0])) / uw).clamp(0.0, 1.0);
+        let ry = ((v - f64::from(uv[1])) / vh).clamp(0.0, 1.0);
+        let max_x = f64::from(self.dest_w - 1);
+        let max_y = f64::from(self.dest_h - 1);
+        let sx = self.dest_x.saturating_add((rx * f64::from(self.dest_w)).floor().clamp(0.0, max_x) as i32);
+        let sy = self.dest_y.saturating_add((ry * f64::from(self.dest_h)).floor().clamp(0.0, max_y) as i32);
+        Some((sx, sy))
+    }
+
+    /// Maps a normalized game client clip rect `[left, top, right, bottom]` in `0.0..=1.0`
+    /// to a physical screen rect `[left, top, right, bottom]` clamped inside `dest`.
+    pub fn project_clip_rect(&self, norm: [f32; 4]) -> Option<[i32; 4]> {
+        if self.dest_w == 0 || self.dest_h == 0 {
+            return None;
+        }
+        let uv = self.uv();
+        let uw = f64::from(uv[2] - uv[0]);
+        let vh = f64::from(uv[3] - uv[1]);
+        if uw <= 1e-6 || vh <= 1e-6 {
+            return None;
+        }
+        let map_x = |u: f32| {
+            let rx = ((f64::from(u) - f64::from(uv[0])) / uw).clamp(0.0, 1.0);
+            self.dest_x.saturating_add((rx * f64::from(self.dest_w)).round() as i32)
+        };
+        let map_y = |v: f32| {
+            let ry = ((f64::from(v) - f64::from(uv[1])) / vh).clamp(0.0, 1.0);
+            self.dest_y.saturating_add((ry * f64::from(self.dest_h)).round() as i32)
+        };
+        let l = map_x(norm[0].min(norm[2]));
+        let t = map_y(norm[1].min(norm[3]));
+        let r = map_x(norm[0].max(norm[2])).max(l.saturating_add(1));
+        let b = map_y(norm[1].max(norm[3])).max(t.saturating_add(1));
+        let max_r = self.dest_x.saturating_add(self.dest_w as i32);
+        let max_b = self.dest_y.saturating_add(self.dest_h as i32);
+        Some([l.clamp(self.dest_x, max_r.saturating_sub(1)), t.clamp(self.dest_y, max_b.saturating_sub(1)), r.clamp(self.dest_x.saturating_add(1), max_r), b.clamp(self.dest_y.saturating_add(1), max_b)])
+    }
+}
+
 /// The block's words at one moment (one `InputHeader::read_stable`), or what a writer
 /// publishes (its `seq` is the block's own, and ignored).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
@@ -233,6 +369,7 @@ pub struct InputSnapshot {
     pub mouse: VirtualMouse,
     pub keyboard: VirtualKeyboard,
     pub wheel: VirtualWheel,
+    pub pane: PaneProjection,
 }
 
 /// The pad's words, at 16.
@@ -286,6 +423,19 @@ pub struct WheelWords {
     pub reserved: [AtomicU32; 2],
 }
 
+/// The pane projection's words, at 176 (44 bytes).
+#[repr(C)]
+pub struct PaneWords {
+    pub dest_x: AtomicU32,
+    pub dest_y: AtomicU32,
+    pub dest_w: AtomicU32,
+    pub dest_h: AtomicU32,
+    pub uv_bits: [AtomicU32; 4],
+    pub compositor_hwnd_lo: AtomicU32,
+    pub compositor_hwnd_hi: AtomicU32,
+    pub flags: AtomicU32,
+}
+
 /// The whole block, as both sides see it.
 #[repr(C)]
 pub struct InputHeader {
@@ -298,7 +448,8 @@ pub struct InputHeader {
     pub mouse: MouseWords,
     pub keyboard: KeyboardWords,
     pub wheel: WheelWords,
-    pub reserved: [AtomicU32; 20],
+    pub pane: PaneWords,
+    pub reserved: [AtomicU32; 9],
 }
 
 const _: () = assert!(std::mem::size_of::<InputHeader>() == INPUT_BLOCK_SIZE);
@@ -313,7 +464,189 @@ const _: () = assert!(std::mem::offset_of!(InputHeader, keyboard) == 96);
 const _: () = assert!(std::mem::offset_of!(InputHeader, keyboard.keys) == 100);
 const _: () = assert!(std::mem::offset_of!(InputHeader, wheel) == 144);
 const _: () = assert!(std::mem::offset_of!(InputHeader, wheel.buttons) == 164);
-const _: () = assert!(std::mem::offset_of!(InputHeader, reserved) == 176);
+const _: () = assert!(std::mem::offset_of!(InputHeader, pane) == 176);
+const _: () = assert!(std::mem::offset_of!(InputHeader, reserved) == 220);
+
+/// Hook -> Host cursor state published lock-free in `CursorChannel` (sub-millisecond,
+/// bypassing the JSON pipe and host tick).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct CursorFeedback {
+    /// Monotonic version (seqlock-even); changes on every shape/hide/clip update.
+    pub seq: u32,
+    /// Current `HCURSOR` handle (0 if hidden via `SetCursor(NULL)` or unset).
+    pub handle: u64,
+    /// `CURSOR_*` flags.
+    pub flags: u32,
+    /// Normalized `[left, top, right, bottom]` in `0.0..=1.0` of game client rect (`f32::to_bits`).
+    pub clip_bits: [u32; 4],
+}
+
+impl CursorFeedback {
+    pub fn clip_norm(&self) -> Option<[f32; 4]> {
+        (self.flags & CURSOR_HAS_CLIP_RECT != 0).then(|| self.clip_bits.map(f32::from_bits))
+    }
+
+    pub fn has_shape(&self) -> bool {
+        self.flags & CURSOR_HAS_SHAPE != 0
+    }
+
+    pub fn hidden_show(&self) -> bool {
+        self.flags & CURSOR_HIDDEN_SHOW != 0
+    }
+
+    pub fn hidden_shape(&self) -> bool {
+        self.flags & CURSOR_HIDDEN_SHAPE != 0
+    }
+
+    pub fn clipped(&self) -> bool {
+        self.flags & CURSOR_CLIPPED != 0
+    }
+
+    pub fn recentering(&self) -> bool {
+        self.flags & CURSOR_RECENTERING != 0
+    }
+
+    pub fn coalescing(&self) -> bool {
+        self.flags & CURSOR_COALESCING != 0
+    }
+}
+
+/// Bidirectional lock-free cursor & coalesced-move channel sitting at offset 256 of the
+/// 4 KiB `InputBlock` mapping. Split across two 64-byte cache lines so host writes and
+/// hook writes never false-share.
+#[repr(C)]
+pub struct CursorChannel {
+    // --- Cache line 0 (offset 256..320): Host writes, Hook reads ---
+    pub move_seq: AtomicU32,
+    pub move_wparam: AtomicU32,
+    pub move_client_x: AtomicU32,
+    pub move_client_y: AtomicU32,
+    pub _host_pad: [AtomicU32; 12],
+    // --- Cache line 1 (offset 320..384): Hook writes, Host reads ---
+    pub move_acked: AtomicU32,
+    /// Odd while hook is writing `cursor_*` fields, even when stable (seqlock).
+    pub cursor_seq: AtomicU32,
+    pub cursor_handle_lo: AtomicU32,
+    pub cursor_handle_hi: AtomicU32,
+    pub cursor_flags: AtomicU32,
+    pub clip_bits: [AtomicU32; 4],
+    /// Monotonic generation bumped when `SetCursor` sets a new shape (even if handle
+    /// value was reused after `DestroyCursor`).
+    pub shape_gen: AtomicU32,
+    /// Separate atomic bit set once `focus_proc` starts acknowledging coalesced moves
+    /// (written without touching `cursor_seq`).
+    pub coalescing: AtomicU32,
+    pub _hook_pad: [AtomicU32; 5],
+}
+
+const _: () = assert!(std::mem::size_of::<CursorChannel>() == CURSOR_CHANNEL_SIZE);
+const _: () = assert!(std::mem::offset_of!(CursorChannel, move_acked) == 64);
+
+impl CursorChannel {
+    /// A zeroed channel (tests).
+    pub fn new() -> CursorChannel {
+        unsafe { std::mem::zeroed() }
+    }
+
+    /// Borrows the channel from the base of a 4 KiB `InputBlock` mapping.
+    ///
+    /// # Safety
+    /// Same requirements as `InputHeader::from_raw`.
+    pub unsafe fn from_mapping<'a>(base: *const u8, len: usize) -> Option<&'a CursorChannel> {
+        if base.is_null() || len < CURSOR_CHANNEL_OFFSET + CURSOR_CHANNEL_SIZE {
+            return None;
+        }
+        let ptr = unsafe { base.add(CURSOR_CHANNEL_OFFSET) };
+        if ptr.align_offset(std::mem::align_of::<CursorChannel>()) != 0 {
+            return None;
+        }
+        Some(unsafe { &*(ptr as *const CursorChannel) })
+    }
+
+    /// Host: records the latest `WM_MOUSEMOVE` and bumps `move_seq`, returning the new
+    /// sequence number. Uses `SeqCst` so the paired `move_acked` check cannot miss an ack.
+    pub fn record_move(&self, wparam: u32, cx: i32, cy: i32) -> u32 {
+        self.move_wparam.store(wparam, Ordering::Relaxed);
+        self.move_client_x.store(cx as u32, Ordering::Relaxed);
+        self.move_client_y.store(cy as u32, Ordering::Relaxed);
+        self.move_seq.fetch_add(1, Ordering::SeqCst).wrapping_add(1)
+    }
+
+    /// Host: whether `posted_seq` has been acknowledged by the hook (wrapping comparison).
+    pub fn is_move_acked(&self, posted_seq: u32) -> bool {
+        let acked = self.move_acked.load(Ordering::SeqCst);
+        acked.wrapping_sub(posted_seq) < 0x8000_0000
+    }
+
+    /// Host: whether the hook's `focus_proc` is actively acknowledging coalesced moves.
+    pub fn coalescing_active(&self) -> bool {
+        self.coalescing.load(Ordering::Acquire) != 0
+    }
+
+    /// Hook: acknowledges the latest host `move_seq` before reading live cursor coordinates.
+    pub fn ack_latest_move(&self) -> u32 {
+        if self.coalescing.load(Ordering::Relaxed) == 0 {
+            self.coalescing.store(1, Ordering::Release);
+        }
+        let seq = self.move_seq.load(Ordering::SeqCst);
+        self.move_acked.store(seq, Ordering::SeqCst);
+        seq
+    }
+
+    /// Hook: latest fallback client coordinates written by the host.
+    pub fn latest_move_xy(&self) -> (i32, i32) {
+        (self.move_client_x.load(Ordering::Relaxed) as i32, self.move_client_y.load(Ordering::Relaxed) as i32)
+    }
+
+    /// Hook: publishes cursor state (`handle`, `flags`, `clip_bits`, `shape_gen`) via
+    /// seqlock on `cursor_seq`. Single writer (serialized by the hook's cursor mutex).
+    pub fn publish_feedback(&self, fb: &CursorFeedback, shape_gen: u32) {
+        let odd = self.cursor_seq.load(Ordering::Acquire).wrapping_add(1) | 1;
+        self.cursor_seq.store(odd, Ordering::Release);
+        fence(Ordering::Release);
+        put(&self.cursor_handle_lo, fb.handle as u32);
+        put(&self.cursor_handle_hi, (fb.handle >> 32) as u32);
+        put(&self.cursor_flags, fb.flags);
+        for (dst, src) in self.clip_bits.iter().zip(fb.clip_bits) {
+            put(dst, src);
+        }
+        put(&self.shape_gen, shape_gen);
+        self.cursor_seq.store(odd.wrapping_add(1), Ordering::Release);
+    }
+
+    /// Host: reads a tear-free cursor feedback snapshot and its shape generation, or
+    /// `None` if never published (`seq == 0`) or torn mid-write.
+    pub fn read_feedback(&self) -> Option<(CursorFeedback, u32)> {
+        for _ in 0..8 {
+            let seq = self.cursor_seq.load(Ordering::Acquire);
+            if seq == 0 {
+                return None;
+            }
+            if seq & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let handle = u64::from(get(&self.cursor_handle_lo)) | (u64::from(get(&self.cursor_handle_hi)) << 32);
+            let mut flags = get(&self.cursor_flags);
+            if self.coalescing.load(Ordering::Relaxed) != 0 {
+                flags |= CURSOR_COALESCING;
+            }
+            let clip_bits = [get(&self.clip_bits[0]), get(&self.clip_bits[1]), get(&self.clip_bits[2]), get(&self.clip_bits[3])];
+            let shape_gen = get(&self.shape_gen);
+            fence(Ordering::Acquire);
+            if self.cursor_seq.load(Ordering::Acquire) == seq {
+                return Some((CursorFeedback { seq, handle, flags, clip_bits }, shape_gen));
+            }
+        }
+        None
+    }
+}
+
+impl Default for CursorChannel {
+    fn default() -> CursorChannel {
+        CursorChannel::new()
+    }
+}
 
 fn put(word: &AtomicU32, v: u32) {
     word.store(v, Ordering::Release);
@@ -410,6 +743,17 @@ impl InputHeader {
         put(&w.brake, r.brake.into());
         put(&w.clutch, r.clutch.into());
         put(&w.buttons, r.buttons);
+        let (pn, pw) = (&s.pane, &self.pane);
+        put(&pw.dest_x, pn.dest_x as u32);
+        put(&pw.dest_y, pn.dest_y as u32);
+        put(&pw.dest_w, pn.dest_w);
+        put(&pw.dest_h, pn.dest_h);
+        for (dst, src) in pw.uv_bits.iter().zip(pn.uv_bits) {
+            put(dst, src);
+        }
+        put(&pw.compositor_hwnd_lo, pn.compositor_hwnd as u32);
+        put(&pw.compositor_hwnd_hi, (pn.compositor_hwnd >> 32) as u32);
+        put(&pw.flags, pn.flags);
         // The mode last: a reader that only checks it sees the new devices' state with it.
         put(&self.mode, s.mode.as_u32());
     }
@@ -417,7 +761,7 @@ impl InputHeader {
     /// The words now, whether or not they're mid-change.
     fn read(&self) -> InputSnapshot {
         let seq = self.seq.load(Ordering::Acquire);
-        let (p, m, k, r) = (&self.pad, &self.mouse, &self.keyboard, &self.wheel);
+        let (p, m, k, r, pn) = (&self.pad, &self.mouse, &self.keyboard, &self.wheel, &self.pane);
         let mut keys = [0u32; KEY_WORDS];
         for (v, word) in keys.iter_mut().zip(&k.keys) {
             *v = get(word);
@@ -456,6 +800,15 @@ impl InputHeader {
                 brake: get(&r.brake) as u16,
                 clutch: get(&r.clutch) as u16,
                 buttons: get(&r.buttons),
+            },
+            pane: PaneProjection {
+                dest_x: get(&pn.dest_x) as i32,
+                dest_y: get(&pn.dest_y) as i32,
+                dest_w: get(&pn.dest_w),
+                dest_h: get(&pn.dest_h),
+                uv_bits: [get(&pn.uv_bits[0]), get(&pn.uv_bits[1]), get(&pn.uv_bits[2]), get(&pn.uv_bits[3])],
+                compositor_hwnd: u64::from(get(&pn.compositor_hwnd_lo)) | (u64::from(get(&pn.compositor_hwnd_hi)) << 32),
+                flags: get(&pn.flags),
             },
         }
     }
@@ -519,6 +872,15 @@ mod tests {
             mouse: VirtualMouse { active: true, cursor_x: n.wrapping_neg(), cursor_y: n, delta_x: n.wrapping_mul(3), delta_y: n.wrapping_neg(), wheel_delta: n.wrapping_mul(120), buttons: MOUSE_LEFT | MOUSE_X2 },
             keyboard,
             wheel: VirtualWheel { connected: true, steer: n.wrapping_neg(), throttle: i as u16, brake: u16::MAX, clutch: !i as u16, buttons: i },
+            pane: PaneProjection {
+                dest_x: n.wrapping_neg(),
+                dest_y: n,
+                dest_w: 960,
+                dest_h: 1080,
+                uv_bits: PaneProjection::uv_to_bits([0.1, 0.0, 0.9, 1.0]),
+                compositor_hwnd: u64::from(i) << 16 | 0x42,
+                flags: POINTER_LIVE_OS | POINTER_COMPOSITOR_FRONT,
+            },
         }
     }
 
@@ -540,7 +902,8 @@ mod tests {
         assert_eq!([at(&h.keyboard.active), at(&h.keyboard.keys[0]), at(&h.keyboard.keys[7])], [96, 100, 128]);
         let w = &h.wheel;
         assert_eq!([at(&w.connected), at(&w.steer), at(&w.throttle), at(&w.brake), at(&w.clutch), at(&w.buttons)], [144, 148, 152, 156, 160, 164]);
-        assert_eq!([at(&h.reserved[0]), at(&h.reserved[19])], [176, 252]);
+        assert_eq!([at(&h.pane.dest_x), at(&h.pane.flags)], [176, 216]);
+        assert_eq!([at(&h.reserved[0]), at(&h.reserved[8])], [220, 252]);
         assert_eq!(INPUT_MAGIC.to_le_bytes(), *b"PPIN");
         for m in [InputMode::PassThrough, InputMode::BlockAll, InputMode::Virtual] {
             assert_eq!(InputMode::from_u32(m.as_u32()), Some(m));
@@ -730,5 +1093,70 @@ mod tests {
             assert!(r.join().unwrap() > 0);
         }
         assert_eq!(shared.read_stable(), Some(InputSnapshot { seq: WRITES * 2, ..snapshot(WRITES) }));
+    }
+
+    #[test]
+    fn pane_projection_round_trips_and_maps_clip() {
+        let p = PaneProjection {
+            dest_x: 960,
+            dest_y: 0,
+            dest_w: 960,
+            dest_h: 1080,
+            uv_bits: PaneProjection::uv_to_bits([0.25, 0.0, 0.75, 1.0]),
+            compositor_hwnd: 0x1234,
+            flags: POINTER_LIVE_OS | POINTER_COMPOSITOR_FRONT,
+        };
+        assert!(p.live_os() && p.compositor_front());
+        // Middle of pane maps to middle of client (even with Fill UV crop).
+        assert_eq!(p.project_to_client(960 + 480, 540, 1920, 1080), Some((960, 540)));
+        assert_eq!(p.unproject_from_client(960, 540, 1920, 1080), Some((960 + 480, 540)));
+        // Left edge of pane maps to u=0.25 of client (x=480), and unprojects back to pane left.
+        assert_eq!(p.project_to_client(960, 0, 1920, 1080), Some((480, 0)));
+        assert_eq!(p.unproject_from_client(480, 0, 1920, 1080), Some((960, 0)));
+        // Outside pane clamps cleanly to the crop edges.
+        assert_eq!(p.project_to_client(100, -50, 1920, 1080), Some((480, 0)));
+        assert_eq!(p.project_to_client(2500, 2000, 1920, 1080), Some((1440, 1079)));
+        // Full client clip maps to full pane dest; sub-rect inside crop maps proportionally.
+        assert_eq!(p.project_clip_rect([0.0, 0.0, 1.0, 1.0]), Some([960, 0, 1920, 1080]));
+        assert_eq!(p.project_clip_rect([0.25, 0.25, 0.75, 0.75]), Some([960, 270, 1920, 810]));
+    }
+
+    #[test]
+    fn cursor_channel_coalesces_moves_and_publishes_feedback() {
+        let words: Vec<AtomicU32> = (0..(CURSOR_CHANNEL_OFFSET + CURSOR_CHANNEL_SIZE) / 4).map(|_| AtomicU32::new(0)).collect();
+        let base = words.as_ptr() as *const u8;
+        assert!(unsafe { CursorChannel::from_mapping(base, INPUT_BLOCK_SIZE) }.is_none(), "256-byte block has no channel");
+        let ch = unsafe { CursorChannel::from_mapping(base, words.len() * 4) }.unwrap();
+        assert!(!ch.coalescing_active());
+        assert_eq!(ch.read_feedback(), None);
+
+        // Host posts move 1 -> in flight until hook acks.
+        let s1 = ch.record_move(1, 10, 20);
+        assert_eq!(s1, 1);
+        assert!(!ch.is_move_acked(s1));
+        assert_eq!(ch.latest_move_xy(), (10, 20));
+        // Host records move 2 while move 1 is still in flight.
+        let s2 = ch.record_move(1, 30, 40);
+        assert_eq!(s2, 2);
+        assert!(!ch.is_move_acked(s1));
+        // Hook handles move 1 and acks the latest seq (2): s1 and s2 are both acked.
+        assert_eq!(ch.ack_latest_move(), 2);
+        assert!(ch.coalescing_active());
+        assert!(ch.is_move_acked(s1));
+        assert!(ch.is_move_acked(s2));
+
+        // Feedback seqlock round-trip.
+        let fb = CursorFeedback {
+            seq: 0,
+            handle: 0x0001_0003,
+            flags: CURSOR_HAS_SHAPE | CURSOR_CLIPPED | CURSOR_HAS_CLIP_RECT,
+            clip_bits: [0.0f32.to_bits(), 0.25f32.to_bits(), 1.0f32.to_bits(), 0.75f32.to_bits()],
+        };
+        ch.publish_feedback(&fb, 7);
+        let (got, shape_gen) = ch.read_feedback().unwrap();
+        assert_eq!(shape_gen, 7);
+        assert_eq!(got.handle, 0x0001_0003);
+        assert!(got.has_shape() && got.clipped() && got.coalescing() && !got.hidden_shape());
+        assert_eq!(got.clip_norm(), Some([0.0, 0.25, 1.0, 0.75]));
     }
 }

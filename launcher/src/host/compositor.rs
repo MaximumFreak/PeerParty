@@ -640,16 +640,48 @@ impl CompositorWindow {
         None
     }
 
-    /// Keeps the real mouse inside pane `confine` (for a game that locked its cursor),
-    /// and hides the pointer over the window while confined, while the focused game hid
-    /// its cursor (`game_hide`), or while the mouse has sat idle (`idle_hide`). Returns
+    /// Physical screen rect and UV crop of pane `i`'s drawn frames, for in-process
+    /// hardware cursor projection (`PaneProjection`).
+    pub fn pane_projection(&self, i: usize, live_os: bool, front: bool) -> peerparty_protocol::input_shm::PaneProjection {
+        #[cfg(windows)]
+        if let Some(w) = &self.window {
+            return w.pane_projection(i, live_os, front);
+        }
+        let _ = (i, live_os, front);
+        peerparty_protocol::input_shm::PaneProjection::default()
+    }
+
+    /// Whether a copy posted `WM_APP_CURSOR` to wake cursor state updates since the last look.
+    pub fn take_cursor_dirty(&self) -> bool {
+        #[cfg(windows)]
+        if let Some(w) = &self.window {
+            return w.take_cursor_dirty();
+        }
+        false
+    }
+
+    /// Keeps the real mouse inside pane `confine` (mapped to `clip_norm` when provided),
+    /// and updates the hardware pointer over the focused pane's drawn frames (hiding when
+    /// `overlay_owns`, `game_hide`, or idle; showing the game's cursor shape otherwise,
+    /// and the normal arrow over other panes or letterbox bars when unconfined). Returns
     /// whether confinement changed.
-    pub fn update_pointer(&mut self, confine: Option<usize>, game_hide: bool, idle_hide: bool, shape: u64) -> bool {
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_pointer(
+        &mut self,
+        focus: usize,
+        confine: Option<usize>,
+        clip_norm: Option<[f32; 4]>,
+        overlay_owns: bool,
+        game_hide: bool,
+        idle_hide: bool,
+        shape: u64,
+        shape_gen: u32,
+    ) -> bool {
         #[cfg(windows)]
         if let Some(w) = self.window.as_mut() {
-            return w.update_pointer(confine, game_hide, idle_hide, shape);
+            return w.update_pointer(focus, confine, clip_norm, overlay_owns, game_hide, idle_hide, shape, shape_gen);
         }
-        let _ = (confine, game_hide, idle_hide, shape);
+        let _ = (focus, confine, clip_norm, overlay_owns, game_hide, idle_hide, shape, shape_gen);
         false
     }
 
@@ -793,9 +825,11 @@ impl CompositorWindow {
 #[cfg(windows)]
 mod win {
     use std::path::Path;
-    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering};
     use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant};
+
+    use peerparty_protocol::input_shm::{POINTER_COMPOSITOR_FRONT, POINTER_LIVE_OS, PaneProjection, WM_APP_CURSOR};
 
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
     use windows_sys::core::BOOL;
@@ -942,11 +976,23 @@ mod win {
         out
     }
 
-    /// The pointer is hidden over the session's window (a game locked/hid its cursor, or
-    /// the mouse sat idle while controllers play).
+    /// The focused game hid its cursor (`ShowCursor < 0`, `SetCursor(NULL)`, or
+    /// recentering): hidden over the focused pane's drawn frames (other panes still get
+    /// the normal arrow unless confined).
     static HIDE_POINTER: AtomicBool = AtomicBool::new(false);
-    /// The game itself locked or hid the cursor, so moving the mouse doesn't unhide it.
+    /// The overlay or Layout Studio owns the cursor (draws its own): hidden everywhere.
+    static OVERLAY_OWNS_POINTER: AtomicBool = AtomicBool::new(false);
+    /// The mouse sat idle while controllers play (or KBM off): hidden everywhere until moved.
+    static IDLE_HIDE_POINTER: AtomicBool = AtomicBool::new(false);
+    /// The real mouse is currently confined (`ClipCursor`) to the focused pane.
+    static CONFINED_POINTER: AtomicBool = AtomicBool::new(false);
+    /// The game itself hid the cursor (or the overlay owns it), so moving the mouse doesn't unhide it.
     static FORCE_HIDE_POINTER: AtomicBool = AtomicBool::new(false);
+    /// A split-screen copy posted `WM_APP_CURSOR` to signal a cursor state change in SHM.
+    static CURSOR_DIRTY: AtomicBool = AtomicBool::new(false);
+    /// Focused pane's drawn frame rect in client coordinates `[x, y, w, h]`, for per-pane
+    /// `WM_SETCURSOR` decisions inside `proc`.
+    static FOCUSED_DEST: [AtomicI32; 4] = [const { AtomicI32::new(0) }; 4];
     /// When the mouse last moved or clicked over the session's window (`mono_ms`; 0: never).
     static LAST_MOUSE_MS: AtomicU64 = AtomicU64::new(0);
     /// How long the mouse sits still before auto-hiding in controller/idle mode.
@@ -963,13 +1009,14 @@ mod win {
     /// last look (0: no change).
     static POINTER_CHANGED: AtomicU8 = AtomicU8::new(0);
     /// The cursor the focused pane's game set (`update_pointer`'s `shape`), copied for
-    /// this window (`CopyIcon`; 0: the arrow), and the game's handle it was copied from.
+    /// this window (`CopyIcon`; 0: the arrow), and the `(handle, shape_gen)` it came from.
     /// The game's window is under this one, so its cursor would never show; this window's
     /// real pointer takes it, and moves with the mouse like any hardware cursor.
     static GAME_CURSOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     static GAME_CURSOR_FROM: AtomicU64 = AtomicU64::new(0);
+    static GAME_CURSOR_GEN: AtomicU32 = AtomicU32::new(0);
 
-    /// The pointer over the window when it shows: the game's cursor, else the arrow.
+    /// The pointer over the focused pane when visible: the game's cursor, else the arrow.
     fn shown_cursor() -> HCURSOR {
         match GAME_CURSOR.load(Ordering::Relaxed) {
             0 => unsafe { LoadCursorW(std::ptr::null_mut(), IDC_ARROW) },
@@ -977,12 +1024,57 @@ mod win {
         }
     }
 
-    /// Takes the game's cursor `shape` (0: none to take, the arrow then). The copy it
-    /// replaced, to destroy once it's no longer the one shown; None when nothing changed.
-    fn take_game_cursor(shape: u64) -> Option<usize> {
-        if GAME_CURSOR_FROM.swap(shape, Ordering::Relaxed) == shape {
+    fn arrow_cursor() -> HCURSOR {
+        unsafe { LoadCursorW(std::ptr::null_mut(), IDC_ARROW) }
+    }
+
+    /// Whether the real pointer is currently over the focused pane's drawn frames (or
+    /// confined to it).
+    fn pointer_over_focused(hwnd: HWND) -> bool {
+        if CONFINED_POINTER.load(Ordering::Relaxed) {
+            return true;
+        }
+        let (x, y, w, h) = (
+            FOCUSED_DEST[0].load(Ordering::Relaxed),
+            FOCUSED_DEST[1].load(Ordering::Relaxed),
+            FOCUSED_DEST[2].load(Ordering::Relaxed),
+            FOCUSED_DEST[3].load(Ordering::Relaxed),
+        );
+        if w <= 0 || h <= 0 {
+            return false;
+        }
+        let mut pt = POINT { x: 0, y: 0 };
+        unsafe {
+            GetCursorPos(&mut pt);
+            ScreenToClient(hwnd, &mut pt);
+        }
+        on_frames(PaneRect { x, y, width: w as u32, height: h as u32 }, pt.x, pt.y)
+    }
+
+    /// The cursor to show over `hwnd`'s client area right now: hidden for overlay/idle,
+    /// focused game's cursor/hide state over its drawn frames, and the standard arrow
+    /// over other panes or letterbox bars.
+    fn desired_cursor_at(hwnd: HWND) -> HCURSOR {
+        if OVERLAY_OWNS_POINTER.load(Ordering::Relaxed) || IDLE_HIDE_POINTER.load(Ordering::Relaxed) {
+            return std::ptr::null_mut();
+        }
+        if pointer_over_focused(hwnd) {
+            if HIDE_POINTER.load(Ordering::Relaxed) { std::ptr::null_mut() } else { shown_cursor() }
+        } else {
+            arrow_cursor()
+        }
+    }
+
+    /// Takes the game's cursor `(shape, shape_gen)` (`shape == 0`: none to take, the arrow
+    /// then). The copy it replaced, to destroy once it's no longer shown; None when unchanged.
+    fn take_game_cursor(shape: u64, shape_gen: u32) -> Option<usize> {
+        let prev_shape = GAME_CURSOR_FROM.load(Ordering::Relaxed);
+        let prev_gen = GAME_CURSOR_GEN.load(Ordering::Relaxed);
+        if prev_shape == shape && prev_gen == shape_gen {
             return None;
         }
+        GAME_CURSOR_FROM.store(shape, Ordering::Relaxed);
+        GAME_CURSOR_GEN.store(shape_gen, Ordering::Relaxed);
         let copy = if shape == 0 { 0 } else { (unsafe { CopyIcon(shape as usize as HICON) }) as usize };
         if shape != 0 && copy == 0 {
             eprintln!("peerparty: session: the game's cursor 0x{shape:x} couldn't be copied (error {}): the pointer stays the arrow", unsafe { windows_sys::Win32::Foundation::GetLastError() });
@@ -1096,12 +1188,12 @@ mod win {
             WM_MOVE | WM_DPICHANGED | WM_DISPLAYCHANGE => RESIZED.store(true, Ordering::Release),
             WM_KILLFOCUS | WM_CANCELMODE => push_input(ForwardedInput::ReleaseAll),
             WM_ACTIVATE if w & 0xffff == WA_INACTIVE as usize => push_input(ForwardedInput::ReleaseAll),
-            WM_SETCURSOR if HIDE_POINTER.load(Ordering::Relaxed) && (l & 0xffff) as u32 == HTCLIENT => {
-                unsafe { SetCursor(std::ptr::null_mut()) };
-                return 1;
+            m if m == WM_APP_CURSOR => {
+                CURSOR_DIRTY.store(true, Ordering::Release);
+                return 0;
             }
-            WM_SETCURSOR if GAME_CURSOR.load(Ordering::Relaxed) != 0 && (l & 0xffff) as u32 == HTCLIENT => {
-                unsafe { SetCursor(shown_cursor()) };
+            WM_SETCURSOR if (l & 0xffff) as u32 == HTCLIENT => {
+                unsafe { SetCursor(desired_cursor_at(h)) };
                 return 1;
             }
             WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_RBUTTONDBLCLK | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_XBUTTONDOWN | WM_XBUTTONUP => {
@@ -1113,9 +1205,9 @@ mod win {
                 }
                 if m == WM_MOUSEMOVE || is_button_down {
                     LAST_MOUSE_MS.store(mono_ms(), Ordering::Relaxed);
-                    if !FORCE_HIDE_POINTER.load(Ordering::Relaxed) && HIDE_POINTER.swap(false, Ordering::Relaxed) {
+                    if !FORCE_HIDE_POINTER.load(Ordering::Relaxed) && IDLE_HIDE_POINTER.swap(false, Ordering::Relaxed) {
                         POINTER_CHANGED.store(2, Ordering::Relaxed);
-                        unsafe { SetCursor(shown_cursor()) };
+                        unsafe { SetCursor(desired_cursor_at(h)) };
                     }
                 }
                 if m == WM_LBUTTONDOWN {
@@ -1401,6 +1493,9 @@ mod win {
         /// Where the mouse last was over each copy's pane, on screen as that game counts
         /// it (`cursor_for`).
         cursor_screen: Vec<Option<(i32, i32)>>,
+        /// Last coalesced `WM_MOUSEMOVE` sequence posted to each copy, and when.
+        last_move_posted: Vec<u32>,
+        last_move_at: Vec<Instant>,
         /// The real cursor is kept inside this copy's pane (`confine`).
         confined: Option<usize>,
         /// Each copy's display pane, fit, and z, as `show`/`preview_pane` last saw them
@@ -1444,8 +1539,15 @@ mod win {
             RESIZED.store(false, Ordering::Release);
             CLICK.store(NO_CLICK, Ordering::Release);
             HIDE_POINTER.store(false, Ordering::Relaxed);
+            OVERLAY_OWNS_POINTER.store(false, Ordering::Relaxed);
+            IDLE_HIDE_POINTER.store(false, Ordering::Relaxed);
+            CONFINED_POINTER.store(false, Ordering::Relaxed);
             FORCE_HIDE_POINTER.store(false, Ordering::Relaxed);
-            if let Some(old) = take_game_cursor(0) {
+            CURSOR_DIRTY.store(false, Ordering::Relaxed);
+            for slot in &FOCUSED_DEST {
+                slot.store(0, Ordering::Relaxed);
+            }
+            if let Some(old) = take_game_cursor(0, 0) {
                 drop_game_cursor(old);
             }
             LAST_MOUSE_MS.store(0, Ordering::Relaxed);
@@ -1504,6 +1606,8 @@ mod win {
                 icon_big,
                 icon_small,
                 cursor_screen: Vec::new(),
+                last_move_posted: Vec::new(),
+                last_move_at: Vec::new(),
                 confined: None,
                 display: Vec::new(),
                 pressed: Vec::new(),
@@ -1560,44 +1664,113 @@ mod win {
             }))
         }
 
-        /// Keeps the real cursor inside copy `confine`'s frames (None: lets it go), and
-        /// hides the pointer over the window when confined, when the focused game hid its
-        /// cursor (`game_hide`), or when the mouse is idle (`idle_hide`). Returns whether
-        /// confinement changed.
-        pub fn update_pointer(&mut self, confine: Option<usize>, game_hide: bool, idle_hide: bool, shape: u64) -> bool {
-            let replaced = take_game_cursor(shape);
-            let dest = confine.and_then(|i| self.shown.get(i)?.as_ref()).map(|s| s.dest).filter(|d| d.width > 0 && d.height > 0);
-            let i = confine.filter(|_| dest.is_some());
-            if let Some(d) = dest {
+        pub fn pane_projection(&self, i: usize, live_os: bool, front: bool) -> PaneProjection {
+            let hwnd = self.hwnd as usize as u64;
+            let Some(s) = self.shown.get(i).and_then(|s| s.as_ref()) else {
+                return PaneProjection { compositor_hwnd: hwnd, ..Default::default() };
+            };
+            let d = s.dest;
+            if d.width == 0 || d.height == 0 {
+                return PaneProjection { compositor_hwnd: hwnd, ..Default::default() };
+            }
+            let mut tl = POINT { x: d.x, y: d.y };
+            unsafe { ClientToScreen(self.hwnd, &mut tl) };
+            let flags = if live_os { POINTER_LIVE_OS } else { 0 } | if front { POINTER_COMPOSITOR_FRONT } else { 0 };
+            PaneProjection {
+                dest_x: tl.x,
+                dest_y: tl.y,
+                dest_w: d.width,
+                dest_h: d.height,
+                uv_bits: PaneProjection::uv_to_bits(s.uv),
+                compositor_hwnd: hwnd,
+                flags,
+            }
+        }
+
+        pub fn take_cursor_dirty(&self) -> bool {
+            CURSOR_DIRTY.swap(false, Ordering::AcqRel)
+        }
+
+        /// Keeps the real cursor inside copy `confine`'s frames (mapped to `clip_norm` when
+        /// provided; None: lets it go), and updates the hardware pointer over the focused
+        /// pane's drawn frames (hiding when `overlay_owns`, `game_hide`, or idle; never
+        /// force-hiding just because `ClipCursor` is active). Returns whether confinement changed.
+        #[allow(clippy::too_many_arguments)]
+        pub fn update_pointer(
+            &mut self,
+            focus: usize,
+            confine: Option<usize>,
+            clip_norm: Option<[f32; 4]>,
+            overlay_owns: bool,
+            game_hide: bool,
+            idle_hide: bool,
+            shape: u64,
+            shape_gen: u32,
+        ) -> bool {
+            let focus_dest = self.shown.get(focus).and_then(|s| s.as_ref()).map(|s| s.dest).unwrap_or(super::HIDDEN);
+            let dest_changed = FOCUSED_DEST[0].swap(focus_dest.x, Ordering::Relaxed) != focus_dest.x
+                || FOCUSED_DEST[1].swap(focus_dest.y, Ordering::Relaxed) != focus_dest.y
+                || FOCUSED_DEST[2].swap(focus_dest.width as i32, Ordering::Relaxed) != focus_dest.width as i32
+                || FOCUSED_DEST[3].swap(focus_dest.height as i32, Ordering::Relaxed) != focus_dest.height as i32;
+
+            let replaced = take_game_cursor(shape, shape_gen);
+            let confine_shown = confine.and_then(|i| self.shown.get(i)?.as_ref()).filter(|s| s.dest.width > 0 && s.dest.height > 0);
+            let i = confine.filter(|_| confine_shown.is_some());
+            if let Some(s) = confine_shown {
+                let d = s.dest;
                 let mut tl = POINT { x: d.x, y: d.y };
                 unsafe { ClientToScreen(self.hwnd, &mut tl) };
-                let r = RECT { left: tl.x, top: tl.y, right: tl.x.saturating_add(d.width as i32), bottom: tl.y.saturating_add(d.height as i32) };
+                let full = RECT { left: tl.x, top: tl.y, right: tl.x.saturating_add(d.width as i32), bottom: tl.y.saturating_add(d.height as i32) };
+                let proj = PaneProjection {
+                    dest_x: tl.x,
+                    dest_y: tl.y,
+                    dest_w: d.width,
+                    dest_h: d.height,
+                    uv_bits: PaneProjection::uv_to_bits(s.uv),
+                    compositor_hwnd: 0,
+                    flags: 0,
+                };
+                // Map a sub-window clip rect when large enough to be a real visible cursor
+                // confinement; tiny 1x1 mouselook clips keep the whole pane.
+                let r = clip_norm
+                    .and_then(|n| proj.project_clip_rect(n))
+                    .filter(|c| c[2].saturating_sub(c[0]) >= 16 && c[3].saturating_sub(c[1]) >= 16)
+                    .map_or(full, |c| RECT { left: c[0], top: c[1], right: c[2], bottom: c[3] });
                 // Again every tick: Windows lets a clip go when another window takes the
                 // foreground for a moment.
                 unsafe { ClipCursor(&r) };
             }
             let confine_changed = i != self.confined;
             if confine_changed {
-                if dest.is_none() {
+                if confine_shown.is_none() {
                     unsafe { ClipCursor(std::ptr::null()) };
                 }
                 self.confined = i;
             }
-            let force_hide = i.is_some() || game_hide;
+            CONFINED_POINTER.store(i.is_some(), Ordering::Relaxed);
+
+            let force_hide = overlay_owns || game_hide;
             FORCE_HIDE_POINTER.store(force_hide, Ordering::Relaxed);
-            let want_hide = force_hide || (idle_hide && mouse_idle());
-            if HIDE_POINTER.swap(want_hide, Ordering::Relaxed) != want_hide || (replaced.is_some() && !want_hide) {
-                if !force_hide {
-                    POINTER_CHANGED.store(if want_hide { 1 } else { 2 }, Ordering::Relaxed);
-                }
-                // The pointer's look is asked for again when it next moves; set it on this
-                // thread too so hiding/showing takes effect at once even while `WH_MOUSE_LL`
-                // swallows mouse moves (an open overlay or Layout Studio).
+            let prev_overlay = OVERLAY_OWNS_POINTER.swap(overlay_owns, Ordering::Relaxed);
+            let prev_hide = HIDE_POINTER.swap(game_hide, Ordering::Relaxed);
+            let want_idle = !force_hide && idle_hide && mouse_idle();
+            let prev_idle = IDLE_HIDE_POINTER.swap(want_idle, Ordering::Relaxed);
+            if prev_idle != want_idle && !force_hide {
+                POINTER_CHANGED.store(if want_idle { 1 } else { 2 }, Ordering::Relaxed);
+            }
+            let visual_changed = dest_changed || prev_overlay != overlay_owns || prev_hide != game_hide || prev_idle != want_idle || (replaced.is_some() && !game_hide && !overlay_owns);
+            if visual_changed {
+                // Apply immediately on the compositor's thread without calling SetCursorPos
+                // (which nudges the live mouse and injects synthetic WM_MOUSEMOVE).
                 let mut pt = POINT { x: 0, y: 0 };
+                let mut rc = RECT { left: 0, top: 0, right: 0, bottom: 0 };
                 unsafe {
-                    SetCursor(if want_hide { std::ptr::null_mut() } else { shown_cursor() });
-                    GetCursorPos(&mut pt);
-                    SetCursorPos(pt.x, pt.y);
+                    if GetCursorPos(&mut pt) != 0 && ScreenToClient(self.hwnd, &mut pt) != 0 && GetClientRect(self.hwnd, &mut rc) != 0 {
+                        let inside = pt.x >= rc.left && pt.y >= rc.top && pt.x < rc.right && pt.y < rc.bottom;
+                        if inside || overlay_owns {
+                            SetCursor(desired_cursor_at(self.hwnd));
+                        }
+                    }
                 }
             }
             if let Some(old) = replaced {
@@ -1952,6 +2125,23 @@ mod win {
             if events.is_empty() {
                 return None;
             }
+            // Collapse back-to-back WM_MOUSEMOVE events with the same button mask so a
+            // high-polling mouse never queues redundant moves before a click or frame.
+            let mut coalesced: Vec<ForwardedInput> = Vec::with_capacity(events.len());
+            for ev in events {
+                if let (
+                    Some(ForwardedInput::Mouse { msg: prev_msg, w: prev_w, .. }),
+                    ForwardedInput::Mouse { msg: WM_MOUSEMOVE, w, .. },
+                ) = (coalesced.last_mut(), ev)
+                    && *prev_msg == WM_MOUSEMOVE
+                    && *prev_w == w
+                {
+                    *coalesced.last_mut().unwrap() = ev;
+                    continue;
+                }
+                coalesced.push(ev);
+            }
+            let events = coalesced;
             let mut switched = None;
             let mut order: Vec<usize> = (0..panes.len()).collect();
             order.sort_by_key(|&i| (zs.get(i).copied().unwrap_or(0), i));
@@ -2058,6 +2248,28 @@ mod win {
                     if let Some(held) = pressed(&ev) {
                         self.press(held, src as isize, lp);
                     }
+                    // True QS_MOUSEMOVE-style coalescing: keep at most one WM_MOUSEMOVE in
+                    // flight in the game's posted queue once its hook acknowledges moves;
+                    // the hook refreshes lparam from the live hardware cursor on delivery.
+                    if msg == WM_MOUSEMOVE
+                        && let Some(ch) = instances.get(*focus).and_then(|inst| inst.input.as_ref()).and_then(|b| b.cursor_channel())
+                    {
+                        let seq = ch.record_move(w as u32, gx, gy);
+                        if self.last_move_posted.len() <= *focus {
+                            self.last_move_posted.resize(*focus + 1, 0);
+                            self.last_move_at.resize(*focus + 1, Instant::now());
+                        }
+                        let last = self.last_move_posted[*focus];
+                        let in_flight = ch.coalescing_active()
+                            && last != 0
+                            && !ch.is_move_acked(last)
+                            && self.last_move_at[*focus].elapsed() < Duration::from_millis(100);
+                        if in_flight {
+                            return true;
+                        }
+                        self.last_move_posted[*focus] = seq;
+                        self.last_move_at[*focus] = Instant::now();
+                    }
                     unsafe { PostMessageW(src, msg, w, lp) };
                 }
                 ForwardedInput::Key { msg, w, l } => {
@@ -2163,8 +2375,12 @@ mod win {
                 unsafe { ClipCursor(std::ptr::null()) };
             }
             HIDE_POINTER.store(false, Ordering::Relaxed);
+            OVERLAY_OWNS_POINTER.store(false, Ordering::Relaxed);
+            IDLE_HIDE_POINTER.store(false, Ordering::Relaxed);
+            CONFINED_POINTER.store(false, Ordering::Relaxed);
             FORCE_HIDE_POINTER.store(false, Ordering::Relaxed);
-            if let Some(old) = take_game_cursor(0) {
+            CURSOR_DIRTY.store(false, Ordering::Relaxed);
+            if let Some(old) = take_game_cursor(0, 0) {
                 unsafe { SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_ARROW)) };
                 drop_game_cursor(old);
             }

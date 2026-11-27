@@ -651,12 +651,33 @@ impl SessionHost {
         }
     }
 
-    /// Between ticks: the keyboards and mice as they are now, to the copies they go to
-    /// (`InputHub::publish_kbm`).
+    /// Screen-space pane projection of `focus` (with live-OS-pointer flag and foreground
+    /// status), for in-process hardware `GetCursorPos` and one-shot `SetCursorPos` warps.
+    fn focus_pane_projection(&self, focus: Option<usize>, front: bool) -> peerparty_protocol::input_shm::PaneProjection {
+        let Some(c) = self.compositor.as_ref() else {
+            return peerparty_protocol::input_shm::PaneProjection::default();
+        };
+        let overlay_open = self.panes.get(self.focus).is_some_and(|p| p.visible) || self.layout_studio.active;
+        let comp_front = front && !overlay_open && !self.kbm_off && c.hwnd() != 0 && desktop::in_front(std::process::id());
+        match focus {
+            Some(f) => c.pane_projection(f, true, comp_front),
+            None => peerparty_protocol::input_shm::PaneProjection { compositor_hwnd: c.hwnd(), ..Default::default() },
+        }
+    }
+
+    /// Between ticks: forward queued mouse/key messages first (so `cursor_screen` is up
+    /// to date and clicks/moves never lag), publish keyboards and mice to SHM, and apply
+    /// any instant cursor shape/visibility/confinement update signalled via `WM_APP_CURSOR`.
     fn kbm_tick(&mut self) {
-        let focus_cursor = self.input.kbm_focus().and_then(|f| self.compositor.as_ref().and_then(|c| c.cursor_screen(f)));
-        self.input.publish_kbm(&mut self.instances, focus_cursor);
         self.forward_queued_input();
+        let front = self.in_front();
+        let focus = self.input.kbm_focus();
+        let focus_cursor = focus.and_then(|f| self.compositor.as_ref().and_then(|c| c.cursor_screen(f)));
+        let focus_pane = self.focus_pane_projection(focus, front);
+        self.input.publish_kbm(&mut self.instances, focus_cursor, focus_pane);
+        if self.compositor.as_ref().is_some_and(|c| c.take_cursor_dirty()) {
+            self.update_pointer(front);
+        }
     }
 
     /// How long the loop waits before its next tick (ms).
@@ -1162,17 +1183,42 @@ impl SessionHost {
             }
         }
         let has_pad = self.input.pads().seat_info().iter().any(Option::is_some);
+        let fb = self.instances.get(f).and_then(|i| i.input.as_ref()).and_then(|b| b.cursor_channel()).and_then(|ch| ch.read_feedback());
         let Some(c) = self.compositor.as_mut() else { return };
         let ours = front && c.hwnd() != 0 && desktop::in_front(std::process::id());
         let overlay_owns = ours && (self.panes[f].visible || self.layout_studio.active) && !self.under_gamebar;
         let active = ours && !self.panes[f].visible && !self.layout_studio.active && self.instances.get(f).is_some_and(|i| !i.gone);
-        let lock = active && !self.kbm_off && self.instances[f].cursor_locked;
-        let shape = if active && !self.kbm_off { self.instances[f].cursor_shape } else { None };
-        let game_hide = overlay_owns || (active && !self.kbm_off && (self.instances[f].cursor_hidden || shape == Some(0)));
+        let (clipped, recentering, hidden_show, hidden_shape, shape, shape_gen, clip_norm) = match fb {
+            Some((fb, sgen)) => (
+                fb.clipped(),
+                fb.recentering(),
+                fb.hidden_show(),
+                fb.hidden_shape(),
+                fb.has_shape().then_some(fb.handle),
+                sgen,
+                fb.clip_norm(),
+            ),
+            None => (
+                self.instances[f].cursor_locked,
+                false,
+                self.instances[f].cursor_hidden,
+                self.instances[f].cursor_shape == Some(0),
+                self.instances[f].cursor_shape,
+                0,
+                None,
+            ),
+        };
+        let lock = active && !self.kbm_off && (clipped || recentering);
+        let shape = if active && !self.kbm_off { shape } else { None };
+        let game_hide = active && !self.kbm_off && (hidden_show || hidden_shape || recentering);
         let idle_hide = active && (self.kbm_off || has_pad);
-        if c.update_pointer(lock.then_some(f), game_hide, idle_hide, shape.unwrap_or(0)) {
+        if c.update_pointer(f, lock.then_some(f), clip_norm, overlay_owns, game_hide, idle_hide, shape.unwrap_or(0), shape_gen) {
             let text = if lock {
-                "session: the game locked its cursor: the mouse stays in its pane, the pointer hidden, while the session is in front".to_string()
+                if game_hide {
+                    "session: the game locked its cursor: the mouse stays in its pane, the pointer hidden, while the session is in front".to_string()
+                } else {
+                    "session: the game confined its cursor: the mouse stays in its pane while the session is in front".to_string()
+                }
             } else {
                 "session: the mouse is free of the pane again (the cursor unlocked, the overlay opened, or the session left the front)".to_string()
             };
@@ -1495,6 +1541,11 @@ impl SessionHost {
 
     fn tick(&mut self) {
         input::heartbeat();
+        // Forward queued mouse/key messages and publish KBM immediately before controller
+        // polling and window maintenance so clicks and moves never stall behind a full tick.
+        if !self.any_open() && !self.layout_studio.active {
+            self.kbm_tick();
+        }
         // Poll controllers before handling hook messages: when the game opens the
         // overlay on a controller button press (its own Invite button), `show()` must
         // see that button already down in `pad_prev` so `gather()` doesn't fire Row 0
@@ -1597,7 +1648,11 @@ impl SessionHost {
         // front, Layout Studio is closed, and keyboard/mouse input to games is enabled.
         let focus = self.compositor.as_ref().map(|_| self.focus).filter(|_| front && !self.kbm_off && !self.layout_studio.active);
         let focus_cursor = self.compositor.as_ref().and_then(|c| c.cursor_screen(self.focus));
-        self.input.publish_session(&mut self.instances, &open, focus, focus_cursor);
+        let focus_pane = self.focus_pane_projection(focus, front);
+        self.input.publish_session(&mut self.instances, &open, focus, focus_cursor, focus_pane);
+        if let Some(c) = self.compositor.as_ref() {
+            let _ = c.take_cursor_dirty();
+        }
         self.update_pointer(front);
     }
 

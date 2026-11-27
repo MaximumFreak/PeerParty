@@ -60,6 +60,7 @@ mod joy;
 
 pub(crate) use device::{opened_a, opened_w, refuse_open_a, refuse_open_w};
 pub(crate) use audio::unfiltered as audio_unfiltered;
+pub(crate) use cursor::{begin_synth_setcursor, end_synth_setcursor, observe_thread_cursor, on_forwarded_mouse_move};
 pub(crate) mod hid;
 mod shm;
 mod wgi;
@@ -1668,6 +1669,14 @@ fn remember_cursor(x: i32, y: i32) {
 /// Where a copy that has never had the mouse sees the cursor: Windows' own "nowhere"
 /// (where it puts minimized windows), off every screen.
 const OFF_WINDOW: (i32, i32) = (-32000, -32000);
+
+/// Calls the real (unhooked) Win32 `GetCursorPos` directly.
+pub(super) fn real_cursor_pos(pt: *mut POINT) -> i32 {
+    match CURSOR_POS.get() {
+        Some(h) => unsafe { h.call(pt) },
+        None => unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(pt) },
+    }
+}
 
 unsafe extern "system" fn cursor_pos(pt: *mut POINT) -> i32 {
     // While a split-screen copy's overlay has its input, the real cursor (another

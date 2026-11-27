@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use peerparty_protocol::input_shm::{INPUT_BLOCK_SIZE, InputHeader, InputMode, InputSnapshot, VirtualKeyboard, VirtualMouse, VirtualPad, VirtualWheel};
+use peerparty_protocol::input_shm::{CursorChannel, INPUT_BLOCK_SIZE, InputHeader, InputMode, InputSnapshot, PaneProjection, VirtualKeyboard, VirtualMouse, VirtualPad, VirtualWheel};
 use peerparty_protocol::session::{ANY_KEYBOARD, InputAssignment};
 use peerparty_protocol::transport::{FileShm, ShmBacking, token_from_bytes};
 
@@ -132,6 +132,13 @@ impl InputBlock {
         // SAFETY: the view is mapped (read and write) for as long as self, and holds
         // MAPPED bytes; the hook touches it only through its words.
         unsafe { InputHeader::from_raw(self.view, MAPPED) }.expect("a mapped view is aligned and long enough")
+    }
+
+    /// The bidirectional cursor & coalesced-move channel past `InputHeader` in the same
+    /// 4 KiB page.
+    pub fn cursor_channel(&self) -> Option<&CursorChannel> {
+        // SAFETY: the view is mapped (read and write) for MAPPED bytes for as long as self.
+        unsafe { CursorChannel::from_mapping(self.view, MAPPED) }
     }
 
     /// Publishes `s`, unless it's the one published last. Whether it was published.
@@ -522,10 +529,11 @@ impl InputHub {
     /// thousand times a second): each copy's last snapshot with its keyboard and mouse
     /// as they are now, the rest (controllers, overlay, focus) as last published. No
     /// controller is read and no device table copied. `focus_cursor` is the focused
-    /// pane's cursor (`publish_session`).
-    pub fn publish_kbm(&mut self, instances: &mut [InstanceConn], focus_cursor: Option<(i32, i32)>) {
+    /// pane's cursor (`publish_session`) and `focus_pane` its screen projection.
+    pub fn publish_kbm(&mut self, instances: &mut [InstanceConn], focus_cursor: Option<(i32, i32)>, focus_pane: PaneProjection) {
         let focus = self.kbm_focus;
         let pairs = std::mem::take(&mut self.pairs);
+        let idle_pane = PaneProjection { compositor_hwnd: focus_pane.compositor_hwnd, ..Default::default() };
         self.with_kbm(|k| {
             for (idx, inst) in instances.iter_mut().enumerate() {
                 let assignment = inst.spec.input_assignment;
@@ -533,6 +541,7 @@ impl InputHub {
                 // An open overlay's copy (BlockAll) and a pass-through one are left as
                 // they are.
                 let Some(mut s) = block.last.filter(|s| s.mode == InputMode::Virtual) else { continue };
+                s.pane = idle_pane;
                 if let InputAssignment::KeyboardMouse { device_id } = assignment {
                     let mouse = pairs.get(&device_id).copied().unwrap_or(device_id);
                     s.keyboard = k.keyboards.get(&device_id).map(|kb| VirtualKeyboard { active: true, ..*kb }).unwrap_or_default();
@@ -540,6 +549,7 @@ impl InputHub {
                 }
                 if focus == Some(idx) && matches!(assignment, InputAssignment::Controller { .. } | InputAssignment::KeyboardMouse { device_id: ANY_KEYBOARD }) {
                     (s.keyboard, s.mouse) = combined(&k.keyboards, &k.mice, focus_cursor);
+                    s.pane = focus_pane;
                 }
                 block.publish(&s);
             }
@@ -578,7 +588,7 @@ impl InputHub {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn publish(&mut self, instances: &mut [InstanceConn], overlay_open: bool) {
         let open = vec![overlay_open; instances.len()];
-        self.publish_session(instances, &open, None, None);
+        self.publish_session(instances, &open, None, None, PaneProjection::default());
     }
 
     /// Writes each copy's block from its assignment (`route`; `open[i]`: copy `i`'s
@@ -586,7 +596,7 @@ impl InputHub {
     /// Some(i)`) also routes combined keyboard and mouse state to the focused pane (a
     /// controller player's, or the keyboard player's: `ANY_KEYBOARD`) while keeping
     /// unfocused panes isolated.
-    pub fn publish_session(&mut self, instances: &mut [InstanceConn], open: &[bool], focus: Option<usize>, focus_cursor: Option<(i32, i32)>) {
+    pub fn publish_session(&mut self, instances: &mut [InstanceConn], open: &[bool], focus: Option<usize>, focus_cursor: Option<(i32, i32)>, focus_pane: PaneProjection) {
         if !instances.iter().any(|i| i.input.is_some()) {
             return;
         }
@@ -608,14 +618,17 @@ impl InputHub {
         let is_open = |i: usize| open.get(i).copied().unwrap_or(false);
         self.kbm_focus = focus.filter(|&f| !is_open(f));
         let focused_kbm = self.kbm_focus.map(|_| devices.combined_kbm(focus_cursor));
+        let idle_pane = PaneProjection { compositor_hwnd: focus_pane.compositor_hwnd, ..Default::default() };
         for (idx, inst) in instances.iter_mut().enumerate() {
             let mut snapshot = route(&inst.spec.input_assignment, is_open(idx), &devices);
+            snapshot.pane = idle_pane;
             if let Some((kb, ms)) = focused_kbm
                 && focus == Some(idx)
                 && matches!(inst.spec.input_assignment, InputAssignment::Controller { .. } | InputAssignment::KeyboardMouse { device_id: ANY_KEYBOARD })
             {
                 snapshot.keyboard = kb;
                 snapshot.mouse = ms;
+                snapshot.pane = focus_pane;
             }
             if let Some(block) = inst.input.as_mut() {
                 block.publish(&snapshot);
@@ -1030,10 +1043,10 @@ mod tests {
         hub.publish(&mut instances, false);
         assert_eq!(instances[2].input.as_ref().unwrap().header().mode(), InputMode::Virtual, "closed again");
         // One player's overlay open holds back that copy alone.
-        hub.publish_session(&mut instances, &[false, false, true, false], None, None);
+        hub.publish_session(&mut instances, &[false, false, true, false], None, None, PaneProjection::default());
         let modes: Vec<_> = instances[..3].iter().map(|i| i.input.as_ref().unwrap().header().mode()).collect();
         assert_eq!(modes, [InputMode::PassThrough, InputMode::BlockAll, InputMode::BlockAll]);
-        hub.publish_session(&mut instances, &[true, false, false, false], None, None);
+        hub.publish_session(&mut instances, &[true, false, false, false], None, None, PaneProjection::default());
         let modes: Vec<_> = instances[..3].iter().map(|i| i.input.as_ref().unwrap().header().mode()).collect();
         assert_eq!(modes, [InputMode::BlockAll, InputMode::BlockAll, InputMode::Virtual], "the others play on");
         // A copy given a keyboard and mouse keeps its mouse's cursor inside its screen.

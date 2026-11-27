@@ -417,10 +417,16 @@ thread_local! {
     /// The message (window, message, wparam, lparam) this thread's innermost `focus_proc`
     /// is handing to the procedure it wraps.
     static FORWARDING: std::cell::Cell<(usize, u32, usize, isize)> = const { std::cell::Cell::new((0, 0, 0, 0)) };
+    /// Inside `focus_proc`'s synthetic `WM_SETCURSOR` dispatch, so nested messages don't
+    /// re-enter it.
+    static IN_SYNTH_SETCURSOR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 const WM_DESTROY: u32 = 0x0002;
+const WM_SETCURSOR: u32 = 0x0020;
 const WM_NCDESTROY: u32 = 0x0082;
+const WM_MOUSEMOVE: u32 = 0x0200;
+const HTCLIENT: usize = 1;
 
 #[cfg(test)]
 pub(crate) fn wrap_window_for_test(hwnd: usize) {
@@ -463,6 +469,31 @@ unsafe extern "system" fn focus_proc(h: HWND, m: u32, w: usize, l: isize) -> isi
         FORWARDING.with(|f| f.set(outer));
         rc
     };
+    let mut l = l;
+    let spoof = FOCUS_SPOOF.load(Ordering::Relaxed);
+    if spoof && m == WM_MOUSEMOVE {
+        l = crate::input::on_forwarded_mouse_move(h as isize, l);
+    }
+    // The game's window sits behind the session's, so Windows never sends it WM_SETCURSOR.
+    // Synthesize it right before forwarded mouse moves and button presses (just as Windows
+    // does), so engines that set their cursor in WM_SETCURSOR or via WNDCLASS.hCursor
+    // update the session's hardware pointer immediately.
+    if spoof
+        && matches!(m, WM_MOUSEMOVE | 0x0201 | 0x0203 | 0x0204 | 0x0206 | 0x0207 | 0x0209 | 0x020B | 0x020D)
+        && !IN_SYNTH_SETCURSOR.with(|f| f.replace(true))
+    {
+        crate::input::begin_synth_setcursor();
+        let sc_l = (HTCLIENT | ((m as usize & 0xffff) << 16)) as isize;
+        let _ = call(WM_SETCURSOR, h as usize, sc_l);
+        let called_set_cursor = crate::input::end_synth_setcursor();
+        IN_SYNTH_SETCURSOR.with(|f| f.set(false));
+        if !called_set_cursor {
+            let cur = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetCursor() } as isize;
+            if cur != 0 {
+                crate::input::observe_thread_cursor(cur);
+            }
+        }
+    }
     // A game that took the mouse as pointer messages gets the forwarded mouse as those
     // (pointer.rs).
     if let Some(msgs) = crate::pointer::convert(h, m, w, l) {

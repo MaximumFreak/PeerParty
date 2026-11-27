@@ -7,7 +7,7 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
-use peerparty_protocol::input_shm::{INPUT_BLOCK_SIZE, InputHeader, InputMode, InputSnapshot};
+use peerparty_protocol::input_shm::{CURSOR_CHANNEL_OFFSET, CURSOR_CHANNEL_SIZE, CursorChannel, INPUT_BLOCK_SIZE, InputHeader, InputMode, InputSnapshot};
 use peerparty_protocol::transport::ShmBacking;
 
 use crate::log;
@@ -15,6 +15,7 @@ use crate::log;
 struct View {
     base: usize,
     size: usize,
+    writable: bool,
 }
 
 /// Mapped block: never unmapped during the process lifetime so input threads reading
@@ -55,11 +56,12 @@ pub fn attach(name: &str) -> bool {
         return true;
     }
     match open(name) {
-        Some((base, size)) => {
-            VIEW.store(Box::into_raw(Box::new(View { base, size })), Ordering::Release);
+        Some((base, size, writable)) => {
+            VIEW.store(Box::into_raw(Box::new(View { base, size, writable })), Ordering::Release);
             *known = name.to_string();
             ATTACHED.store(true, Ordering::Release);
-            log!("input: mapped virtual input block {name} ({size} bytes)");
+            log!("input: mapped virtual input block {name} ({size} bytes{})", if writable { ", rw" } else { ", ro" });
+            super::cursor::on_shm_attached();
             true
         }
         None => {
@@ -67,6 +69,38 @@ pub fn attach(name: &str) -> bool {
             false
         }
     }
+}
+
+/// The bidirectional cursor & coalesced-move channel (offset 256 of the 4 KiB block),
+/// when the block is mapped read-write and large enough.
+pub fn cursor_channel() -> Option<&'static CursorChannel> {
+    if !attached() {
+        return None;
+    }
+    let v = VIEW.load(Ordering::Acquire);
+    if v.is_null() {
+        return None;
+    }
+    let (base, size, writable) = unsafe { ((*v).base, (*v).size, (*v).writable) };
+    if !writable || size < CURSOR_CHANNEL_OFFSET + CURSOR_CHANNEL_SIZE {
+        return None;
+    }
+    // SAFETY: `open` validated the mapping and views stay mapped for the process lifetime.
+    unsafe { CursorChannel::from_mapping(base as *const u8, size) }
+}
+
+/// The session compositor's HWND from the input block's pane projection (`0` when none).
+pub fn compositor_hwnd() -> u64 {
+    if !attached() {
+        return 0;
+    }
+    let v = VIEW.load(Ordering::Acquire);
+    if v.is_null() {
+        return 0;
+    }
+    let (base, size) = unsafe { ((*v).base, (*v).size) };
+    let Some(h) = (unsafe { InputHeader::from_raw(base as *const u8, size) }) else { return 0 };
+    u64::from(h.pane.compositor_hwnd_lo.load(Ordering::Acquire)) | (u64::from(h.pane.compositor_hwnd_hi.load(Ordering::Acquire)) << 32)
 }
 
 /// Reads the current snapshot from the mapped input block, if attached.
@@ -133,23 +167,31 @@ pub(super) fn read_from(header: &InputHeader) -> Option<InputSnapshot> {
     }
 }
 
-/// Maps an input SHM block read-only and verifies its size and `PPIN` magic.
-fn open(name: &str) -> Option<(usize, usize)> {
+/// Maps an input SHM block (read-write when allowed, so the hook can write `CursorChannel`
+/// feedback, falling back to read-only) and verifies its size and `PPIN` magic.
+fn open(name: &str) -> Option<(usize, usize, bool)> {
     use windows_sys::Win32::System::Memory::{
-        FILE_MAP_READ, MEMORY_BASIC_INFORMATION, MapViewOfFile, OpenFileMappingW, VirtualQuery,
+        FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_BASIC_INFORMATION, MapViewOfFile, OpenFileMappingW, VirtualQuery,
     };
-    let (base, file_size) = match ShmBacking::parse(name) {
+    let (base, file_size, writable) = match ShmBacking::parse(name) {
         Some(ShmBacking::FileMmap { path }) => map_file(&path)?,
         Some(ShmBacking::WinMapping { name: mapping }) => open_mapping(&mapping)?,
         None => {
             let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
-            let map = unsafe { OpenFileMappingW(FILE_MAP_READ, 0, wide.as_ptr()) };
+            let (map, access, writable) = {
+                let rw = unsafe { OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, 0, wide.as_ptr()) };
+                if !rw.is_null() {
+                    (rw, FILE_MAP_READ | FILE_MAP_WRITE, true)
+                } else {
+                    (unsafe { OpenFileMappingW(FILE_MAP_READ, 0, wide.as_ptr()) }, FILE_MAP_READ, false)
+                }
+            };
             if map.is_null() {
                 return None;
             }
-            let view = unsafe { MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0) };
+            let view = unsafe { MapViewOfFile(map, access, 0, 0, 0) };
             unsafe { windows_sys::Win32::Foundation::CloseHandle(map) };
-            (view.Value as usize, usize::MAX)
+            (view.Value as usize, usize::MAX, writable)
         }
     };
     if base == 0 {
@@ -170,40 +212,65 @@ fn open(name: &str) -> Option<(usize, usize)> {
         }
         return None;
     }
-    Some((base, size))
+    Some((base, size, writable))
 }
 
-fn open_mapping(name: &str) -> Option<(usize, usize)> {
-    use windows_sys::Win32::System::Memory::{FILE_MAP_READ, MapViewOfFile, OpenFileMappingW};
+fn open_mapping(name: &str) -> Option<(usize, usize, bool)> {
+    use windows_sys::Win32::System::Memory::{FILE_MAP_READ, FILE_MAP_WRITE, MapViewOfFile, OpenFileMappingW};
     let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
-    let map = unsafe { OpenFileMappingW(FILE_MAP_READ, 0, wide.as_ptr()) };
+    let (map, access, writable) = {
+        let rw = unsafe { OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, 0, wide.as_ptr()) };
+        if !rw.is_null() {
+            (rw, FILE_MAP_READ | FILE_MAP_WRITE, true)
+        } else {
+            (unsafe { OpenFileMappingW(FILE_MAP_READ, 0, wide.as_ptr()) }, FILE_MAP_READ, false)
+        }
+    };
     if map.is_null() {
         return None;
     }
-    let view = unsafe { MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0) };
+    let view = unsafe { MapViewOfFile(map, access, 0, 0, 0) };
     unsafe { windows_sys::Win32::Foundation::CloseHandle(map) };
-    Some((view.Value as usize, usize::MAX))
+    Some((view.Value as usize, usize::MAX, writable))
 }
 
-fn map_file(path: &str) -> Option<(usize, usize)> {
+fn map_file(path: &str) -> Option<(usize, usize, bool)> {
     let path = crate::sys::wine::windows_path(path);
-    use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
         GetFileSizeEx, OPEN_EXISTING,
     };
-    use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_READ, MapViewOfFile, PAGE_READONLY};
+    use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MapViewOfFile, PAGE_READONLY, PAGE_READWRITE};
     let wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
-    let file = unsafe {
-        CreateFileW(
-            wide.as_ptr(),
-            GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            std::ptr::null_mut(),
-        )
+    let (file, writable) = {
+        let rw = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        if rw != INVALID_HANDLE_VALUE {
+            (rw, true)
+        } else {
+            let ro = unsafe {
+                CreateFileW(
+                    wide.as_ptr(),
+                    GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL,
+                    std::ptr::null_mut(),
+                )
+            };
+            (ro, false)
+        }
     };
     if file == INVALID_HANDLE_VALUE {
         return None;
@@ -211,7 +278,7 @@ fn map_file(path: &str) -> Option<(usize, usize)> {
     let mut len = 0i64;
     let sized = unsafe { GetFileSizeEx(file, &mut len) } != 0 && len >= INPUT_BLOCK_SIZE as i64;
     let map = if sized {
-        unsafe { CreateFileMappingW(file, std::ptr::null(), PAGE_READONLY, 0, 0, std::ptr::null()) }
+        unsafe { CreateFileMappingW(file, std::ptr::null(), if writable { PAGE_READWRITE } else { PAGE_READONLY }, 0, 0, std::ptr::null()) }
     } else {
         std::ptr::null_mut()
     };
@@ -219,9 +286,9 @@ fn map_file(path: &str) -> Option<(usize, usize)> {
     if map.is_null() {
         return None;
     }
-    let view = unsafe { MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0) };
+    let view = unsafe { MapViewOfFile(map, if writable { FILE_MAP_READ | FILE_MAP_WRITE } else { FILE_MAP_READ }, 0, 0, 0) };
     unsafe { CloseHandle(map) };
-    Some((view.Value as usize, usize::try_from(len).unwrap_or(usize::MAX)))
+    Some((view.Value as usize, usize::try_from(len).unwrap_or(usize::MAX), writable))
 }
 
 #[cfg(test)]
@@ -262,7 +329,7 @@ mod tests {
             (&shm.file).write_all(&bytes).unwrap();
         }
         let backing = ShmBacking::FileMmap { path: path.display().to_string() }.to_env_string();
-        let (base, size) = open(&backing).expect("file input block maps");
+        let (base, size, _writable) = open(&backing).expect("file input block maps");
         assert_eq!(size, INPUT_BLOCK_SIZE);
         let reader = unsafe { InputHeader::from_raw(base as *const u8, size) }.unwrap();
         let got = read_from(reader).unwrap();
