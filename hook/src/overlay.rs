@@ -9,7 +9,9 @@
 //! - While the overlay shows, the game hears its SDK's overlay event
 //!   (each `OverlayListener`: `GameOverlayActivated_t`, EOS's display settings, Galaxy's
 //!   overlay listener) and controllers stop reaching it
-//!   (padblock.rs). Keyboard and mouse are held back by the launcher itself.
+//!   (padblock.rs). The launcher holds keyboard and mouse itself; the hook adds the raw-input
+//!   mouse reports, which its mouse hook leaves (relative motion), and the raw-input key presses,
+//!   behind a keyboard hook Windows may drop (`input::keep_raw`).
 //! - When it closes with a controller button still down (the Start or B that closed
 //!   it), controllers stay held back until the launcher reads that button up (`pads_held`):
 //!   let go at once, the game would read the button as a fresh press and open its pause
@@ -112,6 +114,8 @@ pub fn pads_held_back() -> bool {
     // input call, which is where this is asked.
     if end_hold() {
         log!("overlay: controllers reach the game again: the launcher didn't say the buttons were up within {} s", PADS_HELD_FOR.as_secs());
+        // Not in tests: it would reset the input counters other tests read, out of turn.
+        #[cfg(not(test))]
         let _ = std::thread::Builder::new().name("peerparty-hold".into()).spawn(crate::input::hidden);
     }
     false

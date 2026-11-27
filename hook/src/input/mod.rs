@@ -4,7 +4,9 @@
 //! API hook:
 //! - `Policy::PassThrough`: zero overhead; calls go straight to Windows/driver.
 //! - `Policy::BlockAll`: overlay is open (or copy has `InputAssignment::None`); physical
-//!   controllers read at rest so the game doesn't react behind the overlay.
+//!   controllers read at rest so the game doesn't react behind the overlay, and raw-input
+//!   mouse reports are held (the launcher's mouse hook doesn't stop the relative motion),
+//!   key presses too (a second barrier: Windows drops a low-level keyboard hook that is slow).
 //! - `Policy::Virtual(InputSnapshot)`: multi-instance split-screen; each copy sees only
 //!   its assigned virtual controller / keyboard / mouse from the session host's
 //!   `InputHeader` shared memory (`shm.rs`). Where the copy's controller can be reached
@@ -75,7 +77,7 @@ use retour::GenericDetour;
 use windows_sys::Win32::Foundation::POINT;
 
 use crate::log;
-use crate::overlay::pads_held_back;
+use crate::overlay::{self, pads_held_back};
 use crate::sys::hook::with_lock;
 
 /// What the input hooks do on the current call.
@@ -409,6 +411,26 @@ static INSTALL: Once = Once::new();
 /// Reads held back while the overlay showed: XInput states, raw-input reports.
 static HELD_XINPUT: AtomicU32 = AtomicU32::new(0);
 static HELD_RAW: AtomicU32 = AtomicU32::new(0);
+/// Raw-input keyboard and mouse reports held while the overlay showed in a copy not in
+/// split screen (`keep_raw`): taken out whole or passed on as their releases alone.
+/// Counted apart from each other and from `HELD_RAW`, which has the other reports held
+/// back (controllers').
+static HELD_RAW_KEYS: AtomicU32 = AtomicU32::new(0);
+static HELD_RAW_MOUSE: AtomicU32 = AtomicU32::new(0);
+/// Keyboard and mouse input that still reached the game while the overlay showed (a copy
+/// not in split screen lets the Win32 paths through under `BlockAll`), logged and reset by
+/// `hidden`: raw-input keyboard and mouse reports, key-state answers of a key that went
+/// up and down again, cursor positions that moved. GameInput's are in `gameinput`.
+static REACHED_RAW_KEYS: AtomicU32 = AtomicU32::new(0);
+static REACHED_RAW_MOUSE: AtomicU32 = AtomicU32::new(0);
+static REACHED_KEYS: AtomicU32 = AtomicU32::new(0);
+static REACHED_CURSOR: AtomicU32 = AtomicU32::new(0);
+/// Per key-state path (`GetAsyncKeyState`, `GetKeyState`, `GetKeyboardState`), the keys
+/// answered up during this opening: a key held from before it opened (the hotkey's Shift)
+/// isn't input until it has been up.
+static KEY_SEEN_UP: [[AtomicBool; 256]; 3] = [const { [const { AtomicBool::new(false) }; 256] }; 3];
+/// The last cursor position answered during this opening, packed like `LAST_CURSOR`.
+static REACHED_CURSOR_AT: AtomicU64 = AtomicU64::new(u64::MAX);
 /// Per-30 s split-screen diagnostics (`log_summary`).
 static XINPUT_CALLS: AtomicU32 = AtomicU32::new(0);
 static XINPUT_OK: AtomicU32 = AtomicU32::new(0);
@@ -588,13 +610,93 @@ pub fn hidden() {
         gameinput::hidden();
         hid::hidden();
     }
-    let (x, r, d, h) = (
-        HELD_XINPUT.swap(0, Ordering::Relaxed),
-        HELD_RAW.swap(0, Ordering::Relaxed),
-        dinput::HELD.swap(0, Ordering::Relaxed),
-        hid::take_held(),
-    );
-    log!("input: held back while the overlay showed: {x} XInput reads, {r} raw-input reports, {d} DirectInput reads, {h} HID reads");
+    log!("{}", take_held());
+    log!("{}", take_reached());
+}
+
+fn take(counter: &AtomicU32) -> u32 {
+    counter.swap(0, Ordering::Relaxed)
+}
+
+/// The "held back" log line for the opening that ended, and a fresh start for the next.
+fn take_held() -> String {
+    let (x, r, rk, rm, d, h) = (take(&HELD_XINPUT), take(&HELD_RAW), take(&HELD_RAW_KEYS), take(&HELD_RAW_MOUSE), take(&dinput::HELD), hid::take_held());
+    format!("input: held back while the overlay showed: {x} XInput reads, {r} raw-input reports, {rk} raw-input keyboard reports, {rm} raw-input mouse reports, {d} DirectInput reads, {h} HID reads")
+}
+
+/// The "reached the game" log line for the opening that ended, and a fresh start for the
+/// next (the counts, and the keys' and the cursor's state of it).
+fn take_reached() -> String {
+    let [gk, gm, gp] = gameinput::take_reached();
+    let (rk, rm, ks, cur) = (take(&REACHED_RAW_KEYS), take(&REACHED_RAW_MOUSE), take(&REACHED_KEYS), take(&REACHED_CURSOR));
+    for path in &KEY_SEEN_UP {
+        path.iter().for_each(|k| k.store(false, Ordering::Relaxed));
+    }
+    REACHED_CURSOR_AT.store(u64::MAX, Ordering::Relaxed);
+    format!(
+        "input: reached the game while the overlay showed: GameInput {gk} keyboard/{gm} mouse/{gp} controller readings, {rk} raw-input keyboard reports, {rm} raw-input mouse reports, {ks} key-state presses, {cur} cursor moves"
+    )
+}
+
+/// A key-state path answered `vkey` as `down`: whether that's a press during this opening
+/// (`KEY_SEEN_UP`; path 0 `GetAsyncKeyState`, 1 `GetKeyState`, 2 `GetKeyboardState`).
+fn key_pressed(path: usize, vkey: usize, down: bool) -> bool {
+    let Some(seen) = KEY_SEEN_UP[path].get(vkey) else { return false };
+    if down {
+        return seen.swap(false, Ordering::Relaxed);
+    }
+    seen.store(true, Ordering::Relaxed);
+    false
+}
+
+/// A `GetAsyncKeyState` or `GetKeyState` answer that went to the game while the overlay showed.
+fn note_key_answer(path: usize, vkey: i32, answer: i16) {
+    if overlay::visible() && usize::try_from(vkey).is_ok_and(|k| key_pressed(path, k, answer < 0)) {
+        REACHED_KEYS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A `GetCursorPos` answer that went to the game while the overlay showed: a move when it
+/// differs from the one before it in this opening.
+fn note_cursor_answer(x: i32, y: i32) {
+    if !overlay::visible() {
+        return;
+    }
+    let now = u64::from(x as u32) | (u64::from(y as u32) << 32);
+    let before = REACHED_CURSOR_AT.swap(now, Ordering::Relaxed);
+    if before != u64::MAX && before != now {
+        REACHED_CURSOR.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A raw-input keyboard or mouse report kept for the game while the overlay showed: a
+/// press or a motion, not a key or button let go.
+fn note_raw_reached(kind: u32, report: &[u8], header: usize) {
+    if !overlay::visible() {
+        return;
+    }
+    match kind {
+        RIM_TYPEKEYBOARD if report.len() >= header + 4 && u16::from_le_bytes([report[header + 2], report[header + 3]]) & RI_KEY_BREAK == 0 => {
+            REACHED_RAW_KEYS.fetch_add(1, Ordering::Relaxed);
+        }
+        RIM_TYPEMOUSE if raw_mouse_input(report, header) => {
+            REACHED_RAW_MOUSE.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+}
+
+/// Whether a raw mouse report (its header `header` bytes) carries motion, a wheel turn or a
+/// button press, not only buttons let go. RAWMOUSE as `releases_only_at` has it:
+/// usButtonFlags at 4, lLastX at 12, lLastY at 16.
+fn raw_mouse_input(report: &[u8], header: usize) -> bool {
+    if report.len() < header + 20 {
+        return false;
+    }
+    let m = header;
+    u16::from_le_bytes([report[m + 4], report[m + 5]]) & !MOUSE_UPS != 0
+        || i32::from_le_bytes(report[m + 12..m + 16].try_into().unwrap()) != 0
+        || i32::from_le_bytes(report[m + 16..m + 20].try_into().unwrap()) != 0
 }
 
 /// A controller module loaded (`watch.rs`): GameInput and XInput at once in a game with
@@ -1373,18 +1475,18 @@ unsafe extern "system" fn raw_input_data(h: isize, cmd: u32, data: *mut u8, size
     // `rc`: the bytes written to `data` (the process's own layout, whatever Windows'
     // is: `GetRawInputData` converts it).
     let report = unsafe { std::slice::from_raw_parts_mut(data, rc as usize) };
-    if keep_raw(report, RAW_HEADER) {
-        rc
-    } else {
-        HELD_RAW.fetch_add(1, Ordering::Relaxed);
-        u32::MAX
-    }
+    if keep_raw(report, RAW_HEADER) { rc } else { u32::MAX }
 }
 
 /// Whether one raw input report (`RAWINPUT`, a `header`-byte header first) reaches the
 /// game now, as it is or rewritten (`releases_only`). Only game controllers are held
 /// back from a copy: another HID device (a headset's buttons, a touchpad) is no
-/// player's.
+/// player's. While the overlay shows, a mouse's and a keyboard's reports are held too, in
+/// a copy not in split screen as well: the launcher's low-level mouse hook stops the clicks
+/// but not the relative motion Windows hands to raw input, so the camera would still turn;
+/// its keyboard hook takes the keys, but Windows silently removes a low-level hook that
+/// exceeds its timeout, so this is a second barrier. Counts the reports it holds back,
+/// whole or not (`HELD_RAW`, `HELD_RAW_KEYS`, `HELD_RAW_MOUSE`).
 fn keep_raw(report: &mut [u8], header: usize) -> bool {
     if report.len() < header {
         return true;
@@ -1393,11 +1495,18 @@ fn keep_raw(report: &mut [u8], header: usize) -> bool {
     // RAWINPUTHEADER: type, size, then the device's handle (its low bytes first in a
     // 64-bit header too).
     let dev = || isize::from_le_bytes(report[8..8 + size_of::<isize>()].try_into().unwrap());
+    let mut overlay_held = false;
     let block = match policy() {
         Policy::PassThrough => false,
         Policy::BlockAll => match kind {
             RIM_TYPEHID => device::of_raw(dev()).is_none_or(|d| d.controller),
-            _ => shm::attached() && matches!(kind, RIM_TYPEKEYBOARD | RIM_TYPEMOUSE),
+            // Not `BlockAll` alone: a controller button held when the overlay closed keeps
+            // it on, and the keyboard and mouse are back at once.
+            RIM_TYPEKEYBOARD | RIM_TYPEMOUSE => {
+                overlay_held = !shm::attached() && overlay::visible();
+                shm::attached() || overlay_held
+            }
+            _ => false,
         },
         Policy::Virtual(snap) => match kind {
             RIM_TYPEHID => {
@@ -1423,7 +1532,24 @@ fn keep_raw(report: &mut [u8], header: usize) -> bool {
     // A key or button let go still reaches a copy that doesn't have the keyboard and
     // mouse now (the focus moved to another pane, or its overlay opened while it was
     // held): it was pressed while the copy had them, and would stay down there for good.
-    !block || (shm::attached() && matches!(kind, RIM_TYPEKEYBOARD | RIM_TYPEMOUSE) && releases_only_at(kind, report, header))
+    // The motion counts before the rewrite takes it out.
+    let held_input = overlay_held && kind == RIM_TYPEMOUSE && raw_mouse_input(report, header);
+    let kept = !block
+        || ((shm::attached() || overlay_held) && matches!(kind, RIM_TYPEKEYBOARD | RIM_TYPEMOUSE) && releases_only_at(kind, report, header));
+    if overlay_held && kept {
+        // What reaches the game now: releases only, so this stays 0.
+        note_raw_reached(kind, report, header);
+    }
+    // An absolute mouse report is held whole, whatever it carries.
+    if !kept || held_input {
+        let count = match (overlay_held, kind) {
+            (false, _) => &HELD_RAW,
+            (true, RIM_TYPEKEYBOARD) => &HELD_RAW_KEYS,
+            (true, _) => &HELD_RAW_MOUSE,
+        };
+        count.fetch_add(1, Ordering::Relaxed);
+    }
+    kept
 }
 
 /// Whether this is a 32-bit process on 64-bit Windows (WOW64, on x64 or Arm).
@@ -1458,9 +1584,7 @@ unsafe extern "system" fn raw_input_buffer(data: *mut u8, size: *mut u32, header
     first_use_with(&USED_RAW_BUFFER, || format!("Raw Input in batches (GetRawInputBuffer, {}-byte headers)", batch_layout().0));
     // `size`: the buffer's size in bytes (the reports are inside it).
     let room = unsafe { size.as_ref() }.map_or(0, |s| *s as usize);
-    let kept = unsafe { filter_batch(data, room, n, batch_layout(), keep_raw) };
-    HELD_RAW.fetch_add(n.saturating_sub(kept), Ordering::Relaxed);
-    kept
+    unsafe { filter_batch(data, room, n, batch_layout(), keep_raw) }
 }
 
 /// Keeps the `n` reports in the `room` bytes at `data` that `keep` takes (`layout`: the
@@ -1614,7 +1738,9 @@ unsafe extern "system" fn async_key_state(vkey: i32) -> i16 {
             if shm::attached() {
                 0
             } else {
-                ASYNC_KEY.get().map_or(0, |h| unsafe { h.call(vkey) })
+                let answer = ASYNC_KEY.get().map_or(0, |h| unsafe { h.call(vkey) });
+                note_key_answer(0, vkey, answer);
+                answer
             }
         }
         Policy::Virtual(snap) => {
@@ -1646,7 +1772,9 @@ unsafe extern "system" fn key_state(vkey: i32) -> i16 {
             if shm::attached() {
                 toggle_of(vkey)
             } else {
-                KEY_STATE.get().map_or(0, |h| unsafe { h.call(vkey) })
+                let answer = KEY_STATE.get().map_or(0, |h| unsafe { h.call(vkey) });
+                note_key_answer(1, vkey, answer);
+                answer
             }
         }
         Policy::Virtual(snap) => {
@@ -1676,7 +1804,16 @@ unsafe extern "system" fn keyboard_state(out: *mut u8) -> i32 {
                 }
                 1
             } else {
-                KEYBOARD_STATE.get().map_or(0, |h| unsafe { h.call(out) })
+                let rc = KEYBOARD_STATE.get().map_or(0, |h| unsafe { h.call(out) });
+                if rc != 0 && overlay::visible() {
+                    let buf = unsafe { std::slice::from_raw_parts(out, 256) };
+                    // Every key's state is followed; the call counts once at most.
+                    let pressed = buf.iter().enumerate().fold(false, |any, (vk, b)| key_pressed(2, vk, b & 0x80 != 0) | any);
+                    if pressed {
+                        REACHED_KEYS.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                rc
             }
         }
         Policy::Virtual(snap) => {
@@ -1716,6 +1853,7 @@ unsafe extern "system" fn cursor_pos(pt: *mut POINT) -> i32 {
         Policy::BlockAll if shm::attached() => Policy::Virtual(InputSnapshot { mode: InputMode::Virtual, ..Default::default() }),
         p => p,
     };
+    let block_all = matches!(p, Policy::BlockAll);
     if let Policy::Virtual(snap) = p
         && !pt.is_null()
     {
@@ -1740,7 +1878,12 @@ unsafe extern "system" fn cursor_pos(pt: *mut POINT) -> i32 {
         }
         return 1;
     }
-    CURSOR_POS.get().map_or(0, |h| unsafe { h.call(pt) })
+    let rc = CURSOR_POS.get().map_or(0, |h| unsafe { h.call(pt) });
+    if block_all && rc != 0 && !pt.is_null() {
+        let at = unsafe { *pt };
+        note_cursor_answer(at.x, at.y);
+    }
+    rc
 }
 
 pub(super) const fn guid(a: u32, b: u16, c: u16, d: [u8; 8]) -> [u8; 16] {
@@ -1987,6 +2130,261 @@ mod tests {
             assert_eq!(a, b, "the same reading while the overlay shows");
             assert_eq!(c, 0);
         }
+    }
+
+    /// A built `RAWINPUT` report of `kind` (16-byte header) with `bytes` at `at` in its body.
+    fn raw_report(kind: u32, at: usize, bytes: &[u8]) -> Vec<u8> {
+        let header = 16;
+        let mut r = vec![0u8; header + 24];
+        r[..4].copy_from_slice(&kind.to_le_bytes());
+        r[header + at..header + at + bytes.len()].copy_from_slice(bytes);
+        r
+    }
+
+    /// Zeroes the held-raw counts and what reached the game, for a test of `keep_raw`.
+    fn reset_raw_counts() {
+        take_reached();
+        for c in [&HELD_RAW, &HELD_RAW_KEYS, &HELD_RAW_MOUSE] {
+            c.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Nothing raw reached the game: the overlay's hold took every press and motion out.
+    fn assert_no_raw_reached() {
+        let line = take_reached();
+        assert!(line.contains(" 0 raw-input keyboard reports, 0 raw-input mouse reports"), "{line}");
+    }
+
+    /// `reports` read as one batch while the overlay shows: the buffer, where the reports
+    /// start in it, their size and how many `filter_batch` kept.
+    fn read_batch_while_shown(reports: &[Vec<u8>]) -> (Vec<u8>, usize, usize, u32) {
+        let (header, align) = (16usize, 4usize);
+        let len = reports[0].len();
+        let mut buf = vec![0u8; len * reports.len() + 64];
+        let at = buf.as_ptr().align_offset(8);
+        for (i, r) in reports.iter().enumerate() {
+            let o = at + i * len;
+            buf[o..o + len].copy_from_slice(r);
+            buf[o + 4..o + 8].copy_from_slice(&(len as u32).to_le_bytes());
+        }
+        let room = buf.len() - at;
+        reset_raw_counts();
+        crate::overlay::set_visible_for_test(true);
+        let kept = unsafe { filter_batch(buf.as_mut_ptr().add(at), room, reports.len() as u32, (header, align), keep_raw) };
+        crate::overlay::set_visible_for_test(false);
+        (buf, at, len, kept)
+    }
+
+    /// While the overlay shows in a copy not in split screen, a raw-input key press (the
+    /// prefixed ones too), mouse move, wheel turn or button press is held back and counted
+    /// apart; only a release goes through (a mouse report as its releases alone), and an
+    /// absolute mouse report is held whole. Nothing reaches the game. Hidden, or with only
+    /// the controller hold on (`BlockAll` after the overlay closed on a held button), every
+    /// report passes as it is and nothing counts.
+    #[test]
+    fn raw_keyboard_and_mouse_held_while_shown() {
+        let _turn = crate::overlay::test_turn();
+        let header = 16;
+        let key = |flags: u16| raw_report(RIM_TYPEKEYBOARD, 2, &flags.to_le_bytes());
+        let moved = raw_report(RIM_TYPEMOUSE, 12, &5i32.to_le_bytes());
+        let wheel = raw_report(RIM_TYPEMOUSE, 4, &0x0400u16.to_le_bytes());
+        let click = raw_report(RIM_TYPEMOUSE, 4, &1u16.to_le_bytes());
+        let button_up = raw_report(RIM_TYPEMOUSE, 4, &MOUSE_UPS.to_le_bytes());
+        let mut drag_end = raw_report(RIM_TYPEMOUSE, 4, &(MOUSE_UPS & 0x0002 | 1).to_le_bytes());
+        drag_end[header + 12..header + 16].copy_from_slice(&7i32.to_le_bytes());
+        let absolute = raw_report(RIM_TYPEMOUSE, 0, &MOUSE_MOVE_ABSOLUTE.to_le_bytes());
+        // The report with its motion, wheel and presses taken out, `ups` left.
+        let emptied = |r: &Vec<u8>, ups: u16| {
+            let mut e = r.clone();
+            e[header + 4..header + 20].fill(0);
+            e[header + 4..header + 6].copy_from_slice(&ups.to_le_bytes());
+            e
+        };
+        // (report, kept, what the game gets, [keyboard, mouse] counts); key flags: 1 break, 2 E0, 4 E1.
+        let cases = [
+            (key(0), false, key(0), [1, 0]),
+            (key(RI_KEY_BREAK), true, key(RI_KEY_BREAK), [0, 0]),
+            (key(2), false, key(2), [1, 0]),
+            (key(2 | RI_KEY_BREAK), true, key(2 | RI_KEY_BREAK), [0, 0]),
+            (key(4), false, key(4), [1, 0]),
+            (key(4 | RI_KEY_BREAK), true, key(4 | RI_KEY_BREAK), [0, 0]),
+            (moved.clone(), true, emptied(&moved, 0), [0, 1]),
+            (wheel.clone(), true, emptied(&wheel, 0), [0, 1]),
+            (click.clone(), true, emptied(&click, 0), [0, 1]),
+            (button_up.clone(), true, button_up.clone(), [0, 0]),
+            (drag_end.clone(), true, emptied(&drag_end, 0x0002), [0, 1]),
+            (absolute.clone(), false, absolute.clone(), [0, 1]),
+        ];
+        reset_raw_counts();
+
+        // Hidden: with the controller hold on too (the overlay closed with a button still down) as without.
+        let _reset = PolicyReset;
+        for policy in [None, Some(Policy::BlockAll)] {
+            *TEST_POLICY.lock().unwrap() = policy;
+            for (report, ..) in &cases {
+                let mut c = report.clone();
+                assert!(keep_raw(&mut c, header));
+                assert_eq!(&c, report, "untouched");
+            }
+        }
+        *TEST_POLICY.lock().unwrap() = None;
+        assert_eq!((HELD_RAW_KEYS.load(Ordering::Relaxed), HELD_RAW_MOUSE.load(Ordering::Relaxed)), (0, 0), "hidden: nothing held");
+
+        crate::overlay::set_visible_for_test(true);
+        for (report, kept, out, held) in &cases {
+            let before = [HELD_RAW_KEYS.load(Ordering::Relaxed), HELD_RAW_MOUSE.load(Ordering::Relaxed)];
+            let mut c = report.clone();
+            assert_eq!(keep_raw(&mut c, header), *kept, "{report:?}");
+            assert_eq!(&c, out, "{report:?}");
+            let now = [HELD_RAW_KEYS.load(Ordering::Relaxed), HELD_RAW_MOUSE.load(Ordering::Relaxed)];
+            assert_eq!([now[0].wrapping_sub(before[0]), now[1].wrapping_sub(before[1])], *held, "{report:?}");
+        }
+        assert_eq!(HELD_RAW.load(Ordering::Relaxed), 0, "not as a controller's");
+        crate::overlay::set_visible_for_test(false);
+        assert_no_raw_reached();
+    }
+
+    /// A batch read with every kind in it: the key press, the mouse move and the HID report
+    /// are held, the key release stays, each kind counted once, in its own count.
+    #[test]
+    fn raw_batch_of_every_kind_while_shown() {
+        let _turn = crate::overlay::test_turn();
+        let header = 16;
+        let (buf, at, len, kept) = read_batch_while_shown(&[
+            raw_report(RIM_TYPEKEYBOARD, 2, &0u16.to_le_bytes()),
+            raw_report(RIM_TYPEKEYBOARD, 2, &RI_KEY_BREAK.to_le_bytes()),
+            raw_report(RIM_TYPEMOUSE, 12, &5i32.to_le_bytes()),
+            raw_report(RIM_TYPEHID, 0, &[0u8; 4]),
+        ]);
+        // The HID report is from an unknown device: held as a controller's.
+        assert_eq!(kept, 2, "the key release and the emptied mouse report stay");
+        assert_eq!(HELD_RAW_KEYS.load(Ordering::Relaxed), 1, "the key press");
+        assert_eq!(HELD_RAW_MOUSE.load(Ordering::Relaxed), 1, "the mouse move");
+        assert_eq!(HELD_RAW.load(Ordering::Relaxed), 1, "the HID report");
+        let kind_at = |i: usize| u32::from_le_bytes(buf[at + i * len..at + i * len + 4].try_into().unwrap());
+        assert_eq!(kind_at(0), RIM_TYPEKEYBOARD);
+        assert_eq!(buf[at + header + 2], RI_KEY_BREAK as u8, "the release, moved up over the press");
+        assert_eq!(kind_at(1), RIM_TYPEMOUSE);
+        assert_eq!(buf[at + len + header + 4..at + 2 * len], [0u8; 20], "the move is held, left empty");
+        assert_no_raw_reached();
+    }
+
+    /// The batch read (`GetRawInputBuffer`) holds the mouse as the single read does: what is
+    /// kept moves up to where the next report starts, and every held report is counted.
+    #[test]
+    fn raw_mouse_batch_is_held_and_packed() {
+        let _turn = crate::overlay::test_turn();
+        let header = 16;
+        let mut drag_end = raw_report(RIM_TYPEMOUSE, 4, &(0x0002u16 | 1).to_le_bytes());
+        drag_end[header + 12..header + 16].copy_from_slice(&7i32.to_le_bytes());
+        let mut moved = raw_report(RIM_TYPEMOUSE, 12, &5i32.to_le_bytes());
+        moved[header + 4..header + 6].copy_from_slice(&1u16.to_le_bytes());
+        let (buf, at, len, kept) = read_batch_while_shown(&[
+            moved,
+            drag_end,
+            raw_report(RIM_TYPEMOUSE, 0, &MOUSE_MOVE_ABSOLUTE.to_le_bytes()),
+            raw_report(RIM_TYPEMOUSE, 4, &MOUSE_UPS.to_le_bytes()),
+            raw_report(RIM_TYPEKEYBOARD, 2, &0u16.to_le_bytes()),
+        ]);
+        assert_eq!(kept, 3, "the absolute report and the key press are taken out");
+        assert_eq!(HELD_RAW_MOUSE.load(Ordering::Relaxed), 3, "the moved, the released-with-motion and the absolute report");
+        assert_eq!(HELD_RAW.load(Ordering::Relaxed), 0);
+        let body = |i: usize| &buf[at + i * len + header..at + (i + 1) * len];
+        assert_eq!(body(0)[4..20], [0u8; 16], "the move with a press is held, left empty");
+        assert_eq!(u16::from_le_bytes([body(1)[4], body(1)[5]]), 0x0002, "the release alone");
+        assert_eq!(body(1)[12..20], [0u8; 8]);
+        assert_eq!(u16::from_le_bytes([body(2)[4], body(2)[5]]), MOUSE_UPS, "the plain release, moved up over the absolute one");
+        assert_no_raw_reached();
+    }
+
+    /// The hide line names the raw-input keyboard and mouse reports held apart from the
+    /// other counts, and resets them.
+    #[test]
+    fn hide_reports_held_raw_keyboard_and_mouse() {
+        let _turn = crate::overlay::test_turn();
+        let _turn = GAMEINPUT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        HELD_XINPUT.store(1, Ordering::Relaxed);
+        HELD_RAW.store(2, Ordering::Relaxed);
+        HELD_RAW_KEYS.store(4, Ordering::Relaxed);
+        HELD_RAW_MOUSE.store(3, Ordering::Relaxed);
+        dinput::HELD.store(0, Ordering::Relaxed);
+        hid::take_held();
+        assert_eq!(
+            take_held(),
+            "input: held back while the overlay showed: 1 XInput reads, 2 raw-input reports, 4 raw-input keyboard reports, 3 raw-input mouse reports, 0 DirectInput reads, 0 HID reads"
+        );
+        assert!(take_held().contains("0 raw-input reports, 0 raw-input keyboard reports, 0 raw-input mouse reports, "), "reset");
+    }
+
+    /// A key held from before the opening never counts; one that went up and down counts
+    /// once, however long it stays down; a keyboard state counts once at most.
+    #[test]
+    fn key_state_counts_a_press_during_the_opening() {
+        let _turn = crate::overlay::test_turn();
+        take_reached();
+        note_key_answer(0, 0x41, i16::MIN);
+        assert_eq!(REACHED_KEYS.load(Ordering::Relaxed), 0, "hidden: nothing");
+        crate::overlay::set_visible_for_test(true);
+        // The hotkey's Shift, down from before the opening.
+        for _ in 0..3 {
+            note_key_answer(0, 0x10, i16::MIN);
+        }
+        assert_eq!(REACHED_KEYS.load(Ordering::Relaxed), 0);
+        note_key_answer(0, 0x41, 0);
+        note_key_answer(0, 0x41, i16::MIN);
+        note_key_answer(0, 0x41, i16::MIN);
+        assert_eq!(REACHED_KEYS.load(Ordering::Relaxed), 1);
+        // Another path follows its own answers.
+        note_key_answer(1, 0x41, i16::MIN);
+        assert_eq!(REACHED_KEYS.load(Ordering::Relaxed), 1);
+        for vk in [0x42, 0x43] {
+            assert!(!key_pressed(2, vk, false));
+        }
+        let pressed = [0x42, 0x43].iter().fold(false, |any, &vk| key_pressed(2, vk, true) | any);
+        assert!(pressed);
+        crate::overlay::set_visible_for_test(false);
+        assert!(take_reached().contains(" 1 key-state presses"));
+        // The next opening starts from nothing: the key is held again, not pressed.
+        crate::overlay::set_visible_for_test(true);
+        note_key_answer(0, 0x41, i16::MIN);
+        crate::overlay::set_visible_for_test(false);
+        assert!(take_reached().contains(" 0 key-state presses"));
+    }
+
+    /// A cursor answer counts when it differs from the previous one of this opening.
+    #[test]
+    fn cursor_counts_a_move_during_the_opening() {
+        let _turn = crate::overlay::test_turn();
+        take_reached();
+        note_cursor_answer(1, 1);
+        note_cursor_answer(2, 2);
+        crate::overlay::set_visible_for_test(true);
+        note_cursor_answer(10, 10);
+        note_cursor_answer(10, 10);
+        assert_eq!(REACHED_CURSOR.load(Ordering::Relaxed), 0, "the first answer is where it was");
+        note_cursor_answer(11, 10);
+        note_cursor_answer(11, 10);
+        note_cursor_answer(10, 10);
+        crate::overlay::set_visible_for_test(false);
+        assert!(take_reached().contains(" 2 cursor moves"));
+        assert!(take_reached().contains(" 0 cursor moves"), "reset");
+    }
+
+    /// The hide line carries every count, in order, and resets them.
+    #[test]
+    fn hide_reports_and_resets_what_reached_the_game() {
+        let _turn = crate::overlay::test_turn();
+        let _turn = GAMEINPUT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        take_reached();
+        REACHED_RAW_KEYS.store(1, Ordering::Relaxed);
+        REACHED_RAW_MOUSE.store(2, Ordering::Relaxed);
+        REACHED_KEYS.store(3, Ordering::Relaxed);
+        REACHED_CURSOR.store(4, Ordering::Relaxed);
+        assert_eq!(
+            take_reached(),
+            "input: reached the game while the overlay showed: GameInput 0 keyboard/0 mouse/0 controller readings, 1 raw-input keyboard reports, 2 raw-input mouse reports, 3 key-state presses, 4 cursor moves"
+        );
+        assert!(take_reached().contains("0 raw-input keyboard reports, 0 raw-input mouse reports, 0 key-state presses, 0 cursor moves"));
     }
 
     /// Puts the test policy back when a test ends, failed assertion or not.
