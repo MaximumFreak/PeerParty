@@ -463,8 +463,11 @@ pub fn my_steam_id() -> u64 {
         crate::steam::own::set(id, game);
         crate::saves::adopt_steam(id, game, &crate::saves::earlier_own_steam_ids());
     }
-    // The first copy waits for the game to fetch its ISteamUser before settling.
-    if real.is_some() || !first {
+    // The first copy waits for the game to fetch its ISteamUser before settling. Once
+    // SteamUser is seen and SteamAPI_Init has run, settle anyway if steam_api gave no
+    // plausible SteamID when we're assigning this PC's own ID, so presence still publishes.
+    let no_real_needed = own_id_on() && crate::steam::obj::seen("SteamUser").is_some() && crate::steam::client_started();
+    if real.is_some() || !first || no_real_needed {
         ME.store(id, Ordering::Relaxed);
         {
             let mut b = crate::sys::lock(&BOOK);
@@ -493,6 +496,8 @@ pub fn my_steam_id() -> u64 {
                 "the game's own from steam_api".to_string()
             } else if lan.server() {
                 "a LAN one: this is a dedicated server".to_string()
+            } else if first && no_real_needed {
+                format!("this PC's own, account {}; steam_api gave no SteamID", id as u32)
             } else {
                 "a LAN one: another copy has this PC's".to_string()
             }
@@ -544,20 +549,20 @@ fn real_steam_id() -> Option<u64> {
     // while the C++ method returns a class, whose hidden return pointer not every
     // steam_api build expects in the same place. Some flat APIs without versioned
     // accessors return the class too, through a hidden pointer before `self`.
-    let out = match real("SteamAPI_ISteamUser_GetSteamID") {
-        Some(f) => call_flat_id!(f, crate::steam::obj::unwrap(user)),
-        None => {
-            let mut out = 0u64;
-            let _ = call_real!(
-                user,
-                "GetSteamID",
-                fn(*mut u64) -> *mut u64,
-                std::ptr::null_mut(),
-                &mut out
-            );
-            out
+    if let Some(f) = real("SteamAPI_ISteamUser_GetSteamID") {
+        let out = call_flat_id!(f, crate::steam::obj::unwrap(user));
+        if plausible_steam_id(out) {
+            return Some(out);
         }
-    };
+    }
+    let mut out = 0u64;
+    let _ = call_real!(
+        user,
+        "GetSteamID",
+        fn(*mut u64) -> *mut u64,
+        std::ptr::null_mut(),
+        &mut out
+    );
     plausible_steam_id(out).then_some(out)
 }
 

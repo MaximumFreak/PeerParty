@@ -578,6 +578,9 @@ unsafe extern "C" fn detour_run_callbacks() {
     if !MANUAL.load(Ordering::Relaxed) {
         dispatched();
         deliver_registered(false);
+        if crate::steam::gs::piggyback_run_callbacks() {
+            deliver_registered(true);
+        }
     }
 }
 
@@ -610,16 +613,18 @@ unsafe extern "C" fn detour_unregister_result(obj: usize, call: u64) {
 }
 
 unsafe extern "C" fn detour_register(obj: usize, id: i32) {
+    let mut gs = false;
     if obj != 0 {
         // CCallbackBase: vtable, then m_nCallbackFlags (k_ECallbackFlagsGameServer = 2),
         // set before the object registers.
         let flags = unsafe { *((obj + size_of::<usize>()) as *const u8) };
-        crate::sys::lock(&REGISTERED).entry(id).or_default().push((obj, flags & 2 != 0));
+        gs = flags & 2 != 0;
+        crate::sys::lock(&REGISTERED).entry(id).or_default().push((obj, gs));
         // steam_api's own callbacks name the player as the game knows it (steamown.rs).
         unsafe { crate::steam::own::wrap(obj) };
     }
     log::throttled(&format!("SteamAPI_RegisterCallback {id}"), 4, |n| {
-        log!("call SteamAPI_RegisterCallback n={n} id={id} obj={obj:#x}")
+        log!("call SteamAPI_RegisterCallback n={n} id={id} obj={obj:#x}{}", if gs { " (game server)" } else { "" })
     });
     if let Some(hook) = REGISTER.get() {
         unsafe { hook.call(obj, id) };
@@ -681,9 +686,10 @@ fn deliver_registered(server: bool) {
                 unsafe { run_callback(*obj, &mut p.data) };
             }
         }
-        log::throttled(&format!("steam-lan delivered {}", p.id), 8, |n| {
+        log::throttled(&format!("steam-lan delivered {server} {}", p.id), 8, |n| {
             log!(
-                "steam-lan delivered callback {} to {} registered objects (n={n})",
+                "steam-lan delivered {}callback {} to {} registered objects (n={n})",
+                if server { "server " } else { "" },
                 p.id,
                 objs.len()
             )

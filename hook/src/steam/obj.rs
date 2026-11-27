@@ -62,9 +62,9 @@ macro_rules! call_flat_id {
     ($f:expr, $self:expr $(, $a:expr => $t:ty)* $(,)?) => {{
         let f: usize = $f;
         let this: usize = $self;
-        let class = |out: *mut u64| {
-            let f: unsafe extern "C" fn(*mut u64, usize $(, $t)*) -> *mut u64 = unsafe { std::mem::transmute(f) };
-            unsafe { f(out, this $(, $a)*) };
+        let class = |out: *mut u64| -> u64 {
+            let f: unsafe extern "C" fn(*mut u64, usize $(, $t)*) -> u64 = unsafe { std::mem::transmute(f) };
+            unsafe { f(out, this $(, $a)*) }
         };
         let register = || {
             let f: unsafe extern "C" fn(usize $(, $t)*) -> u64 = unsafe { std::mem::transmute(f) };
@@ -580,10 +580,10 @@ pub(crate) fn flat_returns_class() -> bool {
 /// decoy's method. Either way nothing is called on a wrong object, where the guess
 /// from the export names crashed a build of the first flat API (it took the hidden
 /// pointer for `self`). `arg_bytes`: the size of the arguments after `self`.
-pub(crate) fn flat_id(arg_bytes: usize, class: &dyn Fn(*mut u64), register: &dyn Fn() -> u64) -> u64 {
-    let into = |class: &dyn Fn(*mut u64)| {
+pub(crate) fn flat_id(arg_bytes: usize, class: &dyn Fn(*mut u64) -> u64, register: &dyn Fn() -> u64) -> u64 {
+    let into = |class: &dyn Fn(*mut u64) -> u64| {
         let mut id = 0u64;
-        class(&mut id);
+        let _ = class(&mut id);
         id
     };
     match FLAT_ID.load(std::sync::atomic::Ordering::Relaxed) {
@@ -611,14 +611,14 @@ static DECOY_CALLED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::
 /// Calls `class` with a decoy object for the hidden pointer and records which form the
 /// flat function has. None when it can't be tried (another call is trying, or no
 /// executable memory): the caller goes by the guess.
-fn probe_flat_id(arg_bytes: usize, class: &dyn Fn(*mut u64)) -> Option<Probe> {
+fn probe_flat_id(arg_bytes: usize, class: &dyn Fn(*mut u64) -> u64) -> Option<Probe> {
     use std::sync::atomic::Ordering::Relaxed;
     static TRYING: Mutex<()> = Mutex::new(());
     let Ok(_trying) = TRYING.try_lock() else { return None };
     match FLAT_ID.load(Relaxed) {
         ID_CLASS => {
             let mut id = 0u64;
-            class(&mut id);
+            let _ = class(&mut id);
             return Some(Probe::Class(id));
         }
         ID_REGISTER => return Some(Probe::Register),
@@ -630,8 +630,9 @@ fn probe_flat_id(arg_bytes: usize, class: &dyn Fn(*mut u64)) -> Option<Probe> {
     let mut decoy = [0usize; 16];
     decoy[0] = vt;
     let before = unsafe { std::ptr::read_unaligned(decoy.as_ptr() as *const u64) };
+    let decoy_ptr = decoy.as_mut_ptr() as *mut u64;
     DECOY_CALLED.store(0, Relaxed);
-    class(decoy.as_mut_ptr() as *mut u64);
+    let ret = class(decoy_ptr);
     let called = DECOY_CALLED.swap(0, Relaxed) != 0;
     let after = unsafe { std::ptr::read_unaligned(decoy.as_ptr() as *const u64) };
     if called {
@@ -650,12 +651,20 @@ fn probe_flat_id(arg_bytes: usize, class: &dyn Fn(*mut u64)) -> Option<Probe> {
         );
         return Some(Probe::Class(after));
     }
+    if ret != decoy_ptr as usize as u64 && ret != 0 {
+        FLAT_ID.store(ID_REGISTER, Relaxed);
+        log!(
+            "steam-lan flat API: a CSteamID comes back in a register (the flat function returned it directly without touching the decoy){}",
+            if FLAT_CLASS.load(Relaxed) { "; not what the export names suggested" } else { "" }
+        );
+        return Some(Probe::Register);
+    }
     // Neither: the function returned without calling or writing anything. Not
-    // recorded, so the next call tries again; nothing was written for this one.
+    // recorded, so the next call tries again; fall back to the export-name guess.
     log::throttled("steam-lan flat id probe undecided", 3, |_| {
         log!("steam-lan flat API: a CSteamID function neither wrote into the decoy nor called it; tried again on the next call")
     });
-    Some(Probe::Class(0))
+    None
 }
 
 /// The decoy object's vtable: every slot the same method, which notes it was called,
@@ -1788,10 +1797,15 @@ mod tests {
         out
     }
 
+    unsafe extern "C" fn direct_flat_id(_this: usize) -> u64 {
+        0x0110_0001_0BED_6549
+    }
+
     #[test]
     fn flat_ids_are_read_the_way_each_flat_api_returns_them() {
         let old = old_flat_id as *const () as usize;
         let new = new_flat_id as *const () as usize;
+        let direct = direct_flat_id as *const () as usize;
         // The hidden-pointer form is found by the first call, which gives its ID.
         forget_flat_id();
         assert_eq!(call_flat_id!(old, 7, 3 => i32), 73);
@@ -1806,6 +1820,10 @@ mod tests {
         assert_eq!(call_flat_id!(new, this, 7u64 => u64, 3 => i32), 73);
         assert!(!flat_returns_class());
         assert_eq!(call_flat_id!(new, this, 8u64 => u64, 1 => i32), 81);
+        // A register-form flat function that returns a SteamID directly without touching `self`.
+        forget_flat_id();
+        assert_eq!(call_flat_id!(direct, this), 0x0110_0001_0BED_6549);
+        assert!(!flat_returns_class());
         forget_flat_id();
         // The game's own call into the older flat API gets the ID at its pointer.
         let mut out = 99u64;

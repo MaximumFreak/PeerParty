@@ -339,6 +339,13 @@ pub fn server_started() -> bool {
     SERVER_STARTED.load(Ordering::Relaxed)
 }
 
+/// Whether game server callbacks should also be delivered from `SteamAPI_RunCallbacks`:
+/// true whenever `SteamGameServer_RunCallbacks` isn't hooked at its own address (e.g.
+/// it shares `SteamAPI_RunCallbacks`'s code, was folded into a stub, or isn't exported).
+pub fn piggyback_run_callbacks() -> bool {
+    RUN_CALLBACKS.get().is_none()
+}
+
 /// The game server's dispatch pipe, once the game has started a game server.
 pub fn server_pipe() -> Option<i32> {
     let started = SERVER_STARTED.load(Ordering::Relaxed);
@@ -473,6 +480,7 @@ fn hosted_by(id: u64, host: PeerId) -> bool {
 }
 
 fn log_on(anonymous: bool) {
+    SERVER_STARTED.store(true, Ordering::Relaxed);
     let id = {
         let mut st = crate::sys::lock(&S);
         let st = &mut *st;
@@ -913,6 +921,7 @@ fn one_filter(l: &Lobby, item: &ServerItem, filters: &[(String, String)], at: &m
 
 pub fn server() -> Vec<(&'static str, usize)> {
     vec![
+        ("InitGameServer", init_game_server as *const () as usize),
         ("SetProduct", set_product as *const () as usize),
         ("SetGameDescription", set_game_description as *const () as usize),
         ("SetModDir", set_mod_dir as *const () as usize),
@@ -951,6 +960,18 @@ pub fn server() -> Vec<(&'static str, usize)> {
         ("BSetServerType~8", set_server_type_old as *const () as usize),
         ("UpdateServerStatus~6", update_server_status_old as *const () as usize),
     ]
+}
+
+vmethod! {
+    fn init_game_server(this: usize, ip: u32, game_port: u16, query_port: u16, flags: u32, app_id: u32, version: *const c_char) -> bool {
+        SERVER_STARTED.store(true, Ordering::Relaxed);
+        let ok = call_real!(this, "InitGameServer", fn(u32, u16, u16, u32, u32, *const c_char) -> bool, true, ip, game_port, query_port, flags, app_id, version);
+        SERVER_STARTED.store(ok, Ordering::Relaxed);
+        if ok {
+            started(ip, game_port, query_port, &s(version));
+        }
+        ok
+    }
 }
 
 /// A setter: records the value, then lets the real server have it too.
@@ -1248,6 +1269,8 @@ type BoolFn = unsafe extern "C" fn() -> bool;
 
 static INIT_V2: OnceLock<GenericDetour<InitV2Fn>> = OnceLock::new();
 static INIT: OnceLock<GenericDetour<InitFn>> = OnceLock::new();
+static INIT_LEGACY: OnceLock<GenericDetour<InitFn>> = OnceLock::new();
+static INIT_SAFE: OnceLock<GenericDetour<InitFn>> = OnceLock::new();
 static SHUTDOWN: OnceLock<GenericDetour<VoidFn>> = OnceLock::new();
 static RUN_CALLBACKS: OnceLock<GenericDetour<VoidFn>> = OnceLock::new();
 static GET_ID: OnceLock<GenericDetour<IdFn>> = OnceLock::new();
@@ -1255,13 +1278,19 @@ static BSECURE: OnceLock<GenericDetour<BoolFn>> = OnceLock::new();
 
 fn started(ip: u32, game_port: u16, query_port: u16, version: &str) {
     let version = version.to_string();
+    let mut changed = false;
     with_server(|s| {
-        s.ip = ip;
-        s.game_port = game_port;
-        s.query_port = query_port;
-        s.version = version.clone();
+        if s.ip != ip || s.game_port != game_port || s.query_port != query_port || s.version != version {
+            s.ip = ip;
+            s.game_port = game_port;
+            s.query_port = query_port;
+            s.version = version.clone();
+            changed = true;
+        }
     });
-    log!("steam-lan game server started: ip={ip:#x} port={game_port} query={query_port} version={version}");
+    if changed {
+        log!("steam-lan game server started: ip={ip:#x} port={game_port} query={query_port} version={version}");
+    }
 }
 
 unsafe extern "C" fn detour_init_v2(
@@ -1286,8 +1315,8 @@ unsafe extern "C" fn detour_init_v2(
     rc
 }
 
-unsafe extern "C" fn detour_init(ip: u32, steam_port: u16, game_port: u16, query_port: u16, mode: u32, version: *const c_char) -> bool {
-    let Some(h) = INIT.get() else { return false };
+unsafe fn run_init(slot: &OnceLock<GenericDetour<InitFn>>, ip: u32, steam_port: u16, game_port: u16, query_port: u16, mode: u32, version: *const c_char) -> bool {
+    let Some(h) = slot.get() else { return false };
     SERVER_STARTED.store(true, Ordering::Relaxed);
     let ok = unsafe { h.call(ip, steam_port, game_port, query_port, mode, version) };
     SERVER_STARTED.store(ok, Ordering::Relaxed);
@@ -1297,6 +1326,18 @@ unsafe extern "C" fn detour_init(ip: u32, steam_port: u16, game_port: u16, query
         log!("steam-lan game server init failed");
     }
     ok
+}
+
+unsafe extern "C" fn detour_init(ip: u32, steam_port: u16, game_port: u16, query_port: u16, mode: u32, version: *const c_char) -> bool {
+    unsafe { run_init(&INIT, ip, steam_port, game_port, query_port, mode, version) }
+}
+
+unsafe extern "C" fn detour_init_legacy(ip: u32, steam_port: u16, game_port: u16, query_port: u16, mode: u32, version: *const c_char) -> bool {
+    unsafe { run_init(&INIT_LEGACY, ip, steam_port, game_port, query_port, mode, version) }
+}
+
+unsafe extern "C" fn detour_init_safe(ip: u32, steam_port: u16, game_port: u16, query_port: u16, mode: u32, version: *const c_char) -> bool {
+    unsafe { run_init(&INIT_SAFE, ip, steam_port, game_port, query_port, mode, version) }
 }
 
 unsafe extern "C" fn detour_shutdown() {
@@ -1339,37 +1380,65 @@ where
 }
 
 /// The game server exports `attach` hooks.
-const HOOKED: [&str; 9] = [
+const HOOKED: [&str; 11] = [
     "SteamGameServer_GetHSteamPipe",
     "SteamAPI_GetHSteamPipe",
     "GetHSteamPipe",
     "SteamInternal_GameServer_Init_V2",
     "SteamInternal_GameServer_Init",
+    "SteamGameServer_Init",
+    "SteamGameServer_InitSafe",
     "SteamGameServer_Shutdown",
     "SteamGameServer_RunCallbacks",
     "SteamGameServer_GetSteamID",
     "SteamGameServer_BSecure",
 ];
 
-/// The other exports whose code is at `addr` too, leaving out `name`'s other name
-/// (`GetHSteamPipe` is `SteamAPI_GetHSteamPipe`). A DLL whose small functions were folded
-/// into one body runs it for all of them, so a hook on it takes their calls for this
-/// one's: every call to any of them was a game server starting.
+/// Exports that are identical aliases of each other (same signature and semantics):
+/// a DLL folding them into one body is normal and safe to hook once.
+const GS_INIT_ALIASES: [&str; 3] = [
+    "SteamInternal_GameServer_Init",
+    "SteamGameServer_Init",
+    "SteamGameServer_InitSafe",
+];
+const RUN_CALLBACKS_ALIASES: [&str; 4] = [
+    "SteamAPI_RunCallbacks",
+    "SteamGameServer_RunCallbacks",
+    "SteamContentServer_RunCallbacks",
+    "Steam_RunCallbacks",
+];
+
+fn same_alias_group(a: &str, b: &str) -> bool {
+    fn base(n: &str) -> &str {
+        n.strip_prefix("SteamAPI_").unwrap_or(n)
+    }
+    base(a) == base(b)
+        || (GS_INIT_ALIASES.contains(&a) && GS_INIT_ALIASES.contains(&b))
+        || (RUN_CALLBACKS_ALIASES.contains(&a) && RUN_CALLBACKS_ALIASES.contains(&b))
+}
+
+/// The other exports whose code is at `addr` too, leaving out `name`'s known aliases
+/// (`GetHSteamPipe` / `SteamAPI_GetHSteamPipe`, the 6-arg `GameServer_Init` aliases,
+/// and the `RunCallbacks` family). A DLL whose unrelated small functions were folded
+/// into one body runs it for all of them, so a hook on it would take their calls for
+/// this one's.
 fn sharing<'a>(exports: &'a [Export], name: &str, addr: usize) -> Vec<&'a str> {
-    let base = |n: &str| n.strip_prefix("SteamAPI_").unwrap_or(n).to_string();
     exports
         .iter()
-        .filter(|e| e.addr as usize == addr && e.name != name && base(&e.name) != base(name))
+        .filter(|e| e.addr as usize == addr && e.name != name && !same_alias_group(&e.name, name))
         .map(|e| e.name.as_str())
         .collect()
 }
 
 /// Hooks steam_api's game server exports. Returns the addresses it patched.
 pub fn attach(exports: &[Export]) -> Vec<usize> {
+    let mut warned = Vec::new();
     for name in HOOKED {
         let Some(e) = exports.iter().find(|e| e.name == name) else { continue };
-        let others = sharing(exports, name, e.addr as usize);
-        if !others.is_empty() {
+        let addr = e.addr as usize;
+        let others = sharing(exports, name, addr);
+        if !others.is_empty() && !warned.contains(&addr) {
+            warned.push(addr);
             let more = if others.len() > 4 { format!(", and {} more", others.len() - 4) } else { String::new() };
             log!(
                 "steam-gs: {name}'s code is other exports' too ({}{more}): not hooked, since its hook would take their calls for its own; a game server it starts goes unseen by PeerParty",
@@ -1407,15 +1476,24 @@ pub fn attach(exports: &[Export]) -> Vec<usize> {
     }
     let mut try_arm = |name: &str, ok: &dyn Fn(usize) -> bool| {
         if let Some(a) = find(name) {
-            if ok(a) {
+            if !patched.contains(&a) && ok(a) {
                 patched.push(a);
             }
         }
     };
     try_arm("SteamInternal_GameServer_Init_V2", &|a| arm(&INIT_V2, a, detour_init_v2 as InitV2Fn));
     try_arm("SteamInternal_GameServer_Init", &|a| arm(&INIT, a, detour_init as InitFn));
+    try_arm("SteamGameServer_Init", &|a| arm(&INIT_LEGACY, a, detour_init_legacy as InitFn));
+    try_arm("SteamGameServer_InitSafe", &|a| arm(&INIT_SAFE, a, detour_init_safe as InitFn));
     try_arm("SteamGameServer_Shutdown", &|a| arm(&SHUTDOWN, a, detour_shutdown as VoidFn));
-    try_arm("SteamGameServer_RunCallbacks", &|a| arm(&RUN_CALLBACKS, a, detour_run_callbacks as VoidFn));
+    let client_run_cb = exports.iter().find(|e| e.name == "SteamAPI_RunCallbacks").map(|e| e.addr as usize);
+    if find("SteamGameServer_RunCallbacks").is_some_and(|a| Some(a) == client_run_cb) {
+        // steam/mod.rs already hooked SteamAPI_RunCallbacks at this address, and
+        // delivers game server callbacks there too (`piggyback_run_callbacks`).
+        log!("steam-gs: SteamGameServer_RunCallbacks shares SteamAPI_RunCallbacks: server callbacks go out there too");
+    } else {
+        try_arm("SteamGameServer_RunCallbacks", &|a| arm(&RUN_CALLBACKS, a, detour_run_callbacks as VoidFn));
+    }
     try_arm("SteamGameServer_GetSteamID", &|a| arm(&GET_ID, a, detour_get_id as IdFn));
     try_arm("SteamGameServer_BSecure", &|a| arm(&BSECURE, a, detour_bsecure as BoolFn));
     if !patched.is_empty() {
@@ -1806,10 +1884,20 @@ mod tests {
             ex("SteamAPI_GetHSteamPipe", 0x200),
             ex("GetHSteamPipe", 0x200),
             ex("SteamGameServer_Shutdown", 0x300),
+            ex("SteamInternal_GameServer_Init", 0x400),
+            ex("SteamGameServer_Init", 0x400),
+            ex("SteamGameServer_InitSafe", 0x400),
+            ex("SteamAPI_RunCallbacks", 0x500),
+            ex("SteamGameServer_RunCallbacks", 0x500),
+            ex("SteamContentServer_RunCallbacks", 0x500),
+            ex("Steam_RunCallbacks", 0x500),
         ];
         assert_eq!(sharing(&exports, "SteamInternal_GameServer_Init_V2", 0x100), vec!["SteamAPI_InitFlat", "Steam_GetHSteamUserCurrent"]);
         assert!(sharing(&exports, "GetHSteamPipe", 0x200).is_empty());
         assert!(sharing(&exports, "SteamGameServer_Shutdown", 0x300).is_empty());
+        assert!(sharing(&exports, "SteamInternal_GameServer_Init", 0x400).is_empty());
+        assert!(sharing(&exports, "SteamGameServer_Init", 0x400).is_empty());
+        assert!(sharing(&exports, "SteamGameServer_RunCallbacks", 0x500).is_empty());
     }
 
     fn advert(kv: &[(&str, &str)]) -> Lobby {
