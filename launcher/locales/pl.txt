@@ -764,6 +764,7 @@ studio.pad_fine = Trzymaj: dokładnie
 studio.pad_back = Wróć
 studio.pad_sync = VSync
 studio.pad_available = Kontroler
+studio.fixed_res_notice = Gra zachowała obecną rozdzielczość — wybierz nowy rozmiar w ustawieniach wideo lub uruchom ją ponownie, aby zastosować (układ jest zapisany)
 
 game.adv_fps = Limit klatek
 game.adv_fps_display = Dopasuj do ekranu

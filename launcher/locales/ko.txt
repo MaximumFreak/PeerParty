@@ -734,6 +734,7 @@ studio.pad_fine = 누르기: 미세
 studio.pad_back = 뒤로
 studio.pad_sync = VSync
 studio.pad_available = 컨트롤러
+studio.fixed_res_notice = 게임이 현재 해상도를 유지했습니다 — 비디오 설정에서 새 크기를 선택하거나 다시 시작하면 적용됩니다 (레이아웃은 저장됩니다)
 
 game.adv_fps = 프레임 속도 제한
 game.adv_fps_display = 화면에 맞춤

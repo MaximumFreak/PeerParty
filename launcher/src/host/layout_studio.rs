@@ -234,8 +234,38 @@ pub struct LayoutStudio {
     fonts: bool,
     ppp: f32,
     last_info: Option<StudioInfo>,
+    /// Settle deadline after a layout commit/preset before showing the fixed-resolution notice.
+    notice_due: Option<Instant>,
     pub last_frame: Instant,
     pub dirty: bool,
+}
+
+/// How long to wait after committing a pane resize before warning that a game kept its old resolution.
+const FIXED_RES_SETTLE: Duration = Duration::from_millis(1200);
+/// Pixel tolerance before treating a game's reported picture size as different from its pane target.
+const FIXED_RES_TOL_PX: u32 = 16;
+
+/// Panes whose live game picture still differs from the virtual resolution PeerParty asked
+/// for, once a layout edit has settled. Returns `(pane_index, actual_picture, target_size)`.
+fn fixed_res_panes(slots: &[PaneSlot], info: &StudioInfo, settled: bool) -> Vec<(usize, (u32, u32), (u32, u32))> {
+    if !settled || info.screen.0 == 0 || info.screen.1 == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (i, slot) in slots.iter().enumerate() {
+        if info.players.get(i).is_some_and(|p| p.starting || p.gone) {
+            continue;
+        }
+        let Some((pw, ph)) = info.pictures.get(i).copied().flatten() else {
+            continue;
+        };
+        let phys = slot.rect.to_pane_rect(info.screen.0, info.screen.1);
+        let (vw, vh) = slot.aspect.size_for(phys, slot.fit, info.screen.0, info.screen.1);
+        if pw.abs_diff(vw) > FIXED_RES_TOL_PX || ph.abs_diff(vh) > FIXED_RES_TOL_PX {
+            out.push((i, (pw, ph), (vw, vh)));
+        }
+    }
+    out
 }
 
 impl LayoutStudio {
@@ -269,6 +299,7 @@ impl LayoutStudio {
             fonts: false,
             ppp: 1.0,
             last_info: None,
+            notice_due: None,
             last_frame: now,
             dirty: true,
         }
@@ -299,6 +330,7 @@ impl LayoutStudio {
         self.pad_moving = false;
         self.last_move_tick = Instant::now();
         self.last_info = None;
+        self.notice_due = None;
         self.repeat.reset();
         let w = (bounds.right - bounds.left).max(1) as usize;
         let h = (bounds.bottom - bounds.top).max(1) as usize;
@@ -319,6 +351,7 @@ impl LayoutStudio {
         self.pointer_down = false;
         self.pad_mode = PadMode::Browse;
         self.pad_moving = false;
+        self.notice_due = None;
         if let Some(w) = self.window.as_mut() {
             w.hide();
         }
@@ -329,6 +362,7 @@ impl LayoutStudio {
         self.slots = slots;
         self.selected = self.selected.min(self.slots.len().saturating_sub(1));
         self.drag = None;
+        self.notice_due = Some(Instant::now() + FIXED_RES_SETTLE);
         self.dirty = true;
     }
 
@@ -479,10 +513,17 @@ impl LayoutStudio {
         if self.last_info.as_ref() != Some(info) {
             self.dirty = true;
         }
+        if self.notice_due.is_some_and(|t| Instant::now() >= t) {
+            self.notice_due = None;
+            self.dirty = true;
+        }
 
         let want_pointer = !self.using_pad;
         let pointer_changed = moved || want_pointer != self.render.pointer_shown();
         if !self.dirty && !pointer_changed {
+            if actions.iter().any(|a| matches!(a, StudioAction::Commit(_) | StudioAction::Preset(_))) {
+                self.notice_due = Some(Instant::now() + FIXED_RES_SETTLE);
+            }
             return actions;
         }
 
@@ -508,6 +549,9 @@ impl LayoutStudio {
                 self.dirty = true;
             }
             self.render.draw(&ctx, out, |_| Vec::new(), &mut rects);
+        }
+        if actions.iter().any(|a| matches!(a, StudioAction::Commit(_) | StudioAction::Preset(_))) {
+            self.notice_due = Some(Instant::now() + FIXED_RES_SETTLE);
         }
 
         if want_pointer {
@@ -735,6 +779,7 @@ impl LayoutStudio {
         let pictures: Vec<Option<NormRect>> = (0..count).map(|i| picture_rect(&self.slots[i], picture(i), info.screen)).collect();
         let shown: Vec<NormRect> = (0..count).map(|i| pictures[i].unwrap_or(self.slots[i].rect)).collect();
         let fitted = fit_pictures(&self.slots, &info.pictures, info.screen).filter(|f| *f != self.slots);
+        let fixed_res = fixed_res_panes(&self.slots, info, self.drag.is_none() && self.notice_due.is_none());
         let style = self.pad_style;
         let pad_browse = self.using_pad && self.pad_mode == PadMode::Browse;
         let pad_adjust = self.using_pad && self.pad_mode == PadMode::Adjust;
@@ -890,14 +935,17 @@ impl LayoutStudio {
                                 };
                                 ui.label(egui::RichText::new(title).font(theme::strong(12.5)).color(color));
                                 if !compact {
-                                    let res = if gone {
-                                        t!("overlay.seat_gone").to_string()
+                                    let fixed = fixed_res.iter().find(|&&(idx, _, _)| idx == i);
+                                    let (res, res_col) = if gone {
+                                        (t!("overlay.seat_gone").to_string(), TEXT2)
                                     } else if starting {
-                                        t!("studio.starting").to_string()
+                                        (t!("studio.starting").to_string(), TEXT2)
+                                    } else if let Some(&(_, (pw, ph), _)) = fixed {
+                                        (format!("{pw}×{ph} → {vw}×{vh}"), WARN)
                                     } else {
-                                        format!("{vw}×{vh}")
+                                        (format!("{vw}×{vh}"), TEXT2)
                                     };
-                                    ui.label(egui::RichText::new(res).font(theme::font(11.5)).color(TEXT2));
+                                    ui.label(egui::RichText::new(res).font(theme::font(11.5)).color(res_col));
                                 }
                                 if show_pad && pill_button(ui, t!("studio.edit_pane"), false, true, Some(Glyph::South), style, None) {
                                     self.pad_mode = PadMode::Adjust;
@@ -1155,6 +1203,24 @@ impl LayoutStudio {
             p.rect_filled(badge, 8.0, BAR_BG);
             p.rect_stroke(badge, 8.0, Stroke::new(1.0, if self.alt_down && self.snap { WARN } else { ACCENT_HI }), egui::StrokeKind::Inside);
             p.text(badge.center(), Align2::CENTER_CENTER, txt, theme::strong(12.5), TEXT);
+        }
+
+        // Notice when any game kept its previous resolution after a pane resize settled.
+        if !fixed_res.is_empty() {
+            egui::Area::new(egui::Id::unique("studio-fixed-res"))
+                .interactable(false)
+                .order(egui::Order::Foreground)
+                .anchor(Align2::CENTER_BOTTOM, vec2(0.0, -56.0))
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::new()
+                        .fill(BAR_BG)
+                        .stroke(Stroke::new(1.0, WARN.gamma_multiply(0.85)))
+                        .corner_radius(CornerRadius::same(10))
+                        .inner_margin(egui::Margin::symmetric(14, 6))
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new(t!("studio.fixed_res_notice")).font(theme::font(12.0)).color(WARN));
+                        });
+                });
         }
 
         // 5. Bottom prompt / hint bar (real controller button glyphs in pad mode, clear KBM hints in mouse mode).
@@ -2327,5 +2393,33 @@ mod tests {
             let lit = s.render.canvas.px.iter().filter(|&&px| (px >> 24) > 0).count();
             assert!(lit > 5_000, "studio canvas drew {lit} visible pixels (pad={using_pad}, mode={pad_mode:?})");
         }
+    }
+
+    #[test]
+    fn fixed_res_panes_flags_stale_pictures_only_when_settled() {
+        let slots = LayoutPreset::Horizontal.to_slots(2);
+        let mut info = test_info(2);
+        info.screen = (3440, 1440);
+        // Exact match (1720x1440 each) and within tolerance (1728x1440): no notice.
+        info.pictures = vec![Some((1720, 1440)), Some((1728, 1440))];
+        assert!(fixed_res_panes(&slots, &info, true).is_empty());
+
+        // Pane 0 resized to 2409x1440 while the game kept 1720x1440.
+        let mut resized = slots.clone();
+        resized[0].rect.w = 7000;
+        resized[1].rect.x = 7000;
+        resized[1].rect.w = 3000;
+        info.pictures = vec![Some((1720, 1440)), Some((1720, 1440))];
+        assert!(fixed_res_panes(&resized, &info, false).is_empty(), "suppressed while settling");
+        let stale = fixed_res_panes(&resized, &info, true);
+        assert_eq!(stale.len(), 2);
+        assert_eq!(stale[0].0, 0);
+        assert_eq!(stale[0].1, (1720, 1440));
+        assert_eq!(stale[1].0, 1);
+
+        // Starting or closed players are not flagged.
+        info.players[0].starting = true;
+        info.players[1].gone = true;
+        assert!(fixed_res_panes(&resized, &info, true).is_empty());
     }
 }

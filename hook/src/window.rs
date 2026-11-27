@@ -655,9 +655,11 @@ pub fn update_spec(spec: InstanceSpec) {
     let had = wants_hooks();
     let before = virtual_size();
     apply_spec(spec);
+    let mut size_changed = false;
     if let (Some(_), Some((w, h))) = (before, virtual_size())
         && before != Some((w, h))
     {
+        size_changed = true;
         crate::video::pane_resized(w, h);
     }
     if wants_hooks() {
@@ -667,7 +669,7 @@ pub fn update_spec(spec: InstanceSpec) {
         }
     }
     if let Some(pane) = pane {
-        reposition_window(pane);
+        reposition_window_with(pane, size_changed);
     }
 }
 
@@ -857,9 +859,10 @@ fn find_own_window() -> usize {
     f.best as usize
 }
 
-/// The pane the game's window is to be put in next (`reposition_window`), and whether a
-/// thread is doing it.
-static PENDING_PANE: Mutex<Option<PaneRect>> = Mutex::new(None);
+/// The pane the game's window is to be put in next (`reposition_window`), whether a live
+/// pane resize should also bracket `SetWindowPos` with `WM_ENTERSIZEMOVE`/`WM_EXITSIZEMOVE`,
+/// and whether a thread is doing it.
+static PENDING_PANE: Mutex<Option<(PaneRect, bool)>> = Mutex::new(None);
 static REPOSITIONING: AtomicBool = AtomicBool::new(false);
 
 /// Puts the game's window in `pane`, on a thread of its own: the calls wait on the
@@ -867,17 +870,25 @@ static REPOSITIONING: AtomicBool = AtomicBool::new(false);
 /// a game busy loading or holding a lock its window thread wants. Panes asked for while
 /// one is being done: the last one is done next.
 fn reposition_window(pane: PaneRect) {
+    reposition_window_with(pane, false);
+}
+
+fn reposition_window_with(pane: PaneRect, notify_resize: bool) {
     if pane.width == 0 || pane.height == 0 {
         return;
     }
-    *crate::sys::lock(&PENDING_PANE) = Some(pane);
+    {
+        let mut g = crate::sys::lock(&PENDING_PANE);
+        let keep_notify = g.is_some_and(|(_, n)| n);
+        *g = Some((pane, notify_resize || keep_notify));
+    }
     if REPOSITIONING.swap(true, Ordering::AcqRel) {
         return;
     }
     let spawned = std::thread::Builder::new().name("peerparty-pane".into()).spawn(|| {
         loop {
-            while let Some(p) = crate::sys::lock(&PENDING_PANE).take() {
-                put_in_pane(p);
+            while let Some((p, notify)) = crate::sys::lock(&PENDING_PANE).take() {
+                put_in_pane(p, notify);
             }
             REPOSITIONING.store(false, Ordering::Release);
             // One asked for between the last look and the flag going down.
@@ -888,8 +899,8 @@ fn reposition_window(pane: PaneRect) {
     });
     if spawned.is_err() {
         REPOSITIONING.store(false, Ordering::Release);
-        if let Some(p) = crate::sys::lock(&PENDING_PANE).take() {
-            put_in_pane(p);
+        if let Some((p, notify)) = crate::sys::lock(&PENDING_PANE).take() {
+            put_in_pane(p, notify);
         }
     }
 }
@@ -950,8 +961,11 @@ pub(crate) fn target_window_size(pane: PaneRect, exclusive: Option<(u32, u32)>) 
     }
 }
 
-fn put_in_pane(pane: PaneRect) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{HWND_NOTOPMOST, SWP_ASYNCWINDOWPOS, SWP_NOMOVE, SWP_NOSIZE, ShowWindowAsync, WS_EX_TOPMOST};
+fn put_in_pane(pane: PaneRect, notify_resize: bool) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        HWND_NOTOPMOST, PostMessageW, SWP_ASYNCWINDOWPOS, SWP_NOMOVE, SWP_NOSIZE,
+        SendNotifyMessageW, ShowWindowAsync, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WS_EX_TOPMOST,
+    };
     let mut hwnd = live_primary() as usize;
     if hwnd == 0 {
         hwnd = find_own_window();
@@ -970,6 +984,13 @@ fn put_in_pane(pane: PaneRect) {
     let h = hwnd as HWND;
     let (tw, th) = target_window_size(pane, crate::video::fullscreen::exclusive_size());
     unsafe {
+        let mut cur: RECT = std::mem::zeroed();
+        let (cur_w, cur_h) = if GetClientRect(h, &mut cur) != 0 {
+            (cur.right - cur.left, cur.bottom - cur.top)
+        } else {
+            (0, 0)
+        };
+        let send_sizemove = notify_resize && cur_w > 0 && cur_h > 0 && (cur_w != tw || cur_h != th);
         let style = GetWindowLongW(h, GWL_STYLE) as u32;
         let want_style = (style & !CHROME_STYLES) | WS_POPUP;
         let ex = GetWindowLongW(h, GWL_EXSTYLE) as u32;
@@ -991,6 +1012,13 @@ fn put_in_pane(pane: PaneRect) {
         if toggle {
             ShowWindowAsync(h, SW_SHOWNOACTIVATE);
         }
+        // Engines that defer back-buffer resets until a drag finishes ignore plain
+        // WM_SIZE and wait for WM_EXITSIZEMOVE; bracket the resize asynchronously
+        // (SendNotifyMessageW queues before SWP_ASYNCWINDOWPOS's WM_SIZE, and
+        // PostMessageW dispatches after it).
+        if send_sizemove {
+            SendNotifyMessageW(h, WM_ENTERSIZEMOVE, 0, 0);
+        }
         SetWindowPos(
             h,
             std::ptr::null_mut(),
@@ -1000,6 +1028,10 @@ fn put_in_pane(pane: PaneRect) {
             th,
             SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS,
         );
+        if send_sizemove {
+            PostMessageW(h, WM_EXITSIZEMOVE, 0, 0);
+            log!("window: resized game window 0x{hwnd:x} from {cur_w}x{cur_h} to {tw}x{th} (with WM_ENTERSIZEMOVE/WM_EXITSIZEMOVE)");
+        }
     }
 }
 

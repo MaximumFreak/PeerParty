@@ -607,6 +607,13 @@ pub(super) fn forget_swap(swap: usize) {
     wanted(swap, false);
 }
 
+/// Records whether a Direct3D 9 device asked for exclusive fullscreen (kept windowed in a pane).
+pub(super) fn note_d3d9_fullscreen(device: usize, fullscreen: bool) {
+    if device != 0 {
+        wanted(device, fullscreen);
+    }
+}
+
 /// A swap chain was made: what's known of the one before at its address goes (a
 /// fullscreen one's wish too: a windowed one made at the same address isn't it).
 fn made_swap(swap: usize, device: usize) {

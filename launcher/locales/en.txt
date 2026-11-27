@@ -762,6 +762,7 @@ studio.pad_fine = Hold: fine
 studio.pad_back = Back
 studio.pad_sync = VSync
 studio.pad_available = Controller
+studio.fixed_res_notice = Game kept its current resolution — pick the new size in its video settings or restart to apply (layout is saved)
 
 game.adv_fps = Frame rate cap
 game.adv_fps_display = Match display

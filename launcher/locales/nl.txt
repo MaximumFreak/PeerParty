@@ -748,6 +748,7 @@ studio.pad_fine = Houd: fijn
 studio.pad_back = Terug
 studio.pad_sync = VSync
 studio.pad_available = Controller
+studio.fixed_res_notice = Het spel behield de huidige resolutie — kies het nieuwe formaat in de video-instellingen of herstart om toe te passen (indeling is opgeslagen)
 
 game.adv_fps = Framerate-limiet
 game.adv_fps_display = Scherm volgen

@@ -764,6 +764,7 @@ studio.pad_fine = Утрим.: точно
 studio.pad_back = Назад
 studio.pad_sync = VSync
 studio.pad_available = Геймпад
+studio.fixed_res_notice = Гра зберегла поточну роздільність — виберіть новий розмір у налаштуваннях відео або перезапустіть її (макет збережено)
 
 game.adv_fps = Обмеження частоти кадрів
 game.adv_fps_display = Як на екрані

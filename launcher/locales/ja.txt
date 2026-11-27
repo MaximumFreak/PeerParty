@@ -734,6 +734,7 @@ studio.pad_fine = 長押し: 微調整
 studio.pad_back = 戻る
 studio.pad_sync = VSync
 studio.pad_available = コントローラー
+studio.fixed_res_notice = ゲームが現在の解像度を維持しました — ビデオ設定で新しいサイズを選ぶか、再起動すると適用されます（レイアウトは保存されます）
 
 game.adv_fps = フレームレート上限
 game.adv_fps_display = 画面に合わせる

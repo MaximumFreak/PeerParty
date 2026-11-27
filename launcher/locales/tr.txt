@@ -748,6 +748,7 @@ studio.pad_fine = Basılı: hassas
 studio.pad_back = Geri
 studio.pad_sync = VSync
 studio.pad_available = Kontrolcü
+studio.fixed_res_notice = Oyun mevcut çözünürlüğünü korudu — uygulamak için video ayarlarından yeni boyutu seçin veya yeniden başlatın (düzen kaydedildi)
 
 game.adv_fps = Kare hızı sınırı
 game.adv_fps_display = Ekranla eşleştir

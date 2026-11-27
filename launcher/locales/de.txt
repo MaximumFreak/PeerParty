@@ -748,6 +748,7 @@ studio.pad_fine = Halten: fein
 studio.pad_back = Zurück
 studio.pad_sync = VSync
 studio.pad_available = Controller
+studio.fixed_res_notice = Das Spiel hat seine aktuelle Auflösung behalten — wähle die neue Größe in den Grafikeinstellungen oder starte zum Übernehmen neu (Layout ist gespeichert)
 
 game.adv_fps = Bildratenbegrenzung
 game.adv_fps_display = Bildschirm anpassen

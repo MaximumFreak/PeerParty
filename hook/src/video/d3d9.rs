@@ -382,6 +382,7 @@ fn presenting(dev: usize, wnd: usize, real: impl FnOnce() -> i32) -> i32 {
         if !lower {
             super::capture::pace();
         }
+        let _ = std::panic::catch_unwind(super::source::tick_present);
     }
     // S_PRESENT_OCCLUDED (9Ex): a split-screen copy's window is behind the session's, and
     // is answered as shown so it keeps drawing.
@@ -417,36 +418,85 @@ unsafe extern "system" fn swap_present_hook(sc: usize, src: usize, dst: usize, w
     hr
 }
 
+fn finish_d3d9_reset(dev: usize, want_fs: bool, hr: i32) -> i32 {
+    if hr >= 0 {
+        super::fullscreen::note_d3d9_fullscreen(dev, want_fs);
+        if crate::window::in_pane() {
+            crate::window::sync_window_size();
+        }
+    }
+    hr
+}
+
+fn finish_d3d9_create(out: *mut usize, want_fs: bool, hr: i32) -> i32 {
+    if hr >= 0 && !out.is_null() {
+        let dev = unsafe { *out };
+        if dev != 0 {
+            super::fullscreen::note_d3d9_fullscreen(dev, want_fs);
+        }
+    }
+    hr
+}
+
 unsafe extern "system" fn reset_hook(dev: usize, pp: usize) -> i32 {
     drop_texture();
     d3d9capture::release_all();
-    windowed(pp as *mut PresentParameters, |_| unsafe { RESET.get().unwrap().call(dev, pp) })
+    let mut want_fs = false;
+    let hr = windowed(pp as *mut PresentParameters, |w| {
+        want_fs = w;
+        unsafe { RESET.get().unwrap().call(dev, pp) }
+    });
+    finish_d3d9_reset(dev, want_fs, hr)
 }
 
 unsafe extern "system" fn reset_9ex_hook(dev: usize, pp: usize) -> i32 {
     drop_texture();
     d3d9capture::release_all();
-    windowed(pp as *mut PresentParameters, |_| unsafe { RESET_9EX.get().unwrap().call(dev, pp) })
+    let mut want_fs = false;
+    let hr = windowed(pp as *mut PresentParameters, |w| {
+        want_fs = w;
+        unsafe { RESET_9EX.get().unwrap().call(dev, pp) }
+    });
+    finish_d3d9_reset(dev, want_fs, hr)
 }
 
 unsafe extern "system" fn reset_ex_hook(dev: usize, pp: usize, mode: usize) -> i32 {
     drop_texture();
     d3d9capture::release_all();
-
-    windowed(pp as *mut PresentParameters, |w| unsafe { RESET_EX.get().unwrap().call(dev, pp, if w { 0 } else { mode }) })
+    let mut want_fs = false;
+    let hr = windowed(pp as *mut PresentParameters, |w| {
+        want_fs = w;
+        unsafe { RESET_EX.get().unwrap().call(dev, pp, if w { 0 } else { mode }) }
+    });
+    finish_d3d9_reset(dev, want_fs, hr)
 }
 
 unsafe extern "system" fn create_hook(d3d: usize, adapter: u32, kind: u32, hwnd: usize, flags: u32, pp: *mut PresentParameters, out: *mut usize) -> i32 {
-    windowed(pp, |_| unsafe { CREATE.get().unwrap().call(d3d, adapter, kind, hwnd, flags, pp, out) })
+    let mut want_fs = false;
+    let hr = windowed(pp, |w| {
+        want_fs = w;
+        unsafe { CREATE.get().unwrap().call(d3d, adapter, kind, hwnd, flags, pp, out) }
+    });
+    finish_d3d9_create(out, want_fs, hr)
 }
 
 unsafe extern "system" fn create_9ex_hook(d3d: usize, adapter: u32, kind: u32, hwnd: usize, flags: u32, pp: *mut PresentParameters, out: *mut usize) -> i32 {
-    windowed(pp, |_| unsafe { CREATE_9EX.get().unwrap().call(d3d, adapter, kind, hwnd, flags, pp, out) })
+    let mut want_fs = false;
+    let hr = windowed(pp, |w| {
+        want_fs = w;
+        unsafe { CREATE_9EX.get().unwrap().call(d3d, adapter, kind, hwnd, flags, pp, out) }
+    });
+    finish_d3d9_create(out, want_fs, hr)
 }
 
 unsafe extern "system" fn create_ex_hook(d3d: usize, adapter: u32, kind: u32, hwnd: usize, flags: u32, pp: *mut PresentParameters, mode: usize, out: *mut usize) -> i32 {
     // A windowed device takes no fullscreen display mode.
-    windowed(pp, |w| unsafe { CREATE_EX.get().unwrap().call(d3d, adapter, kind, hwnd, flags, pp, if w { 0 } else { mode }, out) })
+    let mut want_fs = false;
+    let hr = windowed(pp, |w| {
+        want_fs = w;
+        unsafe { CREATE_EX.get().unwrap().call(d3d, adapter, kind, hwnd, flags, pp, if w { 0 } else { mode }, out) }
+    });
+    finish_d3d9_create(out, want_fs, hr)
 }
 
 /// Runs `call` with a fullscreen device's parameters made windowed while this copy is

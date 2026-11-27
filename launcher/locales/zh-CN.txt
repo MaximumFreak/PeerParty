@@ -734,6 +734,7 @@ studio.pad_fine = 按住: 微调
 studio.pad_back = 返回
 studio.pad_sync = VSync
 studio.pad_available = 手柄
+studio.fixed_res_notice = 游戏保持了当前分辨率 — 请在视频设置中选择新尺寸或重启游戏生效（布局已保存）
 
 game.adv_fps = 帧率上限
 game.adv_fps_display = 与显示器一致

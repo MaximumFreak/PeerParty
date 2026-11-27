@@ -18,6 +18,7 @@ pub(crate) mod fullscreen;
 mod gl;
 mod overlay;
 mod pixels;
+mod source;
 mod vkshaders;
 pub(crate) mod vram;
 mod vulkan;
@@ -54,17 +55,26 @@ pub(crate) fn lower_layer_presents(hwnd: impl FnOnce() -> usize) -> bool {
     vulkan::presents_to(hwnd()) || vulkan::presented_recently()
 }
 
+/// The last reported framebuffer size (`(0, 0)` before the first present).
+pub(super) fn current_viewport() -> (u32, u32) {
+    let (w, h, _, _) = *crate::sys::lock(&LAST_VIEWPORT);
+    (w, h)
+}
+
 /// The copy's pane was resized to `w`x`h`. A windowed game follows its window; one that
-/// asked for exclusive fullscreen sizes its frames from the display mode it set, and gets
-/// no WM_SIZE it acts on. It's told what a real display mode change tells a fullscreen
-/// game, WM_DISPLAYCHANGE at the new size, and its display modes are the new pane's now:
-/// a game that sets its mode again on that takes the pane's size.
+/// asked for exclusive fullscreen (or uses Direct3D 9, whose display modes read as the
+/// pane's size) often ignores `WM_SIZE` and sizes from the display mode instead. It's
+/// told what a real display mode change tells a game (`WM_DISPLAYCHANGE` at the new
+/// size), and Source engine Direct3D 9 games are also asked to apply the new mode live.
 pub fn pane_resized(w: u32, h: u32) {
-    if !fullscreen::exclusive_wanted() {
+    let (vw, vh, hwnd, api) = *crate::sys::lock(&LAST_VIEWPORT);
+    source::on_pane_resized(w, h);
+    let exclusive = fullscreen::exclusive_wanted();
+    if !exclusive && api != "d3d9" {
         return;
     }
-    let (vw, vh, hwnd, api) = *crate::sys::lock(&LAST_VIEWPORT);
     let hwnd = if hwnd != 0 { hwnd } else { crate::window::game_window() };
+    let kind = if exclusive { "exclusive fullscreen" } else { "Direct3D 9" };
     let told = hwnd != 0 && {
         use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_DISPLAYCHANGE};
         // wParam: bits per pixel; lParam: the width in the low word, the height in the high.
@@ -72,9 +82,9 @@ pub fn pane_resized(w: u32, h: u32) {
         unsafe { PostMessageW(hwnd as _, WM_DISPLAYCHANGE, 32, size) != 0 }
     };
     if told {
-        log!("video: the pane is {w}x{h} now and the game draws exclusive fullscreen ({vw}x{vh}, {api}): told it the display changed to {w}x{h} (WM_DISPLAYCHANGE to 0x{hwnd:x}); a game that sets its mode again takes the pane's size, one that doesn't has its frames scaled into the pane until its resolution is chosen again in its settings");
+        log!("video: the pane is {w}x{h} now and the game draws {kind} ({vw}x{vh}, {api}): told it the display changed to {w}x{h} (WM_DISPLAYCHANGE to 0x{hwnd:x}); a game that sets its mode again takes the pane's size, one that doesn't has its frames scaled into the pane until its resolution is chosen again in its settings");
     } else {
-        log!("video: the pane is {w}x{h} now, but the game draws exclusive fullscreen ({vw}x{vh}, {api}) and its window isn't known, so it isn't told: its frames are scaled into the pane until its resolution is chosen again in its settings");
+        log!("video: the pane is {w}x{h} now, but the game draws {kind} ({vw}x{vh}, {api}) and its window isn't known, so it isn't told: its frames are scaled into the pane until its resolution is chosen again in its settings");
     }
 }
 

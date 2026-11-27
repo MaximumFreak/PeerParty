@@ -748,6 +748,7 @@ studio.pad_fine = Maintenir : fin
 studio.pad_back = Retour
 studio.pad_sync = VSync
 studio.pad_available = Manette
+studio.fixed_res_notice = Le jeu a conservé sa résolution actuelle — choisissez la nouvelle taille dans ses paramètres vidéo ou redémarrez pour l'appliquer (disposition enregistrée)
 
 game.adv_fps = Limite d’images par seconde
 game.adv_fps_display = Fréquence de l’écran
