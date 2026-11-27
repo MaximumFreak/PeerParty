@@ -1003,11 +1003,41 @@ fn put_in_pane(pane: PaneRect) {
     }
 }
 
+/// Makes a split-screen game process Per-Monitor V2 DPI-aware before it creates its
+/// windows (falls back to `SetProcessDPIAware` on older Windows). Without this, a
+/// DPI-unaware game on a scaled monitor gets a DPI-virtualized window (`GetClientRect`
+/// smaller than the physical pane by the DPI scale) while its graphics device renders at
+/// the physical pane size, offsetting both the image in the pane and mouse projection.
+/// A game that already declared DPI awareness gets `ERROR_ACCESS_DENIED` (harmless no-op).
+fn enable_dpi_awareness() {
+    static DONE: Once = Once::new();
+    DONE.call_once(|| {
+        type SetCtx = unsafe extern "system" fn(isize) -> i32;
+        type SetAware = unsafe extern "system" fn() -> i32;
+        const DPI_PER_MONITOR_V2: isize = -4;
+        let Some(u32_mod) = module("user32.dll") else { return };
+        if let Some(a) = proc_addr(u32_mod, c"SetProcessDpiAwarenessContext") {
+            let f: SetCtx = unsafe { std::mem::transmute(a) };
+            if unsafe { f(DPI_PER_MONITOR_V2) } != 0 {
+                log!("window: enabled Per-Monitor V2 DPI awareness for this split-screen copy");
+            }
+            return;
+        }
+        if let Some(a) = proc_addr(u32_mod, c"SetProcessDPIAware") {
+            let f: SetAware = unsafe { std::mem::transmute(a) };
+            if unsafe { f() } != 0 {
+                log!("window: enabled system DPI awareness for this split-screen copy");
+            }
+        }
+    });
+}
+
 /// Hooks `user32.dll` exports during module watch if an `InstanceSpec` asked for them.
 pub fn attach_user32(exports: &[Export]) -> usize {
     if !wants_hooks() {
         return 0;
     }
+    enable_dpi_awareness();
     let mut n = 0;
     INSTALL.call_once(|| {
         n = hook_exports(exports);
@@ -1016,6 +1046,7 @@ pub fn attach_user32(exports: &[Export]) -> usize {
 }
 
 fn install_loaded_user32() {
+    enable_dpi_awareness();
     INSTALL.call_once(|| {
         let Some(u32_mod) = module("user32.dll") else { return };
         let n = crate::sys::detour::batch(|| arm_user32(&crate::sys::detour::Source::Loaded(&|s| proc_addr(u32_mod, s))));
