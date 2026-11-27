@@ -199,6 +199,9 @@ const FAILED: u8 = 3;
 
 /// Per API (`Api as usize`), how far its hooks got.
 static STATE: [AtomicU8; 4] = [const { AtomicU8::new(NOT_TRIED) }; 4];
+/// Serializes per-API hook installation so a game thread entering an early-entry hook
+/// waits for an in-flight install to finish instead of racing past unhooked COM vtables.
+static INSTALL_LOCKS: [Mutex<()>; 4] = [const { Mutex::new(()) }; 4];
 /// Something wanted the present hooks (the overlay drawn inside the game, the session's
 /// capture or viewport): a graphics module the game loads later gets them too.
 static WANTED: AtomicBool = AtomicBool::new(false);
@@ -253,17 +256,21 @@ impl Api {
         &STATE[self as usize]
     }
 
-    /// Installs its hooks unless they're in or going in: Some(hooked) when this call
-    /// tried, None when it didn't (done or under way, or its module isn't loaded, and its
-    /// load tries again).
+    /// Installs its hooks unless they're in or already tried: Some(hooked) when this call
+    /// tried, None when another thread already installed (after waiting for any in-flight
+    /// install to finish) or its module isn't loaded.
     fn try_install(self) -> Option<bool> {
-        if self.state().compare_exchange(NOT_TRIED, INSTALLING, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        if matches!(self.state().load(Ordering::Acquire), HOOKED | FAILED) {
+            return None;
+        }
+        let _guard = crate::sys::lock(&INSTALL_LOCKS[self as usize]);
+        if self.state().load(Ordering::Acquire) != NOT_TRIED {
             return None;
         }
         if !self.loaded() {
-            self.state().store(NOT_TRIED, Ordering::Release);
             return None;
         }
+        self.state().store(INSTALLING, Ordering::Release);
         let ok = std::panic::catch_unwind(|| self.install()).unwrap_or(false);
         self.state().store(if ok { HOOKED } else { FAILED }, Ordering::Release);
         Some(ok)
@@ -275,7 +282,8 @@ impl Api {
 /// the throwaway device they're found with means calling into the module, which can't be
 /// done under the loader lock or before its start-up ran. Vulkan's lookups go in at once,
 /// before the game makes its device, when the overlay draws inside games or capture is
-/// wanted. A d3d9.dll may be drawn through DXVK.
+/// wanted. Direct3D 9 and DXGI arm lightweight entry-point detours here in split screen so
+/// their full COM hooks go in synchronously before the game's first factory/device call.
 pub fn module_loaded(name: &str, module: windows_sys::Win32::Foundation::HMODULE) {
     let Some(api) = Api::of_module(name) else { return };
     if skipped() {
@@ -284,6 +292,7 @@ pub fn module_loaded(name: &str, module: windows_sys::Win32::Foundation::HMODULE
     match api {
         Api::Vulkan if crate::ipc::enabled() && prefer_ingame() || capture::wanted() || vram::share().is_some() => vulkan::loaded_in_loader(),
         Api::D3d9 => d3d9::redirect(module),
+        Api::Dxgi => dxgi::redirect(name, module),
         _ => {}
     }
     if !WANTED.load(Ordering::Acquire) && !(api == Api::Dxgi && vram::share().is_some()) {
@@ -300,6 +309,19 @@ pub fn module_loaded(name: &str, module: windows_sys::Win32::Foundation::HMODULE
     });
     if spawned.is_err() {
         log!("video: the game loaded {name}, but no thread could be started to hook {}", api.label());
+    }
+}
+
+/// Installs DXGI hooks synchronously (or waits for an in-flight install to complete),
+/// called from `dxgi::redirect` before the game's first DXGI factory or D3D11 device call
+/// so output mode enumeration and swap-chain creation never race the background thread.
+pub(super) fn ensure_dxgi_hooks() {
+    if skipped() {
+        return;
+    }
+    WANTED.store(true, Ordering::Release);
+    if let Some(ok) = Api::Dxgi.try_install() {
+        log!("video: DXGI {} before the game's first factory/device call", if ok { "hooked" } else { "couldn't be hooked" });
     }
 }
 

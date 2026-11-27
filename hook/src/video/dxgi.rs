@@ -34,19 +34,165 @@ use super::capture::{self, D3d11Capture, D3d12Frames};
 use super::com::{self, Guid, HiddenWindow, IID_ID3D11DEVICE, IID_ID3D11TEXTURE2D, IID_ID3D12DEVICE, release, vcall};
 use super::{d3d11, d3d12, frame};
 use crate::log;
-use crate::sys::hook::with_lock;
 
 type Present = unsafe extern "system" fn(usize, u32, u32) -> i32;
 type Present1 = unsafe extern "system" fn(usize, u32, u32, usize) -> i32;
 type Resize = unsafe extern "system" fn(usize, u32, u32, u32, u32, u32) -> i32;
 type Resize1 = unsafe extern "system" fn(usize, u32, u32, u32, u32, u32, *const u32, *const usize) -> i32;
+type CreateFactory = unsafe extern "system" fn(*const Guid, *mut usize) -> i32;
+type CreateFactory2 = unsafe extern "system" fn(u32, *const Guid, *mut usize) -> i32;
+type CreateDevice11 = unsafe extern "system" fn(usize, u32, usize, u32, *const u32, u32, u32, *mut usize, *mut u32, *mut usize) -> i32;
+type CreateDeviceAndSwap11 = unsafe extern "system" fn(usize, u32, usize, u32, *const u32, u32, u32, *const SwapChainDesc, *mut usize, *mut usize, *mut u32, *mut usize) -> i32;
 
 static PRESENT: OnceLock<GenericDetour<Present>> = OnceLock::new();
 static PRESENT1: OnceLock<GenericDetour<Present1>> = OnceLock::new();
 static RESIZE: OnceLock<GenericDetour<Resize>> = OnceLock::new();
 static RESIZE1: OnceLock<GenericDetour<Resize1>> = OnceLock::new();
 static SET_COLOR_SPACE: OnceLock<GenericDetour<SetColorSpace>> = OnceLock::new();
+static CREATE_FACTORY: OnceLock<GenericDetour<CreateFactory>> = OnceLock::new();
+static CREATE_FACTORY1: OnceLock<GenericDetour<CreateFactory>> = OnceLock::new();
+static CREATE_FACTORY2: OnceLock<GenericDetour<CreateFactory2>> = OnceLock::new();
+static D3D11_CREATE_DEV: OnceLock<GenericDetour<CreateDevice11>> = OnceLock::new();
+static D3D11_CREATE_DEV_SWAP: OnceLock<GenericDetour<CreateDeviceAndSwap11>> = OnceLock::new();
+static EARLY_DONE: AtomicBool = AtomicBool::new(false);
 static VIEWPORT_DIRTY: AtomicBool = AtomicBool::new(true);
+
+thread_local! {
+    /// Inside `early_hooks` or `install`: our own throwaway factory/device creation
+    /// passes straight through the early-entry detours.
+    static EARLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct EarlyGuard(bool);
+impl EarlyGuard {
+    fn enter() -> Self {
+        Self(EARLY.with(|e| e.replace(true)))
+    }
+}
+impl Drop for EarlyGuard {
+    fn drop(&mut self) {
+        EARLY.with(|e| e.set(self.0));
+    }
+}
+
+/// Ensures all DXGI hooks (output mode enumeration, swap-chain creation, fullscreen
+/// interception, present/resize, VRAM budget) are installed before the game's first
+/// DXGI factory or D3D11 device call returns.
+fn early_hooks() {
+    if EARLY_DONE.load(Ordering::Acquire) || EARLY.with(|e| e.get()) {
+        return;
+    }
+    let _guard = EarlyGuard::enter();
+    super::ensure_dxgi_hooks();
+    EARLY_DONE.store(true, Ordering::Release);
+}
+
+unsafe extern "system" fn create_factory_hook(riid: *const Guid, out: *mut usize) -> i32 {
+    early_hooks();
+    unsafe { CREATE_FACTORY.get().unwrap().call(riid, out) }
+}
+
+unsafe extern "system" fn create_factory1_hook(riid: *const Guid, out: *mut usize) -> i32 {
+    early_hooks();
+    unsafe { CREATE_FACTORY1.get().unwrap().call(riid, out) }
+}
+
+unsafe extern "system" fn create_factory2_hook(flags: u32, riid: *const Guid, out: *mut usize) -> i32 {
+    early_hooks();
+    unsafe { CREATE_FACTORY2.get().unwrap().call(flags, riid, out) }
+}
+
+unsafe extern "system" fn d3d11_create_device_hook(
+    adapter: usize,
+    driver_type: u32,
+    software: usize,
+    flags: u32,
+    levels: *const u32,
+    num_levels: u32,
+    sdk_version: u32,
+    device: *mut usize,
+    feature_level: *mut u32,
+    context: *mut usize,
+) -> i32 {
+    early_hooks();
+    unsafe { D3D11_CREATE_DEV.get().unwrap().call(adapter, driver_type, software, flags, levels, num_levels, sdk_version, device, feature_level, context) }
+}
+
+unsafe extern "system" fn d3d11_create_device_and_swap_hook(
+    adapter: usize,
+    driver_type: u32,
+    software: usize,
+    flags: u32,
+    levels: *const u32,
+    num_levels: u32,
+    sdk_version: u32,
+    swap_desc: *const SwapChainDesc,
+    swap_chain: *mut usize,
+    device: *mut usize,
+    feature_level: *mut u32,
+    context: *mut usize,
+) -> i32 {
+    early_hooks();
+    unsafe {
+        D3D11_CREATE_DEV_SWAP
+            .get()
+            .unwrap()
+            .call(adapter, driver_type, software, flags, levels, num_levels, sdk_version, swap_desc, swap_chain, device, feature_level, context)
+    }
+}
+
+/// Called from `video::module_loaded` under the loader lock when `dxgi.dll` or `d3d11.dll`
+/// loads in a split-screen copy: arms lightweight entry-point detours so the full DXGI
+/// hooks (`install`) go in synchronously before the game's first factory/device call
+/// instead of racing an async background thread.
+pub fn redirect(name: &str, module: windows_sys::Win32::Foundation::HMODULE) {
+    if !(crate::window::in_pane() || crate::window::compositor_capture()) || EARLY_DONE.load(Ordering::Acquire) {
+        return;
+    }
+    let lower = name.to_ascii_lowercase();
+    let mut n = 0usize;
+    let total = match lower.as_str() {
+        "dxgi.dll" => {
+            crate::sys::detour::batch(|| {
+                let a0 = com::proc(module, c"CreateDXGIFactory");
+                let a1 = com::proc(module, c"CreateDXGIFactory1").filter(|&a| Some(a) != a0);
+                let a2 = com::proc(module, c"CreateDXGIFactory2").filter(|&a| Some(a) != a0 && Some(a) != a1);
+                if let Some(a) = a0 {
+                    let target: CreateFactory = unsafe { std::mem::transmute(a) };
+                    n += usize::from(crate::sys::detour::try_arm(&CREATE_FACTORY, target, create_factory_hook, "video", "CreateDXGIFactory", true) == crate::sys::detour::Armed::Hooked);
+                }
+                if let Some(a) = a1 {
+                    let target: CreateFactory = unsafe { std::mem::transmute(a) };
+                    n += usize::from(crate::sys::detour::try_arm(&CREATE_FACTORY1, target, create_factory1_hook, "video", "CreateDXGIFactory1", true) == crate::sys::detour::Armed::Hooked);
+                }
+                if let Some(a) = a2 {
+                    let target: CreateFactory2 = unsafe { std::mem::transmute(a) };
+                    n += usize::from(crate::sys::detour::try_arm(&CREATE_FACTORY2, target, create_factory2_hook, "video", "CreateDXGIFactory2", true) == crate::sys::detour::Armed::Hooked);
+                }
+            });
+            3
+        }
+        "d3d11.dll" => {
+            crate::sys::detour::batch(|| {
+                let a0 = com::proc(module, c"D3D11CreateDevice");
+                let a1 = com::proc(module, c"D3D11CreateDeviceAndSwapChain").filter(|&a| Some(a) != a0);
+                if let Some(a) = a0 {
+                    let target: CreateDevice11 = unsafe { std::mem::transmute(a) };
+                    n += usize::from(crate::sys::detour::try_arm(&D3D11_CREATE_DEV, target, d3d11_create_device_hook, "video", "D3D11CreateDevice", true) == crate::sys::detour::Armed::Hooked);
+                }
+                if let Some(a) = a1 {
+                    let target: CreateDeviceAndSwap11 = unsafe { std::mem::transmute(a) };
+                    n += usize::from(crate::sys::detour::try_arm(&D3D11_CREATE_DEV_SWAP, target, d3d11_create_device_and_swap_hook, "video", "D3D11CreateDeviceAndSwapChain", true) == crate::sys::detour::Armed::Hooked);
+                }
+            });
+            2
+        }
+        _ => return,
+    };
+    if n > 0 {
+        log!("video: {name} loaded in a split-screen copy: {n} of {total} entry point(s) hooked; DXGI hooks go in before the game's first factory/device call");
+    }
+}
 
 type SetColorSpace = unsafe extern "system" fn(usize, u32) -> i32;
 
@@ -190,7 +336,7 @@ pub(super) struct SwapChainDesc {
     sample_quality: u32,
     usage: u32,
     buffer_count: u32,
-    window: usize,
+    pub(super) window: usize,
     pub(super) windowed: i32,
     effect: u32,
     pub(super) flags: u32,
@@ -200,6 +346,7 @@ pub fn install() -> bool {
     if com::module("dxgi.dll").is_null() {
         return false;
     }
+    let _early = EarlyGuard::enter();
     let Some(win) = HiddenWindow::new() else { return false };
     type Create = unsafe extern "system" fn(usize, u32, usize, u32, *const u32, u32, u32, *const SwapChainDesc, *mut usize, *mut usize, *mut u32, *mut usize) -> i32;
     let Some(f) = com::proc(com::load("d3d11.dll"), c"D3D11CreateDeviceAndSwapChain") else { return false };
@@ -242,25 +389,29 @@ pub fn install() -> bool {
     let swap3 = com::query(swap, &com::IID_IDXGISWAPCHAIN3);
     let resize1 = (swap3 != 0).then(|| com::slot(swap3, 39));
     let set_color_space = (swap3 != 0).then(|| com::slot(swap3, 38));
-    let fullscreen = super::fullscreen::install_dxgi(swap);
-    for o in [swap3, swap1, swap, ctx, dev] {
-        release(o);
-    }
-    drop(win);
-    d3d12::install();
-    super::vram::install_dxgi();
+    let mut fullscreen = 0;
     let mut n = 0;
-    n += arm(&PRESENT, present, present_hook as Present, "Present");
-    n += arm(&RESIZE, resize, resize_hook as Resize, "ResizeBuffers");
-    if let Some(a) = present1 {
-        n += arm(&PRESENT1, a, present1_hook as Present1, "Present1");
-    }
-    if let Some(a) = resize1 {
-        n += arm(&RESIZE1, a, resize1_hook as Resize1, "ResizeBuffers1");
-    }
-    if let Some(a) = set_color_space {
-        n += arm(&SET_COLOR_SPACE, a, set_color_space_hook as SetColorSpace, "SetColorSpace1");
-    }
+    crate::sys::detour::batch(|| {
+        fullscreen = super::fullscreen::install_dxgi(swap);
+        for o in [swap3, swap1, swap, ctx, dev] {
+            release(o);
+        }
+        drop(win);
+        d3d12::install();
+        super::vram::install_dxgi();
+        n += arm(&PRESENT, present, present_hook as Present, "Present");
+        n += arm(&RESIZE, resize, resize_hook as Resize, "ResizeBuffers");
+        if let Some(a) = present1 {
+            n += arm(&PRESENT1, a, present1_hook as Present1, "Present1");
+        }
+        if let Some(a) = resize1 {
+            n += arm(&RESIZE1, a, resize1_hook as Resize1, "ResizeBuffers1");
+        }
+        if let Some(a) = set_color_space {
+            n += arm(&SET_COLOR_SPACE, a, set_color_space_hook as SetColorSpace, "SetColorSpace1");
+        }
+    });
+    EARLY_DONE.store(true, Ordering::Release);
     log!("video: {fullscreen} DXGI fullscreen calls hooked (a copy in a pane stays windowed)");
     n > 0
 }
@@ -269,19 +420,11 @@ fn arm<T>(slot: &OnceLock<GenericDetour<T>>, addr: usize, detour: T, label: &str
 where
     T: retour::Function + Copy + Send + Sync + 'static,
 {
-    with_lock(|| {
-        let target: T = unsafe { T::from_ptr(addr as *const ()) };
-        match unsafe { GenericDetour::new(target, detour) } {
-            Ok(h) => {
-                let _ = slot.set(h);
-                usize::from(crate::sys::hook::frozen(addr, || unsafe { slot.get().unwrap().enable() }).is_ok())
-            }
-            Err(e) => {
-                log!("video: IDXGISwapChain::{label} not hooked: {e}");
-                0
-            }
-        }
-    })
+    if addr == 0 {
+        return 0;
+    }
+    let target: T = unsafe { T::from_ptr(addr as *const ()) };
+    usize::from(crate::sys::detour::try_arm(slot, target, detour, "video", label, true) == crate::sys::detour::Armed::Hooked)
 }
 
 fn device(swap: usize, iid: &Guid) -> usize {
@@ -557,6 +700,21 @@ unsafe extern "system" fn resize1_hook(swap: usize, n: u32, w: u32, h: u32, fmt:
 mod tests {
     use super::*;
     use super::super::capture;
+
+    #[test]
+    fn early_guard_restores_nested_reentrancy_flag() {
+        assert!(!EARLY.with(|e| e.get()));
+        {
+            let _outer = EarlyGuard::enter();
+            assert!(EARLY.with(|e| e.get()));
+            {
+                let _inner = EarlyGuard::enter();
+                assert!(EARLY.with(|e| e.get()));
+            }
+            assert!(EARLY.with(|e| e.get()), "outer guard still active after inner drop");
+        }
+        assert!(!EARLY.with(|e| e.get()), "flag cleared after outer drop");
+    }
 
     /// What a game set sticks to its swap chain until one is made at the same address;
     /// without it a float swap chain is scRGB and the rest sRGB.

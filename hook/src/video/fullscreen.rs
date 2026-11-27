@@ -583,7 +583,7 @@ const NO_ALT_ENTER: u32 = 2;
 /// fullscreen itself: in a pane that's turned off, as the game's own switch is.
 unsafe extern "system" fn make_window_association(factory: usize, hwnd: usize, flags: u32) -> i32 {
     let real = MAKE_ASSOCIATION.get().unwrap();
-    if !keep_windowed() || flags & NO_ALT_ENTER != 0 {
+    if !keep_windowed() || hwnd == 0 || flags & NO_ALT_ENTER != 0 {
         return unsafe { real.call(factory, hwnd, flags) };
     }
     static TOLD_ALT: AtomicBool = AtomicBool::new(false);
@@ -644,7 +644,11 @@ unsafe extern "system" fn create_swap_chain(factory: usize, device: usize, desc:
     let flags_ptr = unsafe { &raw mut (*desc).flags };
     let orig_windowed = unsafe { windowed_ptr.read() };
     let orig_flags = unsafe { flags_ptr.read() };
+    let (req_w, req_h, req_hwnd) = unsafe { ((*desc).width, (*desc).height, (*desc).window) };
     let want_fs = orig_windowed == 0;
+    crate::log::throttled("video: create swap chain", 3, |n| {
+        log!("video: the game creates a DXGI swap chain {req_w}x{req_h} (windowed={orig_windowed}, hwnd=0x{req_hwnd:x}, call {n})");
+    });
     let new_flags = keep_flags(orig_flags, true);
     if want_fs {
         told("a fullscreen swap chain");
@@ -698,6 +702,12 @@ unsafe extern "system" fn create_for_hwnd(
     });
     let desc_arg = desc1.as_ref().map_or(0, |d| d.as_ptr() as usize);
     let want_fs = !fs.is_null() && unsafe { (*fs).windowed } == 0;
+    if let Some(d) = desc1 {
+        let (req_w, req_h) = (d[0], d[1]);
+        crate::log::throttled("video: create swap chain hwnd", 3, |n| {
+            log!("video: the game creates a DXGI swap chain for hwnd 0x{hwnd:x} at {req_w}x{req_h} (fullscreen={want_fs}, call {n})");
+        });
+    }
     let windowed = if want_fs {
         told("a fullscreen swap chain");
         let mut w = unsafe { *fs };
