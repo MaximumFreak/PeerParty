@@ -585,11 +585,11 @@ mod tests {
             if unsafe { create(32, &mut d3d) } < 0 {
                 return None;
             }
-            vcall!(d3d, 20, fn(u32, u32, usize, u32, *const super::super::PresentParameters, usize, *mut usize) -> i32, 0, 1, win.0 as usize, 0x20, &pp, 0, &mut dev);
+            vcall!(d3d, 20, fn(u32, u32, usize, u32, *const super::super::PresentParameters, usize, *mut usize) -> i32, 0, 1, win.0 as usize, super::super::THROWAWAY_BEHAVIOR, &pp, 0, &mut dev);
         } else {
             let create: unsafe extern "system" fn(u32) -> usize = unsafe { std::mem::transmute(com::proc(m, c"Direct3DCreate9")?) };
             d3d = unsafe { create(32) };
-            vcall!(d3d, 16, fn(u32, u32, usize, u32, *const super::super::PresentParameters, *mut usize) -> i32, 0, 1, win.0 as usize, 0x20, &pp, &mut dev);
+            vcall!(d3d, 16, fn(u32, u32, usize, u32, *const super::super::PresentParameters, *mut usize) -> i32, 0, 1, win.0 as usize, super::super::THROWAWAY_BEHAVIOR, &pp, &mut dev);
         }
         if dev == 0 {
             release(d3d);

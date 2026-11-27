@@ -91,12 +91,41 @@ struct LockedRect {
     bits: *mut u8,
 }
 
+/// D3DCREATE_FPU_PRESERVE | D3DCREATE_SOFTWARE_VERTEXPROCESSING: the throwaway device
+/// runs on the game's thread (before its first Direct3DCreate9 in split screen), so it
+/// must never switch the calling thread's x87 FPU to 24-bit single precision.
+const THROWAWAY_BEHAVIOR: u32 = 0x02 | 0x20;
+
+/// Saves and restores the calling thread's x87 FPU control word around throwaway D3D9
+/// device creation on x86, in case a driver or wrapper alters FPU precision despite
+/// `D3DCREATE_FPU_PRESERVE`.
+#[cfg(target_arch = "x86")]
+struct FpuGuard(u16);
+
+#[cfg(target_arch = "x86")]
+impl FpuGuard {
+    fn enter() -> Self {
+        let mut cw: u16 = 0;
+        unsafe { core::arch::asm!("fnstcw [{}]", in(reg) &mut cw, options(nostack, preserves_flags)) };
+        Self(cw)
+    }
+}
+
+#[cfg(target_arch = "x86")]
+impl Drop for FpuGuard {
+    fn drop(&mut self) {
+        unsafe { core::arch::asm!("fldcw [{}]", in(reg) &self.0, options(nostack, preserves_flags)) };
+    }
+}
+
 pub fn install() -> bool {
     let m = com::module("d3d9.dll");
     if m.is_null() {
         return false;
     }
     let _early = d3d9capture::EarlyGuard::enter();
+    #[cfg(target_arch = "x86")]
+    let _fpu = FpuGuard::enter();
     let Some(win) = HiddenWindow::new() else { return false };
     let pp = PresentParameters {
         width: 64,
@@ -123,7 +152,7 @@ pub fn install() -> bool {
             let mut dev = 0usize;
             for kind in [1u32, 4] {
                 // HAL, else NULLREF.
-                if vcall!(d3d, 16, fn(u32, u32, usize, u32, *const PresentParameters, *mut usize) -> i32, 0, kind, win.0 as usize, 0x20, &pp, &mut dev) >= 0 {
+                if vcall!(d3d, 16, fn(u32, u32, usize, u32, *const PresentParameters, *mut usize) -> i32, 0, kind, win.0 as usize, THROWAWAY_BEHAVIOR, &pp, &mut dev) >= 0 {
                     break;
                 }
             }
@@ -149,7 +178,7 @@ pub fn install() -> bool {
         if unsafe { create(32, &mut d3d) } >= 0 && d3d != 0 {
             let mut dev = 0usize;
             // IDirect3D9Ex::CreateDeviceEx is slot 20.
-            if vcall!(d3d, 20, fn(u32, u32, usize, u32, *const PresentParameters, usize, *mut usize) -> i32, 0, 1, win.0 as usize, 0x20, &pp, 0, &mut dev) >= 0 && dev != 0 {
+            if vcall!(d3d, 20, fn(u32, u32, usize, u32, *const PresentParameters, usize, *mut usize) -> i32, 0, 1, win.0 as usize, THROWAWAY_BEHAVIOR, &pp, 0, &mut dev) >= 0 && dev != 0 {
                 // Usually the plain device's functions; when not, hooked as their own.
                 for (slot, plain, own) in [(17, "Present", "Present (9Ex)"), (16, "Reset", "Reset (9Ex)")] {
                     let a = com::slot(dev, slot);
@@ -570,5 +599,31 @@ mod tests {
         assert_eq!(v, Values { windowed: 1, refresh: 0, interval: 1, format: 0 });
         let v = windowed_values(Values { windowed: 0, refresh: 60, interval: 0x8000_0000, format: 22 });
         assert_eq!((v.interval, v.format), (0x8000_0000, 22), "immediate and X8R8G8B8 stay");
+    }
+
+    #[test]
+    fn throwaway_behavior_sets_fpu_preserve() {
+        assert_ne!(THROWAWAY_BEHAVIOR & 0x02, 0, "D3DCREATE_FPU_PRESERVE must be set");
+        assert_ne!(THROWAWAY_BEHAVIOR & 0x20, 0, "D3DCREATE_SOFTWARE_VERTEXPROCESSING must be set");
+    }
+
+    #[cfg(target_arch = "x86")]
+    #[test]
+    fn fpu_guard_restores_x87_precision_control() {
+        fn read_cw() -> u16 {
+            let mut cw: u16 = 0;
+            unsafe { core::arch::asm!("fnstcw [{}]", in(reg) &mut cw, options(nostack, preserves_flags)) };
+            cw
+        }
+        let before = read_cw();
+        {
+            let _guard = FpuGuard::enter();
+            // Clear precision control bits (bits 8..=9 -> 00 = 24-bit single precision),
+            // as Direct3D 9 CreateDevice does without D3DCREATE_FPU_PRESERVE.
+            let single = before & !0x0300;
+            unsafe { core::arch::asm!("fldcw [{}]", in(reg) &single, options(nostack, preserves_flags)) };
+            assert_eq!(read_cw() & 0x0300, 0);
+        }
+        assert_eq!(read_cw(), before, "FpuGuard must restore the calling thread's x87 control word");
     }
 }
