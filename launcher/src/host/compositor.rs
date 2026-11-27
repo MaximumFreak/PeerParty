@@ -620,6 +620,17 @@ impl CompositorWindow {
     /// Where the mouse is in copy `i`'s window, on screen as the game counts it (for
     /// `GetCursorPos` through its input block): where the session's mouse last was over
     /// its pane, else the middle of its window.
+    /// Puts the real pointer in the middle of pane `i` when it's elsewhere. Whether it
+    /// moved.
+    pub fn pointer_into(&self, i: usize) -> bool {
+        #[cfg(windows)]
+        if let Some(w) = &self.window {
+            return w.pointer_into(i);
+        }
+        let _ = i;
+        false
+    }
+
     pub fn cursor_screen(&self, i: usize) -> Option<(i32, i32)> {
         #[cfg(windows)]
         if let Some(w) = &self.window {
@@ -1520,6 +1531,22 @@ mod win {
         /// Where the mouse is in copy `i`'s window, on screen as the game counts it: where
         /// it last was over its pane, else the middle of its window (a pane given the
         /// keyboard and mouse by Ctrl+Alt+1-4 hasn't had the mouse over it yet).
+        pub fn pointer_into(&self, i: usize) -> bool {
+            let Some(d) = self.shown.get(i).and_then(|s| s.as_ref()).map(|s| s.dest).filter(|d| d.width > 0 && d.height > 0) else { return false };
+            let mut tl = POINT { x: d.x, y: d.y };
+            let mut at = POINT { x: 0, y: 0 };
+            unsafe {
+                ClientToScreen(self.hwnd, &mut tl);
+                GetCursorPos(&mut at);
+            }
+            let (w, h) = (d.width as i32, d.height as i32);
+            if (tl.x..tl.x.saturating_add(w)).contains(&at.x) && (tl.y..tl.y.saturating_add(h)).contains(&at.y) {
+                return false;
+            }
+            unsafe { SetCursorPos(tl.x.saturating_add(w / 2), tl.y.saturating_add(h / 2)) };
+            true
+        }
+
         pub fn cursor_for(&self, i: usize) -> Option<(i32, i32)> {
             if let Some(p) = self.cursor_screen.get(i).copied().flatten() {
                 return Some(p);

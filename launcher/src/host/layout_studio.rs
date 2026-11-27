@@ -290,7 +290,10 @@ impl LayoutStudio {
         self.lt_prev = pad.lt;
         self.rt_prev = pad.rt;
         self.pad_mode = PadMode::Browse;
-        self.using_pad = pad.connected;
+        // Controller hints when a controller opened it (its button still down: the
+        // overlay's Arrange panes pressed with it), else the pointer's (a keyboard
+        // shortcut, a click); a controller's first press switches over (`update`).
+        self.using_pad = pad.connected && pad.buttons != 0;
         self.pad_style = pad.style;
         self.pad_connected = pad.connected;
         self.pad_moving = false;
@@ -2191,8 +2194,17 @@ mod tests {
         let mut s = LayoutStudio::new();
         let bounds = ScreenRect { left: 0, top: 0, right: 1280, bottom: 720 };
         let idle = StudioPad { connected: true, style: pad::Style::Xbox, ..Default::default() };
+        // Opened from the keyboard or a click (no controller button down): the pointer's
+        // hints, though a controller is connected.
         s.open(LayoutPreset::Horizontal.to_slots(2), 0, StudioSync::Full, bounds, 1.0, idle);
+        assert!(!s.using_pad);
+        s.active = false;
+        // Opened with a controller (the press that opened it still down).
+        s.open(LayoutPreset::Horizontal.to_slots(2), 0, StudioSync::Full, bounds, 1.0, StudioPad { buttons: pad::SOUTH, ..idle });
         assert!(s.using_pad);
+        let mut actions = Vec::new();
+        s.handle_pad(idle, &test_info(2), &mut actions);
+        assert!(actions.is_empty(), "letting go of the press that opened it does nothing: {actions:?}");
         let mut info = test_info(2);
         let mut actions = Vec::new();
 

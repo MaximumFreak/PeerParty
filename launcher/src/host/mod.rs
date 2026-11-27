@@ -412,6 +412,9 @@ struct SessionHost {
     /// Keyboard and mouse are kept from reaching the games (controllers only); overlay
     /// and session hotkeys still work.
     kbm_off: bool,
+    /// The mouse went to another player (`set_focus`): the pointer goes into its pane
+    /// once no overlay is open (`update_pointer`).
+    pointer_to_focus: bool,
     /// Each player seen playing with the keyboard and mouse before a controller of
     /// theirs was used (`watch_keyboard`): a controller goes to another player first.
     kbm_player: Vec<bool>,
@@ -583,6 +586,7 @@ impl SessionHost {
             panics: 0,
             inputs: Vec::new(),
             kbm_off: false,
+            pointer_to_focus: false,
             kbm_player: Vec::new(),
             kbm_seen: KbmSeen::default(),
             layout_studio: LayoutStudio::new(),
@@ -652,6 +656,7 @@ impl SessionHost {
     fn kbm_tick(&mut self) {
         let focus_cursor = self.input.kbm_focus().and_then(|f| self.compositor.as_ref().and_then(|c| c.cursor_screen(f)));
         self.input.publish_kbm(&mut self.instances, focus_cursor);
+        self.forward_queued_input();
     }
 
     /// How long the loop waits before its next tick (ms).
@@ -784,6 +789,7 @@ impl SessionHost {
             c.focus_pane(i);
             c.activate_pane(i, &self.instances);
         }
+        self.pointer_to_focus = true;
         self.update_capture();
     }
 
@@ -1138,6 +1144,23 @@ impl SessionHost {
     /// mouse sits idle with controllers active (or KBM off).
     fn update_pointer(&mut self, front: bool) {
         let f = self.focus;
+        // The mouse went to another player: a pointer left over another pane would hold
+        // the game's cursor at its pane's edge until it crossed over. Not while an overlay
+        // or Layout Studio is open (the pointer is working it): once it closes.
+        if self.pointer_to_focus && (self.kbm_off || self.instances.get(f).is_none_or(|i| i.gone)) {
+            self.pointer_to_focus = false;
+        }
+        if self.pointer_to_focus
+            && front
+            && !self.panes[f].visible
+            && !self.layout_studio.active
+            && let Some(c) = self.compositor.as_ref()
+        {
+            self.pointer_to_focus = false;
+            if desktop::in_front(std::process::id()) && c.pointer_into(f) {
+                self.instances[f].send(&HostMsg::Note { text: "session: the mouse was over another pane: the pointer moved to the middle of this one, whose player has it now".into() });
+            }
+        }
         let has_pad = self.input.pads().seat_info().iter().any(Option::is_some);
         let Some(c) = self.compositor.as_mut() else { return };
         let ours = front && c.hwnd() != 0 && desktop::in_front(std::process::id());
@@ -1703,10 +1726,8 @@ impl SessionHost {
                 self.open_layout_studio();
             }
         }
-        let overlay_open = self.panes[self.focus].visible || self.layout_studio.active;
-        let can_click: Vec<bool> = (0..self.instances.len()).map(|i| self.click_can_focus(i)).collect();
         let pending: Vec<u32> = self.pending_spawns.iter().copied().collect();
-        let clicked_focus = if let Some(c) = self.compositor.as_mut() {
+        if let Some(c) = self.compositor.as_mut() {
             c.maintain(&self.instances, &pending);
             // What changed in the panes, into each copy's log (a pane whose copy hasn't
             // started yet: player 1's).
@@ -1715,9 +1736,20 @@ impl SessionHost {
                     crate::launch::note(inst.pid, &line);
                 }
             }
-            c.forward_input(self.focus, overlay_open, self.kbm_off, &can_click, &self.instances)
-        } else {
-            None
+        }
+        self.forward_queued_input();
+    }
+
+    /// The keyboard and mouse messages the session's window got, to the focused copy's
+    /// window (a click on another pane focuses it). Between ticks too: a game that moves
+    /// its cursor by its window's mouse messages got them only every tick (33 ms), in
+    /// bursts, and its cursor lagged and stepped behind the mouse.
+    fn forward_queued_input(&mut self) {
+        let overlay_open = self.panes[self.focus].visible || self.layout_studio.active;
+        let can_click: Vec<bool> = (0..self.instances.len()).map(|i| self.click_can_focus(i)).collect();
+        let clicked_focus = match self.compositor.as_mut() {
+            Some(c) => c.forward_input(self.focus, overlay_open, self.kbm_off, &can_click, &self.instances),
+            None => None,
         };
         if let Some(i) = clicked_focus.filter(|&i| i != self.focus && i < self.instances.len() && !self.instances[i].gone) {
             self.set_focus(i);

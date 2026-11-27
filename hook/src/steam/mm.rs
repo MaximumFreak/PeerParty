@@ -300,10 +300,20 @@ fn edit(lobby: u64, f: impl FnOnce(&mut Lobby)) -> bool {
     let Some(mut l) = lan.lobby(&core) else {
         return false;
     };
+    let before = l.clone();
     f(&mut l);
     let joinable = text(&l, KEY_JOINABLE).is_none_or(|v| v != "0");
     let kind = lobby_type(&l);
     l.permission = permission(kind, joinable);
+    // An edit that changes nothing sends no LobbyDataUpdate_t (as with member data). A
+    // game that sets its lobby's values again on every update would otherwise make
+    // another one each time, delivered in the same dispatch, in a loop.
+    if l == before {
+        crate::log::throttled("steam-lan lobby edit unchanged", 2, |n| {
+            log!("steam-lan a lobby edit changes nothing: no LobbyDataUpdate (n={n})");
+        });
+        return true;
+    }
     let ok = lan.update(&core, Some(&l), &[], &[]).is_ok();
     if ok {
         data_update(lobby, lobby, true);
