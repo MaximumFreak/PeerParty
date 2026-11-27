@@ -38,6 +38,10 @@ it does and docs/usage.md how to use it; this file is about how changes get in.
   `tests\run_all.ps1` also runs the two-copy SDK tests; those need SDK DLLs copied from
   games you have installed, named by `PPTEST_*` variables (docs/testing.md), and skip themselves
   without them. Never commit a game's or SDK's files, or paths to them.
+- Building `peerparty.exe` for local use: copy the built binary from Cargo's target
+  directory (find it with `cargo metadata --format-version 1 --no-deps`, as a parent
+  `.cargo/config.toml` may redirect `target-dir` outside the repo) to `peerparty.exe`
+  in the repo root (gitignored).
 - The repo isn't rustfmt-formatted. Don't run rustfmt over files; format only the lines
   you change, like the code around them.
 - Socket tests bind 127.0.0.1 (`PEERPARTY_LOOPBACK=1`, set by .cargo/config.toml) and use
