@@ -11,10 +11,18 @@
 //! tool (an editor, a packer, a dedicated server) wins only when nothing else is left,
 //! and one named after the folder ("SG2" or "SomeGame" in "Some Game II") wins over a
 //! bigger one that isn't, as long as it's no stub (a quarter of the biggest's size).
+//!
+//! And one for a folder holding two copies of one build (the same link, by the time
+//! stamp in their headers) where one was changed after it shipped: the changed copy is
+//! the one the folder is set up to run. Changed means its certificate table is cut off
+//! or gone while the other's is whole, or, with nothing to tell them apart there, that
+//! it was written later. The other ranks after it, to be picked by hand.
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
+use std::time::SystemTime;
 
 use super::pattern::Pattern;
 
@@ -59,6 +67,10 @@ const BUILD_WORDS: &[&str] = &["win64", "win32", "x64", "x86", "64", "32", "ship
 /// A stub (a launcher that starts the real program) is smaller than this share of the
 /// biggest program, so naming the folder doesn't make it the game.
 const STUB_SHARE: u64 = 4;
+
+/// Two copies of one build differ in size by less than this share of the bigger, so a
+/// program and its tool linked in the same second aren't taken for copies.
+const COPY_SHARE: u64 = 8;
 
 const RENDERER_TAGS: &[&str] = &[r"(dx|d3d)(9|10|11|12)", r"vulkan", r"vk"];
 const OLD_RENDERER_TAGS: &[&str] = &[r"(dx|d3d)(9|10|11)"];
@@ -167,9 +179,47 @@ pub fn executables(folder: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Which link a program came from, and whether its certificate table is whole.
+#[derive(Clone, Copy)]
+struct Build {
+    machine: u16,
+    stamp: u32,
+    certificate: bool,
+}
+
+/// `exe`'s build, from its PE headers (`len` bytes long), or None if it isn't a PE file
+/// or carries no time stamp (nothing then says two programs are the same link).
+fn build(exe: &Path, len: u64) -> Option<Build> {
+    let mut head = Vec::with_capacity(4096);
+    fs::File::open(exe).ok()?.take(4096).read_to_end(&mut head).ok()?;
+    let rd16 = |o: usize| head.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    let rd32 = |o: usize| head.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let nt = rd32(0x3c)? as usize;
+    if rd16(0)? != 0x5a4d || rd32(nt)? != 0x4550 {
+        return None;
+    }
+    let opt = nt + 24;
+    let dirs = match rd16(opt)? {
+        0x20b => opt + 112,
+        0x10b => opt + 96,
+        _ => return None,
+    };
+    // The fifth data directory names the certificate table by its file offset.
+    let certificate = rd32(dirs - 4)? > 4 && {
+        let (at, size) = (rd32(dirs + 32)?, rd32(dirs + 36)?);
+        size > 0 && u64::from(at) + u64::from(size) <= len
+    };
+    let stamp = rd32(nt + 8)?;
+    (stamp != 0).then_some(Build { machine: rd16(nt + 4)?, stamp, certificate })
+}
+
 struct Candidate {
     path: PathBuf,
     size: u64,
+    modified: Option<SystemTime>,
+    build: Option<Build>,
+    /// A copy of the same build beside it was changed after it shipped.
+    superseded: bool,
     depth: usize,
     sort_key: String,
     unity: bool,
@@ -189,7 +239,13 @@ pub fn choose(folder: &Path, exes: &[PathBuf]) -> Option<PathBuf> {
     // shows why its program isn't the biggest one in its folder.
     if let Some(largest) = ranked.iter().filter(|c| c.unity == first.unity).max_by_key(|c| c.size) {
         if largest.path != first.path {
-            let why = if largest.tool { "named as a tool" } else { "not named after the folder" };
+            let why = if largest.superseded {
+                "the same build as shipped; this copy was changed from it"
+            } else if largest.tool {
+                "named as a tool"
+            } else {
+                "not named after the folder"
+            };
             eprintln!(
                 "peerparty: library: {}: {} rather than the bigger {} ({why})",
                 folder.display(),
@@ -218,6 +274,9 @@ fn rank(folder: &Path, exes: &[PathBuf]) -> Vec<Candidate> {
         candidates.push(Candidate {
             path: exe.clone(),
             size: meta.len(),
+            modified: meta.modified().ok(),
+            build: build(exe, meta.len()),
+            superseded: false,
             depth: parts.len(),
             sort_key: parts.join("/").to_lowercase(),
             unity: dir.join(format!("{stem}_Data")).is_dir(),
@@ -242,6 +301,10 @@ fn rank(folder: &Path, exes: &[PathBuf]) -> Vec<Candidate> {
         .zip(keep)
         .filter_map(|(c, k)| k.then_some(c))
         .collect();
+    let superseded: Vec<bool> = candidates.iter().map(|c| candidates.iter().any(|o| changed_copy_of(o, c))).collect();
+    for (c, s) in candidates.iter_mut().zip(superseded) {
+        c.superseded = s;
+    }
     // A Unity game's program first (the importer drops the rest; they stay here, after
     // it, to be picked by hand).
     let unity = candidates.iter().any(|c| c.unity);
@@ -253,12 +316,30 @@ fn rank(folder: &Path, exes: &[PathBuf]) -> Vec<Candidate> {
         b.unity
             .cmp(&a.unity)
             .then(a.tool.cmp(&b.tool))
+            .then(a.superseded.cmp(&b.superseded))
             .then(b.named.cmp(&a.named))
             .then(b.size.cmp(&a.size))
             .then(a.depth.cmp(&b.depth))
             .then(a.sort_key.cmp(&b.sort_key))
     });
     candidates
+}
+
+/// Whether `copy` is `of` (another program in its folder, from the same link) changed
+/// after it shipped.
+fn changed_copy_of(copy: &Candidate, of: &Candidate) -> bool {
+    let (Some(a), Some(b)) = (copy.build, of.build) else { return false };
+    if copy.path == of.path
+        || copy.dir != of.dir
+        || (a.machine, a.stamp) != (b.machine, b.stamp)
+        || copy.size.abs_diff(of.size).saturating_mul(COPY_SHARE) >= copy.size.max(of.size)
+    {
+        return false;
+    }
+    if a.certificate != b.certificate {
+        return b.certificate;
+    }
+    matches!((copy.modified, of.modified), (Some(c), Some(o)) if c > o)
 }
 
 #[cfg(test)]
@@ -340,6 +421,69 @@ mod tests {
         assert_eq!(find(&root).unwrap().file_name().unwrap(), "CopperTide-Win64-Shipping.exe");
         let root = tree_in("Copper Tide 2", &[("CopperTide.exe", 10), ("Other.exe", 900)], &[]);
         assert_eq!(find(&root).unwrap().file_name().unwrap(), "Other.exe");
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// A 64-bit PE file of `len` bytes linked at `stamp`, its certificate table (offset,
+    /// size) as given.
+    fn pe(stamp: u32, certificate: (u32, u32), len: usize) -> Vec<u8> {
+        let mut b = vec![0u8; len];
+        b[0..2].copy_from_slice(b"MZ");
+        b[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        b[0x40..0x44].copy_from_slice(b"PE\0\0");
+        b[0x44..0x46].copy_from_slice(&0x8664u16.to_le_bytes());
+        b[0x48..0x4c].copy_from_slice(&stamp.to_le_bytes());
+        let opt = 0x58;
+        b[opt..opt + 2].copy_from_slice(&0x20bu16.to_le_bytes());
+        b[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes());
+        b[opt + 144..opt + 148].copy_from_slice(&certificate.0.to_le_bytes());
+        b[opt + 148..opt + 152].copy_from_slice(&certificate.1.to_le_bytes());
+        b
+    }
+
+    /// Writes `files` (name, bytes, seconds after a fixed time) into a folder `name`, in
+    /// a folder of its own (the other tests here remove theirs while it runs).
+    fn programs_in(name: &str, files: &[(&str, Vec<u8>, u64)]) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("peerparty-mainexe-copies-{}", std::process::id())).join(name);
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let base = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_500_000_000);
+        for (f, bytes, at) in files {
+            fs::write(root.join(f), bytes).unwrap();
+            let file = fs::File::options().write(true).open(root.join(f)).unwrap();
+            file.set_modified(base + std::time::Duration::from_secs(*at)).unwrap();
+        }
+        root
+    }
+
+    /// Two copies of one build, one changed after it shipped: the changed copy wins
+    /// over the bigger one as shipped, even one written later.
+    #[test]
+    fn a_changed_copy_of_the_build_wins() {
+        let shipped = pe(1_509_000_000, (9000, 1000), 10_000);
+        let mut cut = pe(1_509_000_000, (9000, 1000), 9_400);
+        cut[0x200] = 1;
+        let root = programs_in("Iron Vale", &[("iv_sp64_ship.exe", shipped.clone(), 100), ("Play.exe", cut, 50)]);
+        assert_eq!(find(&root).unwrap().file_name().unwrap(), "Play.exe");
+        let names: Vec<String> = programs(&root).iter().map(|p| p.file_name().unwrap().to_string_lossy().to_string()).collect();
+        assert_eq!(names, ["Play.exe", "iv_sp64_ship.exe"]);
+
+        // The certificate table gone, not cut off.
+        let root = programs_in("Iron Vale 2", &[("Ship.exe", shipped.clone(), 100), ("Play.exe", pe(1_509_000_000, (0, 0), 9_000), 50)]);
+        assert_eq!(find(&root).unwrap().file_name().unwrap(), "Play.exe");
+
+        // No certificates: the copy written later.
+        let root = programs_in(
+            "Iron Vale 3",
+            &[("Run.exe", pe(1_509_000_000, (0, 0), 10_000), 50), ("Start.exe", pe(1_509_000_000, (0, 0), 9_800), 100)],
+        );
+        assert_eq!(find(&root).unwrap().file_name().unwrap(), "Start.exe");
+
+        // Another link, or too far apart in size to be a copy: the biggest, as before.
+        let root = programs_in("Iron Vale 4", &[("Ship.exe", shipped.clone(), 100), ("Play.exe", pe(1_509_000_001, (0, 0), 9_400), 50)]);
+        assert_eq!(find(&root).unwrap().file_name().unwrap(), "Ship.exe");
+        let root = programs_in("Iron Vale 5", &[("Ship.exe", shipped, 100), ("Play.exe", pe(1_509_000_000, (0, 0), 5_000), 50)]);
+        assert_eq!(find(&root).unwrap().file_name().unwrap(), "Ship.exe");
         let _ = fs::remove_dir_all(root.parent().unwrap());
     }
 
