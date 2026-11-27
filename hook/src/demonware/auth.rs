@@ -151,6 +151,31 @@ fn umbrella_tokens(req: &Request) -> (u16, String) {
     (200, reply.to_string())
 }
 
+/// A JSON value's outline for the log: keys, and each value's type and length, with short
+/// values that aren't credentials shown. Sign-in forms differ by platform (a Steam ticket,
+/// an Xbox token), and this says which one a game sent without logging the token.
+fn outline(v: &Json, depth: usize) -> String {
+    let secret = |k: &str| ["token", "ticket", "signature", "auth", "key", "secret", "password"].iter().any(|s| k.to_ascii_lowercase().contains(s));
+    match v {
+        Json::Obj(pairs) if depth < 3 => {
+            let inner: Vec<String> = pairs
+                .iter()
+                .map(|(k, v)| match v {
+                    Json::Str(s) if secret(k) => format!("{k}: str {} ({})", s.len(), s.chars().take(7).filter(|c| c.is_ascii_alphabetic() || *c == '.').collect::<String>()),
+                    Json::Str(s) if s.starts_with('{') => format!("{k}: json {}", Json::parse(s).map(|j| outline(&j, depth + 1)).unwrap_or_else(|| format!("str {}", s.len()))),
+                    Json::Str(s) if s.len() <= 40 => format!("{k}: {s:?}"),
+                    Json::Str(s) => format!("{k}: str {}", s.len()),
+                    other => format!("{k}: {}", outline(other, depth + 1)),
+                })
+                .collect();
+            format!("{{{}}}", inner.join(", "))
+        }
+        Json::Arr(a) => format!("[{} items]", a.len()),
+        Json::Obj(p) => format!("{{{} keys}}", p.len()),
+        other => other.to_string(),
+    }
+}
+
 /// Answers one request to a Demonware host over HTTPS: (HTTP status, JSON body).
 pub fn handle(req: &Request) -> (u16, String) {
     let host = req.header("Host").unwrap_or_default().split(':').next().unwrap_or_default().to_ascii_lowercase();
@@ -176,6 +201,10 @@ pub fn handle(req: &Request) -> (u16, String) {
         return (400, "{}".to_string());
     };
     let task = num(body.get("auth_task")).unwrap_or(0);
+    crate::log::throttled(&format!("demonware auth shape {task}"), 1, |_| {
+        let headers: Vec<&str> = req.headers.iter().map(|(k, _)| k.as_str()).collect();
+        log!("demonware auth: task {task} asks with {} (headers {})", outline(&body, 0), headers.join(", "));
+    });
     let iv_seed = num(body.get("iv_seed")).unwrap_or(0);
     let title_id = num(body.get("title_id")).unwrap_or(0) as u32;
     let extra = body.get("extra_data").as_str().and_then(Json::parse).unwrap_or(Json::Null);
@@ -239,6 +268,15 @@ mod tests {
         assert!(j.get("accessToken").as_str().is_some_and(|t| t.len() > 20), "{body}");
         assert!(j.get("refreshToken").as_str().is_some(), "{body}");
         assert!(j.get("accountID").as_u64().is_some(), "{body}");
+    }
+
+    #[test]
+    fn a_sign_in_outline_names_fields_but_not_tokens() {
+        let extra = Json::obj(vec![("token", Json::str("XBL3.0 x=1234;eyJsecretsecretsecret")), ("platform", Json::str("xbl"))]).to_string();
+        let body = Json::obj(vec![("auth_task", Json::u64(44)), ("extra_data", Json::str(extra)), ("identity", Json::str("x".repeat(100)))]);
+        let o = outline(&body, 0);
+        assert!(o.contains("auth_task: 44") && o.contains("platform: \"xbl\"") && o.contains("token: str 35 (XBL.)") && o.contains("identity: str 100"), "{o}");
+        assert!(!o.contains("secret") && !o.contains("1234"), "{o}");
     }
 
     #[test]
