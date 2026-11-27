@@ -263,17 +263,18 @@ pub fn install_dxgi(swap: usize) -> usize {
     n
 }
 
-/// Pure helper: filters a monitor's DXGI display mode list to modes fitting inside pane
-/// `(vw, vh)` and appends `(vw, vh)` at each distinct refresh rate if not already listed.
-/// Leaves an empty list empty (unsupported formats stay unsupported).
+/// Pure helper: a monitor's DXGI display mode list as a copy in pane `(vw, vh)` sees it:
+/// the pane's size at each of the monitor's refresh rates, and no other size. A fullscreen
+/// game matches the resolution it saved against this list (or `FindClosestMatchingMode`):
+/// with the monitor's smaller modes listed, a saved one that isn't the pane's (from another
+/// layout, or a low mode it once fell back to) finds a near one among them and keeps it,
+/// scaled into the pane at the wrong size and aspect. Leaves an empty list empty
+/// (unsupported formats stay unsupported).
 pub fn pane_display_modes(raw: &[ModeDesc], vw: u32, vh: u32) -> Vec<ModeDesc> {
     if raw.is_empty() || vw == 0 || vh == 0 {
         return Vec::new();
     }
-    let mut out: Vec<ModeDesc> = raw.iter().copied().filter(|m| m.width <= vw && m.height <= vh).collect();
-    if out.iter().any(|m| m.width == vw && m.height == vh) {
-        return out;
-    }
+    let mut out = Vec::new();
     let mut rates: Vec<((u32, u32), ModeDesc)> = Vec::new();
     for &m in raw {
         let key = (m.refresh_num, m.refresh_den);
@@ -304,10 +305,7 @@ pub fn pane_display_modes1(raw: &[ModeDesc1], vw: u32, vh: u32) -> Vec<ModeDesc1
     if raw.is_empty() || vw == 0 || vh == 0 {
         return Vec::new();
     }
-    let mut out: Vec<ModeDesc1> = raw.iter().copied().filter(|m| m.width <= vw && m.height <= vh).collect();
-    if out.iter().any(|m| m.width == vw && m.height == vh) {
-        return out;
-    }
+    let mut out = Vec::new();
     let mut rates: Vec<((u32, u32, i32), ModeDesc1)> = Vec::new();
     for &m in raw {
         let key = (m.refresh_num, m.refresh_den, m.stereo);
@@ -332,15 +330,16 @@ pub fn pane_display_modes1(raw: &[ModeDesc1], vw: u32, vh: u32) -> Vec<ModeDesc1
     out
 }
 
-/// Pure helper: adjusts DXGI's `FindClosestMatchingMode` result to the pane's `(vw, vh)`
-/// when the game requested `(0, 0)`, `(vw, vh)`, or anything larger than the pane.
-pub fn fit_closest_mode(want: (u32, u32), closest: &mut (u32, u32), vw: u32, vh: u32) {
-    if vw == 0 || vh == 0 {
-        return;
+/// `FindClosestMatchingMode` in a pane: the pane's size, whatever was asked for (the
+/// pane's is the only size its mode list has), keeping the refresh rate and format DXGI
+/// found.
+fn closest_in_pane(want: (u32, u32), closest: &mut (u32, u32), vw: u32, vh: u32) {
+    if *closest != (vw, vh) {
+        crate::log::throttled("video: dxgi closest mode", 4, |n| {
+            log!("video: the game asks DXGI for the display mode closest to {}x{}: told the pane's {vw}x{vh}, not {}x{} (call {n})", want.0, want.1, closest.0, closest.1);
+        });
     }
-    if (want.0 == 0 && want.1 == 0) || (want.0 == vw && want.1 == vh) || want.0 > vw || want.1 > vh || closest.0 > vw || closest.1 > vh {
-        *closest = (vw, vh);
-    }
+    *closest = (vw, vh);
 }
 
 struct OutputGuard;
@@ -476,7 +475,7 @@ unsafe extern "system" fn output_find_closest(output: usize, want: *const ModeDe
     {
         let w = unsafe { ((*want).width, (*want).height) };
         let mut c = unsafe { ((*closest).width, (*closest).height) };
-        fit_closest_mode(w, &mut c, vw, vh);
+        closest_in_pane(w, &mut c, vw, vh);
         unsafe {
             (*closest).width = c.0;
             (*closest).height = c.1;
@@ -498,7 +497,7 @@ unsafe extern "system" fn output_find_closest1(output: usize, want: *const ModeD
     {
         let w = unsafe { ((*want).width, (*want).height) };
         let mut c = unsafe { ((*closest).width, (*closest).height) };
-        fit_closest_mode(w, &mut c, vw, vh);
+        closest_in_pane(w, &mut c, vw, vh);
         unsafe {
             (*closest).width = c.0;
             (*closest).height = c.1;
@@ -531,6 +530,10 @@ unsafe extern "system" fn set_fullscreen(swap: usize, fullscreen: i32, target: u
     if fullscreen != 0 {
         told("SetFullscreenState");
     }
+    // Shows whether the game re-applies its video mode (after its pane was resized, say).
+    crate::log::throttled("video: set fullscreen", 6, |n| {
+        log!("video: the game sets its swap chain {} (SetFullscreenState, call {n}): it stays windowed in its pane", if fullscreen != 0 { "fullscreen" } else { "windowed" });
+    });
     // Back to windowed if it went fullscreen before the copy was put in a pane.
     let mut now = 0i32;
     let Some(get) = GET_FULLSCREEN.get() else { return S_OK };
@@ -560,6 +563,12 @@ unsafe extern "system" fn get_fullscreen(swap: usize, fullscreen: *mut i32, targ
 
 unsafe extern "system" fn resize_target(swap: usize, mode: usize) -> i32 {
     if keep_windowed() {
+        if mode != 0 {
+            let m = unsafe { *(mode as *const ModeDesc) };
+            crate::log::throttled("video: resize target", 4, |n| {
+                log!("video: the game asks for its window or display mode at {}x{} (ResizeTarget, call {n}): left as it is, the pane sizes the window", m.width, m.height);
+            });
+        }
         return S_OK;
     }
     unsafe { RESIZE_TARGET.get().unwrap().call(swap, mode) }
@@ -748,7 +757,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_display_modes_filters_oversized_and_appends_pane_size() {
+    fn pane_display_modes_list_only_the_pane_size() {
         let raw = vec![
             mode(720, 576, 60000, 1001),
             mode(1280, 720, 60000, 1001),
@@ -756,34 +765,32 @@ mod tests {
             mode(1920, 1080, 100000, 1000),
             mode(3440, 1440, 100000, 1000),
         ];
+        // Only the pane's size, once per refresh rate, in ascending order: a saved low mode
+        // (720x576) or one from another layout has nothing smaller to land on.
         let got = pane_display_modes(&raw, 1720, 1440);
-        // Oversized modes (1920x1080, 3440x1440) dropped; smaller ones kept; pane 1720x1440
-        // added at each distinct refresh rate in ascending order.
-        assert!(got.iter().all(|m| m.width <= 1720 && m.height <= 1440));
-        assert_eq!(got.len(), 5);
-        assert_eq!((got[3].width, got[3].height, got[3].refresh_num), (1720, 1440, 60000));
-        assert_eq!((got[4].width, got[4].height, got[4].refresh_num), (1720, 1440, 100000));
-        // Already-present pane resolution isn't duplicated.
+        assert_eq!(got.len(), 2);
+        assert!(got.iter().all(|m| (m.width, m.height) == (1720, 1440)));
+        assert_eq!((got[0].refresh_num, got[1].refresh_num), (60000, 100000));
+        // A pane the size of a real mode lists it once per rate, not twice.
         let exact = pane_display_modes(&raw, 1280, 720);
-        assert_eq!(exact.iter().filter(|m| m.width == 1280 && m.height == 720).count(), 2);
+        assert_eq!(exact.len(), 2);
+        assert!(exact.iter().all(|m| (m.width, m.height) == (1280, 720)));
         // Empty (unsupported format) stays empty.
         assert!(pane_display_modes(&[], 1720, 1440).is_empty());
+        let raw1: Vec<ModeDesc1> = raw.iter().map(|m| ModeDesc1 { width: m.width, height: m.height, refresh_num: m.refresh_num, refresh_den: m.refresh_den, format: m.format, scanline: m.scanline, scaling: m.scaling, stereo: 0 }).collect();
+        let got1 = pane_display_modes1(&raw1, 1793, 1440);
+        assert_eq!(got1.len(), 2);
+        assert!(got1.iter().all(|m| (m.width, m.height) == (1793, 1440)));
     }
 
     #[test]
-    fn fit_closest_mode_clamps_and_matches_pane() {
-        let mut c = (3440, 1440);
-        fit_closest_mode((1720, 1440), &mut c, 1720, 1440);
-        assert_eq!(c, (1720, 1440));
-        let mut c = (3440, 1440);
-        fit_closest_mode((0, 0), &mut c, 1720, 1440);
-        assert_eq!(c, (1720, 1440));
-        let mut c = (1280, 720);
-        fit_closest_mode((1280, 720), &mut c, 1720, 1440);
-        assert_eq!(c, (1280, 720), "explicit smaller resolution preserved");
-        let mut c = (1920, 1080);
-        fit_closest_mode((1280, 720), &mut c, 1720, 1440);
-        assert_eq!(c, (1720, 1440), "oversized real match clamped to pane");
+    fn closest_mode_in_a_pane_is_the_pane() {
+        // A saved low mode, one larger than the pane and "any size" all come back as the pane.
+        for (want, real) in [((720, 540), (720, 576)), ((2560, 1080), (2560, 1080)), ((0, 0), (3440, 1440)), ((1720, 1440), (1600, 1200))] {
+            let mut c = real;
+            closest_in_pane(want, &mut c, 1720, 1440);
+            assert_eq!(c, (1720, 1440), "asked {want:?}");
+        }
     }
 
     #[test]

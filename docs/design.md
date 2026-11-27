@@ -649,7 +649,12 @@ session; a Linux one (frames read back as pixels) isn't at the same level yet.
 - **The pane is the game's screen** (`hook/src/window.rs`). Each copy is told its pane:
   its window, display modes and screen size read as the pane's (or the aspect Layout
   Studio set), so the game renders at the pane's own size. A zoomed pane is told the
-  whole window. A game's saved resolution reads as the pane's too: Unity's registry
+  whole window. DXGI's display mode list holds only the pane's size (at each refresh
+  rate), and its closest mode to any asked for is the pane's, so a game in exclusive
+  fullscreen whose saved resolution is another layout's, or a low one it fell back to,
+  still takes the pane's (`hook/src/video/fullscreen.rs`). Such a game sizes its frames
+  from the mode it set, not its window: when its pane is resized it's sent
+  `WM_DISPLAYCHANGE` at the new size, as a real mode change would. A game's saved resolution reads as the pane's too: Unity's registry
   values (`hook/src/screen_prefs.rs`), and Unreal's `GameUserSettings.ini`, read as a
   fullscreen window at the pane's size, since in exclusive fullscreen Unreal doesn't
   follow its window when the pane is resized (`hook/src/saves/screen_ini.rs`; what the

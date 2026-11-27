@@ -54,12 +54,27 @@ pub(crate) fn lower_layer_presents(hwnd: impl FnOnce() -> usize) -> bool {
     vulkan::presents_to(hwnd()) || vulkan::presented_recently()
 }
 
-/// The copy's pane was resized to `w`x`h`: a game that asked for exclusive fullscreen
-/// sizes its frames from its own settings there, so it's said that it won't follow.
+/// The copy's pane was resized to `w`x`h`. A windowed game follows its window; one that
+/// asked for exclusive fullscreen sizes its frames from the display mode it set, and gets
+/// no WM_SIZE it acts on. It's told what a real display mode change tells a fullscreen
+/// game, WM_DISPLAYCHANGE at the new size, and its display modes are the new pane's now:
+/// a game that sets its mode again on that takes the pane's size.
 pub fn pane_resized(w: u32, h: u32) {
-    if fullscreen::exclusive_wanted() {
-        let (vw, vh, _, api) = *crate::sys::lock(&LAST_VIEWPORT);
-        log!("video: the pane is {w}x{h} now, but the game draws exclusive fullscreen ({vw}x{vh}, {api}), which sizes its frames from the game's settings: they're scaled into the pane until the game changes its resolution or window mode itself");
+    if !fullscreen::exclusive_wanted() {
+        return;
+    }
+    let (vw, vh, hwnd, api) = *crate::sys::lock(&LAST_VIEWPORT);
+    let hwnd = if hwnd != 0 { hwnd } else { crate::window::game_window() };
+    let told = hwnd != 0 && {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_DISPLAYCHANGE};
+        // wParam: bits per pixel; lParam: the width in the low word, the height in the high.
+        let size = (w.min(0xffff) | (h.min(0xffff) << 16)) as isize;
+        unsafe { PostMessageW(hwnd as _, WM_DISPLAYCHANGE, 32, size) != 0 }
+    };
+    if told {
+        log!("video: the pane is {w}x{h} now and the game draws exclusive fullscreen ({vw}x{vh}, {api}): told it the display changed to {w}x{h} (WM_DISPLAYCHANGE to 0x{hwnd:x}); a game that sets its mode again takes the pane's size, one that doesn't has its frames scaled into the pane until its resolution is chosen again in its settings");
+    } else {
+        log!("video: the pane is {w}x{h} now, but the game draws exclusive fullscreen ({vw}x{vh}, {api}) and its window isn't known, so it isn't told: its frames are scaled into the pane until its resolution is chosen again in its settings");
     }
 }
 
