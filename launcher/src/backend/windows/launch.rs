@@ -25,7 +25,7 @@ use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAllocEx};
 use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, GetExitCodeProcess, INFINITE, PROCESS_INFORMATION, QueueUserAPC, ResumeThread, STARTUPINFOW,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, GetExitCodeProcess, INFINITE, PROCESS_INFORMATION, QueueUserAPC, ResumeThread, STARTUPINFOW,
     TerminateProcess, WaitForSingleObject,
 };
 
@@ -91,7 +91,7 @@ pub fn start(t: Target, env: ChildEnv, pipe: Option<host::pipe::Pipe>, prefs: Pr
         return run_packaged(pkg, &t.exe, &t.args, &env, pipe, prefs, log_dir);
     }
     let exe = t.exe;
-    let x86 = match pe_machine(&exe)? {
+    let x86 = match pe_machine(&exe)?.0 {
         0x8664 => false,
         0x014c => true,
         m => return Err(LaunchError::Machine(m)),
@@ -107,7 +107,7 @@ pub fn start(t: Target, env: ChildEnv, pipe: Option<host::pipe::Pipe>, prefs: Pr
 
     let tree = tree::Tree::new(root);
 
-    let pi = unsafe { start_injected(&exe, &cmdline, cwd, &env, &dll, x86, tree.as_ref(), None)? };
+    let pi = unsafe { start_injected(&exe, &cmdline, cwd, &env, &dll, x86, false, tree.as_ref(), None)? };
     launch::remember(&t.listed);
     eprintln!(
         "peerparty: started {} (pid {}, {}), logs in {}",
@@ -167,7 +167,8 @@ pub fn start_session(t: Target, base_env: ChildEnv, split: &SplitScreen, prefs: 
     }
     let count = split.instances.clamp(1, SplitScreen::MAX_INSTANCES);
     let exe = t.exe;
-    let x86 = match pe_machine(&exe)? {
+    let (machine, console) = pe_machine(&exe)?;
+    let x86 = match machine {
         0x8664 => false,
         0x014c => true,
         m => return Err(LaunchError::Machine(m)),
@@ -227,6 +228,7 @@ pub fn start_session(t: Target, base_env: ChildEnv, split: &SplitScreen, prefs: 
         split: split.clone(),
         dll,
         x86,
+        console,
         log_dir: log_dir.to_path_buf(),
         root: root.map(Path::to_path_buf),
         stamp,
@@ -333,6 +335,8 @@ struct SpawnCtx {
     split: SplitScreen,
     dll: PathBuf,
     x86: bool,
+    /// The game is a console program (`pe_machine`): each copy's console has no window.
+    console: bool,
     log_dir: PathBuf,
     root: Option<PathBuf>,
     stamp: String,
@@ -392,7 +396,11 @@ impl SpawnCtx {
         // game's folder until the last of them ends, as a game started alone is (tree.rs).
         let tree = tree::Tree::new(self.root.as_deref());
         let preferred_cpus = self.cpu_sets.get(slot as usize).map(Vec::as_slice);
-        let pi = unsafe { start_injected(&self.exe, &line, &self.cwd, &env, &self.dll, self.x86, tree.as_ref(), preferred_cpus)? };
+        // A console program started from a program without a console gets a new console
+        // window (in Windows Terminal, on Windows 11) over the session's window, where it
+        // only hides the panes, and closing it ends that player's game. Its console stays;
+        // only the window goes.
+        let pi = unsafe { start_injected(&self.exe, &line, &self.cwd, &env, &self.dll, self.x86, self.console, tree.as_ref(), preferred_cpus)? };
         eprintln!(
             "peerparty: started player {} ({}, pid {}, {})",
             slot + 1,
@@ -400,6 +408,11 @@ impl SpawnCtx {
             pi.dwProcessId,
             if self.x86 { "x86" } else { "x64" }
         );
+        // The copy's own log says so too (hook child.rs `note_own_console`): it isn't
+        // there yet for a `launch::note`.
+        if self.console {
+            eprintln!("peerparty: player {}'s game is a console program: its console has no window", slot + 1);
+        }
         let closer = tree.as_ref().map_or_else(|| tree::Closer::process(pi.hProcess), |tr| tr.closer(pi.hProcess));
         let watch = tree.map(|tr| tr.watch(pi.hProcess, pi.dwProcessId, self.exe.clone()));
         let done = watch.as_ref().map_or(pi.hProcess, |w| w.0);
@@ -506,6 +519,7 @@ unsafe fn start_injected(
     env: &ChildEnv,
     dll: &Path,
     x86: bool,
+    no_console_window: bool,
     tree: Option<&tree::Tree>,
     cpu_sets: Option<&[u32]>,
 ) -> Result<PROCESS_INFORMATION, LaunchError> {
@@ -523,7 +537,7 @@ unsafe fn start_injected(
             ptr::null(),
             ptr::null(),
             0,
-            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | if no_console_window { CREATE_NO_WINDOW } else { 0 },
             env_block.as_ptr().cast(),
             dir.as_ptr(),
             &si,
@@ -653,8 +667,9 @@ pub unsafe fn inject_x64(pi: &PROCESS_INFORMATION, dll: &Path) -> Result<(), Str
     }
 }
 
-/// IMAGE_FILE_HEADER.Machine of a PE file.
-fn pe_machine(exe: &Path) -> Result<u16, LaunchError> {
+/// IMAGE_FILE_HEADER.Machine of a PE file, and whether it's a console program (its
+/// optional header's Subsystem is IMAGE_SUBSYSTEM_WINDOWS_CUI).
+fn pe_machine(exe: &Path) -> Result<(u16, bool), LaunchError> {
     let buf = fs::read(exe).map_err(|e| LaunchError::missing(exe, &e))?;
     let rd16 = |o: usize| buf.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
     let rd32 = |o: usize| buf.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
@@ -663,7 +678,9 @@ fn pe_machine(exe: &Path) -> Result<u16, LaunchError> {
     if rd16(0) != Some(0x5a4d) || rd32(nt) != Some(0x4550) {
         return Err(not_pe());
     }
-    rd16(nt + 4).ok_or_else(|| LaunchError::Other("truncated PE header".into()))
+    let machine = rd16(nt + 4).ok_or_else(|| LaunchError::Other("truncated PE header".into()))?;
+    // Subsystem sits at the same offset in PE32 and PE32+ optional headers.
+    Ok((machine, rd16(nt + 24 + 68) == Some(3)))
 }
 
 /// `fs::canonicalize` returns `\\?\C:\…`; games don't expect that in argv[0].
@@ -687,6 +704,17 @@ fn quote(arg: &OsStr) -> OsString {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A console program's copies are started without a console window: it's told from
+    /// a windowed one by its header.
+    #[test]
+    fn a_console_game_is_told_from_a_windowed_one() {
+        let windir = env::var_os("WINDIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        assert_eq!(pe_machine(&windir.join(r"System32\cmd.exe")).unwrap(), (0x8664, true));
+        assert!(!pe_machine(&windir.join("explorer.exe")).unwrap().1, "a windowed program");
+        // PeerParty itself is a windowed one (main.rs), as this test binary is.
+        assert!(!pe_machine(&env::current_exe().unwrap()).unwrap().1);
+    }
 
     /// A session ends with its first player's exit code, unless another player's game
     /// crashed.

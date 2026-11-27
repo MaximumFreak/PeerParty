@@ -419,9 +419,19 @@ fn consider(m: Mod) {
         if crate::net::enabled() || crate::window::virtual_size().is_some() {
             crate::sys::exitlog::attach(&table.code);
         }
-        if crate::child::enabled() {
+        // A split-screen copy's console programs are started without a console window
+        // (child.rs `hidden_console`), whether or not they're followed.
+        let split = crate::window::wants_hooks();
+        if crate::child::enabled() || split {
             let n = crate::child::attach_kernelbase(&table.code);
-            log!("child: following the processes {} starts ({n})", m.full);
+            if crate::child::enabled() {
+                log!("child: following the processes {} starts ({n})", m.full);
+            } else {
+                log!("child: the processes {} starts are watched for console windows only (a split-screen copy) ({n})", m.full);
+            }
+        }
+        if split {
+            crate::child::note_own_console();
         }
     } else if m.name.eq_ignore_ascii_case("crypt32.dll") {
         // PeerParty's HTTPS server answers the services in `https::services()`: its

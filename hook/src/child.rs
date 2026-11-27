@@ -68,7 +68,69 @@ pub struct ProcessInformation {
 }
 
 const CREATE_SUSPENDED: u32 = 0x4;
+const DETACHED_PROCESS: u32 = 0x8;
+const CREATE_NEW_CONSOLE: u32 = 0x10;
 const CREATE_UNICODE_ENVIRONMENT: u32 = 0x400;
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// The flags a split-screen copy (`split`) starts a program with, when they change: a
+/// console program started from a process without a console (`has_console`) gets a new
+/// console window, in Windows Terminal on Windows 11, over the session's window, where it
+/// only hides the panes. CREATE_NO_WINDOW gives it its console without the window (and is
+/// ignored for a program that isn't a console one). A program that asked for a console of
+/// its own (CREATE_NEW_CONSOLE) or for none (DETACHED_PROCESS) is started as it asked, and
+/// one started from a process with a console shares that console, window or not.
+fn hidden_console(flags: u32, split: bool, has_console: bool) -> Option<u32> {
+    (split && !has_console && flags & (CREATE_NEW_CONSOLE | DETACHED_PROCESS | CREATE_NO_WINDOW) == 0).then_some(flags | CREATE_NO_WINDOW)
+}
+
+/// Whether this process has a console (shown or not).
+fn has_console() -> bool {
+    let mut pid = 0u32;
+    unsafe { windows_sys::Win32::System::Console::GetConsoleProcessList(&mut pid, 1) != 0 }
+}
+
+/// Whether the program `path` is a console one (its PE Subsystem is
+/// IMAGE_SUBSYSTEM_WINDOWS_CUI), when its file can be read.
+fn console_program(path: &str) -> Option<bool> {
+    use std::io::Read;
+    let mut head = Vec::with_capacity(1024);
+    std::fs::File::open(path.trim_matches('"')).ok()?.take(1024).read_to_end(&mut head).ok()?;
+    console_subsystem(&head)
+}
+
+/// Whether a PE file starting with `head` is a console program.
+fn console_subsystem(head: &[u8]) -> Option<bool> {
+    let rd16 = |o: usize| head.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    let nt = head.get(0x3c..0x40).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))? as usize;
+    if rd16(0)? != 0x5a4d || head.get(nt..nt.checked_add(4)?)? != b"PE\0\0" {
+        return None;
+    }
+    // Subsystem sits at the same offset in PE32 and PE32+ optional headers.
+    Some(rd16(nt.checked_add(24 + 68)?)? == 3)
+}
+
+/// What a child's log line adds when it was started without a console window.
+fn console_note(image: &str) -> &'static str {
+    match console_program(image) {
+        Some(true) => "; a console program: its console has no window (one would cover the split-screen session's window)",
+        Some(false) => "",
+        None => "; if it's a console program, its console has no window (one would cover the split-screen session's window)",
+    }
+}
+
+/// Says in a split-screen copy's log whether it's a console program, and so whether the
+/// launcher started it with its console's window hidden (launcher launch.rs).
+pub fn note_own_console() {
+    let Ok(exe) = std::env::current_exe() else { return };
+    if console_program(&exe.to_string_lossy()) == Some(true) {
+        log!(
+            "child: {} is a console program: {} (in split screen a console window would cover the session's window, and closing it would close the game)",
+            exe.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            if has_console() { "its console has no window (the launcher started it so)" } else { "it has no console" }
+        );
+    }
+}
 
 /// An environment block, as CreateProcess takes it.
 enum Block {
@@ -825,8 +887,12 @@ unsafe extern "system" fn create_hook(
     }
     let _leave = Leave;
     let image = image_of(app, cmd, dir);
+    let (flags, console) = match hidden_console(flags, crate::window::wants_hooks(), has_console()) {
+        Some(f) => (f, console_note(&image)),
+        None => (flags, ""),
+    };
     if let Err(why) = follow_verdict(&image) {
-        log!("child: {image} is left alone ({why})");
+        log!("child: {image} is left alone ({why}){console}");
         // A program left alone gets no PeerParty variables: they mean nothing to it, and
         // the room code and pipe name shouldn't travel on in a crash report's copy of its
         // environment. PeerParty's own program keeps them (its `--attach` needs them).
@@ -851,7 +917,7 @@ unsafe extern "system" fn create_hook(
     let event = (!is_helper() && crate::ipc::enabled()).then(|| make_follow_event(info.pid)).flatten();
     match inject(info, asked_suspended) {
         Ok(()) => {
-            log!("child: peerparty goes into {image} (pid {})", info.pid);
+            log!("child: peerparty goes into {image} (pid {}){console}", info.pid);
             if let Some(event) = event {
                 hand_over_when_claimed(event, info.process, info.pid, &image);
             }
@@ -869,7 +935,7 @@ unsafe extern "system" fn create_hook(
                     unsafe { windows_sys::Win32::Foundation::CloseHandle(g as _) };
                 }
             }
-            log!("child: {image} (pid {}) started without peerparty: {e} (flags {flags:#x}, token {token:#x})", info.pid)
+            log!("child: {image} (pid {}) started without peerparty: {e} (flags {flags:#x}, token {token:#x}){console}", info.pid)
         }
     }
     if !asked_suspended {
@@ -880,8 +946,41 @@ unsafe extern "system" fn create_hook(
 
 #[cfg(test)]
 mod tests {
-    use super::{filter_block, game_window_min, is_peerparty, program_of, is_unreal_starter_dir, norm_dir, norm_path, verdict};
+    use super::{console_program, console_subsystem, filter_block, game_window_min, hidden_console, is_peerparty, program_of, is_unreal_starter_dir, norm_dir, norm_path, verdict};
+    use super::{CREATE_NEW_CONSOLE, CREATE_NO_WINDOW, CREATE_SUSPENDED, DETACHED_PROCESS};
     use std::fs;
+
+    /// A split-screen copy without a console starts console programs without a window;
+    /// one that asked for a console of its own, or none, and one outside split screen
+    /// are started as they asked.
+    #[test]
+    fn a_split_screen_copys_consoles_have_no_window() {
+        assert_eq!(hidden_console(CREATE_SUSPENDED, true, false), Some(CREATE_SUSPENDED | CREATE_NO_WINDOW));
+        assert_eq!(hidden_console(0, false, false), None, "not split screen");
+        assert_eq!(hidden_console(0, true, true), None, "it shares this process's console");
+        assert_eq!(hidden_console(CREATE_NEW_CONSOLE, true, false), None);
+        assert_eq!(hidden_console(DETACHED_PROCESS, true, false), None);
+        assert_eq!(hidden_console(CREATE_NO_WINDOW, true, false), None, "already without one");
+    }
+
+    #[test]
+    fn console_programs_are_told_from_windowed_ones() {
+        // The test binary is a console program.
+        assert_eq!(console_program(&std::env::current_exe().unwrap().to_string_lossy()), Some(true));
+        let mut pe = vec![0u8; 0x200];
+        pe[..2].copy_from_slice(b"MZ");
+        pe[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        pe[0x80..0x84].copy_from_slice(b"PE\0\0");
+        pe[0x80 + 24 + 68..0x80 + 24 + 70].copy_from_slice(&2u16.to_le_bytes());
+        assert_eq!(console_subsystem(&pe), Some(false), "a windowed program");
+        pe[0x80 + 24 + 68] = 3;
+        assert_eq!(console_subsystem(&pe), Some(true));
+        assert_eq!(console_subsystem(&pe[..0x90]), None, "cut short");
+        assert_eq!(console_subsystem(b"not a program"), None);
+        pe[0x3c..0x40].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(console_subsystem(&pe), None, "a header pointing past the file");
+        assert_eq!(console_program(r"C:\no such folder\game.exe"), None);
+    }
 
     fn follows(image: &str, root: &str, sdk_seen: bool) -> bool {
         verdict(&norm_path(image), false, &[], norm_dir(root).as_deref(), sdk_seen).is_ok()
