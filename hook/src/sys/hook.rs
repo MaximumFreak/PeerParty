@@ -75,7 +75,9 @@ pub fn freeze(at: &[usize]) -> Option<Paused> {
     use windows_sys::Win32::System::Threading::*;
     let me = unsafe { GetCurrentThreadId() };
     let pid = unsafe { GetCurrentProcessId() };
-    // Collected before pausing anything (this allocates).
+    // Collected and freed before pausing anything (this allocates, and so does the free): a
+    // paused thread may hold the process heap lock, and with every other thread paused
+    // nothing would ever release it.
     let mut ids: Vec<u32> = Vec::with_capacity(256);
     let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
     if snap as isize != -1 {
@@ -97,6 +99,9 @@ pub fn freeze(at: &[usize]) -> Option<Paused> {
             threads.0.push((h, false));
         }
     }
+    drop(ids);
+    #[cfg(test)]
+    tests::before_pause(me);
     // A thread caught in those bytes runs on for a moment, then all are paused again.
     for _ in 0..100 {
         threads.suspend_all();
@@ -583,6 +588,71 @@ mod tests {
     use std::ffi::CString;
     use std::hint::black_box;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+
+    // State of `freeze_does_not_touch_the_heap_while_paused`. All atomics: the freezer
+    // must not allocate between the holder's HeapLock and HeapUnlock.
+    static SEAM_THREAD: AtomicU32 = AtomicU32::new(0);
+    static LOCK_NOW: AtomicBool = AtomicBool::new(false);
+    static LOCKED: AtomicBool = AtomicBool::new(false);
+    static RELEASE: AtomicBool = AtomicBool::new(false);
+    static DONE: AtomicBool = AtomicBool::new(false);
+    static TIMED_OUT: AtomicBool = AtomicBool::new(false);
+    static HOLDER_HANDLE: AtomicUsize = AtomicUsize::new(0);
+    static WATCHDOG_HANDLE: AtomicUsize = AtomicUsize::new(0);
+    static WATCHDOG_UP: AtomicBool = AtomicBool::new(false);
+    static SETUP_FAILED: AtomicBool = AtomicBool::new(false);
+
+    /// Called by `freeze` on thread `me` right before the first pause: the thread the
+    /// test named gets a watchdog (made now, so it is not in the snapshot and stays
+    /// running) and the holder takes the heap lock; the holder is then paused with it.
+    pub(super) fn before_pause(me: u32) {
+        use windows_sys::Win32::System::Threading::CreateThread;
+        if SEAM_THREAD.load(Ordering::Acquire) != me {
+            return;
+        }
+        let h = unsafe { CreateThread(std::ptr::null(), 0, Some(watchdog), std::ptr::null(), 0, std::ptr::null_mut()) };
+        WATCHDOG_HANDLE.store(h as usize, Ordering::Release);
+        // Nothing is paused yet, so the watchdog can't end these waits: they are bounded
+        // (a few seconds each, up to ~78 s at the default 15.6 ms timer resolution) and a failed set-up is reported by the test, never a hang.
+        let wait = |flag: &AtomicBool| {
+            for _ in 0..5000 {
+                if flag.load(Ordering::Acquire) {
+                    return;
+                }
+                unsafe { windows_sys::Win32::System::Threading::Sleep(1) };
+            }
+            SETUP_FAILED.store(true, Ordering::Release);
+        };
+        if h.is_null() {
+            SETUP_FAILED.store(true, Ordering::Release);
+            return;
+        }
+        // A thread's start-up allocates: wait for it before the heap is locked.
+        wait(&WATCHDOG_UP);
+        if SETUP_FAILED.load(Ordering::Acquire) {
+            return;
+        }
+        LOCK_NOW.store(true, Ordering::Release);
+        wait(&LOCKED);
+    }
+
+    /// Heap-free bound: if `freeze` is still blocked after 500 sleeps of 20 ms (~10 s, up to ~16 s at the default timer resolution), lets the paused holder
+    /// go so the test fails instead of hanging.
+    unsafe extern "system" fn watchdog(_: *mut std::ffi::c_void) -> u32 {
+        use windows_sys::Win32::System::Threading::{ResumeThread, Sleep};
+        WATCHDOG_UP.store(true, Ordering::Release);
+        for _ in 0..500 {
+            if DONE.load(Ordering::Acquire) {
+                return 0;
+            }
+            unsafe { Sleep(20) };
+        }
+        TIMED_OUT.store(true, Ordering::Release);
+        RELEASE.store(true, Ordering::Release);
+        unsafe { ResumeThread(HOLDER_HANDLE.load(Ordering::Acquire) as _) };
+        0
+    }
 
     #[test]
     fn calls_skip_takes_name_prefixes() {
@@ -902,5 +972,71 @@ mod tests {
             w.join().unwrap();
         }
         unsafe { VirtualFree(code.cast(), 0, MEM_RELEASE) };
+    }
+
+    /// A thread paused by `freeze` may hold the process heap lock, and nothing runs to
+    /// release it, so `freeze` must not allocate or free once it has paused anyone.
+    #[test]
+    fn freeze_does_not_touch_the_heap_while_paused() {
+        use std::os::windows::io::AsRawHandle;
+        use std::sync::atomic::AtomicBool;
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapLock, HeapUnlock};
+        use windows_sys::Win32::System::Threading::{GetCurrentThreadId, WaitForSingleObject};
+
+        static READY: AtomicBool = AtomicBool::new(false);
+        with_lock(|| {
+            LOCK_NOW.store(false, Ordering::Release);
+            LOCKED.store(false, Ordering::Release);
+            RELEASE.store(false, Ordering::Release);
+            DONE.store(false, Ordering::Release);
+            TIMED_OUT.store(false, Ordering::Release);
+            READY.store(false, Ordering::Release);
+            WATCHDOG_UP.store(false, Ordering::Release);
+            SETUP_FAILED.store(false, Ordering::Release);
+            let holder = std::thread::spawn(|| unsafe {
+                READY.store(true, Ordering::Release);
+                while !LOCK_NOW.load(Ordering::Acquire) {
+                    if DONE.load(Ordering::Acquire) {
+                        return;
+                    }
+                    std::thread::yield_now();
+                }
+                let heap = GetProcessHeap();
+                // Signalled even when the lock fails, so the seam never waits for ever.
+                let locked = HeapLock(heap) != 0;
+                SETUP_FAILED.fetch_or(!locked, Ordering::AcqRel);
+                LOCKED.store(true, Ordering::Release);
+                // Paused here by `freeze`; resumed once `frozen` has run its closure.
+                while !RELEASE.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                if locked {
+                    HeapUnlock(heap);
+                }
+            });
+            HOLDER_HANDLE.store(holder.as_raw_handle() as usize, Ordering::Release);
+            while !READY.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            SEAM_THREAD.store(unsafe { GetCurrentThreadId() }, Ordering::Release);
+
+            let got = frozen(0, || {
+                RELEASE.store(true, Ordering::Release);
+                42u32
+            });
+
+            SEAM_THREAD.store(0, Ordering::Release);
+            DONE.store(true, Ordering::Release);
+            let w = WATCHDOG_HANDLE.load(Ordering::Acquire) as windows_sys::Win32::Foundation::HANDLE;
+            if !w.is_null() {
+                unsafe { WaitForSingleObject(w, 5000) };
+                unsafe { CloseHandle(w) };
+            }
+            holder.join().unwrap();
+            assert!(!SETUP_FAILED.load(Ordering::Acquire), "test set-up failed (watchdog or HeapLock)");
+            assert!(!TIMED_OUT.load(Ordering::Acquire), "freeze blocked on the heap lock held by a paused thread");
+            assert_eq!(got, 42);
+        });
     }
 }
