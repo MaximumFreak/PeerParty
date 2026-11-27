@@ -1,21 +1,23 @@
 //! Lets a second copy of a game start on the same PC, for testing two players on one
 //! machine. With PEERPARTY_MULTI_INSTANCE set (the launcher's `--multi-instance`):
 //!
-//! - a named mutex that looks like a single-instance check gets this process's id
-//!   appended, so each copy owns its own: Unity's "Force Single Instance" one (its name
-//!   holds `SingleInstanceMutex`), and any other whose name says "instance" or holds
-//!   the game's program name (`MyGame_Running`). SDK and system ones (Steam's, Galaxy's,
-//!   EOS's, PeerParty's, GameInput's and the Game Bar's, `Global\` and session names of
-//!   Windows' own) are left alone: they are how a game talks to its store's client and
-//!   Windows' own services. A named event, semaphore or file mapping that looks like one
-//!   (a game that checks for itself by one of those instead) is renamed the same way.
+//! - a named mutex, event, semaphore or file mapping that looks like a single-instance
+//!   check gets this process's id appended, so each copy owns its own: Unity's "Force
+//!   Single Instance" one (`SingleInstanceMutex`), any whose name says "instance" or
+//!   "singleton" or holds the game's program name (`MyGame_Running`), and any named
+//!   mutex, event or semaphore created or opened directly by the game's own executable or
+//!   a DLL in its folder (whatever it's named — a codename, a GUID, an engine lock).
+//!   SDK, driver, browser-runtime and Windows objects (`NEVER` prefixes, names that
+//!   already embed this process's id, and calls from system/driver/SDK modules) are left
+//!   alone: they are how a game talks to its store's client, drivers, child processes and
+//!   Windows' own services.
 //! - FindWindow(Ex) doesn't find the other copy's windows (a game that looks for its own
 //!   window class at start-up and quits, or hands over to it, when one is there).
 //!
-//! A check that goes by some other name isn't caught by the rules above. So that a log
-//! shows which one it was, the start says whether another copy of the program is running,
-//! and a named object the game finds already there (created by another program, or
-//! opened) that isn't renamed is logged once by name.
+//! A check that still slips past (for example a file mapping with an unrelated name) is
+//! visible in the log: the start says whether another copy of the program is running, and
+//! any named object the game finds already there that isn't renamed is logged once by
+//! name.
 
 use std::collections::HashSet;
 use std::sync::{LazyLock, Mutex, OnceLock};
@@ -58,10 +60,25 @@ const MARKER: &str = "SingleInstanceMutex";
 /// Names of SDKs', Windows' and PeerParty's own objects, never renamed (lower case, as
 /// prefixes of the name after any `Global\` / `Local\`): a game's program name inside
 /// one (`game.exe` and `GameInput...`) doesn't make it a single-instance check.
-const NEVER: [&str; 13] = ["steam", "valve", "galaxy", "gog", "eos", "epic", "peerparty", "playfab", "msctf", "gameinput", "gamebar", "xbox", "xgame"];
+const NEVER: [&str; 14] = [
+    "steam",
+    "valve",
+    "galaxy",
+    "gog",
+    "eos",
+    "epic",
+    "peerparty",
+    "playfab",
+    "msctf",
+    "gameinput",
+    "gamebar",
+    "xbox",
+    "xgame",
+    "dbwinmutex",
+];
 
-/// Whether a mutex named `name` is a single-instance check of the game `stem` (its
-/// program's name, lower case).
+/// Whether a named object `name` looks like a single-instance check of the game `stem`
+/// (its program's name, lower case).
 fn single_instance(name: &str, stem: &str) -> bool {
     if name.contains(MARKER) {
         return true;
@@ -71,7 +88,7 @@ fn single_instance(name: &str, stem: &str) -> bool {
     }
     let lower = name.to_ascii_lowercase();
     let bare = lower.rsplit('\\').next().unwrap_or(&lower);
-    bare.contains("instance") || (stem.len() >= 4 && bare.contains(stem))
+    bare.contains("instance") || bare.contains("singleton") || (stem.len() >= 4 && bare.contains(stem))
 }
 
 /// Whether `name` is an SDK's, Windows' or PeerParty's object (`NEVER`): shared with
@@ -80,6 +97,144 @@ fn shared_on_purpose(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     let bare = lower.rsplit('\\').next().unwrap_or(&lower);
     NEVER.iter().any(|n| bare.starts_with(n))
+}
+
+/// Whether `name` already embeds `pid` as a standalone decimal token (e.g.
+/// `Local\SM0:7108:168:...` or `Crashpad_7108_Lock`): already per-process, so it cannot
+/// collide with another copy, and renaming it could break IPC with an unhooked child.
+fn contains_pid(name: &str, pid: u32) -> bool {
+    if pid < 100 {
+        return false;
+    }
+    let needle = pid.to_string();
+    let bytes = name.as_bytes();
+    let mut start = 0;
+    while let Some(off) = name[start..].find(&needle) {
+        let pos = start + off;
+        let end = pos + needle.len();
+        let before_ok = pos == 0 || !bytes[pos - 1].is_ascii_alphanumeric();
+        let after_ok = end == bytes.len() || !bytes[end].is_ascii_alphanumeric();
+        if before_ok && after_ok {
+            return true;
+        }
+        start = pos + 1;
+    }
+    false
+}
+
+/// What a module on the call stack is when deciding whether a named sync object came from
+/// the game itself: PeerParty, the kernel/CRT wrappers (`Passed`) are walked past to find
+/// the real caller; a module inside the game's directory (`Game`, excluding store SDKs
+/// and embedded browser runtimes) gets its named sync objects isolated per copy; any
+/// other module (Windows subsystems like d3d9/combase/winmm, graphics drivers, store
+/// clients) stops the walk and leaves the object shared.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Caller {
+    Passed,
+    Game,
+    Other,
+}
+
+static CALLERS: Mutex<Vec<(usize, Caller, String)>> = Mutex::new(Vec::new());
+
+/// Directories whose binaries belong to this game (lower case, ending with `\`).
+fn game_dirs() -> &'static Vec<String> {
+    static DIRS: OnceLock<Vec<String>> = OnceLock::new();
+    DIRS.get_or_init(|| {
+        let mut out = Vec::new();
+        let mut push = |p: &str| {
+            let mut s = p.replace('/', "\\").to_ascii_lowercase();
+            while s.ends_with('\\') {
+                s.pop();
+            }
+            if !s.is_empty() {
+                s.push('\\');
+                if !out.contains(&s) {
+                    out.push(s);
+                }
+            }
+        };
+        if let Some(root) = crate::config::HookConfig::global().game_root.as_deref() {
+            push(root);
+        }
+        if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_string_lossy().into_owned())) {
+            push(&dir);
+        }
+        out
+    })
+}
+
+/// Classifies a module by its full path (lower case) against the game's directories.
+fn classify_path(path: &str, dirs: &[String]) -> Caller {
+    let file = path.rsplit('\\').next().unwrap_or(path);
+    if matches!(file, "kernelbase.dll" | "kernel32.dll" | "ntdll.dll" | "ucrtbase.dll" | "ucrtbased.dll")
+        || file.starts_with("vcruntime")
+        || file.starts_with("msvcr")
+        || file.starts_with("msvcp")
+        || file.starts_with("api-ms-win-")
+    {
+        return Caller::Passed;
+    }
+    if dirs.iter().any(|d| path.starts_with(d.as_str())) {
+        // Store SDKs and embedded browser runtimes in the game folder share named objects
+        // with external clients or helper subprocesses on purpose.
+        if file.starts_with("steam_api")
+            || file.starts_with("steamclient")
+            || file.starts_with("eossdk")
+            || file.starts_with("galaxy")
+            || file.starts_with("playfab")
+            || file.starts_with("vivoxsdk")
+            || matches!(file, "libcef.dll" | "chromehtml.dll")
+        {
+            return Caller::Other;
+        }
+        return Caller::Game;
+    }
+    Caller::Other
+}
+
+fn caller_kind(m: usize) -> (Caller, String) {
+    if let Some((_, k, name)) = crate::sys::lock(&CALLERS).iter().find(|(b, _, _)| *b == m) {
+        return (*k, name.clone());
+    }
+    let mut buf = [0u16; 520];
+    let len = unsafe { windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW(m as _, buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    let path = String::from_utf16_lossy(&buf[..len]).to_ascii_lowercase();
+    let name = path.rsplit('\\').next().unwrap_or(&path).to_string();
+    let kind = classify_path(&path, game_dirs());
+    let mut c = crate::sys::lock(&CALLERS);
+    if c.len() < 256 {
+        c.push((m, kind, name.clone()));
+    }
+    (kind, name)
+}
+
+/// If the call came directly from one of the game's own modules (walking past PeerParty
+/// and kernel/CRT wrappers only), returns that module's filename.
+#[inline(never)]
+fn game_caller() -> Option<String> {
+    use windows_sys::Win32::System::LibraryLoader::{GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleHandleExW};
+    let mut frames = [std::ptr::null_mut(); 12];
+    let n = unsafe { windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace(1, frames.len() as u32, frames.as_mut_ptr(), std::ptr::null_mut()) } as usize;
+    let owner = |addr: usize| {
+        let mut m = std::ptr::null_mut();
+        let flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
+        (unsafe { GetModuleHandleExW(flags, addr as *const u16, &mut m) } != 0).then_some(m as usize)
+    };
+    let ours = owner(game_caller as *const () as usize);
+    for &f in &frames[..n.min(frames.len())] {
+        let Some(m) = owner(f as usize) else { return None };
+        if Some(m) == ours {
+            continue;
+        }
+        let (kind, name) = caller_kind(m);
+        match kind {
+            Caller::Passed => continue,
+            Caller::Game => return Some(name),
+            Caller::Other => return None,
+        }
+    }
+    None
 }
 
 /// This program's name without its extension, lower case.
@@ -132,19 +287,43 @@ where
     crate::sys::detour::arm(slot, target, detour, "instance", label)
 }
 
-/// The per-process name for a single-instance mutex, or None to leave `name` alone.
-fn rename(name: *const u16, api: &str) -> Option<Vec<u16>> {
+/// The per-process name for an isolated named object, or None to leave `name` alone.
+/// `by_caller` enables caller-origin isolation (for mutexes, events and semaphores):
+/// any named sync object created or opened directly by a game module is isolated per copy,
+/// even when its name doesn't match the heuristic (e.g. a GUID or engine codename).
+/// File mappings stay name-only so external tools (such as telemetry readers) still see them.
+fn rename(name: *const u16, api: &str, by_caller: bool) -> Option<Vec<u16>> {
     if name.is_null() {
         return None;
     }
     let text = read::wstr(name as usize)?;
     // CreateMutexW may reach CreateMutexExW internally; rename only once.
-    if !single_instance(&text, stem()) || text.contains("-peerparty-") {
+    if text.is_empty() || text.contains("-peerparty-") {
         return None;
     }
-    let renamed = format!("{text}-peerparty-{}", unsafe { GetCurrentProcessId() });
-    log!("instance {api} {text} -> {renamed}");
+    let pid = unsafe { GetCurrentProcessId() };
+    let reason = if single_instance(&text, stem()) {
+        "name".to_string()
+    } else if by_caller && !shared_on_purpose(&text) && !contains_pid(&text, pid) {
+        let caller = game_caller()?;
+        format!("caller {caller}")
+    } else {
+        return None;
+    };
+    let renamed = format!("{text}-peerparty-{pid}");
+    log_renamed(api, &text, &renamed, &reason);
     Some(renamed.encode_utf16().chain(Some(0)).collect())
+}
+
+fn log_renamed(api: &str, text: &str, renamed: &str, reason: &str) {
+    static SEEN: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
+    {
+        let mut seen = crate::sys::lock(&SEEN);
+        if seen.len() >= 64 || !seen.insert(text.to_string()) {
+            return;
+        }
+    }
+    log!("instance {api} {text} -> {renamed} ({reason})");
 }
 
 unsafe extern "system" fn detour_create(
@@ -153,7 +332,7 @@ unsafe extern "system" fn detour_create(
     name: *const u16,
 ) -> isize {
     let Some(hook) = CREATE.get() else { return 0 };
-    let renamed = rename(name, "CreateMutexW");
+    let renamed = rename(name, "CreateMutexW", true);
     let at = renamed.as_ref().map_or(name, |w| w.as_ptr());
     let h = unsafe { hook.call(attrs, owner, at) };
     found("CreateMutexW", name, renamed.is_some(), h, false);
@@ -169,7 +348,7 @@ unsafe extern "system" fn detour_create_ex(
     let Some(hook) = CREATE_EX.get() else {
         return 0;
     };
-    let renamed = rename(name, "CreateMutexExW");
+    let renamed = rename(name, "CreateMutexExW", true);
     let at = renamed.as_ref().map_or(name, |w| w.as_ptr());
     let h = unsafe { hook.call(attrs, at, flags, access) };
     found("CreateMutexExW", name, renamed.is_some(), h, false);
@@ -178,7 +357,7 @@ unsafe extern "system" fn detour_create_ex(
 
 unsafe extern "system" fn detour_open(access: u32, inherit: i32, name: *const u16) -> isize {
     let Some(hook) = OPEN.get() else { return 0 };
-    let renamed = rename(name, "OpenMutexW");
+    let renamed = rename(name, "OpenMutexW", true);
     let at = renamed.as_ref().map_or(name, |w| w.as_ptr());
     let h = unsafe { hook.call(access, inherit, at) };
     found("OpenMutexW", name, renamed.is_some(), h, true);
@@ -186,8 +365,8 @@ unsafe extern "system" fn detour_open(access: u32, inherit: i32, name: *const u1
 }
 
 /// `name`, renamed for this copy when it's a single-instance check's (`rename`).
-fn named(name: *const u16, api: &str) -> (Option<Vec<u16>>, *const u16) {
-    let renamed = rename(name, api);
+fn named(name: *const u16, api: &str, by_caller: bool) -> (Option<Vec<u16>>, *const u16) {
+    let renamed = rename(name, api, by_caller);
     let at = renamed.as_ref().map_or(name, |w| w.as_ptr());
     (renamed, at)
 }
@@ -282,7 +461,7 @@ fn same_program(pid: u32) -> bool {
 
 unsafe extern "system" fn detour_event(attrs: *const core::ffi::c_void, manual: i32, initial: i32, name: *const u16) -> isize {
     let Some(hook) = EVENT.get() else { return 0 };
-    let (keep, at) = named(name, "CreateEventW");
+    let (keep, at) = named(name, "CreateEventW", true);
     let h = unsafe { hook.call(attrs, manual, initial, at) };
     found("CreateEventW", name, keep.is_some(), h, false);
     h
@@ -290,7 +469,7 @@ unsafe extern "system" fn detour_event(attrs: *const core::ffi::c_void, manual: 
 
 unsafe extern "system" fn detour_event_ex(attrs: *const core::ffi::c_void, name: *const u16, flags: u32, access: u32) -> isize {
     let Some(hook) = EVENT_EX.get() else { return 0 };
-    let (keep, at) = named(name, "CreateEventExW");
+    let (keep, at) = named(name, "CreateEventExW", true);
     let h = unsafe { hook.call(attrs, at, flags, access) };
     found("CreateEventExW", name, keep.is_some(), h, false);
     h
@@ -298,7 +477,7 @@ unsafe extern "system" fn detour_event_ex(attrs: *const core::ffi::c_void, name:
 
 unsafe extern "system" fn detour_open_event(access: u32, inherit: i32, name: *const u16) -> isize {
     let Some(hook) = OPEN_EVENT.get() else { return 0 };
-    let (keep, at) = named(name, "OpenEventW");
+    let (keep, at) = named(name, "OpenEventW", true);
     let h = unsafe { hook.call(access, inherit, at) };
     found("OpenEventW", name, keep.is_some(), h, true);
     h
@@ -306,7 +485,7 @@ unsafe extern "system" fn detour_open_event(access: u32, inherit: i32, name: *co
 
 unsafe extern "system" fn detour_semaphore(attrs: *const core::ffi::c_void, initial: i32, max: i32, name: *const u16) -> isize {
     let Some(hook) = SEMAPHORE.get() else { return 0 };
-    let (keep, at) = named(name, "CreateSemaphoreW");
+    let (keep, at) = named(name, "CreateSemaphoreW", true);
     let h = unsafe { hook.call(attrs, initial, max, at) };
     found("CreateSemaphoreW", name, keep.is_some(), h, false);
     h
@@ -314,7 +493,7 @@ unsafe extern "system" fn detour_semaphore(attrs: *const core::ffi::c_void, init
 
 unsafe extern "system" fn detour_semaphore_ex(attrs: *const core::ffi::c_void, initial: i32, max: i32, name: *const u16, flags: u32, access: u32) -> isize {
     let Some(hook) = SEMAPHORE_EX.get() else { return 0 };
-    let (keep, at) = named(name, "CreateSemaphoreExW");
+    let (keep, at) = named(name, "CreateSemaphoreExW", true);
     let h = unsafe { hook.call(attrs, initial, max, at, flags, access) };
     found("CreateSemaphoreExW", name, keep.is_some(), h, false);
     h
@@ -322,7 +501,7 @@ unsafe extern "system" fn detour_semaphore_ex(attrs: *const core::ffi::c_void, i
 
 unsafe extern "system" fn detour_open_semaphore(access: u32, inherit: i32, name: *const u16) -> isize {
     let Some(hook) = OPEN_SEMAPHORE.get() else { return 0 };
-    let (keep, at) = named(name, "OpenSemaphoreW");
+    let (keep, at) = named(name, "OpenSemaphoreW", true);
     let h = unsafe { hook.call(access, inherit, at) };
     found("OpenSemaphoreW", name, keep.is_some(), h, true);
     h
@@ -330,7 +509,7 @@ unsafe extern "system" fn detour_open_semaphore(access: u32, inherit: i32, name:
 
 unsafe extern "system" fn detour_mapping(file: isize, attrs: *const core::ffi::c_void, protect: u32, high: u32, low: u32, name: *const u16) -> isize {
     let Some(hook) = MAPPING.get() else { return 0 };
-    let (keep, at) = named(name, "CreateFileMappingW");
+    let (keep, at) = named(name, "CreateFileMappingW", false);
     let h = unsafe { hook.call(file, attrs, protect, high, low, at) };
     found("CreateFileMappingW", name, keep.is_some(), h, false);
     h
@@ -338,7 +517,7 @@ unsafe extern "system" fn detour_mapping(file: isize, attrs: *const core::ffi::c
 
 unsafe extern "system" fn detour_open_mapping(access: u32, inherit: i32, name: *const u16) -> isize {
     let Some(hook) = OPEN_MAPPING.get() else { return 0 };
-    let (keep, at) = named(name, "OpenFileMappingW");
+    let (keep, at) = named(name, "OpenFileMappingW", false);
     let h = unsafe { hook.call(access, inherit, at) };
     found("OpenFileMappingW", name, keep.is_some(), h, true);
     h
@@ -451,25 +630,53 @@ mod tests {
     fn renames_only_single_instance_mutexes_once() {
         let pid = unsafe { GetCurrentProcessId() };
         let unity = wide("Some Studio-SingleInstanceMutex-SomeGameApp");
-        let got = rename(unity.as_ptr(), "test").expect("renamed");
+        let got = rename(unity.as_ptr(), "test", false).expect("renamed");
         let got = String::from_utf16(&got[..got.len() - 1]).unwrap();
         assert_eq!(
             got,
             format!("Some Studio-SingleInstanceMutex-SomeGameApp-peerparty-{pid}")
         );
-        assert!(rename(wide(&got).as_ptr(), "test").is_none());
-        assert!(rename(wide("Local\\SomethingElse").as_ptr(), "test").is_none());
+        assert!(rename(wide(&got).as_ptr(), "test", false).is_none());
+        assert!(rename(wide("Local\\SomethingElse").as_ptr(), "test", false).is_none());
         assert!(single_instance("Global\\SpaceGame_Instance", "launcher"));
+        assert!(single_instance("engine_singleton_mutex", "spacegame"));
         assert!(single_instance("SpaceGameRunning", "spacegame"));
         assert!(!single_instance("Steam3Master_SharedMemLock", "steam3master"), "a store's own");
         assert!(!single_instance("Global\\EOSOverlayInstance", "spacegame"));
+        assert!(!single_instance("DBWinMutex", "spacegame"));
         assert!(!single_instance("Local\\RenderLock", "spacegame"));
-        assert!(rename(std::ptr::null(), "test").is_none());
+        assert!(rename(std::ptr::null(), "test", true).is_none());
         // A program named `game` doesn't make Windows' GameInput or Game Bar objects its own.
         assert!(!single_instance("Local\\GameInputRedistSvcMutex", "game"));
         assert!(!single_instance("GameBarPresenceWriter", "game"));
         assert!(single_instance("Local\\GameLauncherRunning", "game"));
         assert!(!single_instance("Local\\peerparty-frame-7-0102", "frame"), "PeerParty's own mappings");
+    }
+
+    #[test]
+    fn pid_detection_skips_per_process_names_only() {
+        assert!(contains_pid("Local\\SM0:7108:168:WilStaging_02", 7108));
+        assert!(contains_pid("Crashpad_7108_Lock", 7108));
+        assert!(contains_pid("7108", 7108));
+        assert!(!contains_pid("Local\\SM0:11124:168:WilStaging_02", 7108));
+        assert!(!contains_pid("Global\\{52817108-3561-4705-820a-2b3b78be92ba}", 7108));
+        assert!(!contains_pid("engine_7108x_mutex", 7108));
+        assert!(!contains_pid("app_42_lock", 42));
+    }
+
+    #[test]
+    fn caller_classification_isolates_game_modules_only() {
+        let dirs = vec![r"c:\games\space game\".to_string()];
+        assert_eq!(classify_path(r"c:\games\space game\spacegame.exe", &dirs), Caller::Game);
+        assert_eq!(classify_path(r"c:\games\space game\bin\launcher.dll", &dirs), Caller::Game);
+        assert_eq!(classify_path(r"c:\windows\system32\kernelbase.dll", &dirs), Caller::Passed);
+        assert_eq!(classify_path(r"c:\windows\syswow64\kernel32.dll", &dirs), Caller::Passed);
+        assert_eq!(classify_path(r"c:\games\space game\vcruntime140.dll", &dirs), Caller::Passed);
+        assert_eq!(classify_path(r"c:\windows\system32\d3d9.dll", &dirs), Caller::Other);
+        assert_eq!(classify_path(r"c:\windows\system32\driverstore\filerepository\nv\nvd3dum.dll", &dirs), Caller::Other);
+        assert_eq!(classify_path(r"c:\games\space game\bin\steam_api.dll", &dirs), Caller::Other);
+        assert_eq!(classify_path(r"c:\games\space game\bin\libcef.dll", &dirs), Caller::Other);
+        assert_eq!(classify_path(r"c:\program files (x86)\steam\steamclient.dll", &dirs), Caller::Other);
     }
 
     #[test]
