@@ -322,6 +322,38 @@ fn keep_focus(hwnd: usize) {
         x.old = was as usize;
     }
     log!("window: the game's window (0x{hwnd:x}, {}) isn't told when it loses the focus (split screen: every copy keeps it)", if unicode { "Unicode" } else { "ANSI" });
+    tell_active_after_wrap(hwnd);
+}
+
+/// A window wrapped while it isn't in front may have lost the focus before the wrapper
+/// was there (the session's window takes the front as the copy starts, often after the
+/// session's own "you're active" went in), and an engine that keeps its own active flag
+/// from those messages (XNA's `Game.IsActive`, set only by `WM_ACTIVATEAPP`) then ignores
+/// its input for good. Told it's active once more: every loss from now on stops at the
+/// wrapper, so this is the last word.
+fn tell_active_after_wrap(hwnd: usize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    if !FOCUS_SPOOF.load(Ordering::Relaxed) {
+        return;
+    }
+    let front = GET_FOREGROUND.get().map_or_else(|| unsafe { GetForegroundWindow() } as isize, |h| unsafe { h.call() }) as usize;
+    let Some(posted) = post_active_unless_front(hwnd, front) else { return };
+    log!(
+        "window: the game's window 0x{hwnd:x} isn't in front as it's wrapped (0x{front:x} is): {} (a focus loss before the wrapper may have reached it)",
+        if posted { "told it's active again" } else { "telling it it's active failed" }
+    );
+}
+
+/// Posts window `hwnd` the gain of the focus (what the session's window posts a pane it
+/// activates) unless it's the window in front (`front`). None when it is; else whether
+/// every message went.
+fn post_active_unless_front(hwnd: usize, front: usize) -> Option<bool> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
+    if front == hwnd {
+        return None;
+    }
+    let h = hwnd as HWND;
+    Some(unsafe { PostMessageW(h, WM_ACTIVATEAPP, 1, 0) != 0 && PostMessageW(h, WM_ACTIVATE, 1, 0) != 0 && PostMessageW(h, WM_SETFOCUS, 0, 0) != 0 })
 }
 
 #[cfg(target_pointer_width = "64")]
@@ -513,6 +545,11 @@ unsafe extern "system" fn focus_proc(h: HWND, m: u32, w: usize, l: isize) -> isi
         // Release PeerParty's swap chain COM refs before the game's destroy handler tears
         // down its graphics device.
         crate::video::window_destroyed(h as usize);
+    }
+    if spoof && m == WM_ACTIVATEAPP && w != 0 {
+        crate::log::throttled("window: activateapp", 1, |_| {
+            log!("window: the game's window 0x{:x} is told it's the active program (WM_ACTIVATEAPP)", h as usize);
+        });
     }
     let _focus_gain = (spoof && ((m == WM_ACTIVATE && (w & 0xffff) != 0) || m == WM_SETFOCUS)).then(crate::input::suppress_focus_click_buttons);
     let rc = call(m, w, l);
@@ -1910,6 +1947,32 @@ mod tests {
 
     fn send_test(h: HWND) {
         unsafe { windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(h, TEST_MSG, 7, 9) };
+    }
+
+    /// A window wrapped behind another is posted the focus gain, in the order the session
+    /// posts it; the window in front isn't.
+    #[test]
+    fn a_window_wrapped_behind_another_is_told_it_is_active() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, PM_REMOVE, PeekMessageW};
+        let h = class_window();
+        let mut posted = Vec::new();
+        let drain = |posted: &mut Vec<(u32, usize)>| {
+            let mut msg: MSG = unsafe { std::mem::zeroed() };
+            while unsafe { PeekMessageW(&mut msg, h, 0, 0, PM_REMOVE) } != 0 {
+                if matches!(msg.message, WM_ACTIVATEAPP | WM_ACTIVATE | WM_SETFOCUS) {
+                    posted.push((msg.message, msg.wParam));
+                }
+            }
+        };
+        drain(&mut posted);
+        posted.clear();
+        assert_eq!(post_active_unless_front(h as usize, h as usize), None, "the window in front has the focus already");
+        drain(&mut posted);
+        assert!(posted.is_empty());
+        assert_eq!(post_active_unless_front(h as usize, 0), Some(true));
+        drain(&mut posted);
+        assert_eq!(posted, [(WM_ACTIVATEAPP, 1), (WM_ACTIVATE, 1), (WM_SETFOCUS, 0)]);
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(h) };
     }
 
     /// The game reading its wrapped window's procedure gets its own class procedure, so a
