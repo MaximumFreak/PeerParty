@@ -191,7 +191,11 @@ unsafe extern "system" fn create_instance(this: usize, outer: usize, iid: *const
         if vcall!(made, 0, fn(*const Guid, *mut usize) -> i32, &IID_MM_ENUMERATOR, &mut e) >= 0 && e != 0 {
             let n = hook_enumerator(e);
             release(e);
-            log!("input: sound devices: the game's first enumerator: {n} of its calls hooked (other players' controllers' sound devices are left out)");
+            // Two threads making their first enumerators at once both get here: the
+            // second finds its calls hooked already, and says nothing.
+            if n > 0 {
+                log!("input: sound devices: the game's first enumerator: {n} of its calls hooked (other players' controllers' sound devices are left out)");
+            }
         }
     }
     hr
