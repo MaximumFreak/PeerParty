@@ -439,9 +439,7 @@ fn first_use(st: &State, zone: Zone, rel: &str, full: &str) {
     if !crate::sys::lock(&SEEDED).insert(key) {
         return;
     }
-    let norm = layout::normalize(full);
-    // The real root: the path the game gave, up to the seed root's end.
-    let real_root = norm.len().checked_sub(rel.len()).map(|at| format!("{}{}", &norm[..at], seed));
+    let real_root = real_root(&layout::normalize(full), rel, &seed);
     let mine = layout::sandbox_path(&st.fs, zone, &seed);
     if mine.exists() {
         log!("saves: player {}: {} is its own already ({})", st.slot + 1, real_root.as_deref().unwrap_or(&seed), mine.display());
@@ -472,6 +470,15 @@ fn first_use(st: &State, zone: Zone, rel: &str, full: &str) {
         Ok(n) => log!("saves: player {}: {real_root} starts as a copy of player 1's ({n} files copied to {})", st.slot + 1, mine.display()),
         Err(e) => log!("saves: player {}: copying player 1's {real_root} failed ({e}); it starts empty", st.slot + 1),
     }
+}
+
+/// The real seed root: the path the game gave (`norm`, normalized), up to the end of
+/// `seed`, `rel`'s first folders. `rel` comes without trailing backslashes (`classify`)
+/// and the game's path may have them (a folder named as `...\Game\`): cut where `rel`
+/// starts without them, or the cut lands that many characters late (`...\Local\GGame`).
+fn real_root(norm: &str, rel: &str, seed: &str) -> Option<String> {
+    let at = norm.trim_end_matches('\\').len().checked_sub(rel.len())?;
+    Some(format!("{}{seed}", norm.get(..at)?))
 }
 
 /// An older PeerParty's twin of `real` for `slot`: `<real>.peerparty-<N>`.
@@ -580,6 +587,21 @@ pub fn listing_gap(path: &str) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A folder the game names with a trailing backslash has the same real root as one
+    /// named without: player 1's saves are copied from where they are.
+    #[test]
+    fn a_seed_root_named_with_a_trailing_backslash_is_found() {
+        let (rel, seed) = ("Some Game", "Some Game");
+        assert_eq!(real_root(r"C:\Users\p\AppData\Local\Some Game", rel, seed).as_deref(), Some(r"C:\Users\p\AppData\Local\Some Game"));
+        assert_eq!(real_root(r"C:\Users\p\AppData\Local\Some Game\", rel, seed).as_deref(), Some(r"C:\Users\p\AppData\Local\Some Game"));
+        assert_eq!(real_root(r"C:\Users\p\AppData\Local\Some Game\\", rel, seed).as_deref(), Some(r"C:\Users\p\AppData\Local\Some Game"));
+        assert_eq!(
+            real_root(r"C:\Users\p\AppData\Local\Some Game\Saves\slot1.sav", r"Some Game\Saves\slot1.sav", seed).as_deref(),
+            Some(r"C:\Users\p\AppData\Local\Some Game")
+        );
+        assert_eq!(real_root("short", "a longer rel", seed), None);
+    }
 
     /// A later player's state over folders of a test's own.
     pub fn test_state(base: &Path, slot: u32, seed: bool) -> State {
