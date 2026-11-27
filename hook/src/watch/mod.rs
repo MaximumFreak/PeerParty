@@ -71,6 +71,12 @@ pub fn init(module: *mut core::ffi::c_void) {
             dll.display(),
             path.display()
         );
+        if let Ok(cwd) = std::env::current_dir() {
+            let exe_dir = exe.parent().unwrap_or(Path::new(""));
+            if !cwd.as_os_str().eq_ignore_ascii_case(exe_dir.as_os_str()) {
+                log!("cwd: {}", cwd.display());
+            }
+        }
         // Where the stand-ins keep this game's saves: a portable PeerParty's are beside
         // peerparty.exe (PEERPARTY_DATA_DIR), not in the usual folder.
         let named = std::env::var_os(peerparty_protocol::env::DATA_DIR).is_some_and(|d| Path::new(&d).is_absolute());

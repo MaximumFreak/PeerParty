@@ -506,7 +506,7 @@ fn watch(st: &State, path: &str) {
         Discovered::Files { zone, rel: rel.clone(), real: norm }
     } else {
         let Some(seed) = layout::seed_root(zone, &rel) else { return };
-        let real = norm.len().checked_sub(rel.len()).map(|at| format!("{}{}", &norm[..at], seed)).unwrap_or_default();
+        let real = real_root(&norm, &rel, &seed).unwrap_or_default();
         Discovered::Files { zone, rel: seed, real }
     };
     note(st, line);
@@ -776,10 +776,14 @@ pub(crate) mod tests {
         let p = real.join("save.dat").to_string_lossy().into_owned();
         assert_eq!(route(&p, Intent::Read), Route::Same);
         assert_eq!(route(&p, Intent::Create), Route::Same);
+        // Trailing backslash on a directory create must not shift the cut past the zone root.
+        let dir_slash = format!("{}\\", real.display());
+        assert_eq!(route(&dir_slash, Intent::Create), Route::Same);
         assert_eq!(route(&b.join(r"real\Games\Test Game\Saves\a.sav").to_string_lossy(), Intent::Create), Route::Same);
         let text = std::fs::read_to_string(b.join(r"data\saves\test-game-00000000\player-1\discovered.txt")).unwrap();
         let seen = Discovered::parse_all(&text);
         assert!(seen.contains(&Discovered::Files { zone: Zone::LocalLow, rel: r"Co\Game".into(), real: real.to_string_lossy().into_owned() }), "{text}");
+        assert_eq!(seen.iter().filter(|d| matches!(d, Discovered::Files { zone: Zone::LocalLow, .. })).count(), 1, "{text}");
         assert!(seen.iter().any(|d| matches!(d, Discovered::Files { zone: Zone::GameDir, rel, .. } if rel == r"Saves\a.sav")), "{text}");
         // A later player doesn't read through to player 1's noted game-folder saves.
         install(test_state(&b, 1, false));

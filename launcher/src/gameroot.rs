@@ -18,8 +18,8 @@
 use std::path::{Component, Path, PathBuf};
 
 /// Folder names a game's program sits in below the game's own folder.
-const BUILD_DIRS: [&str; 17] = [
-    "bin", "bin32", "bin64", "binaries", "win32", "win64", "x64", "x86", "x86_64", "game", "content", "wingdk", "shipping", "release", "retail", "windows", "windowsnoeditor",
+const BUILD_DIRS: [&str; 18] = [
+    "bin", "bin32", "bin64", "binaries", "win32", "win64", "x64", "x86", "x86_64", "compat", "game", "content", "wingdk", "shipping", "release", "retail", "windows", "windowsnoeditor",
 ];
 
 fn lower(p: &Path) -> String {

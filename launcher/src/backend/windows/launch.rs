@@ -103,11 +103,17 @@ pub fn start(t: Target, env: ChildEnv, pipe: Option<host::pipe::Pipe>, prefs: Pr
         cmdline.push(" ");
         cmdline.push(quote(a));
     }
-    let cwd = t.cwd.as_deref().or(exe.parent()).unwrap_or(Path::new("."));
+    let inherited = env::current_dir().ok().map(|p| strip_verbatim(&p));
+    let (cwd, cwd_why) = working_dir(&exe, t.cwd.as_deref(), root, inherited.as_deref());
+    if let Some(why) = cwd_why {
+        if !same_path(&cwd, exe.parent().unwrap_or(Path::new("."))) {
+            eprintln!("peerparty: working folder is {} ({why})", cwd.display());
+        }
+    }
 
     let tree = tree::Tree::new(root);
 
-    let pi = unsafe { start_injected(&exe, &cmdline, cwd, &env, &dll, x86, false, tree.as_ref(), None)? };
+    let pi = unsafe { start_injected(&exe, &cmdline, &cwd, &env, &dll, x86, false, tree.as_ref(), None)? };
     launch::remember(&t.listed);
     eprintln!(
         "peerparty: started {} (pid {}, {}), logs in {}",
@@ -179,7 +185,13 @@ pub fn start_session(t: Target, base_env: ChildEnv, split: &SplitScreen, prefs: 
         cmdline.push(" ");
         cmdline.push(quote(a));
     }
-    let cwd = t.cwd.as_deref().or(exe.parent()).unwrap_or(Path::new("."));
+    let inherited = env::current_dir().ok().map(|p| strip_verbatim(&p));
+    let (cwd, cwd_why) = working_dir(&exe, t.cwd.as_deref(), root, inherited.as_deref());
+    if let Some(why) = cwd_why {
+        if !same_path(&cwd, exe.parent().unwrap_or(Path::new("."))) {
+            eprintln!("peerparty: working folder is {} ({why})", cwd.display());
+        }
+    }
     let stamp = {
         let [y, mo, d, h, mi, s] = crate::platform::local_time();
         format!("{y:04}{mo:02}{d:02}-{h:02}{mi:02}{s:02}")
@@ -692,6 +704,66 @@ fn strip_verbatim(p: &Path) -> PathBuf {
     }
 }
 
+fn norm_path(p: &Path) -> String {
+    let s = strip_verbatim(p).to_string_lossy().replace('/', "\\");
+    let trimmed = s.trim_end_matches('\\');
+    if trimmed.len() == 2 && trimmed.ends_with(':') {
+        format!("{trimmed}\\").to_ascii_lowercase()
+    } else {
+        trimmed.to_ascii_lowercase()
+    }
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    norm_path(a) == norm_path(b)
+}
+
+fn under_or_eq(dir: &Path, root: &Path) -> bool {
+    let (d, r) = (norm_path(dir), norm_path(root));
+    d == r || d.starts_with(&if r.ends_with('\\') { r } else { format!("{r}\\") })
+}
+
+/// The working folder the game starts in, and why when it isn't the program's own folder:
+/// 1. A wrapper script's explicit `cd` / `start /d`.
+/// 2. The caller's working folder when it is already inside the game's install folder
+///    (Steam launch options and store launchers set it to the game's root or configured
+///    working directory), unless it is just the program's own folder.
+/// 3. An ancestor folder (up to `root`) that holds an executable with the same filename:
+///    games that ship an x64 or compatibility build in a subfolder beside a root binary
+///    resolve their relative data folders from that ancestor.
+/// 4. Otherwise, the program's own folder.
+fn working_dir(exe: &Path, explicit: Option<&Path>, root: Option<&Path>, inherited: Option<&Path>) -> (PathBuf, Option<&'static str>) {
+    if let Some(d) = explicit {
+        return (d.to_path_buf(), Some("from the wrapper script"));
+    }
+    let exe_dir = exe.parent().unwrap_or(Path::new("."));
+    if let Some(root) = root {
+        if let Some(cur) = inherited {
+            if under_or_eq(cur, root) && !same_path(cur, exe_dir) && cur.is_dir() {
+                return (cur.to_path_buf(), Some("kept from the caller, inside the game's folder"));
+            }
+        }
+        if let Some(name) = exe.file_name() {
+            if under_or_eq(exe_dir, root) && !same_path(exe_dir, root) {
+                let mut cur = exe_dir.parent();
+                while let Some(anc) = cur {
+                    if !under_or_eq(anc, root) {
+                        break;
+                    }
+                    if anc.join(name).is_file() {
+                        return (anc.to_path_buf(), Some("same-named program sits in that folder; this build shares its data"));
+                    }
+                    if same_path(anc, root) {
+                        break;
+                    }
+                    cur = anc.parent();
+                }
+            }
+        }
+    }
+    (exe_dir.to_path_buf(), None)
+}
+
 /// Quotes one argument by the MSVC CRT rules (CommandLineToArgvW).
 fn quote(arg: &OsStr) -> OsString {
     let s = arg.to_string_lossy();
@@ -741,5 +813,40 @@ mod tests {
         assert_eq!(unity_log_for(&exe, &["-logFile".into(), "x.log".into()], logs, "s", 1), None);
         assert_eq!(unity_log_for(&dir.join("Other.exe"), &[], logs, "s", 1), None);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn working_dir_handles_wrapper_caller_and_subdir_builds() {
+        let base = env::temp_dir().join(format!("peerparty-cwd-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let root = base.join("Some Game");
+        let sub = root.join("compat");
+        let x64 = root.join("x64");
+        let bin = root.join("bin");
+        let outside = base.join("Launcher");
+        for d in [&sub, &x64, &bin, &outside] {
+            fs::create_dir_all(d).unwrap();
+        }
+        let root_exe = root.join("SomeGame.exe");
+        let sub_exe = sub.join("SomeGame.exe");
+        let x64_exe = x64.join("SomeGame.exe");
+        let bin_exe = bin.join("DifferentName.exe");
+        for f in [&root_exe, &sub_exe, &x64_exe, &bin_exe] {
+            fs::write(f, b"MZ").unwrap();
+        }
+
+        // Subdir build with same-named exe in root -> uses root even from an unrelated cwd or subdir cwd.
+        assert_eq!(working_dir(&sub_exe, None, Some(&root), Some(&outside)).0, root);
+        assert_eq!(working_dir(&sub_exe, None, Some(&root), Some(&sub)).0, root);
+        assert_eq!(working_dir(&x64_exe, None, Some(&root), None).0, root);
+
+        // Subdir exe without a same-named ancestor stays in its own folder unless caller set cwd inside root.
+        assert_eq!(working_dir(&bin_exe, None, Some(&root), Some(&outside)).0, bin);
+        assert_eq!(working_dir(&bin_exe, None, Some(&root), Some(&root)).0, root);
+
+        // Wrapper script's explicit cwd always wins.
+        assert_eq!(working_dir(&sub_exe, Some(&sub), Some(&root), Some(&root)).0, sub);
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

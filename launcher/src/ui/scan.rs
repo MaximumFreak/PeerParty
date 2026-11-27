@@ -226,7 +226,7 @@ pub fn loose(exe: &Path, source: Source) -> Game {
     let stem = exe.file_stem().unwrap_or_default().to_string_lossy().to_string();
     let folder = dir.file_name().map(|f| f.to_string_lossy().to_string());
     let name = match folder {
-        Some(f) if !f.eq_ignore_ascii_case("bin") && !f.eq_ignore_ascii_case("win64") && !f.eq_ignore_ascii_case("x64") => {
+        Some(f) if !f.eq_ignore_ascii_case("bin") && !f.eq_ignore_ascii_case("win64") && !f.eq_ignore_ascii_case("x64") && !f.eq_ignore_ascii_case("compat") => {
             clean_name(&f)
         }
         _ => stem,
