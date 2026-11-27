@@ -55,6 +55,7 @@ mod instance;
 mod layout_studio;
 mod overlay_render;
 pub(crate) mod pad;
+pub(crate) mod wgi_pads;
 pub mod pipe;
 mod prefs_sync;
 pub(crate) mod raster;
@@ -120,9 +121,14 @@ const HOTKEY_NAMES: [&str; 4] = ["Shift+Tab", "Shift+F3", "Shift+F1", "Shift+F2"
 /// `foreign` names), and its name for a player.
 const HOTKEY_OWNERS: [(&str, &str); 4] = [("steam", "Steam"), ("epic", "Epic"), ("ea", "EA"), ("ubisoft", "Ubisoft")];
 /// A split-screen session's keys, with Ctrl+Alt held while its window or a copy is in
-/// front: L the next layout, Z the focused copy on the whole window, 1 to 4 (the number
+/// front: L the next layout, Z the focused copy on the whole window, 1 to 9 (the number
 /// row's, then the number pad's) the focus to that copy, E the live Layout Studio.
-const SESSION_KEYS: [i32; 11] = [0x4C, 0x5A, 0x31, 0x32, 0x33, 0x34, 0x61, 0x62, 0x63, 0x64, 0x45];
+const SESSION_KEYS: [i32; 21] = [
+    0x4C, 0x5A,
+    0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39,
+    0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
+    0x45,
+];
 
 /// Smart ready-gate launch staggering timings: wait for the previous copy to create its
 /// window (plus a brief settle) or render its first frame, with a safety timeout.
@@ -183,18 +189,22 @@ pub fn close_session() {
 }
 
 /// Keys and mouse buttons pressed in a player's pane, with no controller of theirs, that
-/// make them a keyboard player (`SessionHost::watch_keyboard`): more than a click that
-/// focuses the pane or a hotkey.
+/// make them a keyboard player (`SessionHost::watch_keyboard`): 2 non-modifier keyboard
+/// keys or 4 combined key/mouse presses (more than a single click focusing the pane).
 const KBM_PLAYER_PRESSES: u64 = 4;
+const KBM_PLAYER_KEY_PRESSES: u64 = 2;
 
 /// Where the keyboard's presses were counted (`SessionHost::watch_keyboard`).
 #[derive(Default)]
 struct KbmSeen {
     /// `InputHub::kbm_presses` at the last tick.
     last: u64,
+    /// `InputHub::kbm_key_presses` at the last tick.
+    last_keys: u64,
     /// The pane they were counted for, and how many.
     pane: usize,
     count: u64,
+    key_count: u64,
 }
 
 /// One copy's overlay: its pages and notifications, whether it's open, and how it's
@@ -665,16 +675,17 @@ impl SessionHost {
         }
     }
 
-    /// Between ticks: forward queued mouse/key messages first (so `cursor_screen` is up
-    /// to date and clicks/moves never lag), publish keyboards and mice to SHM, and apply
-    /// any instant cursor shape/visibility/confinement update signalled via `WM_APP_CURSOR`.
+    /// Between ticks: forward queued mouse/key messages first (so a pane-switching click
+    /// updates focus and `cursor_screen` is up to date), publish keyboards and mice to
+    /// SHM, and apply any instant cursor shape/visibility/confinement update signalled
+    /// via `WM_APP_CURSOR`.
     fn kbm_tick(&mut self) {
         self.forward_queued_input();
         let front = self.in_front();
-        let focus = self.input.kbm_focus();
+        let focus = self.compositor.as_ref().map(|_| self.focus).filter(|_| front && !self.kbm_off && !self.layout_studio.active && !self.panes[self.focus].visible);
         let focus_cursor = focus.and_then(|f| self.compositor.as_ref().and_then(|c| c.cursor_screen(f)));
         let focus_pane = self.focus_pane_projection(focus, front);
-        self.input.publish_kbm(&mut self.instances, focus_cursor, focus_pane);
+        self.input.publish_kbm(&mut self.instances, focus, focus_cursor, focus_pane);
         if self.compositor.as_ref().is_some_and(|c| c.take_cursor_dirty()) {
             self.update_pointer(front);
         }
@@ -799,19 +810,30 @@ impl SessionHost {
 
     /// The PC's keyboard and mouse go to copy `i` (and its overlay) from now on.
     fn set_focus(&mut self, i: usize) {
+        self.set_focus_inner(i, true);
+    }
+
+    fn set_focus_inner(&mut self, i: usize, activate: bool) {
         if i >= self.instances.len() || i == self.focus {
             return;
         }
+        let prev = self.focus;
         self.focus = i;
         if let Some(exe) = crate::platform::process_exe(self.instances[i].pid) {
             self.firewall.set_exe(exe);
         }
         if let Some(c) = self.compositor.as_mut() {
             c.focus_pane(i);
-            c.activate_pane(i, &self.instances);
+            if activate {
+                c.activate_pane(i, &self.instances);
+            }
         }
         self.pointer_to_focus = true;
         self.update_capture();
+        if self.instances.len() > 1 {
+            let text = format!("session: keyboard and mouse focus moved from player {} to player {}", prev + 1, i + 1);
+            self.instances[i].send(&HostMsg::Note { text });
+        }
     }
 
     /// The keyboard and mouse are taken from the games while the focused copy's overlay
@@ -1134,8 +1156,10 @@ impl SessionHost {
                 }
                 self.instances.push(conn);
                 self.panes.push(PaneOverlay::new(self.game_title.clone()));
+                let seat_idx = self.inputs.len();
                 self.inputs.push(input);
                 self.kbm_player.push(false);
+                self.input.pads().set_seat_config(seat_idx, input.pin(), input.is_controller());
                 if input == SlotInput::KeyboardMouse {
                     self.kbm_off = false;
                 }
@@ -1249,12 +1273,19 @@ impl SessionHost {
         self.inputs = inputs;
         self.inputs.resize(self.instances.len(), SlotInput::Auto);
         let has_kbm = self.inputs.contains(&SlotInput::KeyboardMouse);
+        let pins: Vec<Option<pad::DevicePin>> = self.inputs.iter().map(|i| i.pin()).collect();
+        let explicit: Vec<bool> = self.inputs.iter().map(|i| i.is_controller()).collect();
+        let pads = self.input.pads();
+        pads.set_pins(pins);
+        pads.set_explicit_pads(explicit);
         for k in 0..self.instances.len() {
             let what = match self.inputs[k] {
-                SlotInput::Auto => "a controller (the first one used that no other player has), and the keyboard and mouse while their pane has the focus",
-                SlotInput::KeyboardMouse => "the keyboard and mouse, never a controller",
-                SlotInput::Controller if has_kbm => "a controller (clicking their pane won't pull the keyboard and mouse onto it; Ctrl+Alt+1-4 still can)",
-                SlotInput::Controller => "a controller; the keyboard and mouse only while their pane has the focus",
+                SlotInput::Auto => "a controller (the first one used that no other player has), and the keyboard and mouse while their pane has the focus".to_string(),
+                SlotInput::KeyboardMouse => "the keyboard and mouse, never a controller".to_string(),
+                SlotInput::Controller if has_kbm => "a controller (clicking their pane won't pull the keyboard and mouse onto it; Ctrl+Alt+1-9 still can)".to_string(),
+                SlotInput::Controller => "a controller; the keyboard and mouse only while their pane has the focus".to_string(),
+                SlotInput::Device(pin) if has_kbm => format!("pinned device {} (clicking their pane won't pull the keyboard and mouse onto it; Ctrl+Alt+1-9 still can)", pin.to_token()),
+                SlotInput::Device(pin) => format!("pinned device {}; the keyboard and mouse only while their pane has the focus", pin.to_token()),
             };
             self.instances[k].send(&HostMsg::Note { text: format!("input: player {} plays with {what}", k + 1) });
         }
@@ -1266,9 +1297,9 @@ impl SessionHost {
 
     /// Whether a mouse click on pane `i` may switch keyboard-and-mouse focus to it.
     /// When a player explicitly chose keyboard and mouse, clicking an explicit
-    /// controller player's pane won't steal focus onto it (Ctrl+Alt+1-4 still can).
+    /// controller player's pane won't steal focus onto it (Ctrl+Alt+1-9 still can).
     fn click_can_focus(&self, i: usize) -> bool {
-        !(self.inputs.contains(&SlotInput::KeyboardMouse) && self.inputs.get(i) == Some(&SlotInput::Controller))
+        !(self.inputs.contains(&SlotInput::KeyboardMouse) && self.inputs.get(i).is_some_and(|s| s.is_controller()))
     }
 
     /// Whether a split-screen session's seat `k` may take a controller now (`Pads::set_open`);
@@ -1280,7 +1311,7 @@ impl SessionHost {
         let open = (0..self.instances.len()).map(|k| match self.inputs.get(k).copied().unwrap_or_default() {
             _ if self.instances[k].gone => pad::Open::No,
             SlotInput::KeyboardMouse => pad::Open::No,
-            SlotInput::Controller => pad::Open::Yes,
+            SlotInput::Controller | SlotInput::Device(_) => pad::Open::Yes,
             SlotInput::Auto if self.kbm_player.get(k) == Some(&true) => pad::Open::Later,
             SlotInput::Auto => pad::Open::Yes,
         });
@@ -1322,6 +1353,8 @@ impl SessionHost {
     /// A split-screen session: a player with no controller yet who presses keys and
     /// mouse buttons in their pane (while it has the focus) plays with the keyboard and
     /// mouse, so a controller used next goes to another player first (`seat_open`).
+    /// Clicks or keypresses aimed at a Win32 startup dialog (e.g. safe-mode / optimal
+    /// settings prompts) are ignored so dismissing a prompt never claims keyboard play.
     fn watch_keyboard(&mut self, front: bool) {
         if self.compositor.is_none() || self.instances.len() <= 1 {
             return;
@@ -1329,23 +1362,40 @@ impl SessionHost {
         let presses = self.input.kbm_presses();
         let new = presses.saturating_sub(self.kbm_seen.last);
         self.kbm_seen.last = presses;
+        let key_presses = self.input.kbm_key_presses();
+        let new_keys = key_presses.saturating_sub(self.kbm_seen.last_keys);
+        self.kbm_seen.last_keys = key_presses;
         let f = self.focus;
-        if new == 0 || !front || self.kbm_off || self.layout_studio.active || self.any_open() || self.kbm_player.get(f) != Some(&false) || self.inputs.get(f) != Some(&SlotInput::Auto) {
+        let fg = desktop::foreground();
+        let comp_front = self.compositor.as_ref().is_none_or(|c| c.hwnd() == 0 || desktop::in_front(std::process::id()));
+        if (new == 0 && new_keys == 0)
+            || !front
+            || fg.dialog
+            || !comp_front
+            || self.kbm_off
+            || self.layout_studio.active
+            || self.any_open()
+            || self.kbm_player.get(f) != Some(&false)
+            || self.inputs.get(f) != Some(&SlotInput::Auto)
+        {
             return;
         }
         if self.kbm_seen.pane != f {
             self.kbm_seen.pane = f;
             self.kbm_seen.count = 0;
+            self.kbm_seen.key_count = 0;
         }
         if self.input.pads().seat_info().get(f).is_some_and(Option::is_some) {
             return;
         }
         self.kbm_seen.count += new;
-        if self.kbm_seen.count >= KBM_PLAYER_PRESSES {
+        self.kbm_seen.key_count += new_keys;
+        if self.kbm_seen.key_count >= KBM_PLAYER_KEY_PRESSES || self.kbm_seen.count >= KBM_PLAYER_PRESSES {
             self.kbm_player[f] = true;
             let text = format!(
-                "input: player {} plays with the keyboard and mouse ({} presses in their pane, no controller of theirs used yet): a controller used next goes to another player first",
+                "input: player {} plays with the keyboard and mouse ({} keys, {} total presses in their pane, no controller of theirs used yet): a controller used next goes to another player first",
                 f + 1,
+                self.kbm_seen.key_count,
                 self.kbm_seen.count
             );
             self.instances[f].send(&HostMsg::Note { text });
@@ -1555,9 +1605,10 @@ impl SessionHost {
         self.reload_prefs();
         self.note_fronts();
         if let Some(i) = self.front_copy().filter(|&i| i != self.focus) {
-            // Another copy came to the front: the keyboard follows it, unless its window
-            // is in front only because it just opened.
-            if !self.opened_in_front(i) {
+            // In composited split screen, keyboard focus moves only by explicit user
+            // action (clicking a pane, Ctrl+Alt+1-9, or overlay/Layout Studio) — never
+            // silently when a background copy opens a Win32 dialog or steals foreground.
+            if self.compositor.is_none() && !self.opened_in_front(i) {
                 self.set_focus(i);
             }
         }
@@ -1700,8 +1751,8 @@ impl SessionHost {
         let click = c.take_click();
         let clicked_pane = if self.kbm_off || self.layout_studio.active { None } else { click.and_then(|(x, y)| c.pane_at(x, y)) };
         let has_kbm = self.inputs.contains(&SlotInput::KeyboardMouse);
-        let mut focus = clicked_pane.filter(|&i| !(has_kbm && self.inputs.get(i) == Some(&SlotInput::Controller)));
-        // A focus asked for by Ctrl+Alt+1–4: said in that pane (outside a zoom nothing on
+        let mut focus = clicked_pane.filter(|&i| !(has_kbm && self.inputs.get(i).is_some_and(|s| s.is_controller())));
+        // A focus asked for by Ctrl+Alt+1–9: said in that pane (outside a zoom nothing on
         // screen changes, so the keys seemed to do nothing).
         let mut keyed: Option<usize> = None;
         let mut toggle_studio = false;
@@ -1731,11 +1782,11 @@ impl SessionHost {
                         crate::launch::note(self.instances[c.focused()].pid, &text);
                         self.panes_stale = true;
                     }
-                    10 => {
+                    20 => {
                         toggle_studio = true;
                     }
                     n => {
-                        let i = (n - 2) % 4;
+                        let i = (n - 2) % 9;
                         focus = Some(i);
                         keyed = Some(i);
                     }
@@ -1751,13 +1802,22 @@ impl SessionHost {
             }
         }
         if let Some(i) = focus.filter(|&i| i < self.instances.len() && !self.instances[i].gone) {
+            let was_kbm_off = self.kbm_off;
             if keyed == Some(i) {
                 self.kbm_off = false;
             }
-            c.focus_pane(i);
-            c.activate_pane(i, &self.instances);
-            self.panes_stale = true;
-            self.set_focus(i);
+            if i != self.focus {
+                // `set_focus` updates `c.focus_pane(i)` and activates the pane once; never
+                // re-post WM_ACTIVATE on clicks inside the already-focused pane (an
+                // activation message arriving while a mouse button is down in SHM causes
+                // SDL2 to treat the click as a focus-only click and swallow its release).
+                self.set_focus(i);
+                self.panes_stale = true;
+            } else if keyed == Some(i) && was_kbm_off {
+                if let Some(c) = self.compositor.as_ref() {
+                    c.activate_pane(i, &self.instances);
+                }
+            }
             if keyed == Some(i) && self.prefs.toasts {
                 self.panes[i].overlay.toast(crate::t!("toast.kbm_here", n = i + 1), crate::t!("toast.kbm_here_detail"));
             }
@@ -1807,7 +1867,9 @@ impl SessionHost {
             None => None,
         };
         if let Some(i) = clicked_focus.filter(|&i| i != self.focus && i < self.instances.len() && !self.instances[i].gone) {
-            self.set_focus(i);
+            // `forward_input` already activated pane `i` before posting the button-down
+            // message; don't post a second WM_ACTIVATE after the click.
+            self.set_focus_inner(i, false);
         }
     }
 
@@ -3104,5 +3166,24 @@ mod tests {
         // Without an explicit KBM player, any pane can be click-focused.
         host.set_inputs(vec![SlotInput::Auto, SlotInput::Controller, SlotInput::Controller]);
         assert!(host.click_can_focus(0) && host.click_can_focus(1) && host.click_can_focus(2));
+        // Pinned devices behave like explicit controller players: open seat, resist click focus with KBM.
+        let pin = pad::DevicePin::XInput(0);
+        host.set_inputs(vec![SlotInput::KeyboardMouse, SlotInput::Device(pin)]);
+        assert_eq!(host.seat_open(), Some(vec![pad::Open::No, pad::Open::Yes, pad::Open::Yes, pad::Open::No]));
+        assert!(host.click_can_focus(0) && !host.click_can_focus(1));
+    }
+
+    /// Two non-modifier keyboard presses mark an Auto player as playing with KB&M
+    /// (faster than the 4 combined key/mouse presses threshold).
+    #[test]
+    fn two_keyboard_keys_mark_kbm_player() {
+        let mut k = input_hub::Kbm::default();
+        k.apply(input_hub::RawEvent::Buttons { device: 1, down: 1, up: 0 });
+        assert_eq!((k.presses, k.key_presses), (1, 0), "mouse clicks don't count as key presses");
+        k.apply(input_hub::RawEvent::Key { device: 2, vk: 0x57, down: true }); // W
+        k.apply(input_hub::RawEvent::Key { device: 2, vk: 0x57, down: true }); // repeat ignored
+        k.apply(input_hub::RawEvent::Key { device: 2, vk: 0x44, down: true }); // D
+        assert_eq!((k.presses, k.key_presses), (3, 2));
+        assert!(k.key_presses >= KBM_PLAYER_KEY_PRESSES);
     }
 }

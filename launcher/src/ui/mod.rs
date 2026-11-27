@@ -568,6 +568,9 @@ struct InputNav {
     /// Recording the overlay's controller chord (Settings > Overlay): when it began, the
     /// buttons held, and since when. The controller doesn't navigate meanwhile.
     recording: Option<(Instant, u32, Instant)>,
+    /// Detecting a physical device for a split-screen player: `(game_key, player_slot, armed)`.
+    /// While active, controller presses bind that player instead of navigating the launcher.
+    binding_input: Option<(String, usize, bool)>,
 }
 
 impl InputNav {
@@ -581,6 +584,7 @@ impl InputNav {
             focus_first: false,
             focus_play: false,
             recording: None,
+            binding_input: None,
         }
     }
 }
@@ -1234,6 +1238,10 @@ impl App {
                 self.record_chord(held, now);
             }
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return;
+        }
+        if self.nav.binding_input.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(40));
             return;
         }
         let (b, pressed) = self.nav.pad_gate.filter(front, held, now);

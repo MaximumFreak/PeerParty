@@ -763,3 +763,17 @@ game.adv_vram_budget = Repartir presupuesto de VRAM
 game.adv_vram_budget_sub = Informa a cada copia su parte justa de VRAM para que los motores ajusten las texturas sin tirones.
 game.adv_cpu_balance = Repartir núcleos de CPU
 game.adv_cpu_balance_sub = Asigna núcleos preferidos a cada copia y ajusta los hilos de trabajo para reducir la contención.
+
+game.input_any_pad = Cualquier mando
+game.input_connected = Dispositivos conectados
+game.input_none_found = No se detectaron mandos
+game.input_count = {n} conectados
+game.input_detect = Detectar dispositivo…
+game.input_detect_tip = Detectar un dispositivo: pulsa un botón, mueve un stick, gira un volante o pulsa una tecla
+game.input_listening = Pulsa un botón, mueve un stick o pulsa una tecla…
+game.input_cancel = Cancelar
+game.input_offline = Desconectado
+game.input_assigned_to = J{n}
+game.input_auto_sub = Automático: asigna el primer mando libre o el teclado
+game.input_kbm_sub = Solo teclado y ratón (sin mando)
+game.input_any_pad_sub = Cualquier mando (listo al iniciar si no hay ambigüedad)

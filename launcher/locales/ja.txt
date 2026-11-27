@@ -749,3 +749,17 @@ game.adv_vram_budget = VRAM予算を配分
 game.adv_vram_budget_sub = 各コピーに公平なVRAM予算を通知し、テクスチャプール過剰によるカクつきを防ぎます。
 game.adv_cpu_balance = CPUコアを分散
 game.adv_cpu_balance_sub = 各コピーに優先CPUコアを割り当て、ワーカースレッド数を調整して競合を抑えます。
+
+game.input_any_pad = 任意のコントローラー
+game.input_connected = 接続中のデバイス
+game.input_none_found = コントローラーが検出されません
+game.input_count = {n}台接続中
+game.input_detect = デバイスを検出…
+game.input_detect_tip = ボタン押下、スティック操作、ハンドル回転、またはキー入力でデバイスを検出します
+game.input_listening = ボタン、スティック、またはキーを入力…
+game.input_cancel = キャンセル
+game.input_offline = オフライン
+game.input_assigned_to = P{n}
+game.input_auto_sub = 自動：未使用のコントローラーまたはキーボードを割り当てます
+game.input_kbm_sub = キーボード＆マウスのみ（コントローラーなし）
+game.input_any_pad_sub = 任意のコントローラー（起動時に自動接続）

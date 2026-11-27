@@ -1561,6 +1561,31 @@ static ASYNC_DOWN: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
 static STATE_DOWN: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
 static TOGGLED: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
 
+thread_local! {
+    /// Inside `focus_proc` dispatching a synthetic `WM_ACTIVATE` / `WM_SETFOCUS`: report
+    /// mouse buttons as up to `GetAsyncKeyState` / `GetKeyState` so toolkits (such as
+    /// SDL2's `focus_click_pending`) never mistake a split-screen pane activation for a
+    /// focus-only click and swallow its button release.
+    static IN_FOCUS_GAIN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) struct FocusGainGuard;
+
+pub(crate) fn suppress_focus_click_buttons() -> FocusGainGuard {
+    IN_FOCUS_GAIN.with(|n| n.set(n.get().saturating_add(1)));
+    FocusGainGuard
+}
+
+impl Drop for FocusGainGuard {
+    fn drop(&mut self) {
+        IN_FOCUS_GAIN.with(|n| n.set(n.get().saturating_sub(1)));
+    }
+}
+
+fn suppress_mouse_button(vkey: i32) -> bool {
+    matches!(vkey, 0x01 | 0x02 | 0x04 | 0x05 | 0x06) && IN_FOCUS_GAIN.with(|n| n.get() > 0)
+}
+
 /// Pure helper: `GetAsyncKeyState`'s low bit (pressed since the last call) from whether
 /// the key is `down` now and was at the last call (`seen`, updated).
 fn pressed_since(down: bool, seen: &AtomicBool) -> i16 {
@@ -1580,6 +1605,9 @@ fn toggle_on_press(down: bool, seen: &AtomicBool, toggled: &AtomicBool) -> i16 {
 }
 
 unsafe extern "system" fn async_key_state(vkey: i32) -> i16 {
+    if suppress_mouse_button(vkey) {
+        return 0;
+    }
     match policy() {
         Policy::PassThrough => ASYNC_KEY.get().map_or(0, |h| unsafe { h.call(vkey) }),
         Policy::BlockAll => {
@@ -1609,6 +1637,9 @@ fn toggle_of(vkey: i32) -> i16 {
 }
 
 unsafe extern "system" fn key_state(vkey: i32) -> i16 {
+    if suppress_mouse_button(vkey) {
+        return 0;
+    }
     match policy() {
         Policy::PassThrough => KEY_STATE.get().map_or(0, |h| unsafe { h.call(vkey) }),
         Policy::BlockAll => {
@@ -2001,6 +2032,25 @@ mod tests {
         assert_eq!(rc, 0);
         assert_eq!(&s[4..16], &[0u8; 12], "buttons, triggers and sticks at rest");
         assert!(HELD_XINPUT.load(Ordering::Relaxed) > before);
+    }
+
+    #[test]
+    fn focus_gain_suppresses_only_mouse_buttons_and_nests() {
+        assert!(!suppress_mouse_button(0x01));
+        {
+            let _g1 = suppress_focus_click_buttons();
+            for vk in [0x01, 0x02, 0x04, 0x05, 0x06] {
+                assert!(suppress_mouse_button(vk), "mouse vk 0x{vk:x} suppressed during focus gain");
+            }
+            assert!(!suppress_mouse_button(0x10), "keyboard shift unaffected");
+            assert!(!suppress_mouse_button(0x41), "keyboard A unaffected");
+            {
+                let _g2 = suppress_focus_click_buttons();
+                assert!(suppress_mouse_button(0x01));
+            }
+            assert!(suppress_mouse_button(0x01), "outer guard still active");
+        }
+        assert!(!suppress_mouse_button(0x01), "restored after drop");
     }
 
     #[test]

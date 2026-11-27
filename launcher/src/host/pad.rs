@@ -38,10 +38,13 @@
 //! its copy; a seat whose controller is away goes to a new controller only when no
 //! other seat is free.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+use super::wgi_pads::{WgiPad, WgiPads};
 
 pub const SOUTH: u32 = 1 << 0;
 pub const EAST: u32 = 1 << 1;
@@ -66,6 +69,71 @@ pub enum Style {
     Xbox,
     PlayStation,
     Nintendo,
+}
+
+/// What kind of physical controller a device is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum DeviceKind {
+    #[default]
+    Gamepad,
+    Wheel,
+    FlightStick,
+    Joystick,
+}
+
+/// A specific physical controller pinned to a player (`--inputs xinput:0,wgi:...,hid:...`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DevicePin {
+    XInput(u32),
+    Wgi(u64),
+    Hid(u64),
+}
+
+impl DevicePin {
+    /// Parses a pin token: `xinput:0..3`, `wgi:<hex>`, or `hid:<hex>`.
+    pub fn parse(raw: &str) -> Option<DevicePin> {
+        let s = raw.trim().to_ascii_lowercase();
+        let (kind, val) = s.split_once(':')?;
+        match kind {
+            "xinput" | "xi" => {
+                let slot: u32 = val.parse().ok()?;
+                (slot < 4).then_some(DevicePin::XInput(slot))
+            }
+            "wgi" => {
+                let id = u64::from_str_radix(val, 16).ok()?;
+                (id != 0).then_some(DevicePin::Wgi(id))
+            }
+            "hid" => {
+                let key = u64::from_str_radix(val, 16).ok()?;
+                (key != 0).then_some(DevicePin::Hid(key))
+            }
+            _ => None,
+        }
+    }
+
+    /// Canonical token for `--inputs` and `ui.json`.
+    pub fn to_token(self) -> String {
+        match self {
+            DevicePin::XInput(slot) => format!("xinput:{slot}"),
+            DevicePin::Wgi(id) => format!("wgi:{id:016x}"),
+            DevicePin::Hid(key) => format!("hid:{key:016x}"),
+        }
+    }
+}
+
+/// A live connected controller, wheel, or flight stick for the launcher UI device picker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceInfo {
+    /// Canonical pin token (`DevicePin::to_token`).
+    pub id: String,
+    /// Friendly name ("Xbox Wireless Controller", "Racing wheel", ...).
+    pub label: String,
+    /// Short badge ("XInput 1", "Extended #5", "PlayStation", "Wheel", "Flight", ...).
+    pub badge: String,
+    pub kind: DeviceKind,
+    pub style: Style,
+    /// Currently receiving input (button down, stick/wheel deflected, or trigger/pedal pressed).
+    pub active: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -135,6 +203,7 @@ pub(crate) struct Hid {
     /// Its product name, as the device gives it ("" for none).
     pub(crate) product: String,
     pub(crate) style: Style,
+    pub(crate) kind: DeviceKind,
     pub(crate) state: Arc<Mutex<State>>,
     pub(crate) alive: Arc<AtomicBool>,
     /// Home was down at the last poll, or hasn't been seen up yet.
@@ -164,6 +233,7 @@ pub struct Reading {
     /// "XInput slot 0", "HID 054c:0ce6": the log's name for it.
     pub name: String,
     pub style: Style,
+    pub kind: DeviceKind,
     /// Its buttons (the stick not folded in), sticks and triggers.
     pub state: State,
     /// An XInput pad: its slot and its `XINPUT_GAMEPAD` as XInput gave it.
@@ -259,15 +329,16 @@ fn wake(_t: &JoinHandle<()>) {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Seat {
     XInput(u32),
+    Wgi(u64),
     Device { path: String, serial: u64 },
 }
 
 impl Seat {
-    /// Whether `other` is the same controller: the same slot, the same path, or the
-    /// same serial.
+    /// Whether `other` is the same controller: the same slot, WGI id, path, or serial.
     fn same(&self, other: &Seat) -> bool {
         match (self, other) {
             (Seat::XInput(a), Seat::XInput(b)) => a == b,
+            (Seat::Wgi(a), Seat::Wgi(b)) => a == b,
             (Seat::Device { path: p, serial: s }, Seat::Device { path: q, serial: t }) => p == q || (*s != 0 && s == t),
             _ => false,
         }
@@ -319,6 +390,7 @@ struct Known {
 /// One controller as this poll read it.
 struct Live {
     id: Seat,
+    pin: DevicePin,
     name: String,
     style: Style,
     state: State,
@@ -348,6 +420,11 @@ pub struct Pads {
     /// Which seats a controller used for the first time may take (`set_open`); empty:
     /// any, a new one at the end when they're all held.
     open: Vec<Open>,
+    /// Specific physical devices pinned per seat (`set_pins`).
+    pins: Vec<Option<DevicePin>>,
+    /// Seats explicitly configured for a controller (`set_explicit_pads`): pre-seated
+    /// once the device scan finishes if unambiguous.
+    explicit_pads: Vec<bool>,
     /// Every controller seen, seated or not.
     known: Vec<Known>,
     /// Polls so far (`Known::pressed_at`).
@@ -356,6 +433,12 @@ pub struct Pads {
     /// is slow, so those are tried every two seconds).
     tried: [Option<Instant>; 4],
     connected: [bool; 4],
+    /// Cached product names for connected XInput slots (resolved lazily on connect).
+    x_products: [Option<String>; 4],
+    /// Extended Xbox / GIP controllers via `Windows.Gaming.Input` (for 5+ controllers).
+    wgi: WgiPads,
+    wgi_snap: Vec<WgiPad>,
+    wgi_stick: HashMap<u64, u32>,
     hid: Arc<Mutex<Vec<Hid>>>,
     last_scan: Option<Instant>,
     /// The scan running now, if one is (one at a time).
@@ -395,10 +478,16 @@ impl Pads {
             xinput: xinput(),
             seats: Vec::new(),
             open: Vec::new(),
+            pins: Vec::new(),
+            explicit_pads: Vec::new(),
             known: Vec::new(),
             polls: 0,
             tried: [None; 4],
             connected: [false; 4],
+            x_products: Default::default(),
+            wgi: WgiPads::start(),
+            wgi_snap: Vec::new(),
+            wgi_stick: HashMap::new(),
             hid: Arc::new(Mutex::new(Vec::new())),
             last_scan: None,
             scan: None,
@@ -443,11 +532,47 @@ impl Pads {
         self.open = open;
     }
 
+    /// Specific physical controllers pinned per seat (`--inputs xinput:0,wgi:...,hid:...`).
+    pub fn set_pins(&mut self, pins: Vec<Option<DevicePin>>) {
+        if self.seats.len() < pins.len() {
+            self.seats.resize(pins.len(), None);
+        }
+        self.pins = pins;
+    }
+
+    /// Marks which seats are explicitly configured for a controller (`SlotInput::Controller`),
+    /// allowing unambiguous pre-seating once the initial device scan completes.
+    pub fn set_explicit_pads(&mut self, explicit: Vec<bool>) {
+        self.explicit_pads = explicit;
+    }
+
+    /// Configures pin and explicit-pad flag for a single seat `k` (used when staggered
+    /// split-screen copies spawn after session start without disturbing existing seats).
+    pub fn set_seat_config(&mut self, k: usize, pin: Option<DevicePin>, explicit: bool) {
+        if self.seats.len() <= k {
+            self.seats.resize(k + 1, None);
+        }
+        if self.pins.len() <= k {
+            self.pins.resize(k + 1, None);
+        }
+        if self.explicit_pads.len() <= k {
+            self.explicit_pads.resize(k + 1, false);
+        }
+        self.pins[k] = pin;
+        self.explicit_pads[k] = explicit;
+    }
+
     /// Swaps the controllers of seats `a` and `b` (a player's overlay asked).
     pub fn swap(&mut self, a: usize, b: usize) {
         let n = self.seats.len().max(a + 1).max(b + 1);
         self.seats.resize(n, None);
         self.seats.swap(a, b);
+        if self.pins.len() < n && self.pins.iter().any(Option::is_some) {
+            self.pins.resize(n, None);
+        }
+        if a < self.pins.len() && b < self.pins.len() {
+            self.pins.swap(a, b);
+        }
     }
 
     /// Seat `k` lets its controller go: the next controller used takes it (that one
@@ -455,6 +580,12 @@ impl Pads {
     pub fn free(&mut self, k: usize) {
         if let Some(s) = self.seats.get_mut(k) {
             *s = None;
+        }
+        if let Some(p) = self.pins.get_mut(k) {
+            *p = None;
+        }
+        if let Some(e) = self.explicit_pads.get_mut(k) {
+            *e = false;
         }
     }
 
@@ -468,6 +599,7 @@ impl Pads {
                 let k = self.known.iter().find(|k| k.id.same(s))?;
                 let here = match s {
                     Seat::XInput(slot) => self.connected.get(*slot as usize).copied().unwrap_or(false),
+                    Seat::Wgi(id) => self.wgi_snap.iter().any(|w| w.id == *id),
                     Seat::Device { .. } => hid.iter().any(|h| h.alive.load(Ordering::Relaxed) && device_seat(h, &hid).same(s)),
                 };
                 Some(SeatInfo { style: k.style, name: k.name.clone(), here })
@@ -476,22 +608,26 @@ impl Pads {
     }
 
     /// Seat `k`'s controller's name for its player ("XBOX 360 For Windows"): the
-    /// device's product name, else one for its kind (`friendly_name`). Asked once per
+    /// device's product name, else one for its kind (`friendly_name_for`). Asked once per
     /// seating: an XInput controller's means a look through the HID devices.
     pub fn product_name(&self, k: usize) -> Option<String> {
         let s = self.seats.get(k)?.as_ref()?;
         let style = self.known.iter().find(|c| c.id.same(s)).map_or(Style::Xbox, |c| c.style);
-        let product = match s {
+        let (product, kind) = match s {
             #[cfg(windows)]
-            Seat::XInput(slot) => xinput_ids(*slot).and_then(|(vid, pid)| xinput_product(vid, pid)).unwrap_or_default(),
+            Seat::XInput(slot) => (xinput_ids(*slot).and_then(|(vid, pid)| xinput_product(vid, pid)).unwrap_or_default(), DeviceKind::Gamepad),
             #[cfg(not(windows))]
-            Seat::XInput(_) => String::new(),
+            Seat::XInput(_) => (String::new(), DeviceKind::Gamepad),
+            Seat::Wgi(id) => (self.wgi_snap.iter().find(|w| w.id == *id).map(|w| w.product.clone()).unwrap_or_default(), DeviceKind::Gamepad),
             Seat::Device { .. } => {
                 let hid = self.hid.lock().unwrap();
-                hid.iter().find(|h| device_seat(h, &hid).same(s)).map(|h| h.product.clone()).unwrap_or_default()
+                hid.iter()
+                    .find(|h| device_seat(h, &hid).same(s))
+                    .map(|h| (h.product.clone(), h.kind))
+                    .unwrap_or_else(|| (String::new(), DeviceKind::Gamepad))
             }
         };
-        Some(friendly_name(&product, style))
+        Some(friendly_name_for(&product, style, kind))
     }
 
     /// A seat's controller's name for the log.
@@ -534,6 +670,7 @@ impl Pads {
                     self.x_stick[i] = 0;
                     self.x_state[i] = State::default();
                     self.x_raw[i] = [0; 12];
+                    self.x_products[i] = None;
                     continue;
                 }
                 let b = from_xinput(&s);
@@ -543,22 +680,46 @@ impl Pads {
                 let pressed = home && !self.x_home[i];
                 self.x_home[i] = home;
                 self.x_stick[i] = b.stick(self.x_stick[i]);
-                live.push(Live { id: Seat::XInput(pad), name: format!("XInput slot {pad}"), style: Style::Xbox, state: b, dir: self.x_stick[i], home: pressed });
+                live.push(Live { id: Seat::XInput(pad), pin: DevicePin::XInput(pad), name: format!("XInput slot {pad}"), style: Style::Xbox, state: b, dir: self.x_stick[i], home: pressed });
             }
         }
         {
             let hid = self.hid.clone();
             let mut hid = hid.lock().unwrap();
             hid.retain(|h| h.alive.load(Ordering::Relaxed));
-            let ids: Vec<Seat> = hid.iter().map(|h| device_seat(h, &hid)).collect();
-            for (h, id) in hid.iter_mut().zip(ids) {
+            let meta: Vec<(Seat, u64)> = hid.iter().map(|h| (device_seat(h, &hid), hid_pin_key(h, &hid))).collect();
+            for (h, (id, pin_key)) in hid.iter_mut().zip(meta) {
                 let s = *h.state.lock().unwrap();
                 let home = s.buttons & HOME != 0;
                 let pressed = home && !h.home;
                 h.home = home;
                 h.stick = s.stick(h.stick);
-                live.push(Live { id, name: format!("HID {:04x}:{:04x}", h.vid, h.pid), style: h.style, state: s, dir: h.stick, home: pressed });
+                live.push(Live { id, pin: DevicePin::Hid(pin_key), name: format!("HID {:04x}:{:04x}", h.vid, h.pid), style: h.style, state: s, dir: h.stick, home: pressed });
             }
+        }
+        // Extended Xbox / GIP controllers beyond XInput's 4-slot cap (`Windows.Gaming.Input`).
+        // Exposed when more WGI gamepads exist than XInput slots (5+ Xbox pads), or when
+        // explicitly pinned or already seated. Any WGI mirror of an XInput 0..3 pad appears
+        // after it in `live`, so `first_use` twin detection suppresses duplicates automatically.
+        self.wgi_snap = self.wgi.snapshot();
+        let x_count = self.connected.iter().filter(|&&c| c).count();
+        let wgi_overflow = self.wgi_snap.len() > x_count;
+        self.wgi_stick.retain(|id, _| self.wgi_snap.iter().any(|w| w.id == *id));
+        for (idx, w) in self.wgi_snap.iter().enumerate() {
+            let pinned = self.pins.iter().any(|p| *p == Some(DevicePin::Wgi(w.id)));
+            let seated = self.seats.iter().any(|s| matches!(s, Some(Seat::Wgi(id)) if *id == w.id));
+            if !wgi_overflow && !pinned && !seated {
+                continue;
+            }
+            let entry = self.wgi_stick.entry(w.id).or_insert(0);
+            *entry = w.state.stick(*entry);
+            let dir = *entry;
+            let name = if w.vid != 0 || w.pid != 0 {
+                format!("WGI {:04x}:{:04x} #{}", w.vid, w.pid, idx + 1)
+            } else {
+                format!("WGI gamepad #{}", idx + 1)
+            };
+            live.push(Live { id: Seat::Wgi(w.id), pin: DevicePin::Wgi(w.id), name, style: Style::Xbox, state: w.state, dir, home: false });
         }
         self.place(&live);
         self.per.clear();
@@ -593,19 +754,21 @@ impl Pads {
     }
 
     /// The seat a controller used for the first time takes: the first open one free, then
-    /// the first open one whose controller is away, `Yes` ones before `Later` ones. With
-    /// no seats set (a copy alone), the first free one, or a new one at the end.
+    /// the first open one whose controller is away, `Yes` ones before `Later` ones. Pinned
+    /// seats are reserved for their pinned device. With no seats set (a copy alone), the
+    /// first free one, or a new one at the end.
     fn free_seat(&mut self, live: &[Live]) -> Option<usize> {
         let away = |s: &Option<Seat>| s.as_ref().is_some_and(|s| !live.iter().any(|l| l.id.same(s)));
+        let pinned = |k: usize| self.pins.get(k).is_some_and(Option::is_some);
         if self.open.is_empty() {
-            if let Some(k) = self.seats.iter().position(Option::is_none) {
+            if let Some(k) = self.seats.iter().enumerate().position(|(k, s)| s.is_none() && !pinned(k)) {
                 return Some(k);
             }
             self.seats.push(None);
             return Some(self.seats.len() - 1);
         }
         for want in [Open::Yes, Open::Later] {
-            let open = |k: usize| self.open.get(k) == Some(&want);
+            let open = |k: usize| self.open.get(k) == Some(&want) && !pinned(k);
             if let Some(k) = (0..self.seats.len()).find(|&k| open(k) && self.seats[k].is_none()) {
                 return Some(k);
             }
@@ -616,10 +779,8 @@ impl Pads {
         None
     }
 
-    /// Seats the controllers used for the first time this poll, and keeps track of the
-    /// ones that are another's twin. A controller takes a seat the moment it starts being
-    /// used (a button down, a stick or trigger pushed past half way), not when it's
-    /// first seen: a controller app's idle virtual pad mustn't take a player's seat.
+    /// Seats pinned controllers immediately, pre-seats unambiguous explicit `Controller`
+    /// seats at boot, seats remaining controllers when first used, and keeps track of twins.
     fn place(&mut self, live: &[Live]) {
         // Known ones follow their device to its path now.
         for l in live {
@@ -631,6 +792,55 @@ impl Pads {
         for s in self.seats.iter_mut().flatten() {
             if let Some(l) = live.iter().find(|l| l.id.same(s)) {
                 *s = l.id.clone();
+            }
+        }
+        // 1. Pinned devices bind immediately as soon as they are connected (no button press needed).
+        for seat_idx in 0..self.pins.len() {
+            let Some(pin) = self.pins[seat_idx] else { continue };
+            if self.open.get(seat_idx) == Some(&Open::No) {
+                continue;
+            }
+            let Some(l) = live.iter().find(|l| l.pin == pin) else { continue };
+            if self.seats.len() <= seat_idx {
+                self.seats.resize(seat_idx + 1, None);
+            }
+            let already = self.seats[seat_idx].as_ref().is_some_and(|s| s.same(&l.id));
+            if !already {
+                if let Some(other) = self.seat_of(&l.id) {
+                    self.seats[other] = None;
+                }
+                self.seats[seat_idx] = Some(l.id.clone());
+                self.newly_seated.push((seat_idx, l.name.clone()));
+            }
+        }
+        // 2. Unambiguous pre-seating for explicit `Controller` seats once initial device scan
+        // finishes: if unseated live devices <= empty explicit seats, seat them at boot so
+        // games don't prompt "No gamepad attached". When a remapper creates a twin (more live
+        // devices than seats), fall back to first-use twin detection.
+        if !self.open.is_empty() && self.scanned() {
+            let empty_explicit: Vec<usize> = (0..self.seats.len())
+                .filter(|&k| {
+                    self.explicit_pads.get(k) == Some(&true)
+                        && self.open.get(k) == Some(&Open::Yes)
+                        && self.pins.get(k).is_none_or(Option::is_none)
+                        && self.seats[k].is_none()
+                })
+                .collect();
+            if !empty_explicit.is_empty() {
+                let unseated: Vec<&Live> = live
+                    .iter()
+                    .filter(|l| {
+                        self.seat_of(&l.id).is_none()
+                            && !self.pins.contains(&Some(l.pin))
+                            && !self.known.iter().any(|k| k.id.same(&l.id) && k.twin_of.is_some())
+                    })
+                    .collect();
+                if !unseated.is_empty() && unseated.len() <= empty_explicit.len() {
+                    for (seat_idx, l) in empty_explicit.into_iter().zip(unseated) {
+                        self.seats[seat_idx] = Some(l.id.clone());
+                        self.newly_seated.push((seat_idx, l.name.clone()));
+                    }
+                }
             }
         }
         // When a button last went down on each, before anything is decided: a pad and
@@ -648,7 +858,7 @@ impl Pads {
             let i = known(self, &l.id);
             if let Some(of) = self.known[i].twin_of.clone() {
                 self.twin(i, l, &of, live);
-            } else if l.state.in_use() && !self.known[i].used && self.seat_of(&l.id).is_none() {
+            } else if l.state.in_use() && !self.known[i].used && self.seat_of(&l.id).is_none() && !self.pins.contains(&Some(l.pin)) {
                 self.first_use(i, l, live);
             }
             let k = &mut self.known[i];
@@ -719,6 +929,21 @@ impl Pads {
     }
 }
 
+/// Stable non-zero pin key for a HID / evdev device: its unique `Hid::key`, else a
+/// 64-bit FNV-1a hash of its vendor, product, and path.
+fn hid_pin_key(h: &Hid, all: &[Hid]) -> u64 {
+    let k = h.key(all);
+    if k != 0 {
+        return k;
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in format!("hid-path:{:04x}:{:04x}:{}", h.vid, h.pid, h.path).bytes() {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash.max(1)
+}
+
 /// A HID (evdev) device's seat: its path, and its serial's key unless another device
 /// that's there has the same one (identical pads with one serial number).
 fn device_seat(h: &Hid, all: &[Hid]) -> Seat {
@@ -752,14 +977,28 @@ impl Pads {
                     (self.xinput.is_some() && self.connected[i]).then(|| Reading {
                         name: format!("XInput slot {slot}"),
                         style: Style::Xbox,
+                        kind: DeviceKind::Gamepad,
                         state: self.x_state[i],
                         xinput: Some((*slot, self.x_raw[i])),
                         hid_key: 0,
                     })
                 }
+                Seat::Wgi(id) => self.wgi_snap.iter().enumerate().find(|(_, w)| w.id == *id).map(|(idx, w)| Reading {
+                    name: if w.vid != 0 || w.pid != 0 {
+                        format!("WGI {:04x}:{:04x} #{}", w.vid, w.pid, idx + 1)
+                    } else {
+                        format!("WGI gamepad #{}", idx + 1)
+                    },
+                    style: Style::Xbox,
+                    kind: DeviceKind::Gamepad,
+                    state: w.state,
+                    xinput: None,
+                    hid_key: 0,
+                }),
                 s @ Seat::Device { .. } => hid.iter().find(|h| h.alive.load(Ordering::Relaxed) && device_seat(h, &hid).same(s)).map(|h| Reading {
                     name: format!("HID {:04x}:{:04x}", h.vid, h.pid),
                     style: h.style,
+                    kind: h.kind,
                     state: *h.state.lock().unwrap(),
                     xinput: None,
                     hid_key: h.key(&hid),
@@ -779,8 +1018,96 @@ impl Pads {
     /// for the game's log.
     pub fn found(&self) -> Vec<String> {
         let mut out: Vec<String> = (0..4).filter(|&i| self.xinput.is_some() && self.connected[i]).map(|i| format!("XInput slot {i}")).collect();
+        let x_count = out.len();
         for h in self.hid.lock().unwrap().iter().filter(|h| h.alive.load(Ordering::Relaxed)) {
             out.push(format!("HID {:04x}:{:04x}", h.vid, h.pid));
+        }
+        if self.wgi_snap.len() > x_count {
+            for (idx, w) in self.wgi_snap.iter().enumerate().skip(x_count) {
+                out.push(format!("WGI {:04x}:{:04x} #{}", w.vid, w.pid, idx + 1));
+            }
+        }
+        out
+    }
+
+    /// Live connected controllers, wheels, and sticks for the launcher UI device picker.
+    pub fn device_list(&mut self) -> Vec<DeviceInfo> {
+        let mut out = Vec::new();
+        let mut x_count = 0usize;
+        let mut any_x_active = false;
+        if self.xinput.is_some() {
+            for slot in 0..4u32 {
+                let i = slot as usize;
+                if !self.connected[i] {
+                    continue;
+                }
+                x_count += 1;
+                let active = self.x_state[i].in_use();
+                any_x_active |= active;
+                let product = self.x_products[i].get_or_insert_with(|| {
+                    #[cfg(windows)]
+                    {
+                        xinput_ids(slot).and_then(|(vid, pid)| xinput_product(vid, pid)).unwrap_or_default()
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        String::new()
+                    }
+                });
+                out.push(DeviceInfo {
+                    id: DevicePin::XInput(slot).to_token(),
+                    label: friendly_name_for(product, Style::Xbox, DeviceKind::Gamepad),
+                    badge: format!("XInput {}", slot + 1),
+                    kind: DeviceKind::Gamepad,
+                    style: Style::Xbox,
+                    active,
+                });
+            }
+        }
+        {
+            let hid = self.hid.lock().unwrap();
+            for h in hid.iter().filter(|h| h.alive.load(Ordering::Relaxed)) {
+                let state = *h.state.lock().unwrap();
+                let pin = DevicePin::Hid(hid_pin_key(h, &hid));
+                let badge = match (h.kind, h.style) {
+                    (DeviceKind::Wheel, _) => "Wheel".to_string(),
+                    (DeviceKind::FlightStick, _) => "Flight".to_string(),
+                    (DeviceKind::Joystick, _) => "Joystick".to_string(),
+                    (DeviceKind::Gamepad, Style::PlayStation) => "PlayStation".to_string(),
+                    (DeviceKind::Gamepad, Style::Nintendo) => "Nintendo".to_string(),
+                    (DeviceKind::Gamepad, Style::Xbox) => "HID".to_string(),
+                };
+                out.push(DeviceInfo {
+                    id: pin.to_token(),
+                    label: friendly_name_for(&h.product, h.style, h.kind),
+                    badge,
+                    kind: h.kind,
+                    style: h.style,
+                    active: state.in_use(),
+                });
+            }
+        }
+        // Extended Xbox / GIP controllers beyond XInput's 4-slot limit (or any WGI pad
+        // currently active when no XInput slot is active).
+        let wgi_overflow = self.wgi_snap.len() > x_count;
+        for (idx, w) in self.wgi_snap.iter().enumerate() {
+            let active = w.state.in_use();
+            let twin_of_x = self.known.iter().any(|k| k.id == Seat::Wgi(w.id) && matches!(k.twin_of, Some(Seat::XInput(_))));
+            if twin_of_x {
+                continue;
+            }
+            let show = (wgi_overflow && idx >= x_count) || (active && !any_x_active && wgi_overflow);
+            if !show {
+                continue;
+            }
+            out.push(DeviceInfo {
+                id: DevicePin::Wgi(w.id).to_token(),
+                label: friendly_name_for(&w.product, Style::Xbox, DeviceKind::Gamepad),
+                badge: format!("Extended #{}", idx + 1),
+                kind: DeviceKind::Gamepad,
+                style: Style::Xbox,
+                active,
+            });
         }
         out
     }
@@ -812,6 +1139,9 @@ impl Pads {
         for h in self.hid.lock().unwrap().iter().filter(|h| h.alive.load(Ordering::Relaxed)) {
             merge(*h.state.lock().unwrap());
         }
+        for w in &self.wgi_snap {
+            merge(w.state);
+        }
         if rx.hypot(ry) < 0.22 {
             (rx, ry) = (0.0, 0.0);
         }
@@ -821,17 +1151,24 @@ impl Pads {
     /// Each controller read, with its buttons now (`peerparty --pads`).
     pub fn describe(&mut self) -> Vec<(String, u32)> {
         let mut out = Vec::new();
+        let mut x_count = 0usize;
         if let Some(get) = self.xinput {
             for pad in 0..4u32 {
                 let mut s = [0u8; STATE_LEN];
                 if unsafe { get(pad, &mut s) } == 0 {
+                    x_count += 1;
                     out.push((format!("XInput slot {pad}"), from_xinput(&s).with_stick()));
                 }
             }
         }
         for h in self.hid.lock().unwrap().iter().filter(|h| h.alive.load(Ordering::Relaxed)) {
             let serial_hint = h.path.rsplit('#').nth(1).unwrap_or("");
-            out.push((format!("HID {:04x}:{:04x} {:?} ({serial_hint})", h.vid, h.pid, h.style), h.state.lock().unwrap().with_stick()));
+            out.push((format!("HID {:04x}:{:04x} {:?} {:?} ({serial_hint})", h.vid, h.pid, h.kind, h.style), h.state.lock().unwrap().with_stick()));
+        }
+        if self.wgi_snap.len() > x_count {
+            for (idx, w) in self.wgi_snap.iter().enumerate().skip(x_count) {
+                out.push((format!("WGI {:04x}:{:04x} #{} ({})", w.vid, w.pid, idx + 1, DevicePin::Wgi(w.id).to_token()), w.state.with_stick()));
+            }
         }
         out
     }
@@ -996,9 +1333,12 @@ struct Ranges {
     rx: Option<Range>,
     ry: Option<Range>,
     hat: Option<Range>,
-    /// Simulation Controls' Brake / Accelerator: the triggers, on pads that have them.
+    /// Simulation Controls: Steering, Throttle, Brake, Accelerator, Clutch.
+    steering: Option<Range>,
+    throttle: Option<Range>,
     brake: Option<Range>,
     accel: Option<Range>,
+    clutch: Option<Range>,
 }
 
 /// A stick value as -1..1 across its range. Without one (a descriptor Windows
@@ -1133,6 +1473,48 @@ fn parse_known(vid: u16, pid: u16, report: &[u8]) -> Option<State> {
     }
 }
 
+/// Classifies a HID controller by its top-level usage, simulation axes, and product name.
+#[cfg(any(windows, test))]
+fn classify_kind(usage_page: u16, usage: u16, product: &str, has_steering: bool, has_throttle: bool) -> DeviceKind {
+    if usage_page == 0x02 {
+        return match usage {
+            0x02 => DeviceKind::Wheel,
+            0x01 | 0x05 => DeviceKind::FlightStick,
+            _ => DeviceKind::Joystick,
+        };
+    }
+    let lower = product.to_ascii_lowercase();
+    if has_steering
+        || ["wheel", "driving", "racing", "pedals", "g29", "g920", "g923", "t300", "t150", "t248", "fanatec", "moza", "simagic"]
+            .iter()
+            .any(|k| lower.contains(k))
+    {
+        return DeviceKind::Wheel;
+    }
+    if ["flight", "hotas", "throttle", "yoke", "rudder", "t.16000", "warthog", "virpil", "vkb", "x52", "x56"]
+        .iter()
+        .any(|k| lower.contains(k))
+    {
+        return DeviceKind::FlightStick;
+    }
+    if has_throttle || (usage == 0x04 && (lower.contains("joystick") || lower.contains("stick"))) {
+        return DeviceKind::Joystick;
+    }
+    DeviceKind::Gamepad
+}
+
+/// Whether a HID top-level collection is a game controller, racing wheel, or flight stick.
+#[cfg(any(windows, test))]
+fn is_supported_hid_usage(usage_page: u16, usage: u16) -> bool {
+    match usage_page {
+        // Generic Desktop: Joystick (4), Gamepad (5), Multi-axis Controller (8).
+        0x01 => matches!(usage, 0x04 | 0x05 | 0x08),
+        // Simulation Controls: Flight (1), Automobile/Wheel (2), Sailing (4), Spaceship (5).
+        0x02 => matches!(usage, 0x01 | 0x02 | 0x04 | 0x05),
+        _ => false,
+    }
+}
+
 /// The glyphs for a pad by its USB vendor.
 pub(crate) fn style_of(vid: u16) -> Style {
     match vid {
@@ -1229,8 +1611,7 @@ fn open_hid(list: &Arc<Mutex<Vec<Hid>>>, threads: &Arc<Threads>, path: String) {
     }
     let mut caps: HIDP_CAPS = unsafe { std::mem::zeroed() };
     unsafe { HidP_GetCaps(pre, &mut caps) };
-    // Generic desktop joystick (4) or gamepad (5) only.
-    if caps.UsagePage != 1 || !(caps.Usage == 4 || caps.Usage == 5) || caps.InputReportByteLength == 0 {
+    if !is_supported_hid_usage(caps.UsagePage, caps.Usage) || caps.InputReportByteLength == 0 {
         unsafe { HidD_FreePreparsedData(pre) };
         close();
         return;
@@ -1241,8 +1622,6 @@ fn open_hid(list: &Arc<Mutex<Vec<Hid>>>, threads: &Arc<Threads>, path: String) {
     let serial_key = if serial.trim().is_empty() { 0 } else { peerparty_protocol::input_shm::hid_key(attr.VendorID, attr.ProductID, &serial) };
     let inst_key = peerparty_protocol::input_shm::hid_instance_key(attr.VendorID, attr.ProductID, &path).unwrap_or(0);
     let product = product_of(h);
-    let entry = Hid { path, vid: attr.VendorID, pid: attr.ProductID, product, style: style_of(attr.VendorID), state: state.clone(), alive: alive.clone(), home: true, stick: 0, serial_key, inst_key };
-    let (vid, pid, len) = (attr.VendorID, attr.ProductID, caps.InputReportByteLength as usize);
     let ranges = Ranges {
         x: value_range(pre, 0x01, 0x30),
         y: value_range(pre, 0x01, 0x31),
@@ -1251,9 +1630,15 @@ fn open_hid(list: &Arc<Mutex<Vec<Hid>>>, threads: &Arc<Threads>, path: String) {
         rx: value_range(pre, 0x01, 0x33),
         ry: value_range(pre, 0x01, 0x34),
         hat: value_range(pre, 0x01, 0x39),
+        steering: value_range(pre, 0x02, 0xC8),
+        throttle: value_range(pre, 0x02, 0xBB),
         brake: value_range(pre, 0x02, 0xC5),
         accel: value_range(pre, 0x02, 0xC4),
+        clutch: value_range(pre, 0x02, 0xC6),
     };
+    let kind = classify_kind(caps.UsagePage, caps.Usage, &product, ranges.steering.is_some(), ranges.throttle.is_some());
+    let entry = Hid { path, vid: attr.VendorID, pid: attr.ProductID, product, style: style_of(attr.VendorID), kind, state: state.clone(), alive: alive.clone(), home: true, stick: 0, serial_key, inst_key };
+    let (vid, pid, len) = (attr.VendorID, attr.ProductID, caps.InputReportByteLength as usize);
     let (h, pre) = (h as usize, pre);
     let stop = threads.clone();
     let reader_alive = alive.clone();
@@ -1262,8 +1647,9 @@ fn open_hid(list: &Arc<Mutex<Vec<Hid>>>, threads: &Arc<Threads>, path: String) {
         let mut buf = vec![0u8; len.max(64)];
         // A generic pad's trigger axes count only if they rest at the bottom of their
         // range in its first report: an axis that's really a stick's rests half way,
-        // and would read as a trigger held half down.
-        let mut triggers_rest: Option<bool> = None;
+        // and would read as a trigger held half down. Racing wheels whose pedals rest
+        // inverted at the top (1.0 released -> 0.0 pressed) flip their pedal polarity.
+        let mut triggers_mode: Option<u8> = None; // 0 = dropped, 1 = normal, 2 = inverted
         // Ends when the device goes, or when `Pads` is dropped (`Threads::stop_all`
         // cancels a read that waits).
         while !stop.stopping() {
@@ -1277,8 +1663,22 @@ fn open_hid(list: &Arc<Mutex<Vec<Hid>>>, threads: &Arc<Threads>, path: String) {
             let report = &buf[..got as usize];
             let parsed = parse_known(vid, pid, report).or_else(|| {
                 let mut s = parse_generic(pre, ranges, report)?;
-                if !*triggers_rest.get_or_insert(s.lt < 0.25 && s.rt < 0.25) {
-                    (s.lt, s.rt) = (0.0, 0.0);
+                let mode = *triggers_mode.get_or_insert_with(|| {
+                    if s.lt < 0.25 && s.rt < 0.25 {
+                        1
+                    } else if kind == DeviceKind::Wheel && s.lt > 0.75 && s.rt > 0.75 {
+                        2
+                    } else {
+                        0
+                    }
+                });
+                match mode {
+                    2 => {
+                        s.lt = (1.0 - s.lt).clamp(0.0, 1.0);
+                        s.rt = (1.0 - s.rt).clamp(0.0, 1.0);
+                    }
+                    0 => (s.lt, s.rt) = (0.0, 0.0),
+                    _ => {}
                 }
                 Some(s)
             });
@@ -1354,17 +1754,22 @@ fn xinput_product(vid: u16, pid: u16) -> Option<String> {
 }
 
 /// A controller's name for a player: its product name without the "Controller ( )"
-/// Windows wraps some in, else one for its kind.
-pub fn friendly_name(product: &str, style: Style) -> String {
+/// Windows wraps some in, else one for its kind (gamepad, wheel, flight stick, joystick).
+pub fn friendly_name_for(product: &str, style: Style, kind: DeviceKind) -> String {
     let p = product.trim();
     let p = p.strip_prefix("Controller (").and_then(|r| r.strip_suffix(')')).unwrap_or(p).trim();
     if !p.is_empty() {
         return p.to_string();
     }
-    match style {
-        Style::Xbox => "Xbox controller",
-        Style::PlayStation => "PlayStation controller",
-        Style::Nintendo => "Nintendo controller",
+    match kind {
+        DeviceKind::Wheel => "Racing wheel",
+        DeviceKind::FlightStick => "Flight stick",
+        DeviceKind::Joystick => "Joystick",
+        DeviceKind::Gamepad => match style {
+            Style::Xbox => "Xbox controller",
+            Style::PlayStation => "PlayStation controller",
+            Style::Nintendo => "Nintendo controller",
+        },
     }
     .to_string()
 }
@@ -1445,7 +1850,19 @@ fn parse_generic(pre: isize, ranges: Ranges, report: &[u8]) -> Option<State> {
         (Some(vx), Some(vy)) => Some((stick(vx, rx), -stick(vy, ry))),
         _ => None,
     };
-    let (lx, ly) = pair(0x30, ranges.x, 0x31, ranges.y).unwrap_or_default();
+    let sim_raw = |usage: u16| -> Option<u32> {
+        let mut v = 0u32;
+        let rc = unsafe { HidP_GetUsageValue(HidP_Input, 0x02, 0, usage, &mut v, pre, report.as_ptr() as *mut _, report.len() as u32) };
+        (rc == 0x0011_0000).then_some(v)
+    };
+    let (mut lx, ly) = pair(0x30, ranges.x, 0x31, ranges.y).unwrap_or_else(|| {
+        let x = value(0x30).map(|v| stick(v, ranges.x)).unwrap_or(0.0);
+        let y = value(0x31).map(|v| -stick(v, ranges.y)).unwrap_or(0.0);
+        (x, y)
+    });
+    if ranges.x.is_none() && let Some(sv) = sim_raw(0xC8) {
+        lx = stick(sv, ranges.steering);
+    }
     let rxry = ranges.rx.is_some() && ranges.ry.is_some();
     let right = if ranges.z.is_some() && ranges.rz.is_some() && !rxry {
         pair(0x32, ranges.z, 0x35, ranges.rz)
@@ -1454,12 +1871,12 @@ fn parse_generic(pre: isize, ranges: Ranges, report: &[u8]) -> Option<State> {
     };
     let (rx, ry) = right.unwrap_or_default();
     let sim = |usage: u16, r: Option<Range>| -> Option<f32> {
-        let mut v = 0u32;
-        let rc = unsafe { HidP_GetUsageValue(HidP_Input, 0x02, 0, usage, &mut v, pre, report.as_ptr() as *mut _, report.len() as u32) };
-        (rc == 0x0011_0000).then(|| pulled_by(v, r))
+        sim_raw(usage).map(|v| pulled_by(v, r))
     };
     let (lt, rt) = if ranges.brake.is_some() || ranges.accel.is_some() {
         (sim(0xC5, ranges.brake).unwrap_or(0.0), sim(0xC4, ranges.accel).unwrap_or(0.0))
+    } else if ranges.throttle.is_some() {
+        (sim(0xC6, ranges.clutch).unwrap_or(0.0), sim(0xBB, ranges.throttle).unwrap_or(0.0))
     } else if rxry && ranges.z.is_some() && ranges.rz.is_some() {
         (value(0x32).map_or(0.0, |v| pulled_by(v, ranges.z)), value(0x35).map_or(0.0, |v| pulled_by(v, ranges.rz)))
     } else if rxry && ranges.z.is_some() {
@@ -1807,6 +2224,7 @@ mod tests {
         }
         let mut pads = Pads::new();
         pads.xinput = Some(fake_pads);
+        pads.wgi = WgiPads::empty();
         pads.last_scan = Some(Instant::now());
         (g, pads)
     }
@@ -1825,7 +2243,7 @@ mod tests {
     /// A HID device on the list, as the scan adds one: its state and liveness to set.
     fn add_hid(pads: &Pads, path: &str, serial_key: u64) -> (Arc<Mutex<State>>, Arc<AtomicBool>) {
         let (state, alive) = (Arc::new(Mutex::new(State::default())), Arc::new(AtomicBool::new(true)));
-        let h = Hid { path: path.into(), vid: 0x054c, pid: 0x09cc, product: String::new(), style: Style::PlayStation, state: state.clone(), alive: alive.clone(), home: true, stick: 0, serial_key, inst_key: 0 };
+        let h = Hid { path: path.into(), vid: 0x054c, pid: 0x09cc, product: String::new(), style: Style::PlayStation, kind: DeviceKind::Gamepad, state: state.clone(), alive: alive.clone(), home: true, stick: 0, serial_key, inst_key: 0 };
         pads.hid.lock().unwrap().push(h);
         (state, alive)
     }
@@ -1982,5 +2400,95 @@ mod tests {
         }
         let s = parse_known(0x057e, 0x2009, &r).unwrap();
         assert!(near(s.lx, 1.0) && near(s.ly, 0.0) && near(s.rx, -1.0) && near(s.ry, 0.0), "{s:?}");
+    }
+
+    #[test]
+    fn device_pins_and_kind_classification() {
+        assert_eq!(DevicePin::parse("xinput:0"), Some(DevicePin::XInput(0)));
+        assert_eq!(DevicePin::parse("xinput:3"), Some(DevicePin::XInput(3)));
+        assert_eq!(DevicePin::parse("xinput:4"), None);
+        let w = DevicePin::Wgi(0x0123_4567_89ab_cdef);
+        assert_eq!(DevicePin::parse(&w.to_token()), Some(w));
+        let h = DevicePin::Hid(0xfedc_ba98_7654_3210);
+        assert_eq!(DevicePin::parse(&h.to_token()), Some(h));
+        assert_eq!(DevicePin::parse("wgi:0"), None);
+        assert_eq!(classify_kind(0x02, 0x02, "", false, false), DeviceKind::Wheel);
+        assert_eq!(classify_kind(0x02, 0x01, "", false, false), DeviceKind::FlightStick);
+        assert_eq!(classify_kind(0x01, 0x04, "G29 Driving Force Racing Wheel", false, false), DeviceKind::Wheel);
+        assert_eq!(classify_kind(0x01, 0x04, "HOTAS Warthog", false, false), DeviceKind::FlightStick);
+        assert_eq!(classify_kind(0x01, 0x05, "Wireless Controller", false, false), DeviceKind::Gamepad);
+        assert!(is_supported_hid_usage(0x01, 0x08) && is_supported_hid_usage(0x02, 0x02) && !is_supported_hid_usage(0x01, 0x06));
+    }
+
+    /// Pinned devices bind immediately without pressing a button and stay protected from
+    /// unpinned controllers; unambiguous explicit `Controller` seats pre-seat once scanned.
+    #[test]
+    fn pinned_and_explicit_seats_pre_seat_at_boot() {
+        let (_g, mut pads) = fake_session();
+        pads.scanned.store(true, Ordering::Relaxed);
+        pads.set_open(vec![Open::No, Open::Yes, Open::Yes]);
+        pads.set_pins(vec![None, Some(DevicePin::XInput(1)), None]);
+        pads.set_explicit_pads(vec![false, true, true]);
+        set_x(0, 0);
+        set_x(1, 0);
+        poll(&mut pads);
+        assert_eq!(names(&pads), [None, Some("XInput slot 1".into()), Some("XInput slot 0".into())]);
+        // A pinned seat rejects other controllers even when its pinned pad is unplugged.
+        let mut pads2 = Pads::new();
+        pads2.xinput = Some(fake_pads);
+        pads2.wgi = WgiPads::empty();
+        pads2.last_scan = Some(Instant::now());
+        pads2.scanned.store(true, Ordering::Relaxed);
+        pads2.set_open(vec![Open::Yes, Open::Yes]);
+        pads2.set_pins(vec![Some(DevicePin::XInput(2)), None]);
+        set_x(0, 0x1000);
+        set_x(1, u32::MAX);
+        poll(&mut pads2);
+        assert_eq!(names(&pads2), [None, Some("XInput slot 0".into())], "unpinned pad skips pinned seat 0");
+    }
+
+    /// More than 4 Xbox controllers: slots 0..3 use XInput while #5+ route through WGI
+    /// as virtual pads, and WGI mirrors of XInput 0..3 are suppressed as twins.
+    #[test]
+    fn more_than_four_xbox_controllers_route_via_wgi() {
+        let (_g, mut pads) = fake_session();
+        pads.set_open(vec![Open::Yes; 6]);
+        for s in 0..4 {
+            set_x(s, 0);
+        }
+        let make_wgi = |id: u64, buttons: u32| WgiPad { id, vid: 0x045E, pid: 0x0B12, product: format!("Xbox Pad {id}"), state: State { buttons, ..Default::default() } };
+        // 6 Xbox controllers total: 4 visible in XInput + all 6 in WGI.
+        pads.wgi.set_fake(vec![
+            make_wgi(1, 0),
+            make_wgi(2, 0),
+            make_wgi(3, 0),
+            make_wgi(4, 0),
+            make_wgi(5, SOUTH),
+            make_wgi(6, EAST),
+        ]);
+        poll(&mut pads);
+        // Controllers #5 and #6 claim seats 0 and 1 via WGI (`xinput: None` -> VirtualPad).
+        let r = pads.readings();
+        assert_eq!(r[0].as_ref().map(|x| (x.xinput.is_none(), x.state.buttons)), Some((true, SOUTH)));
+        assert_eq!(r[1].as_ref().map(|x| (x.xinput.is_none(), x.state.buttons)), Some((true, EAST)));
+        // Pressing A on XInput slot 0 + its WGI mirror #1 at the same moment claims ONE seat, not two.
+        set_x(0, 0x1000);
+        pads.wgi.set_fake(vec![
+            make_wgi(1, SOUTH),
+            make_wgi(2, 0),
+            make_wgi(3, 0),
+            make_wgi(4, 0),
+            make_wgi(5, 0),
+            make_wgi(6, 0),
+        ]);
+        poll(&mut pads);
+        assert_eq!(names(&pads)[2], Some("XInput slot 0".into()));
+        assert_eq!(names(&pads)[3], None, "WGI mirror of XInput slot 0 suppressed as twin");
+        // Device list exposes XInput 1..4 plus Extended #5 and #6 (no duplicates).
+        let list = pads.device_list();
+        assert_eq!(list.len(), 6, "{list:?}");
+        assert!(list.iter().any(|d| d.id == "xinput:0" && d.badge == "XInput 1"));
+        assert!(list.iter().any(|d| d.id == DevicePin::Wgi(5).to_token() && d.badge == "Extended #5"));
+        assert!(list.iter().any(|d| d.id == DevicePin::Wgi(6).to_token() && d.badge == "Extended #6"));
     }
 }

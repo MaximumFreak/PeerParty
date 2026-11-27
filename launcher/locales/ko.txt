@@ -749,3 +749,17 @@ game.adv_vram_budget = VRAM 예산 분배
 game.adv_vram_budget_sub = 각 복사본에 공정한 VRAM 몫을 알려 엔진이 끊김 없이 텍스처 풀 크기를 조절하게 합니다.
 game.adv_cpu_balance = CPU 코어 분산
 game.adv_cpu_balance_sub = 각 복사본에 선호 CPU 코어를 배정하고 워커 스레드 수를 조절해 스레드 경합을 줄입니다.
+
+game.input_any_pad = 아무 컨트롤러
+game.input_connected = 연결된 장치
+game.input_none_found = 감지된 컨트롤러 없음
+game.input_count = {n}개 연결됨
+game.input_detect = 장치 감지…
+game.input_detect_tip = 버튼 누르기, 스틱 움직이기, 핸들 돌리기 또는 키 입력으로 장치를 감지합니다
+game.input_listening = 버튼, 스틱 또는 키를 입력하세요…
+game.input_cancel = 취소
+game.input_offline = 오프라인
+game.input_assigned_to = P{n}
+game.input_auto_sub = 자동: 사용되지 않은 첫 컨트롤러나 키보드를 배정합니다
+game.input_kbm_sub = 키보드 및 마우스 전용 (컨트롤러 없음)
+game.input_any_pad_sub = 아무 컨트롤러 (실행 시 즉시 연결)

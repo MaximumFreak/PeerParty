@@ -763,3 +763,17 @@ game.adv_vram_budget = Partager le budget VRAM
 game.adv_vram_budget_sub = Indique à chaque copie sa part de VRAM afin que les moteurs dimensionnent leurs textures sans saccades.
 game.adv_cpu_balance = Équilibrer les cœurs CPU
 game.adv_cpu_balance_sub = Attribue des cœurs CPU préférés à chaque copie et ajuste les threads pour limiter la contention.
+
+game.input_any_pad = N'importe quelle manette
+game.input_connected = Périphériques connectés
+game.input_none_found = Aucune manette détectée
+game.input_count = {n} connecté(s)
+game.input_detect = Détecter un périphérique…
+game.input_detect_tip = Détecter un périphérique : appuyez sur un bouton, bougez un stick, tournez un volant ou appuyez sur une touche
+game.input_listening = Appuyez sur un bouton, bougez un stick ou une touche…
+game.input_cancel = Annuler
+game.input_offline = Hors ligne
+game.input_assigned_to = J{n}
+game.input_auto_sub = Automatique : attribue la première manette libre ou le clavier
+game.input_kbm_sub = Clavier et souris uniquement (sans manette)
+game.input_any_pad_sub = N'importe quelle manette (prête au lancement si sans ambiguïté)

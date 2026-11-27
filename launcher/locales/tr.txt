@@ -763,3 +763,17 @@ game.adv_vram_budget = GPU bellek bütçesini paylaş
 game.adv_vram_budget_sub = Motorların takılmadan doku havuzu boyutlandırması için her kopyaya adil VRAM payını bildirir.
 game.adv_cpu_balance = CPU çekirdeklerini dengele
 game.adv_cpu_balance_sub = Çekirdek çekişmesini azaltmak için her kopyaya tercih edilen çekirdekler verir ve iş parçacıklarını ölçekler.
+
+game.input_any_pad = Herhangi bir kontrolcü
+game.input_connected = Bağlı cihazlar
+game.input_none_found = Kontrolcü algılanmadı
+game.input_count = {n} bağlı
+game.input_detect = Cihazı algıla…
+game.input_detect_tip = Cihaz algıla: bir düğmeye basın, çubuğu oynatın, direksiyonu çevirin veya bir tuşa basın
+game.input_listening = Bir düğmeye, çubuğa veya tuşa basın…
+game.input_cancel = İptal
+game.input_offline = Çevrimdışı
+game.input_assigned_to = O{n}
+game.input_auto_sub = Otomatik: ilk boş kontrolcüyü veya klavyeyi atar
+game.input_kbm_sub = Yalnızca klavye ve fare (kontrolcü yok)
+game.input_any_pad_sub = Herhangi bir kontrolcü (belirsizlik yoksa başlangıçta hazır)

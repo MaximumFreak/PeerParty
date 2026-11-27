@@ -779,3 +779,17 @@ game.adv_vram_budget = Dziel budżet VRAM
 game.adv_vram_budget_sub = Zgłasza każdej kopii jej sprawiedliwą część VRAM, aby silniki dobierały pule tekstur bez przycięć.
 game.adv_cpu_balance = Równoważ rdzenie CPU
 game.adv_cpu_balance_sub = Przydziela każdej kopii preferowane rdzenie CPU i skaluje wątki robocze, ograniczając rywalizację.
+
+game.input_any_pad = Dowolny kontroler
+game.input_connected = Podłączone urządzenia
+game.input_none_found = Nie wykryto kontrolerów
+game.input_count = Podłączono: {n}
+game.input_detect = Wykryj urządzenie…
+game.input_detect_tip = Wykryj urządzenie: naciśnij przycisk, porusz drążkiem, obróć kierownicą lub naciśnij klawisz
+game.input_listening = Naciśnij przycisk, porusz drążkiem lub naciśnij klawisz…
+game.input_cancel = Anuluj
+game.input_offline = Offline
+game.input_assigned_to = G{n}
+game.input_auto_sub = Automatycznie: przypisuje pierwszy wolny kontroler lub klawiaturę
+game.input_kbm_sub = Tylko klawiatura i mysz (bez kontrolera)
+game.input_any_pad_sub = Dowolny kontroler (gotowy przy starcie, gdy jednoznaczny)

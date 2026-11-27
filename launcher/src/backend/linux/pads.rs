@@ -238,7 +238,7 @@ mod device {
     use std::sync::{Arc, Mutex};
 
     use super::{AbsRange, BTN_SOUTH, EVENT_SIZE, Ranges, Translate, events};
-    use crate::host::pad::{Hid, State, Threads, style_of};
+    use crate::host::pad::{DeviceKind, Hid, State, Threads, style_of};
 
     /// How long a reader waits for its device before looking at `Threads::stopping`.
     const POLL_MS: i32 = 100;
@@ -318,7 +318,7 @@ mod device {
         };
         let state = Arc::new(Mutex::new(State::default()));
         let alive = Arc::new(AtomicBool::new(true));
-        list.lock().unwrap().push(Hid { path, vid, pid, product, style: style_of(vid), state: state.clone(), alive: alive.clone(), home: true, stick: 0, serial_key: 0, inst_key: 0 });
+        list.lock().unwrap().push(Hid { path, vid, pid, product, style: style_of(vid), kind: DeviceKind::Gamepad, state: state.clone(), alive: alive.clone(), home: true, stick: 0, serial_key: 0, inst_key: 0 });
         let (stop, reader_alive) = (threads.clone(), alive.clone());
         let read = move || {
             let alive = reader_alive;

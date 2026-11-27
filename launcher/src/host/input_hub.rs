@@ -191,6 +191,8 @@ fn block_path(dir: &Path, pid: u32) -> std::path::PathBuf {
 pub struct Devices {
     /// The controllers, by index (`Pads::readings`' order).
     pub pads: Vec<VirtualPad>,
+    /// Wheel state for controller seats whose physical device is a racing wheel, matching `pads`.
+    pub pad_wheels: Vec<Option<VirtualWheel>>,
     /// Each controller's log name ("XInput slot 1", "HID 054c:0ce6"), matching `pads`.
     pub pad_names: Vec<Option<String>>,
     pub keyboards: HashMap<u64, VirtualKeyboard>,
@@ -255,7 +257,12 @@ pub fn route(assignment: &InputAssignment, overlay_open: bool, d: &Devices) -> I
         InputAssignment::None => s.mode = InputMode::BlockAll,
         InputAssignment::Controller { index } => {
             s.mode = InputMode::Virtual;
-            s.pad = usize::try_from(index).ok().and_then(|i| d.pads.get(i)).copied().unwrap_or_default();
+            if let Ok(i) = usize::try_from(index) {
+                s.pad = d.pads.get(i).copied().unwrap_or_default();
+                if let Some(w) = d.pad_wheels.get(i).and_then(|w| *w) {
+                    s.wheel = w;
+                }
+            }
         }
         InputAssignment::KeyboardMouse { device_id } => {
             s.mode = InputMode::Virtual;
@@ -345,6 +352,18 @@ pub fn virtual_pad(state: &pad::State, packet: u32) -> VirtualPad {
     }
 }
 
+/// A racing wheel reading mapped to `VirtualWheel` (None for non-wheel devices).
+pub fn reading_wheel(r: &pad::Reading) -> Option<VirtualWheel> {
+    (r.kind == pad::DeviceKind::Wheel).then(|| VirtualWheel {
+        connected: true,
+        steer: (r.state.lx.clamp(-1.0, 1.0) * 32767.0).round() as i32,
+        throttle: (r.state.rt.clamp(0.0, 1.0) * f32::from(u16::MAX)).round() as u16,
+        brake: (r.state.lt.clamp(0.0, 1.0) * f32::from(u16::MAX)).round() as u16,
+        clutch: 0,
+        buttons: xinput_buttons(r.state.buttons),
+    })
+}
+
 /// The keyboards and mice apart, from their raw input events (`RawInput` on Windows).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Kbm {
@@ -355,6 +374,8 @@ pub struct Kbm {
     /// Keys and mouse buttons gone down so far (a held key's repeats and the modifiers
     /// not counted): a session sees from it which player plays with the keyboard.
     pub presses: u64,
+    /// Non-modifier keyboard keys gone down so far (excluding mouse clicks).
+    pub key_presses: u64,
     /// Key and mouse button events of any kind so far (ups too): while this stays the
     /// same, only the mice moved or turned their wheels (`InputHub::publish_kbm`).
     pub others: u64,
@@ -387,6 +408,7 @@ impl Kbm {
                 let k = self.keyboards.entry(device).or_default();
                 if down && !k.is_down(vk) && !modifier(vk) {
                     self.presses += 1;
+                    self.key_presses += 1;
                 }
                 k.set(vk, down);
                 // A left or right Shift, Ctrl or Alt is also the key either side reads
@@ -515,12 +537,18 @@ impl InputHub {
         self.with_kbm(|k| k.presses)
     }
 
+    /// Non-modifier keyboard keys pressed so far (`Kbm::key_presses`).
+    pub fn kbm_key_presses(&mut self) -> u64 {
+        self.with_kbm(|k| k.key_presses)
+    }
+
     /// Key and button events so far (`Kbm::others`).
     pub fn kbm_others(&mut self) -> u64 {
         self.with_kbm(|k| k.others)
     }
 
     /// The pane the last whole publish gave the combined keyboard and mouse, if any.
+    #[allow(dead_code)]
     pub fn kbm_focus(&self) -> Option<usize> {
         self.kbm_focus
     }
@@ -528,10 +556,11 @@ impl InputHub {
     /// Between whole publishes, when only the mice moved (raw input comes up to a
     /// thousand times a second): each copy's last snapshot with its keyboard and mouse
     /// as they are now, the rest (controllers, overlay, focus) as last published. No
-    /// controller is read and no device table copied. `focus_cursor` is the focused
-    /// pane's cursor (`publish_session`) and `focus_pane` its screen projection.
-    pub fn publish_kbm(&mut self, instances: &mut [InstanceConn], focus_cursor: Option<(i32, i32)>, focus_pane: PaneProjection) {
-        let focus = self.kbm_focus;
+    /// controller is read and no device table copied. `focus` is the pane that owns the
+    /// combined keyboard and mouse now, `focus_cursor` its cursor fallback, and
+    /// `focus_pane` its screen projection.
+    pub fn publish_kbm(&mut self, instances: &mut [InstanceConn], focus: Option<usize>, focus_cursor: Option<(i32, i32)>, focus_pane: PaneProjection) {
+        self.kbm_focus = focus;
         let pairs = std::mem::take(&mut self.pairs);
         let idle_pane = PaneProjection { compositor_hwnd: focus_pane.compositor_hwnd, ..Default::default() };
         self.with_kbm(|k| {
@@ -547,9 +576,14 @@ impl InputHub {
                     s.keyboard = k.keyboards.get(&device_id).map(|kb| VirtualKeyboard { active: true, ..*kb }).unwrap_or_default();
                     s.mouse = k.mice.get(&mouse).map(|m| VirtualMouse { active: true, ..*m }).unwrap_or_default();
                 }
-                if focus == Some(idx) && matches!(assignment, InputAssignment::Controller { .. } | InputAssignment::KeyboardMouse { device_id: ANY_KEYBOARD }) {
-                    (s.keyboard, s.mouse) = combined(&k.keyboards, &k.mice, focus_cursor);
-                    s.pane = focus_pane;
+                if matches!(assignment, InputAssignment::Controller { .. } | InputAssignment::KeyboardMouse { device_id: ANY_KEYBOARD }) {
+                    if focus == Some(idx) {
+                        (s.keyboard, s.mouse) = combined(&k.keyboards, &k.mice, focus_cursor);
+                        s.pane = focus_pane;
+                    } else {
+                        s.keyboard = VirtualKeyboard::default();
+                        s.mouse = VirtualMouse::default();
+                    }
                 }
                 block.publish(&s);
             }
@@ -563,11 +597,13 @@ impl InputHub {
         let readings = self.pads.readings();
         self.last_pads.resize(readings.len(), (pad::State::default(), 0));
         let mut pads = Vec::with_capacity(readings.len());
+        let mut pad_wheels = Vec::with_capacity(readings.len());
         let mut pad_names = Vec::with_capacity(readings.len());
         for (r, (last, packet)) in readings.iter().zip(self.last_pads.iter_mut()) {
             // A seat whose controller is away: its copy has no controller meanwhile.
             let Some(r) = r else {
                 pads.push(VirtualPad::default());
+                pad_wheels.push(None);
                 pad_names.push(None);
                 continue;
             };
@@ -576,10 +612,11 @@ impl InputHub {
                 *packet = packet.wrapping_add(1);
             }
             pads.push(reading_pad(r, *packet));
+            pad_wheels.push(reading_wheel(r));
             pad_names.push(Some(r.name.clone()));
         }
         let (keyboards, mice) = self.with_kbm(|k| (k.keyboards.clone(), k.mice.clone()));
-        Devices { pads, pad_names, keyboards, mice, wheels: self.wheels.clone(), pairs: self.pairs.clone() }
+        Devices { pads, pad_wheels, pad_names, keyboards, mice, wheels: self.wheels.clone(), pairs: self.pairs.clone() }
     }
 
     /// Writes each copy's block from its assignment (`route`). A copy given a keyboard
@@ -872,12 +909,15 @@ mod tests {
         raw[0..2].copy_from_slice(&(0x1000u16 | 0x0400).to_le_bytes());
         raw[2] = 7;
         raw[8..10].copy_from_slice(&(-123i16).to_le_bytes());
-        let r = pad::Reading { name: "XInput slot 2".into(), style: pad::Style::Xbox, state: pad::State::default(), xinput: Some((2, raw)), hid_key: 0 };
+        let r = pad::Reading { name: "XInput slot 2".into(), style: pad::Style::Xbox, kind: pad::DeviceKind::Gamepad, state: pad::State::default(), xinput: Some((2, raw)), hid_key: 0 };
         let p = reading_pad(&r, 5);
         assert_eq!((p.xinput_buttons(), p.left_trigger, p.thumb_rx, p.xinput_slot, p.packet_number), (0x1400, 7, -123, Some(2), 5));
-        let r = pad::Reading { name: "HID 054c:09cc".into(), style: pad::Style::PlayStation, state: pad::State { buttons: pad::SOUTH, ..Default::default() }, xinput: None, hid_key: 99 };
+        let r = pad::Reading { name: "HID 054c:09cc".into(), style: pad::Style::PlayStation, kind: pad::DeviceKind::Gamepad, state: pad::State { buttons: pad::SOUTH, ..Default::default() }, xinput: None, hid_key: 99 };
         let p = reading_pad(&r, 1);
         assert_eq!((p.xinput_buttons(), p.xinput_slot, p.hid_key), (0x1000, None, 99));
+        let w = pad::Reading { name: "HID 046d:c24f".into(), style: pad::Style::Xbox, kind: pad::DeviceKind::Wheel, state: pad::State { lx: -0.5, lt: 0.5, rt: 1.0, buttons: pad::SOUTH, ..Default::default() }, xinput: None, hid_key: 77 };
+        let vw = reading_wheel(&w).expect("wheel reading");
+        assert!(vw.connected && vw.steer < -16000 && vw.throttle == u16::MAX && vw.brake > 32000 && vw.buttons == 0x1000);
     }
 
     /// Keyboards and mice stay apart by device; motion and wheel are running totals; a

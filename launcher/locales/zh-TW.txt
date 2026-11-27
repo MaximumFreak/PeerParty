@@ -749,3 +749,17 @@ game.adv_vram_budget = 分配顯示記憶體預算
 game.adv_vram_budget_sub = 向每個副本回報公平的顯示記憶體份額，讓引擎合理調整貼圖池以避免卡頓。
 game.adv_cpu_balance = 平衡 CPU 核心
 game.adv_cpu_balance_sub = 為每個副本指派偏好 CPU 核心並調整工作執行緒數，減少執行緒爭搶。
+
+game.input_any_pad = 任意控制器
+game.input_connected = 已連線的裝置
+game.input_none_found = 未偵測到控制器
+game.input_count = 已連線 {n} 個
+game.input_detect = 偵測裝置…
+game.input_detect_tip = 按下按鈕、推動搖桿、轉動方向盤或按下鍵盤按鍵以偵測裝置
+game.input_listening = 請按按鈕、推動搖桿或按鍵盤…
+game.input_cancel = 取消
+game.input_offline = 已離線
+game.input_assigned_to = P{n}
+game.input_auto_sub = 自動：指派第一個空閒控制器或鍵盤滑鼠
+game.input_kbm_sub = 僅鍵盤與滑鼠（不使用控制器）
+game.input_any_pad_sub = 任意控制器（無歧義時啟動即就緒）

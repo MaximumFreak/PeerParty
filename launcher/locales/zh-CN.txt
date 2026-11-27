@@ -749,3 +749,17 @@ game.adv_vram_budget = 分配显存预算
 game.adv_vram_budget_sub = 向每个副本报告公平的显存份额，让游戏引擎合理控制纹理池大小以减少卡顿。
 game.adv_cpu_balance = 均衡 CPU 核心
 game.adv_cpu_balance_sub = 为每个副本分配首选 CPU 核心并缩放工作线程数，减少线程争抢。
+
+game.input_any_pad = 任意手柄
+game.input_connected = 已连接的设备
+game.input_none_found = 未检测到手柄
+game.input_count = 已连接 {n} 个
+game.input_detect = 检测设备…
+game.input_detect_tip = 按下按键、推动摇杆、转动方向盘或按键盘按键以检测设备
+game.input_listening = 请按按键、推动摇杆或按键盘…
+game.input_cancel = 取消
+game.input_offline = 已断开
+game.input_assigned_to = P{n}
+game.input_auto_sub = 自动：分配首个空闲手柄或键盘鼠标
+game.input_kbm_sub = 仅键盘和鼠标（不使用手柄）
+game.input_any_pad_sub = 任意手柄（无歧义时启动即就绪）

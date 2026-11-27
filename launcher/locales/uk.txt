@@ -779,3 +779,17 @@ game.adv_vram_budget = Ділити бюджет VRAM
 game.adv_vram_budget_sub = Повідомляє кожній копії її справедливу частку VRAM, щоб рушії налаштовували пули текстур без ривків.
 game.adv_cpu_balance = Балансувати ядра ЦП
 game.adv_cpu_balance_sub = Надає кожній копії переважні ядра ЦП та масштабує робочі потоки для зменшення конкуренції.
+
+game.input_any_pad = Будь-який геймпад
+game.input_connected = Підключені пристрої
+game.input_none_found = Геймпадів не знайдено
+game.input_count = Підключено: {n}
+game.input_detect = Визначити пристрій…
+game.input_detect_tip = Визначити пристрій: натисніть кнопку, відхиліть стік, поверніть кермо або натисніть клавішу
+game.input_listening = Натисніть кнопку, відхиліть стік або натисніть клавішу…
+game.input_cancel = Скасувати
+game.input_offline = Не в мережі
+game.input_assigned_to = Г{n}
+game.input_auto_sub = Авто: призначає перший вільний геймпад або клавіатуру
+game.input_kbm_sub = Лише клавіатура та миша (без геймпада)
+game.input_any_pad_sub = Будь-який геймпад (готовий при запуску, якщо однозначно)

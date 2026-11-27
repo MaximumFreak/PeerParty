@@ -423,6 +423,7 @@ thread_local! {
 }
 
 const WM_DESTROY: u32 = 0x0002;
+const WM_SETFOCUS: u32 = 0x0007;
 const WM_SETCURSOR: u32 = 0x0020;
 const WM_NCDESTROY: u32 = 0x0082;
 const WM_MOUSEMOVE: u32 = 0x0200;
@@ -509,6 +510,7 @@ unsafe extern "system" fn focus_proc(h: HWND, m: u32, w: usize, l: isize) -> isi
         // down its graphics device.
         crate::video::window_destroyed(h as usize);
     }
+    let _focus_gain = (spoof && ((m == WM_ACTIVATE && (w & 0xffff) != 0) || m == WM_SETFOCUS)).then(crate::input::suppress_focus_click_buttons);
     let rc = call(m, w, l);
     if m == WM_NCDESTROY {
         // The window's last message: its entry goes (a later window may get its handle).

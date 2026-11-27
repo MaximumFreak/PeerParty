@@ -96,10 +96,10 @@ impl App {
                         ui.add_space(4.0);
                         widgets::card(ui, |ui| {
                             ui.set_width(ui.available_width());
-                            self.local_players(ui, &mut o, &running);
+                            self.local_players(ui, &key, &mut o, &running);
                         });
                     } else {
-                        self.local_players(ui, &mut o, &running);
+                        self.local_players(ui, &key, &mut o, &running);
                     }
                 } else {
                     widgets::note(ui, Icon::Info, TEXT3, t!("game.xbox_one_copy"));
@@ -210,7 +210,7 @@ impl App {
     /// Players on this PC: how many, and with two or more how they share it (split
     /// screen's layout, monitor and inputs, or when a second instance starts) and their
     /// names. One player sees the count alone.
-    fn local_players(&mut self, ui: &mut egui::Ui, o: &mut GameOptions, running: &[u8]) {
+    fn local_players(&mut self, ui: &mut egui::Ui, key: &str, o: &mut GameOptions, running: &[u8]) {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(t!("game.players_here")).size(13.5).color(if o.players >= 2 { TEXT } else { TEXT2 }));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -296,31 +296,8 @@ impl App {
                     }
                 }
                 widgets::divider(ui);
-                label_tip(ui, t!("game.player_inputs"), t!("game.inputs_note"));
-                let input_opts = [("auto", t!("game.input_auto")), ("kbm", t!("game.input_kbm")), ("pad", t!("game.input_pad"))];
-                let seg_w = segmented_width(ui, &input_opts);
-                for k in 0..usize::from(o.players.clamp(2, 4)) {
-                    let label = egui::RichText::new(t!("game.input_player", n = k + 1)).size(13.0).color(TEXT2);
-                    let mut v = o.split_input(k);
-                    let mut pick = |ui: &mut egui::Ui| {
-                        ui.push_id(("split-input", k), |ui| {
-                            if widgets::segmented(ui, &mut v, &input_opts) {
-                                o.set_split_input(k, v);
-                            }
-                        });
-                    };
-                    // Beside its player where both fit, under it in a narrow panel.
-                    let label_w = ui.painter().layout_no_wrap(label.text().to_string(), theme::font(13.0), TEXT2).size().x;
-                    if label_w + 12.0 + seg_w <= ui.available_width() {
-                        ui.horizontal(|ui| {
-                            ui.label(label);
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| pick(ui));
-                        });
-                    } else {
-                        ui.label(label);
-                        pick(ui);
-                    }
-                }
+                self.player_devices(ui, key, o);
+                ui.add_space(4.0);
                 let kbm_forced = o.has_kbm_player();
                 let mut kbm_on = !o.split_no_kbm || kbm_forced;
                 ui.add_enabled_ui(!kbm_forced, |ui| {
@@ -393,6 +370,230 @@ impl App {
                     self.save_settings();
                 }
             }
+        }
+    }
+
+    /// Per-player split-screen input assignment: simple `Auto` by default, with a live
+    /// connected-device picker (controllers, extended >4 Xbox pads, racing wheels, flight
+    /// sticks) and one-click press-to-detect binding.
+    fn player_devices(&mut self, ui: &mut egui::Ui, key: &str, o: &mut GameOptions) {
+        if self.nav.binding_input.as_ref().is_some_and(|(bk, _, _)| bk != key) {
+            self.nav.binding_input = None;
+        }
+        let devices = self.nav.pads.devices();
+        let active_dev = self.nav.pads.active_device();
+        let count = usize::from(o.players.clamp(2, crate::launch::SplitScreen::MAX_INSTANCES as u8));
+        // Header row: title + info tooltip on left, live connected-device pill on right.
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(t!("game.player_inputs")).size(13.5).color(TEXT));
+            let (ir, iresp) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+            Icon::Info.paint(ui.painter(), ir.center(), 13.0, if iresp.hovered() { TEXT2 } else { TEXT3 });
+            iresp.on_hover_text(t!("game.inputs_note"));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (dot_col, pill_text, tip) = if devices.is_empty() {
+                    (TEXT3, t!("game.input_none_found").to_string(), String::new())
+                } else {
+                    let any_act = devices.iter().any(|d| d.active);
+                    let list = devices.iter().map(|d| format!("{} ({})", d.label, d.badge)).collect::<Vec<_>>().join("\n");
+                    (if any_act { theme::GOOD } else { theme::GOOD.gamma_multiply(0.75) }, t!("game.input_count", n = devices.len()), list)
+                };
+                let galley = ui.painter().layout_no_wrap(pill_text, theme::font(11.5), if devices.is_empty() { TEXT3 } else { TEXT2 });
+                let (pr, presp) = ui.allocate_exact_size(vec2(galley.size().x + 22.0, 20.0), Sense::hover());
+                let p = ui.painter();
+                p.rect_filled(pr, 10.0, theme::FIELD);
+                p.rect_stroke(pr, 10.0, egui::Stroke::new(1.0, theme::line()), egui::StrokeKind::Inside);
+                fx::dot(p, pos2(pr.left() + 9.0, pr.center().y), 3.0, dot_col);
+                p.galley(pos2(pr.left() + 16.0, pr.center().y - galley.size().y / 2.0), galley, if devices.is_empty() { TEXT3 } else { TEXT2 });
+                if !tip.is_empty() {
+                    presp.on_hover_text(tip);
+                }
+            });
+        });
+        ui.add_space(4.0);
+        for k in 0..count {
+            ui.add_space(4.0);
+            let listening = self.nav.binding_input.as_ref().is_some_and(|(bk, slot, _)| bk == key && *slot == k);
+            if listening {
+                let armed = self.nav.binding_input.as_ref().is_some_and(|(_, _, a)| *a);
+                let keys_idle = ui.ctx().input(|i| i.keys_down.is_empty());
+                if !armed {
+                    if active_dev.is_none() && keys_idle {
+                        if let Some((_, _, a)) = self.nav.binding_input.as_mut() {
+                            *a = true;
+                        }
+                    }
+                } else if let Some(dev) = active_dev.as_ref() {
+                    o.set_split_device(k, &dev.id, Some(&dev.label));
+                    self.nav.binding_input = None;
+                } else {
+                    let esc = ui.ctx().input(|i| i.key_pressed(egui::Key::Escape));
+                    let any_key = ui.ctx().input(|i| {
+                        i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, repeat: false, key, .. } if *key != egui::Key::Escape))
+                    });
+                    if esc {
+                        self.nav.binding_input = None;
+                    } else if any_key {
+                        o.set_split_device(k, "kbm", None);
+                        self.nav.binding_input = None;
+                    }
+                }
+                ui.horizontal(|ui| {
+                    ui.add_sized(vec2(64.0, 32.0), egui::Label::new(egui::RichText::new(t!("game.input_player", n = k + 1)).size(13.0).color(TEXT)));
+                    let cancel_w = 64.0;
+                    let pill_w = (ui.available_width() - cancel_w - 6.0).max(100.0);
+                    let (rect, _) = ui.allocate_exact_size(vec2(pill_w, 32.0), Sense::hover());
+                    let p = ui.painter();
+                    fx::glow(p, rect, 9.0, ACCENT.gamma_multiply(0.25), 8.0);
+                    p.rect_filled(rect, 9.0, ACCENT.gamma_multiply(0.14));
+                    p.rect_stroke(rect, 9.0, egui::Stroke::new(1.2, ACCENT), egui::StrokeKind::Inside);
+                    let pulse = ((ui.ctx().input(|i| i.time) * 5.0).sin() as f32 * 0.5 + 0.5).clamp(0.35, 1.0);
+                    fx::dot(p, pos2(rect.left() + 14.0, rect.center().y), 3.5, ACCENT_HI.gamma_multiply(pulse));
+                    let text_rect = Rect::from_min_max(pos2(rect.left() + 26.0, rect.top()), pos2(rect.right() - 8.0, rect.bottom()));
+                    let mut job = egui::text::LayoutJob::simple_singleline(t!("game.input_listening").to_string(), theme::strong(12.5), TEXT);
+                    job.wrap = egui::text::TextWrapping::truncate_at_width(text_rect.width().max(20.0));
+                    let g = p.layout_job(job);
+                    p.with_clip_rect(text_rect).galley(pos2(text_rect.left(), rect.center().y - g.size().y / 2.0), g, TEXT);
+                    let (cr, cresp) = ui.allocate_exact_size(vec2(cancel_w, 32.0), Sense::click());
+                    let chot = cresp.hovered() || cresp.has_focus();
+                    let cp = ui.painter();
+                    cp.rect_filled(cr, 9.0, if chot { theme::CARD_HI } else { theme::FIELD });
+                    cp.rect_stroke(cr, 9.0, egui::Stroke::new(1.0, if chot { theme::line_strong() } else { theme::line() }), egui::StrokeKind::Inside);
+                    cp.text(cr.center(), egui::Align2::CENTER_CENTER, t!("game.input_cancel"), theme::font(12.0), if chot { TEXT } else { TEXT2 });
+                    widgets::ring(ui, &cresp, 9.0);
+                    if cresp.clicked() {
+                        self.nav.binding_input = None;
+                    }
+                });
+                continue;
+            }
+
+            let cur = o.split_input(k);
+            let parsed = crate::launch::SlotInput::named(&cur).unwrap_or_default();
+            let (icon_opt, dot_opt, display_label, badge_text, is_offline) = match parsed {
+                crate::launch::SlotInput::Auto => (Some(Icon::Bolt), None, t!("game.input_auto").to_string(), String::new(), false),
+                crate::launch::SlotInput::KeyboardMouse => (Some(Icon::Keyboard), None, t!("game.input_kbm").to_string(), String::new(), false),
+                crate::launch::SlotInput::Controller => (Some(Icon::Gamepad), None, t!("game.input_any_pad").to_string(), String::new(), false),
+                crate::launch::SlotInput::Device(_) => match devices.iter().find(|d| d.id == cur) {
+                    Some(dev) => {
+                        let col = if dev.active { theme::GOOD } else { theme::GOOD.gamma_multiply(0.75) };
+                        (None, Some(col), dev.label.clone(), dev.badge.clone(), false)
+                    }
+                    None => {
+                        let saved = o.split_input_names.get(&cur).cloned().unwrap_or_else(|| cur.clone());
+                        (None, Some(theme::WARN), saved, t!("game.input_offline").to_string(), true)
+                    }
+                },
+            };
+
+            ui.horizontal(|ui| {
+                ui.add_sized(vec2(64.0, 32.0), egui::Label::new(egui::RichText::new(t!("game.input_player", n = k + 1)).size(13.0).color(TEXT2)));
+                let detect_w = 32.0;
+                let picker_w = (ui.available_width() - detect_w - 6.0).max(120.0);
+                let (rect, resp) = ui.allocate_exact_size(vec2(picker_w, 32.0), Sense::click());
+                let id = ui.make_persistent_id(("split-device-picker", key, k));
+                let popup_id = id.with("popup");
+                if resp.clicked() {
+                    egui::Popup::toggle_id(ui.ctx(), popup_id);
+                }
+                let hot = resp.hovered() || resp.has_focus() || egui::Popup::is_id_open(ui.ctx(), popup_id);
+                let p = ui.painter();
+                p.rect_filled(rect, 9.0, if hot { theme::CARD_HI } else { theme::FIELD });
+                let border = if is_offline { theme::WARN.gamma_multiply(0.45) } else if hot { theme::line_strong() } else { theme::line() };
+                p.rect_stroke(rect, 9.0, egui::Stroke::new(1.0, border), egui::StrokeKind::Inside);
+                let mut left_x = rect.left() + 10.0;
+                if let Some(ic) = icon_opt {
+                    let col = if parsed == crate::launch::SlotInput::Auto { ACCENT_HI } else { TEXT2 };
+                    ic.paint(p, pos2(left_x + 6.0, rect.center().y), 13.5, col);
+                    left_x += 20.0;
+                } else if let Some(col) = dot_opt {
+                    fx::dot(p, pos2(left_x + 5.0, rect.center().y), 3.5, col);
+                    left_x += 16.0;
+                }
+                // Right side: down chevron + optional mini badge.
+                let mut right_x = rect.right() - 14.0;
+                let cv = pos2(right_x, rect.center().y);
+                let st = egui::Stroke::new(1.5, if hot { TEXT } else { TEXT3 });
+                p.line_segment([cv + vec2(-3.5, -1.5), cv + vec2(0.0, 2.0)], st);
+                p.line_segment([cv + vec2(0.0, 2.0), cv + vec2(3.5, -1.5)], st);
+                right_x -= 12.0;
+                if !badge_text.is_empty() {
+                    let bcol = if is_offline { theme::WARN } else { TEXT3 };
+                    let bgal = p.layout_no_wrap(badge_text, theme::font(11.0), bcol);
+                    let bw = bgal.size().x + 10.0;
+                    if right_x - bw > left_x + 48.0 {
+                        let br = Rect::from_min_size(pos2(right_x - bw, rect.center().y - 9.0), vec2(bw, 18.0));
+                        p.rect_filled(br, 5.0, if is_offline { theme::WARN.gamma_multiply(0.14) } else { Color32::from_white_alpha(10) });
+                        p.galley(pos2(br.left() + 5.0, br.center().y - bgal.size().y / 2.0), bgal, bcol);
+                        right_x -= bw + 6.0;
+                    }
+                }
+                let text_rect = Rect::from_min_max(pos2(left_x, rect.top()), pos2(right_x.max(left_x + 12.0), rect.bottom()));
+                let mut job = egui::text::LayoutJob::simple_singleline(display_label, theme::font(13.0), TEXT);
+                job.wrap = egui::text::TextWrapping::truncate_at_width(text_rect.width());
+                let g = p.layout_job(job);
+                p.with_clip_rect(text_rect).galley(pos2(text_rect.left(), rect.center().y - g.size().y / 2.0), g, TEXT);
+                widgets::ring(ui, &resp, 9.0);
+
+                // Dropdown popup with quick modes, live connected devices, and Detect.
+                let pop_w = picker_w.max(264.0);
+                egui::Popup::from_response(&resp)
+                    .id(popup_id)
+                    .open_memory(None)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .width(pop_w)
+                    .show(|ui| {
+                        ui.set_min_width(pop_w - 8.0);
+                        let mut quick = |token: &str, icon: Icon, label: &str, sub: &str| {
+                            let selected = cur == token;
+                            if device_menu_row(ui, Some(icon), None, label, "", selected, None).on_hover_text(sub).clicked() {
+                                o.set_split_device(k, token, None);
+                                ui.close();
+                            }
+                        };
+                        quick("auto", Icon::Bolt, t!("game.input_auto"), t!("game.input_auto_sub"));
+                        quick("kbm", Icon::Keyboard, t!("game.input_kbm"), t!("game.input_kbm_sub"));
+                        quick("pad", Icon::Gamepad, t!("game.input_any_pad"), t!("game.input_any_pad_sub"));
+                        ui.separator();
+                        ui.label(egui::RichText::new(t!("game.input_connected")).size(11.5).color(TEXT3));
+                        if devices.is_empty() {
+                            ui.add_space(2.0);
+                            ui.label(egui::RichText::new(t!("game.input_none_found")).size(12.5).color(TEXT3));
+                            ui.add_space(2.0);
+                        } else {
+                            egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                                for dev in &devices {
+                                    let selected = cur == dev.id;
+                                    let other_owner = (0..count).find(|&j| j != k && o.split_input(j) == dev.id).map(|j| t!("game.input_assigned_to", n = j + 1));
+                                    let dot = if dev.active { theme::GOOD } else { theme::GOOD.gamma_multiply(0.55) };
+                                    if device_menu_row(ui, None, Some(dot), &dev.label, &dev.badge, selected, other_owner.as_deref()).clicked() {
+                                        o.set_split_device(k, &dev.id, Some(&dev.label));
+                                        ui.close();
+                                    }
+                                }
+                            });
+                        }
+                        ui.separator();
+                        if device_menu_row(ui, Some(Icon::Search), None, t!("game.input_detect"), "", false, None).clicked() {
+                            self.nav.binding_input = Some((key.to_string(), k, false));
+                            ui.close();
+                        }
+                    });
+
+                // Compact live-detect target button beside the dropdown.
+                let (dr, dresp) = ui.allocate_exact_size(vec2(detect_w, 32.0), Sense::click());
+                let dhot = dresp.hovered() || dresp.has_focus();
+                let dp = ui.painter();
+                dp.rect_filled(dr, 9.0, if dhot { theme::CARD_HI } else { theme::FIELD });
+                dp.rect_stroke(dr, 9.0, egui::Stroke::new(1.0, if dhot { ACCENT.gamma_multiply(0.65) } else { theme::line() }), egui::StrokeKind::Inside);
+                let col = if dhot { ACCENT_HI } else { TEXT2 };
+                let c = dr.center();
+                dp.circle_stroke(c, 5.5, egui::Stroke::new(1.4, col));
+                dp.circle_filled(c, 2.0, col);
+                widgets::ring(ui, &dresp, 9.0);
+                if dresp.on_hover_text(t!("game.input_detect_tip")).clicked() {
+                    self.nav.binding_input = Some((key.to_string(), k, false));
+                }
+            });
         }
     }
 
@@ -805,6 +1006,66 @@ fn monitors() -> Vec<crate::host::MonitorBounds> {
             v
         }
     }
+}
+
+/// One row in the split-screen device picker popup: optional icon or status dot, label,
+/// optional badge and current-owner pill (`P2`), plus checkmark when selected.
+fn device_menu_row(
+    ui: &mut egui::Ui,
+    icon: Option<Icon>,
+    dot: Option<Color32>,
+    label: &str,
+    badge: &str,
+    selected: bool,
+    owner: Option<&str>,
+) -> egui::Response {
+    let w = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, 30.0), Sense::click());
+    let hot = resp.hovered() || resp.has_focus();
+    let p = ui.painter();
+    if selected {
+        p.rect_filled(rect, 7.0, ACCENT.gamma_multiply(0.20));
+    } else if hot {
+        p.rect_filled(rect, 7.0, Color32::from_white_alpha(14));
+    }
+    let mut left_x = rect.left() + 8.0;
+    if let Some(ic) = icon {
+        ic.paint(p, pos2(left_x + 6.0, rect.center().y), 13.5, if selected { ACCENT_HI } else { TEXT2 });
+        left_x += 20.0;
+    } else if let Some(col) = dot {
+        fx::dot(p, pos2(left_x + 5.0, rect.center().y), 3.5, col);
+        left_x += 16.0;
+    }
+    let mut right_x = rect.right() - 8.0;
+    if selected {
+        Icon::Check.paint(p, pos2(right_x - 6.0, rect.center().y), 13.0, ACCENT_HI);
+        right_x -= 18.0;
+    }
+    if let Some(own) = owner {
+        let g = p.layout_no_wrap(own.to_string(), theme::strong(10.5), ACCENT_HI);
+        let bw = g.size().x + 10.0;
+        let br = Rect::from_min_size(pos2(right_x - bw, rect.center().y - 8.5), vec2(bw, 17.0));
+        p.rect_filled(br, 5.0, ACCENT.gamma_multiply(0.18));
+        p.galley(pos2(br.left() + 5.0, br.center().y - g.size().y / 2.0), g, ACCENT_HI);
+        right_x -= bw + 5.0;
+    }
+    if !badge.is_empty() {
+        let g = p.layout_no_wrap(badge.to_string(), theme::font(11.0), TEXT3);
+        let bw = g.size().x + 10.0;
+        if right_x - bw > left_x + 48.0 {
+            let br = Rect::from_min_size(pos2(right_x - bw, rect.center().y - 8.5), vec2(bw, 17.0));
+            p.rect_filled(br, 5.0, Color32::from_white_alpha(10));
+            p.galley(pos2(br.left() + 5.0, br.center().y - g.size().y / 2.0), g, TEXT3);
+            right_x -= bw + 5.0;
+        }
+    }
+    let text_rect = Rect::from_min_max(pos2(left_x, rect.top()), pos2(right_x.max(left_x + 16.0), rect.bottom()));
+    let mut job = egui::text::LayoutJob::simple_singleline(label.to_string(), theme::font(13.0), if selected { Color32::WHITE } else { TEXT });
+    job.wrap = egui::text::TextWrapping::truncate_at_width(text_rect.width());
+    let g = p.layout_job(job);
+    p.with_clip_rect(text_rect).galley(pos2(text_rect.left(), rect.center().y - g.size().y / 2.0), g, if selected { Color32::WHITE } else { TEXT });
+    widgets::ring(ui, &resp, 7.0);
+    resp
 }
 
 /// A line of "who can join": an icon, who, and how it stands.

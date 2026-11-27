@@ -16,12 +16,13 @@ pub struct Rect {
     pub bottom: i32,
 }
 
-/// Who has the foreground: a process, whether its window is a console's, or nothing
-/// (`none`: a Windows prompt has the screen).
+/// Who has the foreground: a process, whether its window is a console's or a standard
+/// Win32 dialog box (`#32770`), or nothing (`none`: a Windows prompt has the screen).
 pub struct Foreground {
     pub pid: u32,
     pub none: bool,
     pub console: bool,
+    pub dialog: bool,
 }
 
 /// The `(width, height)` of a mode line such as `1280x800`, landscape (the Steam Deck's
@@ -85,7 +86,7 @@ mod win {
         let mut pid = 0u32;
         let fg = unsafe { GetForegroundWindow() };
         unsafe { GetWindowThreadProcessId(fg, &mut pid) };
-        Foreground { pid, none: fg.is_null(), console: !fg.is_null() && is_console(fg) }
+        Foreground { pid, none: fg.is_null(), console: !fg.is_null() && is_console(fg), dialog: !fg.is_null() && is_dialog(fg) }
     }
 
     /// The process whose window is in front is `pid`.
@@ -273,7 +274,7 @@ mod unix {
     }
 
     pub fn foreground() -> Foreground {
-        Foreground { pid: 0, none: true, console: false }
+        Foreground { pid: 0, none: true, console: false, dialog: false }
     }
 
     /// The game has the screen.

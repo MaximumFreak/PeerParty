@@ -763,3 +763,17 @@ game.adv_vram_budget = Condividi budget VRAM
 game.adv_vram_budget_sub = Comunica a ogni copia la sua quota di VRAM così i motori dimensionano le texture senza scatti.
 game.adv_cpu_balance = Bilancia core CPU
 game.adv_cpu_balance_sub = Assegna core CPU preferiti a ogni copia e riduce i thread di lavoro per evitare contese.
+
+game.input_any_pad = Qualsiasi controller
+game.input_connected = Dispositivi connessi
+game.input_none_found = Nessun controller rilevato
+game.input_count = {n} connessi
+game.input_detect = Rileva dispositivo…
+game.input_detect_tip = Rileva un dispositivo: premi un pulsante, muovi uno stick, gira un volante o premi un tasto
+game.input_listening = Premi un pulsante, muovi uno stick o premi un tasto…
+game.input_cancel = Annulla
+game.input_offline = Offline
+game.input_assigned_to = G{n}
+game.input_auto_sub = Automatico: assegna il primo controller libero o la tastiera
+game.input_kbm_sub = Solo tastiera e mouse (nessun controller)
+game.input_any_pad_sub = Qualsiasi controller (pronto all'avvio se non ambiguo)

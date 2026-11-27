@@ -763,3 +763,17 @@ game.adv_vram_budget = GPU-Speicherbudget teilen
 game.adv_vram_budget_sub = Meldet jeder Kopie ihren fairen VRAM-Anteil, damit Engines Textur-Pools ohne Ruckler dimensionieren.
 game.adv_cpu_balance = CPU-Kerne verteilen
 game.adv_cpu_balance_sub = Weist jeder Kopie bevorzugte CPU-Kerne zu und skaliert Worker-Threads gegen Thread-Konkurrenz.
+
+game.input_any_pad = Beliebiger Controller
+game.input_connected = Verbundene Geräte
+game.input_none_found = Keine Controller erkannt
+game.input_count = {n} verbunden
+game.input_detect = Gerät erkennen…
+game.input_detect_tip = Gerät erkennen: Taste drücken, Stick bewegen, Lenkrad drehen oder Taste auf der Tastatur drücken
+game.input_listening = Taste drücken, Stick bewegen oder Taste eingeben…
+game.input_cancel = Abbrechen
+game.input_offline = Offline
+game.input_assigned_to = S{n}
+game.input_auto_sub = Automatisch: weist den ersten freien Controller oder die Tastatur zu
+game.input_kbm_sub = Nur Tastatur und Maus (kein Controller)
+game.input_any_pad_sub = Beliebiger Controller (beim Start bereit, wenn eindeutig)

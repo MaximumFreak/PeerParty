@@ -625,34 +625,48 @@ pub(super) fn nav_buttons(b: u16) -> (u32, u32) {
     (pick(&REQ), pick(&OPT))
 }
 
-/// A reading of a class no copy is seated on (arcade stick, flight stick, wheel): at
-/// rest in split screen and while the overlay has the controllers, its timestamp kept;
-/// `rest` writes the rest after the timestamp.
-fn at_rest(h: &GenericDetour<GamepadReading>, this: usize, out: *mut u8, rest: impl FnOnce(*mut u8)) -> i32 {
+/// A reading of a specialised controller class (arcade stick, flight stick, racing wheel):
+/// at rest while the overlay has the controllers (`BlockAll`), or in split screen when
+/// this copy doesn't own a wheel or native HID controller; passes through for a copy
+/// that was assigned one.
+fn at_rest(h: &GenericDetour<GamepadReading>, this: usize, out: *mut u8, is_wheel: bool, rest: impl FnOnce(*mut u8)) -> i32 {
     let hr = unsafe { h.call(this, out) };
-    if hr >= 0 && !out.is_null() && policy() != Policy::PassThrough {
-        super::first_use(&super::USED_WGI_OTHER, "Windows.Gaming.Input arcade sticks, flight sticks or wheels (at rest in split screen)");
-        rest(out);
+    if hr >= 0 && !out.is_null() {
+        let hold = match policy() {
+            Policy::PassThrough => false,
+            Policy::BlockAll => true,
+            Policy::Virtual(snap) => {
+                if is_wheel && snap.wheel.connected {
+                    false
+                } else {
+                    !(snap.pad.connected && snap.pad.hid_key != 0)
+                }
+            }
+        };
+        if hold {
+            super::first_use(&super::USED_WGI_OTHER, "Windows.Gaming.Input arcade sticks, flight sticks or wheels (held at rest when not assigned to this copy)");
+            rest(out);
+        }
     }
     hr
 }
 
 /// ArcadeStickReading: Timestamp, Buttons.
 unsafe extern "system" fn arcade_reading(this: usize, out: *mut u8) -> i32 {
-    ARCADE.get().map_or(-1, |h| at_rest(h, this, out, |o| unsafe { std::ptr::write_bytes(o.add(8), 0, 4) }))
+    ARCADE.get().map_or(-1, |h| at_rest(h, this, out, false, |o| unsafe { std::ptr::write_bytes(o.add(8), 0, 4) }))
 }
 
 /// FlightStickReading: Timestamp, Buttons, HatSwitch (0: centre), Roll, Pitch, Yaw,
 /// Throttle (doubles; 0 is centred, and the throttle closed).
 unsafe extern "system" fn flight_reading(this: usize, out: *mut u8) -> i32 {
-    FLIGHT.get().map_or(-1, |h| at_rest(h, this, out, |o| unsafe { std::ptr::write_bytes(o.add(8), 0, 40) }))
+    FLIGHT.get().map_or(-1, |h| at_rest(h, this, out, false, |o| unsafe { std::ptr::write_bytes(o.add(8), 0, 40) }))
 }
 
 /// RacingWheelReading: Timestamp, Buttons, PatternShifterGear (kept), Wheel, Throttle,
 /// Brake, Clutch, Handbrake (doubles: wheel centred, pedals up).
 unsafe extern "system" fn wheel_reading(this: usize, out: *mut u8) -> i32 {
     WHEEL.get().map_or(-1, |h| {
-        at_rest(h, this, out, |o| unsafe {
+        at_rest(h, this, out, true, |o| unsafe {
             std::ptr::write_bytes(o.add(8), 0, 4);
             std::ptr::write_bytes(o.add(16), 0, 40);
         })

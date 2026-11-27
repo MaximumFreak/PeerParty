@@ -12,7 +12,7 @@ use crate::launch::{self, Launch, LaunchError, SplitScreen};
 use crate::{backend, firewall, host};
 use peerparty_protocol::session::LayoutPreset;
 
-pub const USAGE: &str = "usage: peerparty [--room CODE] [--public] [--set key=value] [--log-dir DIR] [--multi-instance] [--copy-saves] [--player N] [--split-screen [--instances N] [--layout horizontal|vertical|top2|bottom2|grid|slots:...] [--inputs auto|kbm|pad,...] [--no-kbm] [--stagger smart|0..60] [--no-sync] [--fps 0|1/2|1/3|15..240] [--render-scale 50..100] [--no-upscale] [--no-vram-budget] [--no-cpu-balance] [--names A,B,...] [--monitor N]] <game.exe> [args...]\n         plays the game through peerparty: the local network, plus the internet with --room or --public\n         a simple .bat or .cmd that starts the game works too: peerparty starts the program it runs\n         --set changes one setting for this run: name=Alex, voice=off, internet=off, overlay=off, auto_accept=on, ... (docs/usage.md)\n         --player N plays alone as player N (1-4): that player's saves, name and identity\n       peerparty --saves <game.exe>   (each player's saves for the game, and their backups)\n       peerparty --copy-save FROM TO <game.exe> | --swap-saves A B <game.exe> | --reset-save N <game.exe> | --restore-save N BACKUP <game.exe>   (players 1-4; the one replaced is backed up first)\n       peerparty --invite   (invites every other player to the game in front)\n       peerparty --new-room   (makes a room code for internet play)\n       peerparty --net-test   (checks this PC's internet path: STUN, NAT type, the DHT)\n       peerparty --pads   (lists the controllers the overlay reads, and their buttons)\n       peerparty --firewall <game.exe>   (whether Windows Firewall lets other players connect to it)\n       peerparty --fix-firewall <game.exe> [--public]   (as administrator: lets them, on private and domain networks, and public ones with --public)\n       peerparty --remove-firewall   (as administrator: removes every firewall rule peerparty added)\n       peerparty --blocked | --block FINGERPRINT | --unblock FINGERPRINT|all   (public players you blocked)\n       peerparty --friends | --friend FINGERPRINT | --unfriend FINGERPRINT|all   (friends for PEERPARTY_PUBLIC_FRIENDS_ONLY=1)";
+pub const USAGE: &str = "usage: peerparty [--room CODE] [--public] [--set key=value] [--log-dir DIR] [--multi-instance] [--copy-saves] [--player N] [--split-screen [--instances N] [--layout horizontal|vertical|top2|bottom2|grid|slots:...] [--inputs auto|kbm|pad|xinput:N|wgi:ID|hid:ID,...] [--no-kbm] [--stagger smart|0..60] [--no-sync] [--fps 0|1/2|1/3|15..240] [--render-scale 50..100] [--no-upscale] [--no-vram-budget] [--no-cpu-balance] [--names A,B,...] [--monitor N]] <game.exe> [args...]\n         plays the game through peerparty: the local network, plus the internet with --room or --public\n         a simple .bat or .cmd that starts the game works too: peerparty starts the program it runs\n         --set changes one setting for this run: name=Alex, voice=off, internet=off, overlay=off, auto_accept=on, ... (docs/usage.md)\n         --player N plays alone as player N (1-4): that player's saves, name and identity\n       peerparty --saves <game.exe>   (each player's saves for the game, and their backups)\n       peerparty --copy-save FROM TO <game.exe> | --swap-saves A B <game.exe> | --reset-save N <game.exe> | --restore-save N BACKUP <game.exe>   (players 1-4; the one replaced is backed up first)\n       peerparty --invite   (invites every other player to the game in front)\n       peerparty --new-room   (makes a room code for internet play)\n       peerparty --net-test   (checks this PC's internet path: STUN, NAT type, the DHT)\n       peerparty --pads   (lists the controllers the overlay reads, and their buttons)\n       peerparty --firewall <game.exe>   (whether Windows Firewall lets other players connect to it)\n       peerparty --fix-firewall <game.exe> [--public]   (as administrator: lets them, on private and domain networks, and public ones with --public)\n       peerparty --remove-firewall   (as administrator: removes every firewall rule peerparty added)\n       peerparty --blocked | --block FINGERPRINT | --unblock FINGERPRINT|all   (public players you blocked)\n       peerparty --friends | --friend FINGERPRINT | --unfriend FINGERPRINT|all   (friends for PEERPARTY_PUBLIC_FRIENDS_ONLY=1)";
 
 /// A parsed command-line invocation.
 pub enum Command {
@@ -122,7 +122,7 @@ pub fn parse(raw: impl IntoIterator<Item = OsString>) -> Result<Command, String>
             Some("--inputs") => {
                 args.next();
                 let list = args.next().ok_or(USAGE)?.to_string_lossy().into_owned();
-                let inputs = SplitScreen::inputs_named(&list).ok_or_else(|| format!("bad --inputs {list:?} (expected up to {} of auto, kbm or pad, comma-separated)", SplitScreen::MAX_INSTANCES))?;
+                let inputs = SplitScreen::inputs_named(&list).ok_or_else(|| format!("bad --inputs {list:?} (expected up to {} of auto, kbm, pad, or device pin like xinput:0, comma-separated)", SplitScreen::MAX_INSTANCES))?;
                 launch.split.get_or_insert_with(SplitScreen::default).inputs = inputs;
             }
             Some("--no-kbm") => {
@@ -516,6 +516,16 @@ mod tests {
         assert_eq!(split(&["--split-screen", "--fps", "1/3", "game.exe"]).fps, launch::FpsCap::Divisor(3));
         assert_eq!(split(&["--split-screen", "--fps", "half", "game.exe"]).fps, launch::FpsCap::Divisor(2));
         assert_eq!(split(&["--split-screen", "--fps", "third", "game.exe"]).fps, launch::FpsCap::Divisor(3));
+        let pinned = split(&["--split-screen", "--instances", "4", "--inputs", "kbm,xinput:0,wgi:0000000000000005,hid:1234", "game.exe"]);
+        assert_eq!(
+            pinned.inputs,
+            vec![
+                SlotInput::KeyboardMouse,
+                SlotInput::Device(crate::host::pad::DevicePin::XInput(0)),
+                SlotInput::Device(crate::host::pad::DevicePin::Wgi(5)),
+                SlotInput::Device(crate::host::pad::DevicePin::Hid(0x1234)),
+            ]
+        );
     }
 
     #[test]

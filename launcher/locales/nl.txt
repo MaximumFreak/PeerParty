@@ -763,3 +763,17 @@ game.adv_vram_budget = VRAM-budget delen
 game.adv_vram_budget_sub = Meldt elke kopie zijn eerlijke deel van het VRAM zodat engines texture-pools zonder haperingen instellen.
 game.adv_cpu_balance = CPU-kernen verdelen
 game.adv_cpu_balance_sub = Geeft elke kopie eigen voorkeurskernen en schaalt worker-threads tegen thread-concurrentie.
+
+game.input_any_pad = Willekeurige controller
+game.input_connected = Verbonden apparaten
+game.input_none_found = Geen controllers gevonden
+game.input_count = {n} verbonden
+game.input_detect = Apparaat detecteren…
+game.input_detect_tip = Detecteer een apparaat: druk op een knop, beweeg een stick, draai een stuur of druk op een toets
+game.input_listening = Druk op een knop, beweeg stick of druk op een toets…
+game.input_cancel = Annuleren
+game.input_offline = Offline
+game.input_assigned_to = S{n}
+game.input_auto_sub = Automatisch: wijst de eerste vrije controller of toetsenbord toe
+game.input_kbm_sub = Alleen toetsenbord en muis (geen controller)
+game.input_any_pad_sub = Willekeurige controller (direct klaar bij starten indien eenduidig)

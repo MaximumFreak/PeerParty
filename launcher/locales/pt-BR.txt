@@ -763,3 +763,17 @@ game.adv_vram_budget = Dividir orçamento de VRAM
 game.adv_vram_budget_sub = Informa a cada cópia sua parte justa da VRAM para os motores ajustarem as texturas sem engasgos.
 game.adv_cpu_balance = Equilibrar núcleos de CPU
 game.adv_cpu_balance_sub = Dá núcleos preferenciais a cada cópia e ajusta threads de trabalho para reduzir disputa.
+
+game.input_any_pad = Qualquer controle
+game.input_connected = Dispositivos conectados
+game.input_none_found = Nenhum controle detectado
+game.input_count = {n} conectado(s)
+game.input_detect = Detectar dispositivo…
+game.input_detect_tip = Detectar um dispositivo: pressione um botão, mova um analógico, gire um volante ou pressione uma tecla
+game.input_listening = Pressione um botão, mova o analógico ou uma tecla…
+game.input_cancel = Cancelar
+game.input_offline = Offline
+game.input_assigned_to = J{n}
+game.input_auto_sub = Automático: atribui o primeiro controle livre ou teclado
+game.input_kbm_sub = Apenas teclado e mouse (sem controle)
+game.input_any_pad_sub = Qualquer controle (pronto ao iniciar quando inequívoco)

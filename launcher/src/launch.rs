@@ -373,7 +373,7 @@ impl<'de> serde::Deserialize<'de> for FpsCap {
     }
 }
 
-/// What a split-screen player plays with (`--inputs auto,kbm,pad`).
+/// What a split-screen player plays with (`--inputs auto,kbm,pad,xinput:0,hid:...`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SlotInput {
     /// A controller, the first one used that no other player has; the keyboard and
@@ -383,25 +383,43 @@ pub enum SlotInput {
     Auto,
     /// The keyboard and mouse, never a controller.
     KeyboardMouse,
-    /// A controller; the keyboard and mouse only while their pane has the focus.
+    /// Any controller; pre-seated at boot when unambiguous; the keyboard and mouse only
+    /// while their pane has the focus.
     Controller,
+    /// A specific pinned physical controller, wheel, or flight stick (`xinput:N`, `wgi:ID`, `hid:ID`).
+    Device(crate::host::pad::DevicePin),
 }
 
 impl SlotInput {
     pub fn named(name: &str) -> Option<SlotInput> {
-        Some(match name.trim().to_ascii_lowercase().as_str() {
+        let trimmed = name.trim();
+        Some(match trimmed.to_ascii_lowercase().as_str() {
             "auto" | "" => SlotInput::Auto,
             "kbm" | "keyboard" | "mouse" => SlotInput::KeyboardMouse,
             "pad" | "controller" | "gamepad" => SlotInput::Controller,
-            _ => return None,
+            _ => SlotInput::Device(crate::host::pad::DevicePin::parse(trimmed)?),
         })
     }
 
-    pub fn as_str(self) -> &'static str {
+    pub fn to_arg(self) -> String {
         match self {
-            SlotInput::Auto => "auto",
-            SlotInput::KeyboardMouse => "kbm",
-            SlotInput::Controller => "pad",
+            SlotInput::Auto => "auto".into(),
+            SlotInput::KeyboardMouse => "kbm".into(),
+            SlotInput::Controller => "pad".into(),
+            SlotInput::Device(pin) => pin.to_token(),
+        }
+    }
+
+    /// Whether this player is explicitly assigned a controller (any or pinned).
+    pub fn is_controller(self) -> bool {
+        matches!(self, SlotInput::Controller | SlotInput::Device(_))
+    }
+
+    /// The pinned device, if this player chose a specific controller/wheel/stick.
+    pub fn pin(self) -> Option<crate::host::pad::DevicePin> {
+        match self {
+            SlotInput::Device(pin) => Some(pin),
+            _ => None,
         }
     }
 
@@ -410,7 +428,7 @@ impl SlotInput {
     pub fn assignment(self, slot: u32) -> InputAssignment {
         match self {
             SlotInput::KeyboardMouse => InputAssignment::KeyboardMouse { device_id: ANY_KEYBOARD },
-            SlotInput::Auto | SlotInput::Controller => InputAssignment::Controller { index: slot },
+            SlotInput::Auto | SlotInput::Controller | SlotInput::Device(_) => InputAssignment::Controller { index: slot },
         }
     }
 }

@@ -54,9 +54,13 @@ pub struct GameOptions {
     pub split_no_vram_budget: bool,
     /// Turn off CPU core partitioning and worker thread scaling (`--no-cpu-balance`).
     pub split_no_cpu_balance: bool,
-    /// What each split-screen player plays with, by player: "auto", "kbm" or "pad"
-    /// (`launch::SlotInput`); missing ones are "auto".
+    /// What each split-screen player plays with, by player: "auto", "kbm", "pad", or a
+    /// pinned device token (`xinput:N`, `wgi:ID`, `hid:ID`); missing ones are "auto".
     pub split_inputs: Vec<String>,
+    /// Friendly display names remembered for pinned device tokens (`xinput:0` -> name)
+    /// so unplugged pinned devices still show a readable label.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub split_input_names: HashMap<String, String>,
     /// Keep the PC's keyboard and mouse from reaching games in split screen (`--no-kbm`,
     /// controllers only), unless a player explicitly chose keyboard and mouse.
     pub split_no_kbm: bool,
@@ -138,9 +142,9 @@ impl GameOptions {
         (0..n).any(|k| self.split_input(k) == "kbm")
     }
 
-    /// Split-screen player `k`'s input: "auto", "kbm" or "pad".
-    pub fn split_input(&self, k: usize) -> &'static str {
-        crate::launch::SlotInput::named(self.split_inputs.get(k).map_or("", String::as_str)).unwrap_or_default().as_str()
+    /// Split-screen player `k`'s input: "auto", "kbm", "pad", or a pinned device token.
+    pub fn split_input(&self, k: usize) -> String {
+        crate::launch::SlotInput::named(self.split_inputs.get(k).map_or("", String::as_str)).unwrap_or_default().to_arg()
     }
 
     pub fn set_split_input(&mut self, k: usize, v: &str) {
@@ -150,11 +154,29 @@ impl GameOptions {
         self.split_inputs[k] = v.into();
     }
 
+    /// Assigns `token` to player `k`, clearing any duplicate pin on another player so two
+    /// players never fight over the same physical device, and remembers its friendly name.
+    pub fn set_split_device(&mut self, k: usize, token: &str, friendly_name: Option<&str>) {
+        let parsed = crate::launch::SlotInput::named(token).unwrap_or_default();
+        let canonical = parsed.to_arg();
+        if parsed.pin().is_some() {
+            for (j, slot) in self.split_inputs.iter_mut().enumerate() {
+                if j != k && crate::launch::SlotInput::named(slot).is_some_and(|s| s == parsed) {
+                    *slot = "auto".into();
+                }
+            }
+            if let Some(name) = friendly_name.map(str::trim).filter(|n| !n.is_empty()) {
+                self.split_input_names.insert(canonical.clone(), name.to_string());
+            }
+        }
+        self.set_split_input(k, &canonical);
+    }
+
     /// `--inputs`' value for the players there are, or None when they're all "auto".
     pub fn split_inputs_arg(&self) -> Option<String> {
         let n = usize::from(self.players.clamp(2, 4));
-        let v: Vec<&str> = (0..n).map(|k| self.split_input(k)).collect();
-        v.iter().any(|i| *i != "auto").then(|| v.join(","))
+        let v: Vec<String> = (0..n).map(|k| self.split_input(k)).collect();
+        v.iter().any(|i| i != "auto").then(|| v.join(","))
     }
 
     /// Effective render scale percentage (`50..=100`; 0 in older files reads as 100%).
@@ -189,6 +211,7 @@ impl Default for GameOptions {
             split_no_vram_budget: false,
             split_no_cpu_balance: false,
             split_inputs: Vec::new(),
+            split_input_names: HashMap::new(),
             split_no_kbm: false,
             split_monitor: 0,
             compositor: String::new(),
@@ -917,5 +940,20 @@ mod tests {
         assert_eq!(split_args(r#"-windowed  "-name=A B" -x"#), ["-windowed", "-name=A B", "-x"]);
         assert!(split_args("   ").is_empty());
         assert_eq!(split_args(r#""""#), [""]);
+    }
+
+    #[test]
+    fn split_device_pinning_moves_duplicates_and_remembers_names() {
+        let mut o = GameOptions { players: 3, split_screen: true, ..GameOptions::default() };
+        o.set_split_device(0, "kbm", None);
+        o.set_split_device(1, "xinput:0", Some("Xbox Wireless Controller"));
+        o.set_split_device(2, "hid:0000000000000042", Some("Racing Wheel"));
+        assert_eq!(o.split_inputs_arg().as_deref(), Some("kbm,xinput:0,hid:0000000000000042"));
+        assert_eq!(o.split_input_names.get("xinput:0").map(String::as_str), Some("Xbox Wireless Controller"));
+        // Reassigning xinput:0 to player 3 clears it from player 2 cleanly.
+        o.set_split_device(2, "xinput:0", Some("Xbox Wireless Controller"));
+        assert_eq!(o.split_input(1), "auto");
+        assert_eq!(o.split_input(2), "xinput:0");
+        assert_eq!(o.split_inputs_arg().as_deref(), Some("kbm,auto,xinput:0"));
     }
 }

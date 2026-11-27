@@ -35,6 +35,7 @@ type GetDeviceInfo = unsafe extern "system" fn(isize, u32, *mut u16, *mut u32) -
 const RIDI_DEVICENAME: u32 = 0x2000_0007;
 const HIDP_STATUS_SUCCESS: i32 = 0x0011_0000;
 const USAGE_PAGE_GENERIC: u16 = 0x01;
+const USAGE_PAGE_SIMULATION: u16 = 0x02;
 
 /// A HID device as the hook sees it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,10 +64,12 @@ impl Hid {
     }
 }
 
-/// Whether a generic-desktop usage is a game controller's: joystick, gamepad,
-/// multi-axis.
+/// Whether a HID top-level collection usage is a game controller's: Generic Desktop
+/// joystick, gamepad or multi-axis, or Simulation Controls (flight stick, steering wheel,
+/// sailing, spaceship).
 pub(super) fn is_controller_usage(page: u16, usage: u16) -> bool {
-    page == USAGE_PAGE_GENERIC && matches!(usage, 0x04 | 0x05 | 0x08)
+    (page == USAGE_PAGE_GENERIC && matches!(usage, 0x04 | 0x05 | 0x08))
+        || (page == USAGE_PAGE_SIMULATION && matches!(usage, 0x01 | 0x02 | 0x04 | 0x05))
 }
 
 struct HidFns {
@@ -631,6 +634,7 @@ mod tests {
         assert!(is_xinput_path(&w("\\\\?\\HID#VID_045E&PID_028E&IG_00#4&fb85800&0&0000#{4d1e55b2}")));
         assert!(!is_xinput_path(&w("\\\\?\\HID#VID_054C&PID_0DF2#7&1&0000#{4d1e55b2}")));
         assert!(is_controller_usage(1, 5) && is_controller_usage(1, 4) && is_controller_usage(1, 8));
+        assert!(is_controller_usage(2, 1) && is_controller_usage(2, 2), "flight stick and racing wheel");
         assert!(!is_controller_usage(1, 6), "a keyboard");
         assert!(!is_controller_usage(0x0c, 5), "consumer controls");
     }
