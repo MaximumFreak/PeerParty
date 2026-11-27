@@ -206,6 +206,37 @@ static INSTALL_LOCKS: [Mutex<()>; 4] = [const { Mutex::new(()) }; 4];
 /// capture or viewport): a graphics module the game loads later gets them too.
 static WANTED: AtomicBool = AtomicBool::new(false);
 
+thread_local! {
+    /// Bitmask of APIs currently inside `Api::try_install` on this thread, so a hook
+    /// triggered by our own throwaway device creation can never self-deadlock on
+    /// `INSTALL_LOCKS`.
+    static IN_TRY_INSTALL: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+struct TryInstallGuard {
+    prev: u8,
+}
+
+impl TryInstallGuard {
+    fn enter(api: Api) -> Option<Self> {
+        let bit = 1u8 << (api as u8);
+        IN_TRY_INSTALL.with(|mask| {
+            let prev = mask.get();
+            if prev & bit != 0 {
+                return None;
+            }
+            mask.set(prev | bit);
+            Some(Self { prev })
+        })
+    }
+}
+
+impl Drop for TryInstallGuard {
+    fn drop(&mut self) {
+        IN_TRY_INSTALL.with(|mask| mask.set(self.prev));
+    }
+}
+
 impl Api {
     const ALL: [Api; 4] = [Api::Dxgi, Api::D3d9, Api::Gl, Api::Vulkan];
 
@@ -258,11 +289,14 @@ impl Api {
 
     /// Installs its hooks unless they're in or already tried: Some(hooked) when this call
     /// tried, None when another thread already installed (after waiting for any in-flight
-    /// install to finish) or its module isn't loaded.
+    /// install to finish), this thread is already installing it, or its module isn't loaded.
     fn try_install(self) -> Option<bool> {
         if matches!(self.state().load(Ordering::Acquire), HOOKED | FAILED) {
             return None;
         }
+        let Some(_reentry) = TryInstallGuard::enter(self) else {
+            return None;
+        };
         let _guard = crate::sys::lock(&INSTALL_LOCKS[self as usize]);
         if self.state().load(Ordering::Acquire) != NOT_TRIED {
             return None;
@@ -322,6 +356,19 @@ pub(super) fn ensure_dxgi_hooks() {
     WANTED.store(true, Ordering::Release);
     if let Some(ok) = Api::Dxgi.try_install() {
         log!("video: DXGI {} before the game's first factory/device call", if ok { "hooked" } else { "couldn't be hooked" });
+    }
+}
+
+/// Installs Direct3D 9 hooks synchronously (or waits for an in-flight install to complete),
+/// called from `d3d9::redirect` before the game's first `Direct3DCreate9(Ex)` call so its
+/// display-mode, device-creation and present hooks never race the background thread.
+pub(super) fn ensure_d3d9_hooks() {
+    if skipped() {
+        return;
+    }
+    WANTED.store(true, Ordering::Release);
+    if let Some(ok) = Api::D3d9.try_install() {
+        log!("video: Direct3D 9 {} before the game's first Direct3DCreate9 call", if ok { "hooked" } else { "couldn't be hooked" });
     }
 }
 
@@ -401,7 +448,7 @@ fn ensure_hooks() {
 
 #[cfg(test)]
 mod tests {
-    use super::Api;
+    use super::{Api, TryInstallGuard};
 
     #[test]
     fn graphics_modules_are_known_by_name() {
@@ -412,5 +459,16 @@ mod tests {
         assert_eq!(Api::of_module("OPENGL32.DLL"), Some(Api::Gl));
         assert_eq!(Api::of_module("winevulkan.dll"), Some(Api::Vulkan));
         assert_eq!(Api::of_module("d3dcompiler_47.dll"), None);
+    }
+
+    #[test]
+    fn try_install_reentrancy_guard_avoids_self_deadlock() {
+        let _d3d9 = TryInstallGuard::enter(Api::D3d9).expect("first entry succeeds");
+        assert!(TryInstallGuard::enter(Api::D3d9).is_none(), "same-thread re-entry into same API is rejected");
+        assert!(Api::D3d9.try_install().is_none(), "re-entrant try_install returns None instead of deadlocking");
+        let _dxgi = TryInstallGuard::enter(Api::Dxgi).expect("independent API can still be entered");
+        assert!(TryInstallGuard::enter(Api::Dxgi).is_none());
+        drop(_dxgi);
+        assert!(TryInstallGuard::enter(Api::Dxgi).is_some(), "bit cleared after drop");
     }
 }

@@ -21,6 +21,7 @@
 //! Direct3D 9 can also be drawn through DXVK instead (opt-in with `PEERPARTY_DXVK`): its
 //! frames then come through Vulkan, with no copy on the CPU.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use retour::GenericDetour;
@@ -423,7 +424,7 @@ static DXVK_PATH: OnceLock<(std::path::PathBuf, usize)> = OnceLock::new();
 /// This runs in the load notification, under the loader lock: only the two entry points
 /// are hooked here. DXVK itself is loaded at the game's first call (`dxvk`).
 pub fn redirect(system: windows_sys::Win32::Foundation::HMODULE) {
-    if !crate::window::compositor_capture() || CREATE9.get().is_some() || CREATE9EX.get().is_some() {
+    if !crate::window::compositor_capture() || EARLY_DONE.load(Ordering::Acquire) || CREATE9.get().is_some() || CREATE9EX.get().is_some() {
         return;
     }
     if !crate::sys::wine::is_wine()
@@ -458,25 +459,42 @@ pub fn redirect(system: windows_sys::Win32::Foundation::HMODULE) {
     log!("video: d3d9.dll loaded in a split-screen copy: {n} of 2 entry points hooked; the Direct3D 9 hooks go in at the game's first Direct3DCreate9");
 }
 
+static EARLY_DONE: AtomicBool = AtomicBool::new(false);
+
 thread_local! {
-    /// Inside `early_hooks`: its own Direct3DCreate9 (the hooks are found through a
-    /// throwaway device) goes straight through.
+    /// Inside `early_hooks` or `d3d9::install`: our own Direct3DCreate9(Ex) for the
+    /// throwaway device passes straight through.
     static EARLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(super) struct EarlyGuard(bool);
+
+impl EarlyGuard {
+    pub(super) fn enter() -> Self {
+        Self(EARLY.with(|e| e.replace(true)))
+    }
+}
+
+impl Drop for EarlyGuard {
+    fn drop(&mut self) {
+        EARLY.with(|e| e.set(self.0));
+    }
+}
+
+pub(super) fn mark_early_done() {
+    EARLY_DONE.store(true, Ordering::Release);
 }
 
 /// The game made its first Direct3D 9 object: the present, reset and device-creation
 /// hooks go in now, on its thread (outside the loader lock), so the device it makes next
 /// is made windowed in its pane and its frames are seen from the first.
 fn early_hooks() {
-    if EARLY.with(|e| e.replace(true)) {
+    if EARLY_DONE.load(Ordering::Acquire) || EARLY.with(|e| e.get()) {
         return;
     }
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        log!("video: the game makes its first Direct3D 9 object: its hooks go in before it makes a device");
-        super::super::ensure_viewport_hooks();
-    });
-    EARLY.with(|e| e.set(false));
+    let _guard = EarlyGuard::enter();
+    super::super::ensure_d3d9_hooks();
+    EARLY_DONE.store(true, Ordering::Release);
 }
 
 /// DXVK's two entry points, loaded the first time the game makes a Direct3D 9 object
@@ -673,6 +691,21 @@ mod tests {
         release_all();
         release(dev);
         release(d3d);
+    }
+
+    #[test]
+    fn early_guard_restores_nested_reentrancy_flag() {
+        assert!(!EARLY.with(|e| e.get()));
+        {
+            let _outer = EarlyGuard::enter();
+            assert!(EARLY.with(|e| e.get()));
+            {
+                let _inner = EarlyGuard::enter();
+                assert!(EARLY.with(|e| e.get()));
+            }
+            assert!(EARLY.with(|e| e.get()), "outer guard still active after inner drop");
+        }
+        assert!(!EARLY.with(|e| e.get()), "flag cleared after outer drop");
     }
 
     #[test]

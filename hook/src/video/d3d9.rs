@@ -96,6 +96,7 @@ pub fn install() -> bool {
     if m.is_null() {
         return false;
     }
+    let _early = d3d9capture::EarlyGuard::enter();
     let Some(win) = HiddenWindow::new() else { return false };
     let pp = PresentParameters {
         width: 64,
@@ -187,6 +188,7 @@ pub fn install() -> bool {
     if modes > 0 {
         log!("video: Direct3D 9's display-mode calls hooked ({modes}): in a split-screen pane they answer the pane's size");
     }
+    d3d9capture::mark_early_done();
     n > 0
 }
 

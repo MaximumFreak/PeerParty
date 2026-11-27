@@ -353,7 +353,9 @@ fn connect_patched_by() -> Option<String> {
     };
     let by = owner(target);
     let ours = by.is_some() && by == owner(connect_patched_by as *const () as usize);
-    if crate::net::ipfwd::hooks_connect() || ours || by == Some(module as usize) {
+    // When ipfwd hooks connect, its trampoline sits in our DLL or in unowned heap memory;
+    // a jump into another loaded DLL means that DLL patched connect on top of ours.
+    if ours || by == Some(module as usize) || (crate::net::ipfwd::hooks_connect() && by.is_none()) {
         return None;
     }
     // The patch's code is often in memory of its own, outside any module.

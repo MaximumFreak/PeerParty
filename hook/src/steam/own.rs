@@ -261,6 +261,7 @@ const FLAT: &[&str] = &[
     "SteamAPI_ISteamUserStats_DownloadLeaderboardEntriesForUsers",
     "SteamAPI_ISteamUserStats_GetDownloadedLeaderboardEntry",
     "SteamAPI_ISteamApps_GetAppOwner",
+    "SteamAPI_ISteamApps_GetLaunchCommandLine",
     "SteamAPI_ISteamUGC_CreateQueryUserUGCRequest",
 ];
 
@@ -278,9 +279,15 @@ fn real(name: &str) -> Option<usize> {
     REAL.read().unwrap().get(name).copied()
 }
 
-/// PeerParty's stand-in for flat function `name`, if it maps SteamIDs.
+/// PeerParty's stand-in for flat function `name`, if it maps SteamIDs or guards output buffers.
 pub fn resolve(name: &str) -> Option<usize> {
-    if crate::net::skip("steamown") || real(name).is_none() {
+    if real(name).is_none() {
+        return None;
+    }
+    if name == "SteamAPI_ISteamApps_GetLaunchCommandLine" {
+        return Some(get_launch_command_line as *const () as usize);
+    }
+    if crate::net::skip("steamown") {
         return None;
     }
     let f: usize = match name {
@@ -370,6 +377,34 @@ unsafe extern "C" fn get_downloaded_entry(this: usize, entries: u64, index: i32,
     ok
 }
 
+/// Ensures `ISteamApps::GetLaunchCommandLine`'s output buffer is always NUL-terminated.
+/// Managed wrappers (such as Steamworks.NET) allocate an uninitialized buffer and decode
+/// it whenever the return value isn't -1, so an underlying client that returns 0 without
+/// writing a NUL byte hands the game heap garbage as launch arguments.
+unsafe fn sanitize_launch_command_line(out: *mut c_char, max: i32, call: impl FnOnce() -> i32) -> i32 {
+    if !out.is_null() && max > 0 {
+        unsafe { *out = 0 };
+    }
+    let ret = call();
+    if !out.is_null() && max > 0 {
+        if ret <= 0 {
+            unsafe { *out = 0 };
+        } else {
+            let cap = max as usize;
+            let slice = unsafe { std::slice::from_raw_parts_mut(out.cast::<u8>(), cap) };
+            if !slice.contains(&0) {
+                slice[cap - 1] = 0;
+            }
+        }
+    }
+    ret
+}
+
+unsafe extern "C" fn get_launch_command_line(this: usize, out: *mut c_char, max: i32) -> i32 {
+    let call = || flat!("SteamAPI_ISteamApps_GetLaunchCommandLine", fn(usize, *mut c_char, i32) -> i32, 0, this, out, max);
+    unsafe { sanitize_launch_command_line(out, max, call) }
+}
+
 unsafe extern "C" fn get_app_owner(this: usize) -> u64 {
     let raw = flat!("SteamAPI_ISteamApps_GetAppOwner", fn(usize) -> u64, 0, this);
     let id = to_game(raw);
@@ -415,10 +450,11 @@ pub fn user_stats() -> Vec<(&'static str, usize)> {
 }
 
 pub fn apps() -> Vec<(&'static str, usize)> {
-    if crate::net::skip("steamown") {
-        return Vec::new();
+    let mut out = vec![("GetLaunchCommandLine", v_get_launch_command_line as *const () as usize)];
+    if !crate::net::skip("steamown") {
+        out.push(("GetAppOwner", v_get_app_owner as *const () as usize));
     }
-    vec![("GetAppOwner", v_get_app_owner as *const () as usize)]
+    out
 }
 
 pub fn ugc() -> Vec<(&'static str, usize)> {
@@ -496,6 +532,14 @@ vmethod! {
             unsafe { *entry = to_game(*entry) };
         }
         ok
+    }
+}
+
+vmethod! {
+    /// Ensures `GetLaunchCommandLine` always NUL-terminates the caller's buffer.
+    fn v_get_launch_command_line(this: usize, out: *mut c_char, max: i32) -> i32 {
+        let call = || call_real!(this, "GetLaunchCommandLine", fn(*mut c_char, i32) -> i32, 0, out, max);
+        unsafe { sanitize_launch_command_line(out, max, call) }
     }
 }
 
@@ -605,5 +649,56 @@ mod tests {
         unsafe { run_result(p, param.as_mut_ptr(), false, 1) };
         assert_eq!(obj[1], 100 + (own as u8) as usize);
         OWN.store(0, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn launch_command_line_is_always_nul_terminated() {
+        // Underlying client returns 0 without touching an uninitialized buffer.
+        let mut buf = [0xA5u8; 32];
+        let rc = unsafe { sanitize_launch_command_line(buf.as_mut_ptr().cast(), buf.len() as i32, || 0) };
+        assert_eq!(rc, 0);
+        assert_eq!(buf[0], 0, "empty return must NUL-terminate the buffer");
+
+        // Underlying client writes scratch bytes and returns -1.
+        let mut buf = [0xA5u8; 16];
+        let rc = unsafe {
+            sanitize_launch_command_line(buf.as_mut_ptr().cast(), buf.len() as i32, || {
+                buf[0] = b'X';
+                -1
+            })
+        };
+        assert_eq!(rc, -1);
+        assert_eq!(buf[0], 0);
+
+        // Real launch arguments are preserved verbatim.
+        let mut buf = [0xA5u8; 32];
+        let rc = unsafe {
+            sanitize_launch_command_line(buf.as_mut_ptr().cast(), buf.len() as i32, || {
+                let msg = b"+connect_lobby 42\0";
+                buf[..msg.len()].copy_from_slice(msg);
+                msg.len() as i32
+            })
+        };
+        assert_eq!(rc, 18);
+        assert_eq!(&buf[..18], b"+connect_lobby 42\0");
+
+        // Non-NUL-terminated write filling the whole buffer gets capped with NUL.
+        let mut buf = [0xA5u8; 4];
+        let rc = unsafe {
+            sanitize_launch_command_line(buf.as_mut_ptr().cast(), buf.len() as i32, || {
+                buf.copy_from_slice(b"ABCD");
+                4
+            })
+        };
+        assert_eq!(rc, 4);
+        assert_eq!(&buf, b"ABC\0");
+
+        // Null pointer or non-positive capacity does not touch memory.
+        assert_eq!(unsafe { sanitize_launch_command_line(std::ptr::null_mut(), 16, || 0) }, 0);
+        assert_eq!(unsafe { sanitize_launch_command_line(buf.as_mut_ptr().cast(), 0, || 0) }, 0);
+
+        // Both ISteamApps008 and 009 carry GetLaunchCommandLine in the vtable layout.
+        assert_eq!(crate::steam::obj::slot("STEAMAPPS_INTERFACE_VERSION008", "GetLaunchCommandLine"), Some(26));
+        assert!(crate::steam::obj::slot("STEAMAPPS_INTERFACE_VERSION009", "GetLaunchCommandLine").is_some());
     }
 }

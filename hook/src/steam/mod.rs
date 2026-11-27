@@ -9,6 +9,7 @@
 //! lobby's `CreateLobby`) complete the same two ways: a `SteamAPICallCompleted_t` and
 //! `GetAPICallResult`, or the `CCallResult` registered for the call.
 
+pub(crate) mod active;
 pub(crate) mod gns;
 pub(crate) mod gs;
 pub(crate) mod ids;
@@ -739,6 +740,7 @@ unsafe fn run_result(obj: usize, data: &mut [u8], call: u64) {
 
 unsafe extern "C" fn detour_init() -> bool {
     let Some(hook) = INIT.get() else { return false };
+    active::ensure();
     CLIENT_STARTED.store(true, std::sync::atomic::Ordering::Relaxed);
     let ok = unsafe { hook.call() };
     log::throttled("SteamAPI_Init", 4, |n| {
@@ -751,6 +753,7 @@ unsafe extern "C" fn detour_init_safe() -> bool {
     let Some(hook) = INIT_SAFE.get() else {
         return false;
     };
+    active::ensure();
     CLIENT_STARTED.store(true, std::sync::atomic::Ordering::Relaxed);
     let ok = unsafe { hook.call() };
     log::throttled("SteamAPI_InitSafe", 4, |n| {
@@ -763,6 +766,7 @@ unsafe extern "C" fn detour_init_flat(err: *mut i8) -> i32 {
     let Some(hook) = INIT_FLAT.get() else {
         return 1;
     };
+    active::ensure();
     CLIENT_STARTED.store(true, std::sync::atomic::Ordering::Relaxed);
     let rc = unsafe { hook.call(err) };
     let msg = if err.is_null() {
@@ -783,6 +787,7 @@ unsafe extern "C" fn detour_internal_init(versions: *const i8, err: *mut i8) -> 
     let Some(hook) = INTERNAL_INIT.get() else {
         return 1;
     };
+    active::ensure();
     CLIENT_STARTED.store(true, std::sync::atomic::Ordering::Relaxed);
     let interfaces = read::steam_version_blob(versions as usize);
     let rc = unsafe { hook.call(versions, err) };
