@@ -2020,7 +2020,7 @@ mod tests {
         let found = unsafe { real_proc(h, true) };
         assert_eq!(found, wrapper());
         CLASS_PREV.with(|c| c.set(found));
-        unsafe { SetWindowLongPtrW(h, GWLP_WNDPROC, class_proc as Proc as usize as isize) };
+        unsafe { SetWindowLongPtrW(h, GWLP_WNDPROC, class_proc as Proc as usize as _) };
         send_test(h);
         assert_eq!(CLASS_SEEN.with(|c| c.get()), 2, "once from Windows, once from the wrapper");
         unsafe { windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(h) };
