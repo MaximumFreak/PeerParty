@@ -20,7 +20,7 @@
 //! `GameInputInitialize` are hooked by export, and the objects they return give the rest.
 
 use std::sync::{Arc, Condvar, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use peerparty_protocol::input_shm::{InputSnapshot, VirtualPad};
 
@@ -84,6 +84,34 @@ const KEYBOARD: u32 = 0x10;
 const MOUSE: u32 = 0x20;
 const GAMEPAD: u32 = 0x0004_0000;
 const DEVICE_CONNECTED: u32 = 0x0010_0000;
+
+/// Readings that still reached the game while the overlay showed, per kind asked for
+/// (keyboard, mouse, controllers; a mask naming two counts in both), and the last one
+/// `current` handed out for each: the same reading handed out again isn't new input.
+/// Read and reset by `take_reached` when the overlay hides.
+static REACHED: [AtomicU32; 3] = [const { AtomicU32::new(0) }; 3];
+static LAST_HANDED: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
+
+/// A reading of `kind` goes to the game: counted while the overlay shows. `newer_only`
+/// (`current`, which a game polls every frame) counts a reading other than the last one
+/// handed out for that kind: its address says, with no call into GameInput.
+fn note_reached(kind: u32, reading: usize, newer_only: bool) {
+    if !crate::overlay::visible() || !matches!(policy(), Policy::BlockAll) {
+        return;
+    }
+    for (i, asked) in [kind & KEYBOARD != 0, kind & MOUSE != 0, held_kind(kind)].into_iter().enumerate() {
+        if asked && !(newer_only && LAST_HANDED[i].swap(reading, Ordering::Relaxed) == reading) {
+            REACHED[i].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The counts of `note_reached` (keyboard, mouse, controllers) for the opening that ended;
+/// the next starts from none.
+pub(super) fn take_reached() -> [u32; 3] {
+    LAST_HANDED.iter().for_each(|l| l.store(0, Ordering::Relaxed));
+    [0, 1, 2].map(|i| REACHED[i].swap(0, Ordering::Relaxed))
+}
 
 /// Whether reads of `kind` are held back under `BlockAll` (anything but keyboard and
 /// mouse alone; 0 is "any kind", so held).
@@ -559,7 +587,11 @@ fn current(i: usize, this: usize, kind: u32, device: usize, out: *mut usize) -> 
         return own_current(h, this, kind, device, out, &snap);
     }
     if !should_hold(kind) {
-        return unsafe { h.call(this, kind, device, out) };
+        let hr = unsafe { h.call(this, kind, device, out) };
+        if hr >= 0 && unsafe { *out } != 0 {
+            note_reached(kind, unsafe { *out }, true);
+        }
+        return hr;
     }
     // The held reading: AddRef'd under the lock (another thread's `hidden` may let it
     // go), the real call made outside it.
@@ -673,7 +705,11 @@ fn next(i: usize, this: usize, reference: usize, kind: u32, device: usize, out: 
         unsafe { *out = 0 };
         return NOT_FOUND;
     }
-    unsafe { h.call(this, reference, kind, device, out) }
+    let hr = unsafe { h.call(this, reference, kind, device, out) };
+    if hr >= 0 && unsafe { *out } != 0 {
+        note_reached(kind, unsafe { *out }, false);
+    }
+    hr
 }
 
 struct Relay {
@@ -699,6 +735,7 @@ unsafe extern "system" fn relay_v0(token: u64, relay: usize, reading: usize, ove
     if !passes(r.kind, reading) {
         return;
     }
+    note_reached(r.kind, reading, false);
     let f: CallbackV0 = unsafe { std::mem::transmute(r.callback) };
     unsafe { f(token, r.context, reading, overrun) }
 }
@@ -708,6 +745,7 @@ unsafe extern "system" fn relay(token: u64, relay: usize, reading: usize) {
     if !passes(r.kind, reading) {
         return;
     }
+    note_reached(r.kind, reading, false);
     let f: Callback = unsafe { std::mem::transmute(r.callback) };
     unsafe { f(token, r.context, reading) }
 }
@@ -1226,6 +1264,59 @@ mod tests {
         }
     }
 
+    /// Keyboard and mouse relays that go through while the overlay shows are counted under
+    /// their kind, nothing while it is hidden; `take_reached` resets.
+    #[test]
+    fn relays_count_what_reaches_the_game() {
+        let _turn = crate::overlay::test_turn();
+        let _turn = super::super::tests::GAMEINPUT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe extern "system" fn game(_: u64, _: usize, _: usize) {}
+        unsafe extern "system" fn game_v0(_: u64, _: usize, _: usize, _: bool) {}
+        let kb = relay_for(game as Callback as usize, 0, KEYBOARD);
+        let mouse = relay_for(game as Callback as usize, 0, MOUSE);
+        let kb_v0 = relay_for(game_v0 as CallbackV0 as usize, 0, KEYBOARD);
+        let pad = relay_for(game as Callback as usize, 0, GAMEPAD);
+        take_reached();
+        unsafe {
+            relay(1, kb, 0);
+            relay(1, mouse, 0);
+            relay_v0(1, kb_v0, 0, false);
+        }
+        assert_eq!(take_reached(), [0, 0, 0], "hidden: nothing counted");
+        crate::overlay::set_visible_for_test(true);
+        unsafe {
+            relay(1, kb, 0);
+            relay(1, kb, 0);
+            relay(1, mouse, 0);
+            relay_v0(1, kb_v0, 0, false);
+            relay(1, pad, 0);
+        }
+        crate::overlay::set_visible_for_test(false);
+        assert_eq!(take_reached(), [3, 1, 0], "the held controller relay reaches nobody");
+        assert_eq!(take_reached(), [0, 0, 0], "reset");
+    }
+
+    /// `current` is polled every frame: one reading handed out again is not new input.
+    /// (A reading held under `BlockAll` is never counted: it is not what the device reads.)
+    #[test]
+    fn a_reading_polled_again_counts_once() {
+        let _turn = crate::overlay::test_turn();
+        let _turn = super::super::tests::GAMEINPUT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        take_reached();
+        crate::overlay::set_visible_for_test(true);
+        for r in [0x1000, 0x1000, 0x1000, 0x2000] {
+            note_reached(KEYBOARD, r, true);
+        }
+        note_reached(MOUSE, 0x3000, true);
+        note_reached(MOUSE, 0x3000, true);
+        // `next` hands out each reading it finds.
+        note_reached(KEYBOARD, 0x2000, false);
+        note_reached(KEYBOARD, 0x2000, false);
+        crate::overlay::set_visible_for_test(false);
+        note_reached(KEYBOARD, 0x5000, true);
+        assert_eq!(take_reached(), [4, 1, 0]);
+    }
+
     #[test]
     fn gamepad_matching_covers_buttons_and_axes() {
         let rest = GamepadState::default();
@@ -1407,11 +1498,13 @@ mod tests {
         }
         let r = relay_for(game as Callback as usize, 0x1234, 0x40000);
         let keys = relay_for(game as Callback as usize, 0x1234, KEYBOARD | MOUSE);
+        take_reached();
         crate::overlay::set_visible_for_test(true);
         unsafe { relay(1, r, 0) };
         assert_eq!(CALLS.load(Ordering::SeqCst), 0, "held back while the overlay shows");
         unsafe { relay(1, keys, 0) };
         assert_eq!(CALLS.load(Ordering::SeqCst), 1, "keyboard and mouse go through");
+        assert_eq!(take_reached(), [1, 1, 0], "and are counted as reaching the game, the held controller relay not");
         crate::overlay::set_visible_for_test(false);
         unsafe { relay(1, r, 0) };
         assert_eq!(CALLS.load(Ordering::SeqCst), 2);
