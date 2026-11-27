@@ -741,6 +741,10 @@ controllers. The overlay's **Split screen** tab (first, and where it opens unles
 invite waits) lists this PC's players: swap two players' controllers, free one for the
 next controller pressed, or hand the keyboard and mouse to another player.
 
+A player who presses a key in their pane (or clicks in it a few times) before using a
+controller plays with the keyboard and mouse: the next controller used goes to another
+player first, and to them only once the others have one.
+
 The keyboard and mouse start with player 1 (or the player given them with `--inputs`)
 and move when a player clicks a pane, presses `Ctrl+Alt+1`–`4` or uses the overlay, or
 switches to a copy's window: not when a copy's window comes to the front by itself as it

@@ -372,9 +372,11 @@ pub struct Kbm {
     /// The client size of the copy each mouse moves in, its cursor kept inside.
     bounds: HashMap<u64, (u32, u32)>,
     /// Keys and mouse buttons gone down so far (a held key's repeats and the modifiers
-    /// not counted): a session sees from it which player plays with the keyboard.
+    /// not counted, nor keys of a hotkey): a session sees from it which player plays
+    /// with the keyboard.
     pub presses: u64,
-    /// Non-modifier keyboard keys gone down so far (excluding mouse clicks).
+    /// Non-modifier keyboard keys gone down so far (excluding mouse clicks and keys
+    /// pressed with Ctrl+Alt or a Windows key held).
     pub key_presses: u64,
     /// Key and mouse button events of any kind so far (ups too): while this stays the
     /// same, only the mice moved or turned their wheels (`InputHub::publish_kbm`).
@@ -406,7 +408,9 @@ impl Kbm {
             RawEvent::Key { device, vk, down } => {
                 self.others += 1;
                 let k = self.keyboards.entry(device).or_default();
-                if down && !k.is_down(vk) && !modifier(vk) {
+                // A session hotkey (Ctrl+Alt+1-4, Ctrl+Alt+E) isn't playing either.
+                let chord = (k.is_down(0x11) && k.is_down(0x12)) || k.is_down(0x5B) || k.is_down(0x5C);
+                if down && !k.is_down(vk) && !modifier(vk) && !chord {
                     self.presses += 1;
                     self.key_presses += 1;
                 }

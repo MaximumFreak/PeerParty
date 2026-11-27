@@ -189,10 +189,11 @@ pub fn close_session() {
 }
 
 /// Keys and mouse buttons pressed in a player's pane, with no controller of theirs, that
-/// make them a keyboard player (`SessionHost::watch_keyboard`): 2 non-modifier keyboard
-/// keys or 4 combined key/mouse presses (more than a single click focusing the pane).
+/// make them a keyboard player (`SessionHost::watch_keyboard`): one non-modifier keyboard
+/// key (a player who presses a key before any controller expects to be the keyboard
+/// player), or 4 combined key/mouse presses (more than a click or two focusing the pane).
 const KBM_PLAYER_PRESSES: u64 = 4;
-const KBM_PLAYER_KEY_PRESSES: u64 = 2;
+const KBM_PLAYER_KEY_PRESSES: u64 = 1;
 
 /// Where the keyboard's presses were counted (`SessionHost::watch_keyboard`).
 #[derive(Default)]
@@ -1338,6 +1339,15 @@ impl SessionHost {
             let named = product.as_ref().map(|p| format!(", {p:?}")).unwrap_or_default();
             let text = format!("input: {name}{named} claimed seat {seat} (player {})", seat + 1);
             self.instances[to].send(&HostMsg::Note { text });
+            // Why a player who'd used the keyboard got a controller anyway.
+            if session && self.kbm_player.get(seat) == Some(&false) {
+                let (keys, all) = if self.kbm_seen.pane == seat { (self.kbm_seen.key_count, self.kbm_seen.count) } else { (0, 0) };
+                let text = format!(
+                    "input: player {} wasn't the keyboard player yet ({keys} keys, {all} presses counted in their pane; {KBM_PLAYER_KEY_PRESSES} key or {KBM_PLAYER_PRESSES} presses make one, and presses into a startup dialog, the overlay or another window don't count)",
+                    seat + 1
+                );
+                self.instances[to].send(&HostMsg::Note { text });
+            }
             if let Some(p) = product
                 && self.prefs.toasts
                 && seat < self.panes.len()
@@ -3173,17 +3183,28 @@ mod tests {
         assert!(host.click_can_focus(0) && !host.click_can_focus(1));
     }
 
-    /// Two non-modifier keyboard presses mark an Auto player as playing with KB&M
-    /// (faster than the 4 combined key/mouse presses threshold).
+    /// One non-modifier keyboard press marks an Auto player as playing with KB&M (a
+    /// player who pressed a key before any controller expects to be the keyboard player);
+    /// mouse clicks take 4, and a session hotkey's keys don't count.
     #[test]
-    fn two_keyboard_keys_mark_kbm_player() {
+    fn one_keyboard_key_marks_kbm_player() {
+        use input_hub::RawEvent::{Buttons, Key};
         let mut k = input_hub::Kbm::default();
-        k.apply(input_hub::RawEvent::Buttons { device: 1, down: 1, up: 0 });
+        k.apply(Buttons { device: 1, down: 1, up: 0 });
         assert_eq!((k.presses, k.key_presses), (1, 0), "mouse clicks don't count as key presses");
-        k.apply(input_hub::RawEvent::Key { device: 2, vk: 0x57, down: true }); // W
-        k.apply(input_hub::RawEvent::Key { device: 2, vk: 0x57, down: true }); // repeat ignored
-        k.apply(input_hub::RawEvent::Key { device: 2, vk: 0x44, down: true }); // D
-        assert_eq!((k.presses, k.key_presses), (3, 2));
+        assert!(k.key_presses < KBM_PLAYER_KEY_PRESSES && k.presses < KBM_PLAYER_PRESSES, "a click focusing a pane isn't playing");
+        // Ctrl+Alt+2 (focus player 2's pane) and Win+D aren't playing.
+        for (vk, down) in [(0x11, true), (0x12, true), (0x32, true), (0x32, false), (0x12, false), (0x11, false), (0x5B, true), (0x44, true), (0x44, false), (0x5B, false)] {
+            k.apply(Key { device: 2, vk, down });
+        }
+        assert_eq!((k.presses, k.key_presses), (1, 0), "hotkeys and modifiers don't count");
+        k.apply(Key { device: 2, vk: 0x0D, down: true }); // Enter
+        k.apply(Key { device: 2, vk: 0x0D, down: true }); // repeat ignored
+        assert_eq!((k.presses, k.key_presses), (2, 1));
         assert!(k.key_presses >= KBM_PLAYER_KEY_PRESSES);
+        // Ctrl alone is a game key (crouch): Ctrl+C counts.
+        k.apply(Key { device: 2, vk: 0x11, down: true });
+        k.apply(Key { device: 2, vk: 0x43, down: true });
+        assert_eq!(k.key_presses, 2);
     }
 }
