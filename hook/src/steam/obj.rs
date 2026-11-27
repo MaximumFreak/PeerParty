@@ -55,21 +55,22 @@ macro_rules! call_real {
 }
 pub(crate) use call_real;
 
-/// Calls steam_api's flat function `$f` that returns a CSteamID, as `$class` says this
-/// build's flat API does: through a hidden pointer before `self` (`true`), else as a
+/// Calls steam_api's flat function `$f` that returns a CSteamID, the way this build's
+/// flat API returns one (`flat_id`): through a hidden pointer before `self`, or as a
 /// plain number in a register. Gives the SteamID.
 macro_rules! call_flat_id {
-    ($class:expr, $f:expr, $self:expr $(, $a:expr => $t:ty)* $(,)?) => {{
+    ($f:expr, $self:expr $(, $a:expr => $t:ty)* $(,)?) => {{
         let f: usize = $f;
-        if $class {
+        let this: usize = $self;
+        let class = |out: *mut u64| {
             let f: unsafe extern "C" fn(*mut u64, usize $(, $t)*) -> *mut u64 = unsafe { std::mem::transmute(f) };
-            let mut id = 0u64;
-            unsafe { f(&mut id, $self $(, $a)*) };
-            id
-        } else {
+            unsafe { f(out, this $(, $a)*) };
+        };
+        let register = || {
             let f: unsafe extern "C" fn(usize $(, $t)*) -> u64 = unsafe { std::mem::transmute(f) };
-            unsafe { f($self $(, $a)*) }
-        }
+            unsafe { f(this $(, $a)*) }
+        };
+        $crate::steam::obj::flat_id(0 $(+ std::mem::size_of::<$t>())*, &class, &register)
     }};
 }
 pub(crate) use call_flat_id;
@@ -543,19 +544,161 @@ pub fn note_flat(exports: &[Export]) {
     let class = returns_class_flat(exports.iter().map(|e| e.name.as_str()));
     FLAT_CLASS.store(class, std::sync::atomic::Ordering::Relaxed);
     if class && exports.iter().any(|e| flat_interface(&e.name).is_some()) {
-        log!("steam-lan flat API without versioned accessors: its CSteamID returns come through a hidden pointer before self");
+        log!(
+            "steam-lan flat API without versioned accessors: its CSteamID returns may come through a hidden pointer before self or in a register; PeerParty's first such call finds out which"
+        );
     }
     let _ = FLAT_REAL.set(real);
 }
 
-/// Whether steam_api's flat functions that return a CSteamID declare it as the class:
+/// Whether steam_api's flat functions that return a CSteamID may declare it as the class:
 /// MSVC hands a class back through a hidden pointer before `self`. The flat API that
 /// added the versioned accessors (`SteamAPI_SteamUser_v020`) declares a plain number,
-/// returned in a register; the one before it the class.
+/// returned in a register. Without them it may be either: the first flat API returned a
+/// plain number too, a later one the class. A guess from the export names, for the
+/// game's own flat calls, whose adapters are handed out before any call can be tried.
 static FLAT_CLASS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// How this build's flat functions were seen to return a CSteamID (`ID_*`).
+static FLAT_ID: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(ID_UNKNOWN);
+const ID_UNKNOWN: u8 = 0;
+const ID_REGISTER: u8 = 1;
+const ID_CLASS: u8 = 2;
+
 pub(crate) fn flat_returns_class() -> bool {
-    FLAT_CLASS.load(std::sync::atomic::Ordering::Relaxed)
+    match FLAT_ID.load(std::sync::atomic::Ordering::Relaxed) {
+        ID_CLASS => true,
+        ID_REGISTER => false,
+        _ => FLAT_CLASS.load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+/// The SteamID from a flat function, through `class` (it takes the hidden pointer) or
+/// `register`, as this build's flat API returns one. The first call tries `class` with
+/// a decoy object for the hidden pointer (`probe_flat_id`): the hidden-pointer form
+/// writes the SteamID into it, the register form takes it for `self` and calls the
+/// decoy's method. Either way nothing is called on a wrong object, where the guess
+/// from the export names crashed a build of the first flat API (it took the hidden
+/// pointer for `self`). `arg_bytes`: the size of the arguments after `self`.
+pub(crate) fn flat_id(arg_bytes: usize, class: &dyn Fn(*mut u64), register: &dyn Fn() -> u64) -> u64 {
+    let into = |class: &dyn Fn(*mut u64)| {
+        let mut id = 0u64;
+        class(&mut id);
+        id
+    };
+    match FLAT_ID.load(std::sync::atomic::Ordering::Relaxed) {
+        ID_CLASS => return into(class),
+        ID_REGISTER => return register(),
+        _ => {}
+    }
+    match probe_flat_id(arg_bytes, class) {
+        Some(Probe::Class(id)) => id,
+        Some(Probe::Register) => register(),
+        None if flat_returns_class() => into(class),
+        None => register(),
+    }
+}
+
+enum Probe {
+    /// Through the hidden pointer: the SteamID it wrote.
+    Class(u64),
+    Register,
+}
+
+/// Set by the decoy's methods.
+static DECOY_CALLED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Calls `class` with a decoy object for the hidden pointer and records which form the
+/// flat function has. None when it can't be tried (another call is trying, or no
+/// executable memory): the caller goes by the guess.
+fn probe_flat_id(arg_bytes: usize, class: &dyn Fn(*mut u64)) -> Option<Probe> {
+    use std::sync::atomic::Ordering::Relaxed;
+    static TRYING: Mutex<()> = Mutex::new(());
+    let Ok(_trying) = TRYING.try_lock() else { return None };
+    match FLAT_ID.load(Relaxed) {
+        ID_CLASS => {
+            let mut id = 0u64;
+            class(&mut id);
+            return Some(Probe::Class(id));
+        }
+        ID_REGISTER => return Some(Probe::Register),
+        _ => {}
+    }
+    let vt = decoy_vtable(arg_bytes)?;
+    // Room for whatever a flat function reads of an object it takes for `self` beyond
+    // its vtable before calling it.
+    let mut decoy = [0usize; 16];
+    decoy[0] = vt;
+    let before = unsafe { std::ptr::read_unaligned(decoy.as_ptr() as *const u64) };
+    DECOY_CALLED.store(0, Relaxed);
+    class(decoy.as_mut_ptr() as *mut u64);
+    let called = DECOY_CALLED.swap(0, Relaxed) != 0;
+    let after = unsafe { std::ptr::read_unaligned(decoy.as_ptr() as *const u64) };
+    if called {
+        FLAT_ID.store(ID_REGISTER, Relaxed);
+        log!(
+            "steam-lan flat API: a CSteamID comes back in a register (the flat function took the decoy for self and called its method){}",
+            if FLAT_CLASS.load(Relaxed) { "; not what the export names suggested" } else { "" }
+        );
+        return Some(Probe::Register);
+    }
+    if after != before {
+        FLAT_ID.store(ID_CLASS, Relaxed);
+        log!(
+            "steam-lan flat API: a CSteamID comes back through a hidden pointer before self (the flat function wrote it into the decoy){}",
+            if FLAT_CLASS.load(Relaxed) { "" } else { "; not what the export names suggested" }
+        );
+        return Some(Probe::Class(after));
+    }
+    // Neither: the function returned without calling or writing anything. Not
+    // recorded, so the next call tries again; nothing was written for this one.
+    log::throttled("steam-lan flat id probe undecided", 3, |_| {
+        log!("steam-lan flat API: a CSteamID function neither wrote into the decoy nor called it; tried again on the next call")
+    });
+    Some(Probe::Class(0))
+}
+
+/// The decoy object's vtable: every slot the same method, which notes it was called,
+/// writes an invalid SteamID through its hidden return pointer and returns it, popping
+/// on x86 (thiscall) the hidden pointer and `arg_bytes` of arguments. One per size.
+fn decoy_vtable(arg_bytes: usize) -> Option<usize> {
+    static TABLES: LazyLock<Mutex<HashMap<usize, usize>>> = LazyLock::new(Mutex::default);
+    let mut tables = crate::sys::lock(&TABLES);
+    if let Some(&vt) = tables.get(&arg_bytes) {
+        return Some(vt);
+    }
+    let flag = &DECOY_CALLED as *const _ as usize;
+    #[cfg(target_arch = "x86")]
+    let code = {
+        // mov byte [flag],1; mov eax,[esp+4]; mov dword [eax],0; mov dword [eax+4],0;
+        // ret 4+arg_bytes
+        let mut c = vec![0xC6, 0x05];
+        c.extend((flag as u32).to_le_bytes());
+        c.extend([0x01, 0x8B, 0x44, 0x24, 0x04, 0xC7, 0x00, 0, 0, 0, 0, 0xC7, 0x40, 0x04, 0, 0, 0, 0, 0xC2]);
+        c.extend(((4 + arg_bytes) as u16).to_le_bytes());
+        c
+    };
+    #[cfg(not(target_arch = "x86"))]
+    let code = {
+        // mov rax,flag; mov byte [rax],1; mov qword [rdx],0; mov rax,rdx; ret
+        let mut c = vec![0x48, 0xB8];
+        c.extend((flag as u64).to_le_bytes());
+        c.extend([0xC6, 0x00, 0x01, 0x48, 0xC7, 0x02, 0, 0, 0, 0, 0x48, 0x89, 0xD0, 0xC3]);
+        let _ = arg_bytes;
+        c
+    };
+    let method = unsafe { exec_block(1, 32, |_| code.clone()) };
+    if method == 0 {
+        return None;
+    }
+    let vt = Box::leak(Box::new([method; vtable::MAX_SLOTS])).as_ptr() as usize;
+    tables.insert(arg_bytes, vt);
+    Some(vt)
+}
+
+#[cfg(test)]
+fn forget_flat_id() {
+    FLAT_ID.store(ID_UNKNOWN, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Whether these export names are the older flat API's: none is a versioned accessor of
@@ -763,7 +906,7 @@ macro_rules! flat_returns_id {
                 return id;
             }
             let Some(real) = FLAT_REAL.get().and_then(|r| r.get($flat).copied()) else { return 0 };
-            call_flat_id!(flat_returns_class(), real, unwrap(this) $(, $a => $t)*)
+            call_flat_id!(real, unwrap(this) $(, $a => $t)*)
         }
     };
 }
@@ -1620,16 +1763,50 @@ mod tests {
         out
     }
 
-    unsafe extern "C" fn new_flat_id(this: usize, i: i32) -> u64 {
-        this as u64 * 10 + i as u64
+    /// The C++ method a register-form flat function calls, as Valve's do: its slot 2,
+    /// the CSteamID through a hidden pointer after `this`.
+    #[cfg(target_arch = "x86")]
+    type IdMethod = unsafe extern "thiscall" fn(usize, *mut u64, u64, i32) -> *mut u64;
+    #[cfg(not(target_arch = "x86"))]
+    type IdMethod = unsafe extern "C" fn(usize, *mut u64, u64, i32) -> *mut u64;
+
+    #[cfg(target_arch = "x86")]
+    unsafe extern "thiscall" fn real_id_method(_this: usize, out: *mut u64, lobby: u64, i: i32) -> *mut u64 {
+        unsafe { *out = lobby * 10 + i as u64 };
+        out
+    }
+    #[cfg(not(target_arch = "x86"))]
+    unsafe extern "C" fn real_id_method(_this: usize, out: *mut u64, lobby: u64, i: i32) -> *mut u64 {
+        unsafe { *out = lobby * 10 + i as u64 };
+        out
+    }
+
+    unsafe extern "C" fn new_flat_id(this: usize, lobby: u64, i: i32) -> u64 {
+        let m: IdMethod = unsafe { std::mem::transmute(*(*(this as *const *const usize)).add(2)) };
+        let mut out = 0u64;
+        unsafe { m(this, &mut out, lobby, i) };
+        out
     }
 
     #[test]
     fn flat_ids_are_read_the_way_each_flat_api_returns_them() {
         let old = old_flat_id as *const () as usize;
         let new = new_flat_id as *const () as usize;
-        assert_eq!(call_flat_id!(true, old, 7, 3 => i32), 73);
-        assert_eq!(call_flat_id!(false, new, 7, 3 => i32), 73);
+        // The hidden-pointer form is found by the first call, which gives its ID.
+        forget_flat_id();
+        assert_eq!(call_flat_id!(old, 7, 3 => i32), 73);
+        assert!(flat_returns_class());
+        assert_eq!(call_flat_id!(old, 8, 1 => i32), 81);
+        // The register form takes the decoy for its object and calls the decoy's method
+        // (popping the arguments on x86); the real call follows, with the real object.
+        forget_flat_id();
+        let vt: [usize; 3] = [0, 0, real_id_method as *const () as usize];
+        let obj = [vt.as_ptr() as usize];
+        let this = obj.as_ptr() as usize;
+        assert_eq!(call_flat_id!(new, this, 7u64 => u64, 3 => i32), 73);
+        assert!(!flat_returns_class());
+        assert_eq!(call_flat_id!(new, this, 8u64 => u64, 1 => i32), 81);
+        forget_flat_id();
         // The game's own call into the older flat API gets the ID at its pointer.
         let mut out = 99u64;
         let p: *mut u64 = &mut out;

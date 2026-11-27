@@ -542,10 +542,10 @@ fn real_steam_id() -> Option<u64> {
     let user = crate::steam::obj::seen("SteamUser")?;
     // The flat function where there is one: it returns the SteamID as a plain number,
     // while the C++ method returns a class, whose hidden return pointer not every
-    // steam_api build expects in the same place. The older flat API returns the class
-    // too, through a hidden pointer before `self`.
+    // steam_api build expects in the same place. Some flat APIs without versioned
+    // accessors return the class too, through a hidden pointer before `self`.
     let out = match real("SteamAPI_ISteamUser_GetSteamID") {
-        Some(f) => call_flat_id!(crate::steam::obj::flat_returns_class(), f, crate::steam::obj::unwrap(user)),
+        Some(f) => call_flat_id!(f, crate::steam::obj::unwrap(user)),
         None => {
             let mut out = 0u64;
             let _ = call_real!(
@@ -651,7 +651,7 @@ fn method_of(flat: &str) -> &str {
 /// the C++ method, which returns the CSteamID through a hidden pointer after `this`.
 fn real_friend_by_index(this: usize, index: i32, flags: i32) -> u64 {
     if let Some(f) = real("SteamAPI_ISteamFriends_GetFriendByIndex") {
-        return call_flat_id!(crate::steam::obj::flat_returns_class(), f, unwrap(this), index => i32, flags => i32);
+        return call_flat_id!(f, unwrap(this), index => i32, flags => i32);
     }
     let mut out = 0u64;
     let _ = call_real!(
