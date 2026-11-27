@@ -492,6 +492,10 @@ unsafe extern "system" fn focus_proc(h: HWND, m: u32, w: usize, l: isize) -> isi
             let cur = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetCursor() } as isize;
             if cur != 0 {
                 crate::input::observe_thread_cursor(cur);
+            } else {
+                crate::log::throttled("window: setcursor none", 1, |_| {
+                    log!("window: the game's window 0x{:x} answered WM_SETCURSOR without setting a cursor, and its thread has none: the session's pointer is left as it is over its pane", h as usize);
+                });
             }
         }
     }
@@ -915,7 +919,12 @@ fn put_in_pane(pane: PaneRect) {
     if hwnd == 0 {
         hwnd = find_own_window();
         if hwnd != 0 {
-            PRIMARY_HWND.store(hwnd, Ordering::Relaxed);
+            // Made too small to be contained (a window sized to its resolution after it's
+            // made): not seen being made, so taken up as the game's window here, focus
+            // wrapper included, or it's told of every focus loss and never asked for its
+            // cursor (WM_SETCURSOR), and the session's pointer shows over its own.
+            log!("window: the game's window 0x{hwnd:x} was found in the process's windows (it wasn't contained as it was made): it's the game's window now");
+            note_game_window(hwnd);
         }
     }
     if hwnd == 0 {
