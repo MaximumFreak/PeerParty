@@ -38,7 +38,7 @@ pub struct Package {
 
 /// The value of attribute `name` in an XML start tag: `name="..."`, not the end of
 /// another name (`xName="..."`).
-fn attr(tag: &str, name: &str) -> Option<String> {
+pub(super) fn attr(tag: &str, name: &str) -> Option<String> {
     let key = format!("{name}=\"");
     let mut from = 0;
     while let Some(i) = tag[from..].find(&key).map(|i| i + from) {
@@ -51,10 +51,49 @@ fn attr(tag: &str, name: &str) -> Option<String> {
     None
 }
 
-fn tag<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
-    let start = xml.find(&format!("<{name} "))?;
-    let end = xml[start..].find('>')? + start;
-    Some(&xml[start..end])
+/// Every start tag `<name ...` in `xml`, up to its `>`. The name ends at whitespace, `/`
+/// or `>` (configs break the line after it as often as they put a space), so `<Executable`
+/// isn't found in `<ExecutableList>`.
+fn tags<'a>(xml: &'a str, name: &str) -> Vec<&'a str> {
+    let open = format!("<{name}");
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(i) = xml[from..].find(&open).map(|i| i + from) {
+        from = i + open.len();
+        if !xml[from..].starts_with(|c: char| c.is_whitespace() || c == '/' || c == '>') {
+            continue;
+        }
+        let Some(end) = xml[from..].find('>') else { break };
+        found.push(&xml[i..from + end]);
+    }
+    found
+}
+
+pub(super) fn tag<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
+    tags(xml, name).into_iter().next()
+}
+
+/// The MicrosoftGame.config in a package's folder, if it has one.
+pub(super) fn read_config(content: &Path) -> Option<String> {
+    ["MicrosoftGame.config", "MicrosoftGame.Config"].iter().find_map(|n| std::fs::read_to_string(content.join(n)).ok())
+}
+
+/// The programs a MicrosoftGame.config lists: each Executable's Name (a path in the
+/// package's folder) and Id (the appxmanifest Application that starts it), in order.
+fn executables(config: &str) -> Vec<(String, Option<String>)> {
+    tags(config, "Executable").into_iter().filter_map(|t| Some((attr(t, "Name")?.replace('/', "\\"), attr(t, "Id")))).collect()
+}
+
+/// The program a package's library entry starts: the one DesktopRegistration's
+/// MultiplayerProtocol names when it lists several (the one other players join), else the
+/// first. Any other one is picked like a second program of any game.
+pub(super) fn main_program(config: &str) -> Option<String> {
+    let programs = executables(config);
+    let multiplayer = tag(config, "MultiplayerProtocol").and_then(|t| attr(t, "Executable")).map(|n| n.replace('/', "\\"));
+    multiplayer
+        .and_then(|m| programs.iter().find(|(n, _)| n.eq_ignore_ascii_case(&m)))
+        .or(programs.first())
+        .map(|(n, _)| n.clone())
 }
 
 /// The package a program belongs to, if it's installed as one (an appxmanifest.xml in
@@ -69,17 +108,33 @@ pub fn find(exe: &Path) -> Option<Package> {
     let arch = attr(identity, "ProcessorArchitecture").unwrap_or_else(|| "x64".into());
     // Part of the full name when present (often "Base").
     let resource = attr(identity, "ResourceId").unwrap_or_default();
-    let app_id = attr(tag(&manifest, "Application")?, "Id")?;
-    let config = ["MicrosoftGame.config", "MicrosoftGame.Config"]
-        .iter()
-        .find_map(|n| std::fs::read_to_string(content.join(n)).ok())
-        .unwrap_or_default();
-    let game = tag(&config, "Executable")
-        .and_then(|t| attr(t, "Name"))
-        .map(|n| content.join(n.replace('/', "\\")))
-        .unwrap_or_else(|| exe.to_path_buf());
+    let config = read_config(&content).unwrap_or_default();
+    let (game, app_id) = pick(exe, &content, &config, &manifest)?;
     let (full_name, family) = names(&name, &publisher, &version, &arch, &resource)?;
     Some(Package { full_name, aumid: format!("{family}!{app_id}"), game })
+}
+
+/// The program a launch of `exe` runs and the Application that starts it. A package can
+/// list several programs (each its own Application, matched by Id); `exe` is one of them,
+/// or else (the launch helper, a tool) the package's main one.
+fn pick(exe: &Path, content: &Path, config: &str, manifest: &str) -> Option<(PathBuf, String)> {
+    let programs = executables(config);
+    let wanted = exe.to_string_lossy().to_ascii_lowercase();
+    let listed = programs.iter().find(|(n, _)| content.join(n).to_string_lossy().to_ascii_lowercase() == wanted);
+    let main = main_program(config);
+    let chosen = listed.or_else(|| programs.iter().find(|(n, _)| Some(n) == main.as_ref()));
+    let apps: Vec<String> = tags(manifest, "Application").into_iter().filter_map(|t| attr(t, "Id")).collect();
+    let app = chosen
+        .and_then(|(_, id)| id.as_ref())
+        .and_then(|id| apps.iter().find(|a| a.eq_ignore_ascii_case(id)))
+        .or(apps.first())?
+        .clone();
+    let game = chosen.map(|(n, _)| content.join(n)).unwrap_or_else(|| exe.to_path_buf());
+    if programs.len() > 1 {
+        let how = if listed.is_some() { "the one picked" } else { "the package's main one, as the one picked isn't listed" };
+        eprintln!("peerparty: package lists {} programs; starting {} through app {app} ({how})", programs.len(), game.display());
+    }
+    Some((game, app))
 }
 
 /// The package's full and family names, as Windows computes them.
@@ -275,6 +330,40 @@ mod tests {
         assert_eq!(attr(t, "Missing"), None);
         assert_eq!(attr(t, "Broken"), None);
         assert_eq!(attr(r#"<Application Id="App""#, "Id").as_deref(), Some("App"));
+    }
+
+    // A package with a campaign and a multiplayer program, each its own Application, the
+    // tags broken after their names.
+    const TWO_PROGRAMS: &str = "<ExecutableList>\n  <Executable\n    Name=\"solo.exe\"\n    Id=\"GameSolo\" />\n  <Executable\n    Name=\"bin/versus.exe\"\n    Id=\"GameVersus\" />\n</ExecutableList>\n<DesktopRegistration>\n  <MultiplayerProtocol\n    Executable=\"bin/versus.exe\">true</MultiplayerProtocol>\n</DesktopRegistration>";
+    const TWO_APPS: &str = "<Applications>\n<Application Id=\"GameSolo\" Executable=\"GameLaunchHelper.exe\">\n</Application>\n<Application\n  Id=\"GameVersus\" Executable=\"GameLaunchHelper.exe\"></Application></Applications>";
+
+    #[test]
+    fn tags_end_at_any_whitespace_not_inside_longer_names() {
+        assert_eq!(tags(TWO_PROGRAMS, "Executable").len(), 2);
+        assert_eq!(tags(TWO_APPS, "Application").len(), 2);
+        assert_eq!(tag("<Identity\r\n\tName=\"A\"/>", "Identity").and_then(|t| attr(t, "Name")).as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn the_main_program_is_the_multiplayer_one() {
+        assert_eq!(main_program(TWO_PROGRAMS).as_deref(), Some(r"bin\versus.exe"));
+        assert_eq!(main_program("<Executable Name=\"only.exe\" Id=\"Game\"/>").as_deref(), Some("only.exe"));
+        // A MultiplayerProtocol naming no listed program is passed over.
+        assert_eq!(main_program("<Executable Name=\"a.exe\"/><Executable Name=\"b.exe\"/><MultiplayerProtocol Executable=\"c.exe\">").as_deref(), Some("a.exe"));
+        assert_eq!(main_program("<ExecutableList></ExecutableList>"), None);
+    }
+
+    #[test]
+    fn each_program_starts_through_its_own_application() {
+        let content = Path::new(r"C:\Games\Contoso\Content");
+        let run = |exe: &str| pick(&content.join(exe), content, TWO_PROGRAMS, TWO_APPS).unwrap();
+        assert_eq!(run("solo.exe"), (content.join("solo.exe"), "GameSolo".into()));
+        assert_eq!(run(r"BIN\Versus.exe"), (content.join(r"bin\versus.exe"), "GameVersus".into()));
+        // The launch helper (or anything not listed) starts the main program.
+        assert_eq!(run("gamelaunchhelper.exe"), (content.join(r"bin\versus.exe"), "GameVersus".into()));
+        // No config: the first Application, and the program as given.
+        let helper = content.join("helper.exe");
+        assert_eq!(pick(&helper, content, "", TWO_APPS).unwrap(), (helper, "GameSolo".into()));
     }
 
     #[test]

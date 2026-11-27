@@ -98,36 +98,27 @@ fn gog(send: &dyn Fn(Game)) {
 // ---- Xbox app (Microsoft Store, GDK) ----
 
 /// Games the Xbox app installed: `<drive>:\XboxGames\<game>\Content`, each a package
-/// (appxmanifest.xml) whose MicrosoftGame.config names the game's program. They start
-/// through packaged.rs.
+/// (appxmanifest.xml) whose MicrosoftGame.config names the game's programs (the main one
+/// is listed: packaged::main_program). They start through packaged.rs.
 fn xbox(send: &dyn Fn(Game)) {
+    use super::packaged::{attr, main_program, read_config, tag};
     for drive in b'C'..=b'Z' {
         let root = PathBuf::from(format!(r"{}:\XboxGames", drive as char));
         let Ok(entries) = fs::read_dir(&root) else { continue };
         for e in entries.flatten() {
             let content = e.path().join("Content");
-            let Ok(config) = fs::read_to_string(content.join("MicrosoftGame.config")).or_else(|_| fs::read_to_string(content.join("MicrosoftGame.Config"))) else {
-                continue;
-            };
-            let attr = |name: &str| {
-                let key = format!("{name}=\"");
-                let start = config.find(&key)? + key.len();
-                let end = config[start..].find('"')? + start;
-                Some(config[start..end].to_string())
-            };
-            let Some(exe) = config.find("<Executable ").and_then(|i| {
-                let tag = &config[i..i + config[i..].find('>')?];
-                let k = tag.find("Name=\"")? + 6;
-                let n = tag[k..].find('"')?;
-                Some(content.join(tag[k..k + n].replace('/', "\\")))
-            }) else {
+            let Some(config) = read_config(&content) else { continue };
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(exe) = main_program(&config).map(|n| content.join(n)) else {
+                eprintln!("peerparty: library: Xbox app package {name} lists no program in its MicrosoftGame.config; left out");
                 continue;
             };
             if !exe.is_file() {
+                eprintln!("peerparty: library: Xbox app package {name}'s program {} isn't there (still installing?); left out", exe.display());
                 continue;
             }
-            let name = e.file_name().to_string_lossy().into_owned();
-            let art = ["Square480x480Logo", "Square150x150Logo"].iter().find_map(|k| attr(k)).map(|p| content.join(p)).filter(|p| p.is_file());
+            let visuals = tag(&config, "ShellVisuals").unwrap_or_default();
+            let art = ["Square480x480Logo", "Square150x150Logo"].iter().find_map(|k| attr(visuals, k)).map(|p| content.join(p)).filter(|p| p.is_file());
             send(Game { name, exe, dir: content, source: Source::Xbox, cover: None, art });
         }
     }
